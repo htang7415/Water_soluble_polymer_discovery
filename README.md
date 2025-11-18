@@ -1,1 +1,0 @@
-# Water_soluble_polymer_discovery
