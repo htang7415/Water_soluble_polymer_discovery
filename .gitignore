@@ -1,90 +1,33 @@
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual environments
-venv/
-ENV/
-env/
-.venv
-
-# PyTorch
-*.pth
-*.pt
-*.ckpt
-
-# Jupyter Notebook
-.ipynb_checkpoints
-*.ipynb
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Data and results
-data/processed/
+*.pyc
+*.pyo
 results/
-runs/
-logs/
-*.log
-
-# Temporary files
-*.tmp
-*.bak
-*.cache
-
-# Optuna
-.optuna/
-
-# Coverage
-htmlcov/
-.coverage
-.coverage.*
-coverage.xml
-*.cover
-
-# pytest
-.pytest_cache/
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Environments
-.env
-.env.local
-
-# Data
+results_1
 Data/
-results/
+*Data
+Generated_polymers
 
-prompt.md
-pyproject.toml
+# 
+experiments*/
+Experiments*/
 
-README.md
-IMPLEMENTATION_SUMMARY.md
-QUICK_START.md
+*.md
+!README.md
+
+*.txt
+*.csv
+*.pkl
+*.pt
+*.png
+*.pdf
+*.svg
+*.eps
+*.tex
+*.log
+*.err
+*.out
+*.ipynb
+*.pptx
+*.sh
+*.gz
