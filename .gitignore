@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 results/
 results_1
+Bi_Diffusion_SMILES
 Data/
 *Data
 Generated_polymers

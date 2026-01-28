@@ -1,0 +1,82 @@
+# Configuration for Water-soluble polymer discovery pipeline
+paths:
+  data_dir: "data"
+  results_dir: "results"
+  d8_file: "data/SMiPoly_polymers.gz"
+  d5_file: "data/OMG_DFT_COSMOSAC_chi.csv"  # fallback handled in code
+  d6_file: "data/Experiment_chi.csv"
+  d1_file: "data/Watersoluble_Polymers_Hansen.csv"
+  d2_file: "data/Watersoluble_Polymers_no_Hansen.csv"
+  d3_file: "data/Waterinsoluble_Polymers_Hansen.csv"
+  d4_file: "data/Waterinsoluble_Polymers_no_Hansen.csv"
+
+seed: 42
+
+# Tokenizer
+model:
+  max_length: 128
+
+special_tokens:
+  pad: "[PAD]"
+  mask: "[MASK]"
+  bos: "[BOS]"
+  eos: "[EOS]"
+  unk: "[UNK]"
+
+# Backbone architecture (DiT)
+backbone:
+  hidden_size: 768
+  num_layers: 12
+  num_heads: 12
+  ffn_hidden_size: 3072
+  dropout: 0.1
+  max_position_embeddings: 256
+
+# Diffusion schedule
+diffusion:
+  num_steps: 50
+  beta_min: 0.05
+  beta_max: 0.95
+
+# Training defaults
+training_backbone:
+  batch_size: 512
+  grad_accum_steps: 1
+  use_amp: true
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 30000
+  gradient_clip_norm: 1.0
+  eval_every: 1000
+  save_every: 30000
+
+training_head:
+  batch_size: 64
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  num_epochs: 200
+  patience: 10
+  gradient_clip_norm: 1.0
+
+optuna:
+  n_trials: 100
+  max_epochs: 100
+  patience: 10
+  pruner: "median"
+
+plotting:
+  figure_size: [5, 5]
+  font_size: 12
+  dpi: 300
+
+sampling:
+  num_samples: 10000
+  batch_size: 256
+  temperature: 1.0
+  use_constraints: true
+  novelty_max: 20000
+
+optimization:
+  compile_model: true
+  compile_mode: "default"
