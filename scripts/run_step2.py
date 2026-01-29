@@ -8,6 +8,7 @@ if str(ROOT) not in sys.path:
 import argparse
 import json
 import os
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -108,6 +109,14 @@ def train_one(model, head, train_loader, val_loader, loss_fn, optimizer, device,
 
 
 def main():
+    warnings.filterwarnings(
+        "ignore",
+        message="enable_nested_tensor is True.*encoder_layer.norm_first.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled.*",
+    )
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

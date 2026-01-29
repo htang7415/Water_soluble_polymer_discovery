@@ -11,6 +11,7 @@ import gzip
 import json
 import os
 import random
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -61,14 +62,27 @@ def main():
     lengths_val = []
     max_samples = 200000
     sample_prob = None
+    save_unlabeled = cfg.get("data", {}).get("save_unlabeled_csv", False)
+    train_unlabeled_path = results_dir / "train_unlabeled.csv"
+    val_unlabeled_path = results_dir / "val_unlabeled.csv"
 
     rng = random.Random(seed)
     vocab_set = None
 
-    with gzip.open(d8_path, "rt") as f, open(split_path, "w", newline="") as out_f:
+    train_ctx = open(train_unlabeled_path, "w", newline="") if save_unlabeled else nullcontext()
+    val_ctx = open(val_unlabeled_path, "w", newline="") if save_unlabeled else nullcontext()
+
+    with gzip.open(d8_path, "rt") as f, open(split_path, "w", newline="") as out_f, train_ctx as train_f, val_ctx as val_f:
         reader = csv.DictReader(f)
         writer = csv.DictWriter(out_f, fieldnames=["id", "split"])
         writer.writeheader()
+        train_writer = None
+        val_writer = None
+        if save_unlabeled:
+            train_writer = csv.DictWriter(train_f, fieldnames=["smiles"])
+            val_writer = csv.DictWriter(val_f, fieldnames=["smiles"])
+            train_writer.writeheader()
+            val_writer.writeheader()
         vocab_set = None
         idx = 0
         for row in reader:
@@ -76,6 +90,11 @@ def main():
             smiles = row[smiles_key]
             split = "val" if rng.random() < 0.05 else "train"
             writer.writerow({"id": idx, "split": split})
+            if save_unlabeled:
+                if split == "train":
+                    train_writer.writerow({"smiles": smiles})
+                else:
+                    val_writer.writerow({"smiles": smiles})
             tokens = SmilesTokenizer.tokenize(smiles)
             if split == "train":
                 if vocab_set is None:

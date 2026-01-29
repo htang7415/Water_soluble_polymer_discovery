@@ -139,50 +139,51 @@ def load_training_smiles(d8_path, split_path, limit):
 def sample_batch(model, tokenizer, num_steps, num_samples, batch_size, seq_length, lengths, temperature, use_constraints, device):
     all_smiles = []
     model.eval()
-    for start in range(0, num_samples, batch_size):
-        bs = min(batch_size, num_samples - start)
-        batch_lengths = lengths[start:start + bs]
-        ids = torch.full((bs, seq_length), tokenizer.mask_id, dtype=torch.long, device=device)
-        attention = torch.zeros_like(ids)
-        for i, L in enumerate(batch_lengths):
-            L = int(min(L, seq_length))
-            ids[i, 0] = tokenizer.bos_id
-            if L >= 2:
-                ids[i, L - 1] = tokenizer.eos_id
-            if L < seq_length:
-                ids[i, L:] = tokenizer.pad_id
-            attention[i, :L] = 1
-        for t in range(num_steps, 0, -1):
-            timesteps = torch.full((bs,), t, dtype=torch.long, device=device)
-            logits = model(ids, timesteps, attention)
-            logits = logits / max(temperature, 1e-6)
+    with torch.inference_mode():
+        for start in range(0, num_samples, batch_size):
+            bs = min(batch_size, num_samples - start)
+            batch_lengths = lengths[start:start + bs]
+            ids = torch.full((bs, seq_length), tokenizer.mask_id, dtype=torch.long, device=device)
+            attention = torch.zeros_like(ids)
+            for i, L in enumerate(batch_lengths):
+                L = int(min(L, seq_length))
+                ids[i, 0] = tokenizer.bos_id
+                if L >= 2:
+                    ids[i, L - 1] = tokenizer.eos_id
+                if L < seq_length:
+                    ids[i, L:] = tokenizer.pad_id
+                attention[i, :L] = 1
+            for t in range(num_steps, 0, -1):
+                timesteps = torch.full((bs,), t, dtype=torch.long, device=device)
+                logits = model(ids, timesteps, attention)
+                logits = logits / max(temperature, 1e-6)
 
-            # forbid special tokens in masked positions
-            for tok in [tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id, tokenizer.mask_id]:
-                logits[:, :, tok] = -1e9
+                # forbid special tokens in masked positions
+                for tok in [tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id, tokenizer.mask_id]:
+                    logits[:, :, tok] = -1e9
 
-            mask_positions = ids == tokenizer.mask_id
+                mask_positions = ids == tokenizer.mask_id
 
-            if use_constraints:
-                star_id = tokenizer.vocab.get("*", -1)
+                if use_constraints:
+                    star_id = tokenizer.vocab.get("*", -1)
+                    for i in range(bs):
+                        if count_stars(tokenizer.decode(ids[i].tolist())) >= 2 and star_id >= 0:
+                            logits[i, :, star_id] = -1e9
+
+                probs = torch.softmax(logits, dim=-1)
+
                 for i in range(bs):
-                    if count_stars(tokenizer.decode(ids[i].tolist())) >= 2 and star_id >= 0:
-                        logits[i, :, star_id] = -1e9
-
-            probs = torch.softmax(logits, dim=-1)
-
+                    positions = torch.where(mask_positions[i])[0].tolist()
+                    if not positions:
+                        continue
+                    k = max(1, int(len(positions) / t))
+                    select = random.sample(positions, min(k, len(positions)))
+                    for pos in select:
+                        p = probs[i, pos]
+                        idx = torch.multinomial(p, 1).item()
+                        ids[i, pos] = idx
             for i in range(bs):
-                positions = torch.where(mask_positions[i])[0].tolist()
-                if not positions:
-                    continue
-                k = max(1, int(len(positions) / t))
-                select = random.sample(positions, min(k, len(positions)))
-                for pos in select:
-                    p = probs[i, pos]
-                    idx = torch.multinomial(p, 1).item()
-                    ids[i, pos] = idx
-        for i in range(bs):
-            all_smiles.append(tokenizer.decode(ids[i].tolist()))
+                all_smiles.append(tokenizer.decode(ids[i].tolist()))
     return all_smiles
 
 

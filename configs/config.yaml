@@ -12,6 +12,11 @@ paths:
 
 seed: 42
 
+# Data prep
+data:
+  save_unlabeled_csv: true
+  use_preprocessed_csv: true
+
 # Tokenizer
 model:
   max_length: 128
@@ -46,10 +51,10 @@ training_backbone:
   learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_steps: 1000
-  max_steps: 30000
+  max_steps: 3000
   gradient_clip_norm: 1.0
   eval_every: 1000
-  save_every: 30000
+  save_every: 100000
 
 training_head:
   batch_size: 64
@@ -78,5 +83,12 @@ sampling:
   novelty_max: 20000
 
 optimization:
+  use_amp: true
   compile_model: true
   compile_mode: "default"
+  gradient_accumulation_steps: 1
+  num_workers: 4
+  pin_memory: true
+  cudnn_benchmark: true
+  prefetch_factor: 2
+  cache_tokenization: false

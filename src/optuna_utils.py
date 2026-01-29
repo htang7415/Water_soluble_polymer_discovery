@@ -3,9 +3,12 @@ from typing import Dict
 import optuna
 
 
-def create_study(name: str, direction: str = "min"):
+def create_study(name: str, direction: str = "minimize"):
     pruner = optuna.pruners.MedianPruner()
-    return optuna.create_study(study_name=name, direction=direction, pruner=pruner)
+    normalized = direction
+    if direction in {"min", "max"}:
+        normalized = "minimize" if direction == "min" else "maximize"
+    return optuna.create_study(study_name=name, direction=normalized, pruner=pruner)
 
 
 def save_study(study: optuna.Study, path: str) -> None:
