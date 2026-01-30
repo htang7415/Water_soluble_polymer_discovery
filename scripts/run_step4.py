@@ -8,6 +8,7 @@ if str(ROOT) not in sys.path:
 import argparse
 import json
 import random
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -22,15 +23,15 @@ from src.data_utils import ensure_dir, split_train_val_test_by_group
 from src.eval_utils import classification_metrics, regression_metrics
 from src.models.dit import DiT, DiTConfig
 from src.models.heads import ChiHead, HansenHead, SolubilityHead
-from src.optuna_utils import create_study, save_study
+from src.optuna_utils import create_study, save_study, trial_logger
 from src.plot_utils import parity_plot, pr_curve_plot, roc_curve_plot, save_loss_plot
 from src.tokenizer import SmilesTokenizer
-from src.train_utils import EarlyStopping, build_optimizer, maybe_compile
+from src.train_utils import EarlyStopping, build_optimizer, maybe_compile, strip_compile_prefix
 from src.log_utils import start_log, end_log
 
 
 class MultiTaskDataset(Dataset):
-    def __init__(self, df, tokenizer):
+    def __init__(self, df, tokenizer, cache_tokenization: bool = False):
         self.smiles = df["SMILES"].astype(str).tolist()
         self.sol = df["water_soluble"].astype(int).tolist()
         self.delta_d = df["delta_d"].astype(float).tolist()
@@ -38,13 +39,26 @@ class MultiTaskDataset(Dataset):
         self.delta_h = df["delta_h"].astype(float).tolist()
         self.has_hansen = df["has_hansen"].astype(int).tolist()
         self.tokenizer = tokenizer
+        self.cache_tokenization = cache_tokenization
+        self._cache = {}
+        if cache_tokenization:
+            self._pretokenize()
+
+    def _pretokenize(self):
+        for idx, smi in enumerate(self.smiles):
+            ids = self.tokenizer.encode(smi)
+            attn = [1 if t != self.tokenizer.pad_id else 0 for t in ids]
+            self._cache[idx] = (ids, attn)
 
     def __len__(self):
         return len(self.smiles)
 
     def __getitem__(self, idx):
-        ids = self.tokenizer.encode(self.smiles[idx])
-        attn = [1 if t != self.tokenizer.pad_id else 0 for t in ids]
+        if self.cache_tokenization and idx in self._cache:
+            ids, attn = self._cache[idx]
+        else:
+            ids = self.tokenizer.encode(self.smiles[idx])
+            attn = [1 if t != self.tokenizer.pad_id else 0 for t in ids]
         hansen = [self.delta_d[idx], self.delta_p[idx], self.delta_h[idx]]
         return (
             torch.tensor(ids, dtype=torch.long),
@@ -56,18 +70,31 @@ class MultiTaskDataset(Dataset):
 
 
 class ChiEvalDataset(Dataset):
-    def __init__(self, df, tokenizer):
+    def __init__(self, df, tokenizer, cache_tokenization: bool = False):
         self.smiles = df["SMILES"].astype(str).tolist()
         self.temp = df["temperature"].astype(float).tolist()
         self.chi = df["chi"].astype(float).tolist()
         self.tokenizer = tokenizer
+        self.cache_tokenization = cache_tokenization
+        self._cache = {}
+        if cache_tokenization:
+            self._pretokenize()
+
+    def _pretokenize(self):
+        for idx, smi in enumerate(self.smiles):
+            ids = self.tokenizer.encode(smi)
+            attn = [1 if t != self.tokenizer.pad_id else 0 for t in ids]
+            self._cache[idx] = (ids, attn)
 
     def __len__(self):
         return len(self.smiles)
 
     def __getitem__(self, idx):
-        ids = self.tokenizer.encode(self.smiles[idx])
-        attn = [1 if t != self.tokenizer.pad_id else 0 for t in ids]
+        if self.cache_tokenization and idx in self._cache:
+            ids, attn = self._cache[idx]
+        else:
+            ids = self.tokenizer.encode(self.smiles[idx])
+            attn = [1 if t != self.tokenizer.pad_id else 0 for t in ids]
         return (
             torch.tensor(ids, dtype=torch.long),
             torch.tensor(attn, dtype=torch.long),
@@ -76,13 +103,49 @@ class ChiEvalDataset(Dataset):
         )
 
 
-def forward_backbone(model, ids, attn):
-    timesteps = torch.zeros(ids.size(0), device=ids.device).long()
+def _amp_helpers(device: str, use_amp: bool):
+    if not use_amp or not device.startswith("cuda"):
+        return None, nullcontext
+    try:
+        from torch.amp import GradScaler, autocast as amp_autocast
+
+        scaler = GradScaler("cuda", enabled=True)
+
+        def autocast_ctx():
+            return amp_autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True)
+
+        return scaler, autocast_ctx
+    except Exception:
+        from torch.cuda.amp import GradScaler, autocast as amp_autocast
+
+        scaler = GradScaler(enabled=True)
+
+        def autocast_ctx():
+            return amp_autocast(enabled=True, dtype=torch.bfloat16)
+
+        return scaler, autocast_ctx
+
+
+def _pool_hidden(hidden: torch.Tensor, attention_mask: torch.Tensor, pooling: str) -> torch.Tensor:
+    if pooling == "cls":
+        return hidden[:, 0, :]
+    if pooling == "max":
+        mask = attention_mask.unsqueeze(-1).bool()
+        masked = hidden.masked_fill(~mask, -1e9)
+        return masked.max(dim=1).values
+    mask = attention_mask.unsqueeze(-1).float()
+    summed = (hidden * mask).sum(dim=1)
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return summed / denom
+
+
+def forward_backbone(model, ids, attn, pooling: str, default_timestep: int):
+    timesteps = torch.full((ids.size(0),), default_timestep, device=ids.device, dtype=torch.long)
     hidden = model.forward_hidden(ids, timesteps, attn)
-    return hidden[:, 0, :]
+    return _pool_hidden(hidden, attn, pooling)
 
 
-def eval_chi_mae(model, chi_head, loader, device):
+def eval_chi_mae(model, chi_head, loader, device, pooling: str, default_timestep: int, autocast_ctx):
     model.eval()
     chi_head.eval()
     y_true, y_pred = [], []
@@ -92,15 +155,37 @@ def eval_chi_mae(model, chi_head, loader, device):
             attn = attn.to(device)
             temp = temp.to(device)
             chi = chi.to(device)
-            emb = forward_backbone(model, ids, attn)
-            pred = chi_head(emb, temp)
+            with autocast_ctx():
+                emb = forward_backbone(model, ids, attn, pooling, default_timestep)
+                pred = chi_head(emb, temp)
             y_true.extend(chi.cpu().numpy().tolist())
             y_pred.extend(pred.cpu().numpy().tolist())
     return regression_metrics(y_true, y_pred)["mae"]
 
 
-def train_one(model, chi_head, sol_head, hansen_head, train_loader, val_loader, device, params, baseline_mae, d6_loader, trial=None):
-    optimizer = build_optimizer(list(model.parameters()) + list(sol_head.parameters()) + list(hansen_head.parameters()), params["lr"], params["weight_decay"])
+def train_one(
+    model,
+    chi_head,
+    sol_head,
+    hansen_head,
+    train_loader,
+    val_loader,
+    device,
+    params,
+    baseline_mae,
+    d6_loader,
+    pooling,
+    default_timestep,
+    autocast_ctx,
+    scaler,
+    grad_accum_steps,
+    trial=None,
+):
+    optimizer = build_optimizer(
+        list(model.parameters()) + list(sol_head.parameters()) + list(hansen_head.parameters()),
+        params["lr"],
+        params["weight_decay"],
+    )
     stopper = EarlyStopping(params["patience"], mode="max")
     best_state = None
     best_auprc = -1e9
@@ -113,28 +198,47 @@ def train_one(model, chi_head, sol_head, hansen_head, train_loader, val_loader, 
         hansen_head.train()
         total_loss = 0.0
         count = 0
+        accum = 0
+        optimizer.zero_grad()
         for ids, attn, sol, hansen, has_hansen in train_loader:
             ids = ids.to(device)
             attn = attn.to(device)
             sol = sol.to(device)
             hansen = hansen.to(device)
             has_hansen = has_hansen.to(device)
-            emb = forward_backbone(model, ids, attn)
-            sol_logits = sol_head(emb)
-            hansen_pred = hansen_head(emb)
+            with autocast_ctx():
+                emb = forward_backbone(model, ids, attn, pooling, default_timestep)
+                sol_logits = sol_head(emb)
+                hansen_pred = hansen_head(emb)
 
-            sol_loss = torch.nn.functional.binary_cross_entropy_with_logits(sol_logits, sol)
-            if has_hansen.sum() > 0:
-                mask = has_hansen.view(-1, 1)
-                hansen_loss = torch.nn.functional.mse_loss(hansen_pred * mask, hansen * mask)
+                sol_loss = torch.nn.functional.binary_cross_entropy_with_logits(sol_logits, sol)
+                if has_hansen.sum() > 0:
+                    mask = has_hansen.view(-1, 1)
+                    hansen_loss = torch.nn.functional.mse_loss(hansen_pred * mask, hansen * mask)
+                else:
+                    hansen_loss = torch.tensor(0.0, device=device)
+                loss = (params["lambda_sol"] * sol_loss + params["lambda_hansen"] * hansen_loss) / grad_accum_steps
+            if scaler is not None:
+                scaler.scale(loss).backward()
             else:
-                hansen_loss = torch.tensor(0.0, device=device)
-            loss = params["lambda_sol"] * sol_loss + params["lambda_hansen"] * hansen_loss
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+                loss.backward()
+            accum += 1
+            if accum % grad_accum_steps == 0:
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+            total_loss += loss.item() * grad_accum_steps
             count += 1
+        if accum % grad_accum_steps != 0:
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
         train_losses.append(total_loss / max(1, count))
 
         # validation metrics
@@ -150,15 +254,17 @@ def train_one(model, chi_head, sol_head, hansen_head, train_loader, val_loader, 
                 sol = sol.to(device)
                 hansen = hansen.to(device)
                 has_hansen = has_hansen.to(device)
-                emb = forward_backbone(model, ids, attn)
-                sol_logits = sol_head(emb)
+                with autocast_ctx():
+                    emb = forward_backbone(model, ids, attn, pooling, default_timestep)
+                    sol_logits = sol_head(emb)
+                    hansen_pred_batch = hansen_head(emb)
                 prob = torch.sigmoid(sol_logits)
                 y_true.extend(sol.cpu().numpy().tolist())
                 y_prob.extend(prob.cpu().numpy().tolist())
                 if has_hansen.sum() > 0:
                     mask = has_hansen.view(-1, 1)
                     hansen_true.extend((hansen * mask).cpu().numpy().tolist())
-                    hansen_pred.extend((hansen_head(emb) * mask).cpu().numpy().tolist())
+                    hansen_pred.extend((hansen_pred_batch * mask).cpu().numpy().tolist())
 
         metrics = classification_metrics(y_true, y_prob)
         val_losses.append(1 - metrics["auprc"])
@@ -180,7 +286,7 @@ def train_one(model, chi_head, sol_head, hansen_head, train_loader, val_loader, 
 
     # penalty for chi degradation
     model.load_state_dict(best_state["model"], strict=False)
-    chi_mae = eval_chi_mae(model, chi_head, d6_loader, device)
+    chi_mae = eval_chi_mae(model, chi_head, d6_loader, device, pooling, default_timestep, autocast_ctx)
     penalty = 0.0
     if chi_mae > 1.05 * baseline_mae:
         penalty = 100.0
@@ -206,6 +312,30 @@ def main():
     start_time = start_log(log_path, "step4_solubility_hansen_D1toD4", args.config, device=args.device)
 
     tokenizer = SmilesTokenizer.from_json(str(Path(cfg["paths"]["results_dir"]) / "step0_tokenizer_split" / "tokenizer.json"))
+    train_cfg = cfg.get("training_property") or cfg.get("training_head", {})
+    head_cfg = cfg.get("property_head", {})
+    opt_cfg = cfg.get("optimization", {})
+    use_amp = bool(opt_cfg.get("use_amp", False)) and args.device.startswith("cuda")
+    grad_accum_steps = max(1, int(opt_cfg.get("gradient_accumulation_steps", 1)))
+    pooling = head_cfg.get("pooling", "cls")
+    default_timestep = int(train_cfg.get("default_timestep", 0))
+    cache_tokenization = bool(train_cfg.get("cache_tokenization", opt_cfg.get("cache_tokenization", False)))
+    compile_in_tuning = bool(opt_cfg.get("compile_in_tuning", False))
+    num_workers = int(opt_cfg.get("num_workers", 0))
+    pin_memory = bool(opt_cfg.get("pin_memory", True))
+    prefetch_factor = int(opt_cfg.get("prefetch_factor", 2))
+
+    def make_loader(dataset, batch_size, shuffle):
+        loader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "persistent_workers": num_workers > 0,
+        }
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+        return DataLoader(dataset, **loader_kwargs)
 
     # load D1-D4
     d1 = pd.read_csv(cfg["paths"]["d1_file"])
@@ -231,13 +361,14 @@ def main():
     df_val = df_all[df_all["SMILES"].isin(val_g)].reset_index(drop=True)
     df_test = df_all[df_all["SMILES"].isin(test_g)].reset_index(drop=True)
 
-    train_loader = DataLoader(MultiTaskDataset(df_train, tokenizer), batch_size=cfg["training_head"]["batch_size"], shuffle=True)
-    val_loader = DataLoader(MultiTaskDataset(df_val, tokenizer), batch_size=cfg["training_head"]["batch_size"], shuffle=False)
-    test_loader = DataLoader(MultiTaskDataset(df_test, tokenizer), batch_size=cfg["training_head"]["batch_size"], shuffle=False)
+    batch_size = train_cfg.get("batch_size", cfg["training_head"]["batch_size"])
+    train_loader = make_loader(MultiTaskDataset(df_train, tokenizer, cache_tokenization=cache_tokenization), batch_size, True)
+    val_loader = make_loader(MultiTaskDataset(df_val, tokenizer, cache_tokenization=cache_tokenization), batch_size, False)
+    test_loader = make_loader(MultiTaskDataset(df_test, tokenizer, cache_tokenization=cache_tokenization), batch_size, False)
 
     # D6 loader for chi retention
     d6 = pd.read_csv(cfg["paths"]["d6_file"])
-    d6_loader = DataLoader(ChiEvalDataset(d6, tokenizer), batch_size=cfg["training_head"]["batch_size"], shuffle=False)
+    d6_loader = make_loader(ChiEvalDataset(d6, tokenizer, cache_tokenization=cache_tokenization), batch_size, False)
 
     # baseline chi MAE
     baseline_mae = None
@@ -280,7 +411,7 @@ def main():
             num_layers=cfg["backbone"]["num_layers"],
             num_heads=cfg["backbone"]["num_heads"],
             ffn_hidden_size=cfg["backbone"]["ffn_hidden_size"],
-            dropout=dropout,
+            dropout=cfg["backbone"]["dropout"],
             max_position_embeddings=cfg["backbone"]["max_position_embeddings"],
             num_steps=cfg["diffusion"]["num_steps"],
         )
@@ -291,9 +422,10 @@ def main():
         if not chi_ckpt_path.exists():
             chi_ckpt_path = Path(cfg["paths"]["results_dir"]) / "step3_exp_chi_T_D6" / "checkpoints" / "model_best_full.pt"
         ckpt = torch.load(chi_ckpt_path, map_location="cpu")
-        model.load_state_dict(ckpt["model_state"], strict=False)
+        model.load_state_dict(strip_compile_prefix(ckpt["model_state"]), strict=False)
         model.set_freeze_mode(freeze_mode)
-        model = maybe_compile(model, cfg.get("optimization", {}))
+        if compile_in_tuning:
+            model = maybe_compile(model, cfg.get("optimization", {}))
 
         chi_head = ChiHead(
             config.hidden_size,
@@ -301,15 +433,17 @@ def main():
             chi_params["dropout"],
             mode=chi_params["model"],
         ).to(device)
-        chi_head = maybe_compile(chi_head, cfg.get("optimization", {}))
-        chi_head.load_state_dict(ckpt["head_state"], strict=False)
+        if compile_in_tuning:
+            chi_head = maybe_compile(chi_head, cfg.get("optimization", {}))
+        chi_head.load_state_dict(strip_compile_prefix(ckpt["head_state"]), strict=False)
         for p in chi_head.parameters():
             p.requires_grad = False
 
         sol_head = SolubilityHead(config.hidden_size, [sol_dim] * sol_layers, dropout).to(device)
         hansen_head = HansenHead(config.hidden_size, [hansen_dim] * hansen_layers, dropout).to(device)
-        sol_head = maybe_compile(sol_head, cfg.get("optimization", {}))
-        hansen_head = maybe_compile(hansen_head, cfg.get("optimization", {}))
+        if compile_in_tuning:
+            sol_head = maybe_compile(sol_head, cfg.get("optimization", {}))
+            hansen_head = maybe_compile(hansen_head, cfg.get("optimization", {}))
 
         params = {
             "lr": lr,
@@ -319,6 +453,7 @@ def main():
             "max_epochs": cfg["optuna"]["max_epochs"],
             "patience": cfg["optuna"]["patience"],
         }
+        trial_scaler, trial_autocast = _amp_helpers(device, use_amp)
         best_auprc, best_state, train_losses, val_losses, chi_mae, penalty = train_one(
             model,
             chi_head,
@@ -330,8 +465,16 @@ def main():
             params,
             baseline_mae,
             d6_loader,
+            pooling,
+            default_timestep,
+            trial_autocast,
+            trial_scaler,
+            grad_accum_steps,
             trial=trial,
         )
+        trial.set_user_attr("best_auprc", float(best_auprc))
+        trial.set_user_attr("chi_mae", float(chi_mae))
+        trial.set_user_attr("penalty", float(penalty))
         objective_value = -best_auprc + penalty
         if objective_value < best_global["objective"]:
             best_global["objective"] = objective_value
@@ -341,7 +484,7 @@ def main():
         return objective_value
 
     study = create_study("step4_solubility", direction="min")
-    study.optimize(objective, n_trials=cfg["optuna"]["n_trials"])
+    study.optimize(objective, n_trials=cfg["optuna"]["n_trials"], callbacks=[trial_logger(str(metrics_dir / "trial.txt"))])
 
     best_trial = study.best_trial
     best_params = best_trial.params
@@ -356,7 +499,7 @@ def main():
         num_layers=cfg["backbone"]["num_layers"],
         num_heads=cfg["backbone"]["num_heads"],
         ffn_hidden_size=cfg["backbone"]["ffn_hidden_size"],
-        dropout=best_params["dropout"],
+        dropout=cfg["backbone"]["dropout"],
         max_position_embeddings=cfg["backbone"]["max_position_embeddings"],
         num_steps=cfg["diffusion"]["num_steps"],
     )
@@ -365,7 +508,7 @@ def main():
     if not chi_ckpt_path.exists():
         chi_ckpt_path = Path(cfg["paths"]["results_dir"]) / "step3_exp_chi_T_D6" / "checkpoints" / "model_best_full.pt"
     ckpt = torch.load(chi_ckpt_path, map_location="cpu")
-    model.load_state_dict(ckpt["model_state"], strict=False)
+    model.load_state_dict(strip_compile_prefix(ckpt["model_state"]), strict=False)
     model.set_freeze_mode(best_params["freeze_mode"])
     model = maybe_compile(model, cfg.get("optimization", {}))
 
@@ -376,7 +519,7 @@ def main():
         mode=chi_params["model"],
     ).to(device)
     chi_head = maybe_compile(chi_head, cfg.get("optimization", {}))
-    chi_head.load_state_dict(ckpt["head_state"], strict=False)
+    chi_head.load_state_dict(strip_compile_prefix(ckpt["head_state"]), strict=False)
     for p in chi_head.parameters():
         p.requires_grad = False
 
@@ -384,6 +527,8 @@ def main():
     hansen_head = HansenHead(config.hidden_size, [best_params["hansen_head_dim"]] * best_params["hansen_head_layers"], best_params["dropout"]).to(device)
     sol_head = maybe_compile(sol_head, cfg.get("optimization", {}))
     hansen_head = maybe_compile(hansen_head, cfg.get("optimization", {}))
+
+    eval_scaler, eval_autocast = _amp_helpers(device, use_amp)
 
     if best_global["state"]:
         model.load_state_dict(best_global["state"]["model"], strict=False)
@@ -404,14 +549,17 @@ def main():
                 sol = sol.to(device)
                 hansen = hansen.to(device)
                 has_hansen = has_hansen.to(device)
-                emb = forward_backbone(model, ids, attn)
-                prob = torch.sigmoid(sol_head(emb))
+                with eval_autocast():
+                    emb = forward_backbone(model, ids, attn, pooling, default_timestep)
+                    sol_logits = sol_head(emb)
+                    hansen_pred_batch = hansen_head(emb)
+                prob = torch.sigmoid(sol_logits)
                 y_true.extend(sol.cpu().numpy().tolist())
                 y_prob.extend(prob.cpu().numpy().tolist())
                 if has_hansen.sum() > 0:
                     mask_idx = has_hansen.bool()
                     hansen_true.extend(hansen[mask_idx].cpu().numpy().tolist())
-                    hansen_pred.extend(hansen_head(emb)[mask_idx].cpu().numpy().tolist())
+                    hansen_pred.extend(hansen_pred_batch[mask_idx].cpu().numpy().tolist())
         return y_true, y_prob, hansen_true, hansen_pred
 
     y_true_tr, y_prob_tr, h_true_tr, h_pred_tr = eval_sol_hansen(train_loader)
@@ -426,7 +574,7 @@ def main():
     h_true_flat = [v for row in h_true_te for v in row] if h_true_te else []
     h_pred_flat = [v for row in h_pred_te for v in row] if h_pred_te else []
     hansen_mae = regression_metrics(h_true_flat, h_pred_flat)["mae"] if h_true_flat else float("nan")
-    chi_mae_after = eval_chi_mae(model, chi_head, d6_loader, device)
+    chi_mae_after = eval_chi_mae(model, chi_head, d6_loader, device, pooling, default_timestep, eval_autocast)
 
     # save metrics
     with open(metrics_dir / "metrics.csv", "w") as f:
@@ -468,7 +616,14 @@ def main():
     if train_losses:
         save_loss_plot(train_losses, val_losses, str(figures_dir / "fig_loss.png"))
 
-    torch.save({"model_state": model.state_dict(), "sol_state": sol_head.state_dict(), "hansen_state": hansen_head.state_dict()}, results_dir / "model_best.pt")
+    torch.save(
+        {
+            "model_state": strip_compile_prefix(model.state_dict()),
+            "sol_state": strip_compile_prefix(sol_head.state_dict()),
+            "hansen_state": strip_compile_prefix(hansen_head.state_dict()),
+        },
+        results_dir / "model_best.pt",
+    )
 
     run_info = {"seed": cfg.get("seed", 42), "timestamp": datetime.utcnow().isoformat(), "device": device}
     with open(results_dir / "run_info.json", "w") as f:

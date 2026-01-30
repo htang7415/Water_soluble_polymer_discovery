@@ -1,32 +1,36 @@
+#!/usr/bin/env python
+"""Step 2: Sample from backbone and evaluate generative metrics (Bi_Diffusion style)."""
+
 import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 import argparse
-import csv
-import json
-import random
 import re
 import time
-from collections import Counter
-from datetime import datetime
 from pathlib import Path
+from collections import Counter
 
-import numpy as np
 import torch
-import yaml
+import pandas as pd
 
-from src.data_utils import ensure_dir
-from src.models.dit import DiT, DiTConfig
-from src.tokenizer import SmilesTokenizer
-from src.chem_utils import count_stars, compute_sa_score
-from src.generative_metrics import GenerativeEvaluator
-from src.log_utils import start_log, end_log
+BI_ROOT = Path(__file__).resolve().parents[1] / "Bi_Diffusion_SMILES"
+if str(BI_ROOT) not in sys.path:
+    sys.path.insert(0, str(BI_ROOT))
+repo_root = Path(__file__).resolve().parents[2]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
-BOND_CHARS = set(['-', '=', '#', '/', '\\'])
+from src.utils.config import load_config, save_config
+from src.utils.plotting import PlotUtils
+from src.utils.chemistry import compute_sa_score, count_stars
+from src.utils.model_scales import get_model_config, get_results_dir
+from src.data.tokenizer import PSmilesTokenizer
+from src.model.backbone import DiffusionBackbone
+from src.model.diffusion import DiscreteMaskingDiffusion
+from src.sampling.sampler import ConstrainedSampler
+from src.evaluation.generative_metrics import GenerativeEvaluator
+from src.utils.reproducibility import seed_everything, save_run_metadata
+
+
+BOND_CHARS = set(["-", "=", "#", "/", "\\"])
 
 
 def _smiles_constraint_violations(smiles: str) -> dict:
@@ -45,9 +49,9 @@ def _smiles_constraint_violations(smiles: str) -> dict:
     depth = 0
     paren_violation = False
     for ch in smiles:
-        if ch == '(':
+        if ch == "(":
             depth += 1
-        elif ch == ')':
+        elif ch == ")":
             depth -= 1
             if depth < 0:
                 paren_violation = True
@@ -59,16 +63,16 @@ def _smiles_constraint_violations(smiles: str) -> dict:
     prev = None
     for ch in smiles:
         if ch in BOND_CHARS:
-            if prev is None or prev in BOND_CHARS or prev in '()':
+            if prev is None or prev in BOND_CHARS or prev in "()":
                 bond_violation = True
                 break
         if ch.strip() == "":
             continue
         prev = ch
 
-    ring_tokens = re.findall(r'%\d{2}', smiles)
-    no_percent = re.sub(r'%\d{2}', '', smiles)
-    ring_tokens += re.findall(r'\d', no_percent)
+    ring_tokens = re.findall(r"%\d{2}", smiles)
+    no_percent = re.sub(r"%\d{2}", "", smiles)
+    ring_tokens += re.findall(r"\d", no_percent)
     ring_violation = False
     if ring_tokens:
         counts = Counter(ring_tokens)
@@ -114,239 +118,266 @@ def compute_smiles_constraint_metrics(smiles_list, method, representation, model
     return rows
 
 
-def load_training_smiles(d8_path, split_path, limit):
-    val_ids = set()
-    with open(split_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row["split"] == "val":
-                val_ids.add(int(row["id"]))
-    smiles = []
-    with open(d8_path, "rb") as fh:
-        import gzip
+def main(args):
+    config = load_config(args.config)
 
-        with gzip.open(fh, "rt") as f:
-            reader = csv.DictReader(f)
-            for idx, row in enumerate(reader):
-                if idx in val_ids:
-                    continue
-                smiles.append(row.get("SMILES") or row.get("smiles") or row.get("p_smiles") or row.get("pSMILES"))
-                if limit and len(smiles) >= limit:
-                    break
-    return smiles
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
 
+    base_results_dir = config["paths"]["results_dir"]
+    results_dir = Path(get_results_dir(args.model_size, base_results_dir))
 
-def sample_batch(model, tokenizer, num_steps, num_samples, batch_size, seq_length, lengths, temperature, use_constraints, device):
-    all_smiles = []
-    model.eval()
-    with torch.inference_mode():
-        for start in range(0, num_samples, batch_size):
-            bs = min(batch_size, num_samples - start)
-            batch_lengths = lengths[start:start + bs]
-            ids = torch.full((bs, seq_length), tokenizer.mask_id, dtype=torch.long, device=device)
-            attention = torch.zeros_like(ids)
-            for i, L in enumerate(batch_lengths):
-                L = int(min(L, seq_length))
-                ids[i, 0] = tokenizer.bos_id
-                if L >= 2:
-                    ids[i, L - 1] = tokenizer.eos_id
-                if L < seq_length:
-                    ids[i, L:] = tokenizer.pad_id
-                attention[i, :L] = 1
-            for t in range(num_steps, 0, -1):
-                timesteps = torch.full((bs,), t, dtype=torch.long, device=device)
-                logits = model(ids, timesteps, attention)
-                logits = logits / max(temperature, 1e-6)
+    step_dir = results_dir / "step2_sampling"
+    metrics_dir = step_dir / "metrics"
+    figures_dir = step_dir / "figures"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
 
-                # forbid special tokens in masked positions
-                for tok in [tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id, tokenizer.mask_id]:
-                    logits[:, :, tok] = -1e9
+    seed_info = seed_everything(config["data"]["random_seed"])
+    save_config(config, step_dir / "config_used.yaml")
+    save_run_metadata(step_dir, args.config, seed_info)
 
-                mask_positions = ids == tokenizer.mask_id
+    print("=" * 50)
+    print("Step 2: Sampling and Generative Evaluation")
+    if args.model_size:
+        print(f"Model Size: {args.model_size}")
+    print("=" * 50)
 
-                if use_constraints:
-                    star_id = tokenizer.vocab.get("*", -1)
-                    for i in range(bs):
-                        if count_stars(tokenizer.decode(ids[i].tolist())) >= 2 and star_id >= 0:
-                            logits[i, :, star_id] = -1e9
+    print("\n1. Loading tokenizer...")
+    tokenizer_path = results_dir / "tokenizer.json"
+    if not tokenizer_path.exists():
+        tokenizer_path = Path(base_results_dir) / "tokenizer.json"
+    tokenizer = PSmilesTokenizer.load(tokenizer_path)
 
-                probs = torch.softmax(logits, dim=-1)
+    print("\n2. Loading training data...")
+    train_path = results_dir / "train_unlabeled.csv"
+    if not train_path.exists():
+        train_path = Path(base_results_dir) / "train_unlabeled.csv"
+    train_df = pd.read_csv(train_path)
+    training_smiles = set(train_df["p_smiles"].tolist())
+    print(f"Training set size: {len(training_smiles)}")
 
-                for i in range(bs):
-                    positions = torch.where(mask_positions[i])[0].tolist()
-                    if not positions:
-                        continue
-                    k = max(1, int(len(positions) / t))
-                    select = random.sample(positions, min(k, len(positions)))
-                    for pos in select:
-                        p = probs[i, pos]
-                        idx = torch.multinomial(p, 1).item()
-                        ids[i, pos] = idx
-            for i in range(bs):
-                all_smiles.append(tokenizer.decode(ids[i].tolist()))
-    return all_smiles
+    print("\n3. Loading model...")
+    checkpoint_path = args.checkpoint or (results_dir / "step1_backbone" / "checkpoints" / "backbone_best.pt")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--num_samples", type=int, default=None)
-    parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--temperature", type=float, default=None)
-    parser.add_argument("--variable_length", action="store_true")
-    parser.add_argument("--min_length", type=int, default=20)
-    parser.add_argument("--max_length", type=int, default=100)
-    parser.add_argument("--samples_per_length", type=int, default=16)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
-
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
-
-    results_dir = Path(cfg["paths"]["results_dir"]) / "step1_2_sampling"
-    metrics_dir = results_dir / "metrics"
-    figures_dir = results_dir / "figures"
-    ensure_dir(results_dir)
-    ensure_dir(metrics_dir)
-    ensure_dir(figures_dir)
-    log_path = results_dir / "log.txt"
-    start_time = start_log(log_path, "step1_2_sampling", args.config, device=args.device)
-
-    tokenizer = SmilesTokenizer.from_json(str(Path(cfg["paths"]["results_dir"]) / "step0_tokenizer_split" / "tokenizer.json"))
-
-    train_split_path = Path(cfg["paths"]["results_dir"]) / "step0_tokenizer_split" / "metrics" / "splits_D8.csv"
-    training_smiles = load_training_smiles(cfg["paths"]["d8_file"], train_split_path, cfg.get("sampling", {}).get("novelty_max", 200000))
-    training_smiles = set(training_smiles)
-
-    config = DiTConfig(
-        vocab_size=len(tokenizer.vocab),
-        hidden_size=cfg["backbone"]["hidden_size"],
-        num_layers=cfg["backbone"]["num_layers"],
-        num_heads=cfg["backbone"]["num_heads"],
-        ffn_hidden_size=cfg["backbone"]["ffn_hidden_size"],
-        dropout=cfg["backbone"]["dropout"],
-        max_position_embeddings=cfg["backbone"]["max_position_embeddings"],
-        num_steps=cfg["diffusion"]["num_steps"],
+    backbone_config = get_model_config(args.model_size, config, model_type="sequence")
+    backbone = DiffusionBackbone(
+        vocab_size=tokenizer.vocab_size,
+        hidden_size=backbone_config["hidden_size"],
+        num_layers=backbone_config["num_layers"],
+        num_heads=backbone_config["num_heads"],
+        ffn_hidden_size=backbone_config["ffn_hidden_size"],
+        max_position_embeddings=backbone_config["max_position_embeddings"],
+        num_diffusion_steps=config["diffusion"]["num_steps"],
+        dropout=backbone_config["dropout"],
+        pad_token_id=tokenizer.pad_token_id,
     )
-    model = DiT(config).to(args.device)
-    ckpt_path = args.checkpoint or (Path(cfg["paths"]["results_dir"]) / "step1_dit_pretrain_D8" / "checkpoints" / "model_best.pt")
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(ckpt["model_state"], strict=False)
 
-    num_samples = args.num_samples or cfg.get("sampling", {}).get("num_samples", 10000)
-    batch_size = args.batch_size or cfg.get("sampling", {}).get("batch_size", 256)
-    temperature = args.temperature or cfg.get("sampling", {}).get("temperature", 1.0)
-    use_constraints = cfg.get("sampling", {}).get("use_constraints", True)
+    model = DiscreteMaskingDiffusion(
+        backbone=backbone,
+        num_steps=config["diffusion"]["num_steps"],
+        beta_min=config["diffusion"]["beta_min"],
+        beta_max=config["diffusion"]["beta_max"],
+        mask_token_id=tokenizer.mask_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
 
-    lengths = []
-    if args.variable_length:
-        for L in range(args.min_length, args.max_length + 1):
-            lengths.extend([L] * args.samples_per_length)
-        if len(lengths) < num_samples:
-            lengths = (lengths * (num_samples // len(lengths) + 1))[:num_samples]
-        else:
-            lengths = lengths[:num_samples]
-    else:
-        # sample lengths from training distribution
-        lengths = []
-        if training_smiles:
-            sampled = random.choices(list(training_smiles), k=num_samples)
-            for s in sampled:
-                lengths.append(min(len(tokenizer.tokenize(s)) + 2, tokenizer.max_length))
-        else:
-            lengths = [tokenizer.max_length] * num_samples
+    state_dict = checkpoint["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    model = model.to(device)
+    model.eval()
+
+    print("\n4. Creating sampler...")
+    sampler = ConstrainedSampler(
+        diffusion_model=model,
+        tokenizer=tokenizer,
+        num_steps=config["diffusion"]["num_steps"],
+        temperature=config["sampling"]["temperature"],
+        use_constraints=config["sampling"].get("use_constraints", True),
+        device=device,
+    )
 
     sampling_start = time.time()
-    generated_smiles = sample_batch(
-        model,
-        tokenizer,
-        cfg["diffusion"]["num_steps"],
-        num_samples,
-        batch_size,
-        tokenizer.max_length,
-        lengths,
-        temperature,
-        use_constraints,
-        args.device,
-    )
-    sampling_time = time.time() - sampling_start
+    batch_size = args.batch_size or config["sampling"]["batch_size"]
+    print(f"\n5. Sampling {args.num_samples} polymers (batch_size={batch_size})...")
+    if args.variable_length:
+        print(f"   Using variable length sampling (range: {args.min_length}-{args.max_length})")
+        _, generated_smiles = sampler.sample_variable_length(
+            num_samples=args.num_samples,
+            length_range=(args.min_length, args.max_length),
+            batch_size=batch_size,
+            samples_per_length=args.samples_per_length,
+            show_progress=True,
+        )
+    else:
+        replace = args.num_samples > len(train_df)
+        sampled = train_df["p_smiles"].sample(
+            n=args.num_samples,
+            replace=replace,
+            random_state=config["data"]["random_seed"],
+        )
+        lengths = [
+            min(len(tokenizer.tokenize(s)) + 2, tokenizer.max_length)
+            for s in sampled.tolist()
+        ]
+        print(f"   Using training length distribution (min={min(lengths)}, max={max(lengths)})")
+        _, generated_smiles = sampler.sample_batch(
+            num_samples=args.num_samples,
+            seq_length=tokenizer.max_length,
+            batch_size=batch_size,
+            show_progress=True,
+            lengths=lengths,
+        )
 
-    with open(metrics_dir / "generated_samples.csv", "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["smiles"])
-        for s in generated_smiles:
-            writer.writerow([s])
+    sampling_time_sec = time.time() - sampling_start
 
+    samples_df = pd.DataFrame({"smiles": generated_smiles})
+    samples_df.to_csv(metrics_dir / "generated_samples.csv", index=False)
+    print(f"Saved {len(generated_smiles)} generated samples")
+
+    print("\n6. Evaluating generative metrics...")
+    method_name = "Bi_Diffusion"
+    representation_name = "SMILES"
+    model_size_label = args.model_size or "base"
     evaluator = GenerativeEvaluator(training_smiles)
     metrics = evaluator.evaluate(
         generated_smiles,
-        sample_id=f"uncond_{num_samples}_best_checkpoint",
-        sampling_time_sec=sampling_time,
-        method="DiT",
-        representation="SMILES",
-        model_size="base",
+        sample_id=f"uncond_{args.num_samples}_best_checkpoint",
+        show_progress=True,
+        sampling_time_sec=sampling_time_sec,
+        method=method_name,
+        representation=representation_name,
+        model_size=model_size_label,
     )
-    evaluator.format_metrics_csv(metrics).to_csv(metrics_dir / "sampling_generative_metrics.csv", index=False)
 
-    constraint_rows = compute_smiles_constraint_metrics(generated_smiles, "DiT", "SMILES", "base")
-    import pandas as pd
+    metrics_csv = evaluator.format_metrics_csv(metrics)
+    metrics_csv.to_csv(metrics_dir / "sampling_generative_metrics.csv", index=False)
 
+    constraint_rows = compute_smiles_constraint_metrics(generated_smiles, method_name, representation_name, model_size_label)
     pd.DataFrame(constraint_rows).to_csv(metrics_dir / "constraint_metrics.csv", index=False)
 
-    # plots
-    import matplotlib.pyplot as plt
+    if args.evaluate_ood:
+        foundation_dir = Path(args.foundation_results_dir)
+        d1_path = foundation_dir / "embeddings_d1.npy"
+        d2_path = foundation_dir / "embeddings_d2.npy"
+        gen_path = Path(args.generated_embeddings_path) if args.generated_embeddings_path else None
+        if d1_path.exists() and d2_path.exists():
+            try:
+                from shared.ood_metrics import compute_ood_metrics_from_files
+                ood_metrics = compute_ood_metrics_from_files(d1_path, d2_path, gen_path, k=args.ood_k)
+                ood_row = {
+                    "method": method_name,
+                    "representation": representation_name,
+                    "model_size": model_size_label,
+                    **ood_metrics,
+                }
+                pd.DataFrame([ood_row]).to_csv(metrics_dir / "metrics_ood.csv", index=False)
+            except Exception as exc:
+                print(f"OOD evaluation failed: {exc}")
+        else:
+            print("OOD embeddings not found; skipping OOD evaluation.")
+
+    print("\nGenerative Metrics:")
+    print(f"  Validity: {metrics['validity']:.4f}")
+    print(f"  Validity (star=2): {metrics['validity_two_stars']:.4f}")
+    print(f"  Uniqueness: {metrics['uniqueness']:.4f}")
+    print(f"  Novelty: {metrics['novelty']:.4f}")
+    print(f"  Diversity: {metrics['avg_diversity']:.4f}")
+    print(f"  Frac star=2: {metrics['frac_star_eq_2']:.4f}")
+    print(f"  Mean SA: {metrics['mean_sa']:.4f}")
+    print(f"  Std SA: {metrics['std_sa']:.4f}")
+
+    print("\n7. Creating plots...")
+    plotter = PlotUtils(
+        figure_size=tuple(config["plotting"]["figure_size"]),
+        font_size=config["plotting"]["font_size"],
+        dpi=config["plotting"]["dpi"],
+    )
 
     valid_smiles = evaluator.get_valid_samples(generated_smiles, require_two_stars=True)
+
     train_sa = [compute_sa_score(s) for s in list(training_smiles)[:5000]]
     train_sa = [s for s in train_sa if s is not None]
     gen_sa = [compute_sa_score(s) for s in valid_smiles[:5000]]
     gen_sa = [s for s in gen_sa if s is not None]
 
-    plt.figure(figsize=(5, 5))
-    plt.rcParams.update({"font.size": 12})
-    plt.hist(train_sa, bins=50, alpha=0.6, label="Train", histtype="step")
-    plt.hist(gen_sa, bins=50, alpha=0.6, label="Generated", histtype="step")
-    plt.xlabel("SA Score")
-    plt.ylabel("Count")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(figures_dir / "sa_hist_train_vs_uncond.png", dpi=300)
-    plt.close()
+    plotter.histogram(
+        data=[train_sa, gen_sa],
+        labels=["Train", "Generated"],
+        xlabel="SA Score",
+        ylabel="Count",
+        title="SA Score: Train vs Generated",
+        save_path=figures_dir / "sa_hist_train_vs_uncond.png",
+        bins=50,
+        style="step",
+    )
 
     train_lengths = [len(s) for s in list(training_smiles)[:5000]]
     gen_lengths = [len(s) for s in valid_smiles[:5000]]
 
-    plt.figure(figsize=(5, 5))
-    plt.rcParams.update({"font.size": 12})
-    plt.hist(train_lengths, bins=50, alpha=0.6, label="Train", histtype="step")
-    plt.hist(gen_lengths, bins=50, alpha=0.6, label="Generated", histtype="step")
-    plt.xlabel("SMILES Length")
-    plt.ylabel("Count")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(figures_dir / "length_hist_train_vs_uncond.png", dpi=300)
-    plt.close()
+    plotter.histogram(
+        data=[train_lengths, gen_lengths],
+        labels=["Train", "Generated"],
+        xlabel="SMILES Length",
+        ylabel="Count",
+        title="Length: Train vs Generated",
+        save_path=figures_dir / "length_hist_train_vs_uncond.png",
+        bins=50,
+        style="step",
+    )
 
     star_counts = [count_stars(s) for s in valid_smiles]
-    plt.figure(figsize=(5, 5))
-    plt.rcParams.update({"font.size": 12})
-    counts = Counter(star_counts)
-    xs = sorted(counts.keys())
-    ys = [counts[x] for x in xs]
-    plt.bar(xs, ys)
-    plt.xlabel("Star Count")
-    plt.ylabel("Count")
-    plt.tight_layout()
-    plt.savefig(figures_dir / "star_count_hist_uncond.png", dpi=300)
-    plt.close()
+    plotter.star_count_bar(
+        star_counts=star_counts,
+        expected_count=2,
+        xlabel="Star Count",
+        ylabel="Count",
+        title="Star Count Distribution",
+        save_path=figures_dir / "star_count_hist_uncond.png",
+    )
 
-    run_info = {"seed": cfg.get("seed", 42), "timestamp": datetime.utcnow().isoformat(), "device": args.device}
-    with open(results_dir / "run_info.json", "w") as f:
-        json.dump(run_info, f, indent=2)
-
-    end_log(log_path, start_time, status="completed")
+    print("\n" + "=" * 50)
+    print("Sampling and evaluation complete!")
+    print(f"Results saved to: {metrics_dir}")
+    print(f"Figures saved to: {figures_dir}")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Sample and evaluate generative model")
+    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to config file")
+    parser.add_argument(
+        "--model_size",
+        type=str,
+        default=None,
+        choices=["small", "medium", "large", "xl"],
+        help="Model size preset (small: ~12M, medium: ~50M, large: ~150M, xl: ~400M)",
+    )
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint")
+    parser.add_argument("--num_samples", type=int, default=10000, help="Number of samples to generate")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size for sampling (default: from config)")
+    parser.add_argument("--variable_length", action="store_true", help="Enable variable length sampling")
+    parser.add_argument("--min_length", type=int, default=20, help="Minimum sequence length for variable length sampling")
+    parser.add_argument("--max_length", type=int, default=100, help="Maximum sequence length for variable length sampling")
+    parser.add_argument(
+        "--samples_per_length",
+        type=int,
+        default=16,
+        help="Samples per length in variable length mode (controls diversity)",
+    )
+    parser.add_argument("--evaluate_ood", action="store_true", help="Compute OOD metrics if embeddings are available")
+    parser.add_argument(
+        "--foundation_results_dir",
+        type=str,
+        default="../Multi_View_Foundation/results",
+        help="Path to Multi_View_Foundation results directory",
+    )
+    parser.add_argument("--generated_embeddings_path", type=str, default=None, help="Optional path to generated embeddings (.npy)")
+    parser.add_argument("--ood_k", type=int, default=1, help="k for nearest-neighbor distance in OOD metrics")
+    args = parser.parse_args()
+    main(args)

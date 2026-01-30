@@ -23,6 +23,7 @@ from src.models.heads import ChiHead, SolubilityHead
 from src.plot_utils import hist_plot
 from src.tokenizer import SmilesTokenizer
 from src.log_utils import start_log, end_log
+from src.train_utils import strip_compile_prefix
 
 
 def detect_smiles_key(row):
@@ -68,6 +69,19 @@ def mc_dropout_predict(head, emb, temp, k=50):
     return preds.mean(axis=0), preds.std(axis=0)
 
 
+def _pool_hidden(hidden: torch.Tensor, attention_mask: torch.Tensor, pooling: str) -> torch.Tensor:
+    if pooling == "cls":
+        return hidden[:, 0, :]
+    if pooling == "max":
+        mask = attention_mask.unsqueeze(-1).bool()
+        masked = hidden.masked_fill(~mask, -1e9)
+        return masked.max(dim=1).values
+    mask = attention_mask.unsqueeze(-1).float()
+    summed = (hidden * mask).sum(dim=1)
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return summed / denom
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config.yaml")
@@ -84,6 +98,10 @@ def main():
 
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
+    train_cfg = cfg.get("training_property") or cfg.get("training_head", {})
+    head_cfg = cfg.get("property_head", {})
+    pooling = head_cfg.get("pooling", "cls")
+    default_timestep = int(train_cfg.get("default_timestep", 0))
 
     results_dir = Path(cfg["paths"]["results_dir"]) / "step5_screen_D8"
     metrics_dir = results_dir / "metrics"
@@ -117,7 +135,7 @@ def main():
     # load step4 backbone and sol head
     step4_dir = Path(cfg["paths"]["results_dir"]) / "step4_solubility_hansen_D1toD4"
     ckpt = torch.load(step4_dir / "model_best.pt", map_location="cpu")
-    model.load_state_dict(ckpt["model_state"], strict=False)
+    model.load_state_dict(strip_compile_prefix(ckpt["model_state"]), strict=False)
     step4_params_path = step4_dir / "best_params.json"
     if step4_params_path.exists():
         step4_params = json.load(open(step4_params_path))
@@ -126,7 +144,7 @@ def main():
     else:
         sol_dim, sol_layers = 128, 2
     sol_head = SolubilityHead(config.hidden_size, [sol_dim] * sol_layers, chi_params.get("dropout", 0.1)).to(args.device)
-    sol_head.load_state_dict(ckpt["sol_state"], strict=False)
+    sol_head.load_state_dict(strip_compile_prefix(ckpt["sol_state"]), strict=False)
 
     chi_head = ChiHead(config.hidden_size, [chi_params["head_dim"]] * chi_params["head_layers"], chi_params.get("dropout", 0.1), mode=chi_params["model"]).to(args.device)
     # load chi head from step3
@@ -134,7 +152,7 @@ def main():
     if not chi_ckpt_path.exists():
         chi_ckpt_path = Path(cfg["paths"]["results_dir"]) / "step3_exp_chi_T_D6" / "checkpoints" / "model_best_full.pt"
     chi_ckpt = torch.load(chi_ckpt_path, map_location="cpu")
-    chi_head.load_state_dict(chi_ckpt["head_state"], strict=False)
+    chi_head.load_state_dict(strip_compile_prefix(chi_ckpt["head_state"]), strict=False)
 
     soluble_set = load_soluble_set(cfg["paths"]["d1_file"], cfg["paths"]["d2_file"])
 
@@ -155,7 +173,9 @@ def main():
             attn = (ids != tokenizer.pad_id).long()
             temp = torch.tensor([args.t_target], dtype=torch.float).to(args.device)
             with torch.no_grad():
-                emb = model.forward_hidden(ids, torch.zeros(1, device=args.device).long(), attn)[:, 0, :]
+                timesteps = torch.full((1,), default_timestep, device=args.device, dtype=torch.long)
+                hidden = model.forward_hidden(ids, timesteps, attn)
+                emb = _pool_hidden(hidden, attn, pooling)
                 p_sol = torch.sigmoid(sol_head(emb)).item()
             if args.mc_passes > 0:
                 mean, std = mc_dropout_predict(chi_head, emb, temp, k=args.mc_passes)

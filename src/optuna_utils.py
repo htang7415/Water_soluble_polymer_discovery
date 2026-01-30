@@ -1,4 +1,7 @@
-from typing import Dict
+from typing import Dict, Callable
+
+import json
+from pathlib import Path
 
 import optuna
 
@@ -18,3 +21,21 @@ def save_study(study: optuna.Study, path: str) -> None:
 
 def trial_params_to_json(trial: optuna.Trial) -> Dict:
     return trial.params
+
+
+def trial_logger(path: str) -> Callable[[optuna.Study, optuna.trial.FrozenTrial], None]:
+    log_path = Path(path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        payload = {
+            "number": trial.number,
+            "state": str(trial.state),
+            "value": trial.value,
+            "params": trial.params,
+            "user_attrs": trial.user_attrs,
+        }
+        with log_path.open("a") as f:
+            f.write(json.dumps(payload) + "\n")
+
+    return _callback

@@ -1,229 +1,176 @@
+#!/usr/bin/env python
+"""Step 0: Prepare data and build vocabulary (Bi_Diffusion style)."""
+
 import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 import argparse
-import csv
-import gzip
-import json
-import os
 import random
-from contextlib import nullcontext
-from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 import numpy as np
-import yaml
 
-from src.tokenizer import SmilesTokenizer, build_vocab, count_oov
-from src.data_utils import ensure_dir, set_seed, read_csv_rows, write_csv
-from src.plot_utils import hist_plot
-from src.log_utils import start_log, end_log
+BI_ROOT = Path(__file__).resolve().parents[1] / "Bi_Diffusion_SMILES"
+if str(BI_ROOT) not in sys.path:
+    sys.path.insert(0, str(BI_ROOT))
 
-
-def detect_smiles_key(row):
-    for key in ["SMILES", "smiles", "p_smiles", "pSMILES"]:
-        if key in row:
-            return key
-    raise KeyError("No SMILES column found")
+from src.utils.config import load_config, save_config
+from src.utils.plotting import PlotUtils
+from src.data.data_loader import PolymerDataLoader
+from src.data.tokenizer import PSmilesTokenizer
+from src.utils.reproducibility import seed_everything, save_run_metadata
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/config.yaml")
-    args = parser.parse_args()
+def main(args):
+    config = load_config(args.config)
 
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
+    results_dir = Path(config["paths"]["results_dir"])
+    step_dir = results_dir / "step0_data_prep"
+    metrics_dir = step_dir / "metrics"
+    figures_dir = step_dir / "figures"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
 
-    seed = cfg.get("seed", 42)
-    set_seed(seed)
+    seed_info = seed_everything(config["data"]["random_seed"])
+    save_config(config, step_dir / "config_used.yaml")
+    save_run_metadata(step_dir, args.config, seed_info)
 
-    data_dir = cfg["paths"]["data_dir"]
-    d8_path = cfg["paths"]["d8_file"]
-    results_dir = Path(cfg["paths"]["results_dir"]) / "step0_tokenizer_split"
-    metrics_dir = results_dir / "metrics"
-    figures_dir = results_dir / "figures"
-    ensure_dir(results_dir)
-    ensure_dir(metrics_dir)
-    ensure_dir(figures_dir)
-    log_path = results_dir / "log.txt"
-    start_time = start_log(log_path, "step0_tokenizer_split", args.config)
+    data_loader = PolymerDataLoader(config)
 
-    special_tokens = cfg["special_tokens"]
-    max_length = cfg["model"]["max_length"]
+    print("=" * 50)
+    print("Step 0: Data Preparation")
+    print("=" * 50)
 
-    # Build vocab from D8 train split while writing splits
-    split_path = metrics_dir / "splits_D8.csv"
-    lengths_train = []
-    lengths_val = []
-    max_samples = 200000
-    sample_prob = None
-    save_unlabeled = cfg.get("data", {}).get("save_unlabeled_csv", False)
-    train_unlabeled_path = results_dir / "train_unlabeled.csv"
-    val_unlabeled_path = results_dir / "val_unlabeled.csv"
+    print("\n1. Loading and preparing unlabeled data...")
+    unlabeled_data = data_loader.prepare_unlabeled_data()
+    train_df = unlabeled_data["train"]
+    val_df = unlabeled_data["val"]
 
-    rng = random.Random(seed)
-    vocab_set = None
+    print("\n2. Building tokenizer vocabulary...")
+    tokenizer = PSmilesTokenizer(max_length=config["tokenizer"]["max_length"])
+    tokenizer.build_vocab(train_df["p_smiles"].tolist())
+    print(f"Vocabulary size: {tokenizer.vocab_size}")
 
-    train_ctx = open(train_unlabeled_path, "w", newline="") if save_unlabeled else nullcontext()
-    val_ctx = open(val_unlabeled_path, "w", newline="") if save_unlabeled else nullcontext()
+    tokenizer_path = results_dir / "tokenizer.json"
+    tokenizer.save(tokenizer_path)
+    print(f"Tokenizer saved to: {tokenizer_path}")
 
-    with gzip.open(d8_path, "rt") as f, open(split_path, "w", newline="") as out_f, train_ctx as train_f, val_ctx as val_f:
-        reader = csv.DictReader(f)
-        writer = csv.DictWriter(out_f, fieldnames=["id", "split"])
-        writer.writeheader()
-        train_writer = None
-        val_writer = None
-        if save_unlabeled:
-            train_writer = csv.DictWriter(train_f, fieldnames=["smiles"])
-            val_writer = csv.DictWriter(val_f, fieldnames=["smiles"])
-            train_writer.writeheader()
-            val_writer.writeheader()
-        vocab_set = None
-        idx = 0
-        for row in reader:
-            smiles_key = detect_smiles_key(row)
-            smiles = row[smiles_key]
-            split = "val" if rng.random() < 0.05 else "train"
-            writer.writerow({"id": idx, "split": split})
-            if save_unlabeled:
-                if split == "train":
-                    train_writer.writerow({"smiles": smiles})
-                else:
-                    val_writer.writerow({"smiles": smiles})
-            tokens = SmilesTokenizer.tokenize(smiles)
-            if split == "train":
-                if vocab_set is None:
-                    vocab_set = {}
-                    for tok in special_tokens.values():
-                        vocab_set[tok] = len(vocab_set)
-                for tok in tokens:
-                    if tok not in vocab_set:
-                        vocab_set[tok] = len(vocab_set)
-            # reservoir-ish sampling for length hist
-            if len(lengths_train) + len(lengths_val) < max_samples:
-                if split == "train":
-                    lengths_train.append(len(tokens))
-                else:
-                    lengths_val.append(len(tokens))
-            else:
-                # after sample filled, randomly replace
-                if sample_prob is None:
-                    sample_prob = max_samples / float(idx + 1)
-                if rng.random() < sample_prob:
-                    if split == "train":
-                        lengths_train[rng.randrange(len(lengths_train))] = len(tokens)
-                    else:
-                        lengths_val[rng.randrange(len(lengths_val))] = len(tokens)
-            idx += 1
+    print("\n3. Verifying tokenization invertibility...")
+    train_valid = 0
+    train_total = len(train_df)
+    for smiles in train_df["p_smiles"]:
+        if tokenizer.verify_roundtrip(smiles):
+            train_valid += 1
 
-    vocab = vocab_set or build_vocab([], special_tokens)
-    tokenizer = SmilesTokenizer(vocab, special_tokens, max_length=max_length)
-    tokenizer.to_json(str(results_dir / "tokenizer.json"))
+    val_valid = 0
+    val_total = len(val_df)
+    for smiles in val_df["p_smiles"]:
+        if tokenizer.verify_roundtrip(smiles):
+            val_valid += 1
 
-    # stats and OOV for CSV datasets (D1-D6)
-    stats_rows = []
-    csv_files = [
-        "Watersoluble_Polymers_Hansen.csv",
-        "Watersoluble_Polymers_no_Hansen.csv",
-        "Waterinsoluble_Polymers_Hansen.csv",
-        "Waterinsoluble_Polymers_no_Hansen.csv",
-        "OMG_DFT_COSMOSAC_chi.csv",
-        "OMG_DFT_COSMOC_chi.csv",
-        "Experiment_chi.csv",
-    ]
+    print(f"Train roundtrip: {train_valid}/{train_total} ({100*train_valid/train_total:.2f}%)")
+    print(f"Val roundtrip: {val_valid}/{val_total} ({100*val_valid/val_total:.2f}%)")
 
-    seen = set()
-    for name in csv_files:
-        path = Path(data_dir) / name
-        if not path.exists() or name in seen:
-            continue
-        seen.add(name)
-        rows = read_csv_rows(str(path))
-        if not rows:
-            continue
-        key = detect_smiles_key(rows[0])
-        smiles_list = [r[key] for r in rows]
-        oov, total = count_oov(smiles_list, tokenizer.vocab)
-        lengths = [len(SmilesTokenizer.tokenize(s)) for s in smiles_list]
-        q10, q50, q90 = np.quantile(lengths, [0.1, 0.5, 0.9])
-        stats_rows.append(
-            {
-                "dataset": name,
-                "n": len(smiles_list),
-                "oov_rate": oov / total if total else 0.0,
-                "len_q10": float(q10),
-                "len_q50": float(q50),
-                "len_q90": float(q90),
-            }
-        )
+    roundtrip_df = pd.DataFrame({
+        "split": ["train", "val"],
+        "total": [train_total, val_total],
+        "valid": [train_valid, val_valid],
+        "pct": [100 * train_valid / train_total, 100 * val_valid / val_total],
+    })
+    roundtrip_df.to_csv(metrics_dir / "tokenizer_roundtrip.csv", index=False)
 
-    # add D8 sample stats
-    if lengths_train:
-        q10, q50, q90 = np.quantile(lengths_train, [0.1, 0.5, 0.9])
-        stats_rows.append(
-            {
-                "dataset": "D8_train_sample",
-                "n": len(lengths_train),
-                "oov_rate": 0.0,
-                "len_q10": float(q10),
-                "len_q50": float(q50),
-                "len_q90": float(q90),
-            }
-        )
-    if lengths_val:
-        q10, q50, q90 = np.quantile(lengths_val, [0.1, 0.5, 0.9])
-        stats_rows.append(
-            {
-                "dataset": "D8_val_sample",
-                "n": len(lengths_val),
-                "oov_rate": 0.0,
-                "len_q10": float(q10),
-                "len_q50": float(q50),
-                "len_q90": float(q90),
-            }
-        )
+    print("   Saving tokenization examples...")
+    random.seed(config["data"]["random_seed"])
+    sample_smiles = random.sample(train_df["p_smiles"].tolist(), min(10, len(train_df)))
 
-    write_csv(str(metrics_dir / "stats.csv"), ["dataset", "n", "oov_rate", "len_q10", "len_q50", "len_q90"], stats_rows)
+    examples = []
+    for smiles in sample_smiles:
+        tokens = tokenizer.tokenize(smiles)
+        token_ids = {tok: tokenizer.vocab.get(tok, tokenizer.unk_token_id) for tok in tokens}
+        reconstructed = tokenizer.detokenize(tokens)
+        examples.append({
+            "original_smiles": smiles,
+            "num_tokens": len(tokens),
+            "tokens_hashmap": str(token_ids),
+            "reconstructed_smiles": reconstructed,
+        })
 
-    # Plots
-    if lengths_train or lengths_val:
-        hist_plot(
-            [lengths_train, lengths_val],
-            ["train", "val"],
-            str(figures_dir / "fig_len_hist.png"),
-            xlabel="token length",
-        )
+    pd.DataFrame(examples).to_csv(metrics_dir / "tokenizer_examples.csv", index=False)
 
-    # OOV bar plot
-    if stats_rows:
-        import matplotlib.pyplot as plt
+    print("\n4. Computing statistics...")
+    train_stats = data_loader.get_statistics(train_df)
+    val_stats = data_loader.get_statistics(val_df)
+    stats_df = pd.DataFrame([
+        {"split": "train", **train_stats},
+        {"split": "val", **val_stats},
+    ])
+    stats_df.to_csv(metrics_dir / "unlabeled_data_stats.csv", index=False)
 
-        plt.figure(figsize=(5, 5))
-        plt.rcParams.update({"font.size": 12})
-        labels = [r["dataset"] for r in stats_rows]
-        rates = [r["oov_rate"] for r in stats_rows]
-        plt.bar(labels, rates)
-        plt.xticks(rotation=45, ha="right")
-        plt.ylabel("OOV rate")
-        plt.tight_layout()
-        plt.savefig(str(figures_dir / "fig_oov_by_dataset.png"), dpi=300)
-        plt.close()
+    print("\n5. Computing token length distributions...")
+    train_lengths = [len(tokenizer.tokenize(s)) for s in train_df["p_smiles"]]
+    val_lengths = [len(tokenizer.tokenize(s)) for s in val_df["p_smiles"]]
 
-    # run info
-    run_info = {
-        "seed": seed,
-        "timestamp": datetime.utcnow().isoformat(),
-        "config": args.config,
-    }
-    with open(results_dir / "run_info.json", "w") as f:
-        json.dump(run_info, f, indent=2)
-    end_log(log_path, start_time, status="completed")
+    length_stats = pd.DataFrame({
+        "split": ["train", "val"],
+        "mean": [np.mean(train_lengths), np.mean(val_lengths)],
+        "std": [np.std(train_lengths), np.std(val_lengths)],
+        "min": [np.min(train_lengths), np.min(val_lengths)],
+        "max": [np.max(train_lengths), np.max(val_lengths)],
+    })
+    length_stats.to_csv(metrics_dir / "length_stats.csv", index=False)
+
+    train_sa = train_df["sa_score"].dropna().values
+    val_sa = val_df["sa_score"].dropna().values
+    sa_stats = pd.DataFrame({
+        "split": ["train", "val"],
+        "mean": [np.mean(train_sa), np.mean(val_sa)],
+        "std": [np.std(train_sa), np.std(val_sa)],
+        "min": [np.min(train_sa), np.min(val_sa)],
+        "max": [np.max(train_sa), np.max(val_sa)],
+    })
+    sa_stats.to_csv(metrics_dir / "sa_stats.csv", index=False)
+
+    print("\n6. Creating plots...")
+    plotter = PlotUtils(
+        figure_size=tuple(config["plotting"]["figure_size"]),
+        font_size=config["plotting"]["font_size"],
+        dpi=config["plotting"]["dpi"],
+    )
+    plotter.histogram(
+        data=[train_lengths, val_lengths],
+        labels=["Train", "Val"],
+        xlabel="Token Length",
+        ylabel="Count",
+        title="Token Length Distribution",
+        save_path=figures_dir / "length_hist_train_val.png",
+        bins=50,
+        style="step",
+    )
+    plotter.histogram(
+        data=[train_sa, val_sa],
+        labels=["Train", "Val"],
+        xlabel="SA Score",
+        ylabel="Count",
+        title="SA Score Distribution",
+        save_path=figures_dir / "sa_hist_train_val.png",
+        bins=50,
+        style="step",
+    )
+
+    print("\n7. Saving processed data...")
+    train_df.to_csv(results_dir / "train_unlabeled.csv", index=False)
+    val_df.to_csv(results_dir / "val_unlabeled.csv", index=False)
+
+    print("\n" + "=" * 50)
+    print("Data preparation complete!")
+    print(f"Train samples: {len(train_df)}")
+    print(f"Val samples: {len(val_df)}")
+    print(f"Vocabulary size: {tokenizer.vocab_size}")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Prepare data and build vocabulary")
+    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to config file")
+    args = parser.parse_args()
+    main(args)

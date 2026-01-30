@@ -8,6 +8,7 @@ if str(ROOT) not in sys.path:
 import argparse
 import json
 import random
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -22,27 +23,40 @@ from src.data_utils import ensure_dir
 from src.eval_utils import regression_metrics, trend_error_by_polymer, uncertainty_coverage
 from src.models.dit import DiT, DiTConfig
 from src.models.heads import ChiHead
-from src.optuna_utils import create_study, save_study
+from src.optuna_utils import create_study, save_study, trial_logger
 from src.plot_utils import parity_plot, save_loss_plot, bar_plot, coverage_plot
 from src.tokenizer import SmilesTokenizer
-from src.train_utils import EarlyStopping, build_optimizer, maybe_compile
+from src.train_utils import EarlyStopping, build_optimizer, maybe_compile, strip_compile_prefix
 from src.log_utils import start_log, end_log
 
 
 class ChiDataset(Dataset):
-    def __init__(self, df, tokenizer):
+    def __init__(self, df, tokenizer, cache_tokenization: bool = False):
         self.smiles = df["SMILES"].astype(str).tolist()
         self.temps = df["temperature"].astype(float).tolist()
         self.chi = df["chi"].astype(str).tolist()
         self.polymer = df["Polymer"].astype(str).tolist()
         self.tokenizer = tokenizer
+        self.cache_tokenization = cache_tokenization
+        self._cache = {}
+        if cache_tokenization:
+            self._pretokenize()
+
+    def _pretokenize(self):
+        for idx, smi in enumerate(self.smiles):
+            ids = self.tokenizer.encode(smi)
+            attn = [1 if t != self.tokenizer.pad_id else 0 for t in ids]
+            self._cache[idx] = (ids, attn)
 
     def __len__(self):
         return len(self.smiles)
 
     def __getitem__(self, idx):
-        ids = self.tokenizer.encode(self.smiles[idx])
-        attn = [1 if t != self.tokenizer.pad_id else 0 for t in ids]
+        if self.cache_tokenization and idx in self._cache:
+            ids, attn = self._cache[idx]
+        else:
+            ids = self.tokenizer.encode(self.smiles[idx])
+            attn = [1 if t != self.tokenizer.pad_id else 0 for t in ids]
         chi_val = self.chi[idx]
         temp = self.temps[idx]
         low, high = parse_interval(chi_val)
@@ -74,6 +88,42 @@ def parse_interval(value: str):
         return min(nums), max(nums)
 
 
+def _amp_helpers(device: str, use_amp: bool):
+    if not use_amp or not device.startswith("cuda"):
+        return None, nullcontext
+    try:
+        from torch.amp import GradScaler, autocast as amp_autocast
+
+        scaler = GradScaler("cuda", enabled=True)
+
+        def autocast_ctx():
+            return amp_autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True)
+
+        return scaler, autocast_ctx
+    except Exception:
+        from torch.cuda.amp import GradScaler, autocast as amp_autocast
+
+        scaler = GradScaler(enabled=True)
+
+        def autocast_ctx():
+            return amp_autocast(enabled=True, dtype=torch.bfloat16)
+
+        return scaler, autocast_ctx
+
+
+def _pool_hidden(hidden: torch.Tensor, attention_mask: torch.Tensor, pooling: str) -> torch.Tensor:
+    if pooling == "cls":
+        return hidden[:, 0, :]
+    if pooling == "max":
+        mask = attention_mask.unsqueeze(-1).bool()
+        masked = hidden.masked_fill(~mask, -1e9)
+        return masked.max(dim=1).values
+    mask = attention_mask.unsqueeze(-1).float()
+    summed = (hidden * mask).sum(dim=1)
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return summed / denom
+
+
 def interval_loss(pred, low, high, loss_type="mse"):
     # zero loss inside interval; outside use mse or huber
     below = pred < low
@@ -84,15 +134,15 @@ def interval_loss(pred, low, high, loss_type="mse"):
     return torch.nn.functional.mse_loss(pred, target)
 
 
-def forward_batch(model, head, ids, attn, temp):
-    timesteps = torch.zeros(ids.size(0), device=ids.device).long()
+def forward_batch(model, head, ids, attn, temp, pooling: str, default_timestep: int):
+    timesteps = torch.full((ids.size(0),), default_timestep, device=ids.device, dtype=torch.long)
     hidden = model.forward_hidden(ids, timesteps, attn)
-    pooled = hidden[:, 0, :]
+    pooled = _pool_hidden(hidden, attn, pooling)
     pred = head(pooled, temp)
     return pred
 
 
-def eval_dataset(model, head, loader, device):
+def eval_dataset(model, head, loader, device, pooling: str, default_timestep: int, autocast_ctx):
     model.eval()
     head.eval()
     y_true, y_pred, temps, polymers = [], [], [], []
@@ -103,7 +153,8 @@ def eval_dataset(model, head, loader, device):
             temp = temp.to(device)
             low = low.to(device)
             high = high.to(device)
-            pred = forward_batch(model, head, ids, attn, temp)
+            with autocast_ctx():
+                pred = forward_batch(model, head, ids, attn, temp, pooling, default_timestep)
             # use midpoint for metrics
             true = (low + high) / 2.0
             y_true.extend(true.cpu().numpy().tolist())
@@ -113,13 +164,13 @@ def eval_dataset(model, head, loader, device):
     return y_true, y_pred, temps, polymers
 
 
-def mc_dropout_predict(model, head, ids, attn, temp, k=50):
+def mc_dropout_predict(model, head, ids, attn, temp, pooling: str, default_timestep: int, k=50):
     preds = []
     model.train()
     head.train()
     with torch.no_grad():
         for _ in range(k):
-            pred = forward_batch(model, head, ids, attn, temp)
+            pred = forward_batch(model, head, ids, attn, temp, pooling, default_timestep)
             preds.append(pred.cpu().numpy())
     preds = np.stack(preds, axis=0)
     return preds.mean(axis=0), preds.std(axis=0)
@@ -136,6 +187,11 @@ def train_fold(
     loss_name,
     lr,
     weight_decay,
+    pooling,
+    default_timestep,
+    autocast_ctx,
+    scaler,
+    grad_accum_steps,
     trial=None,
 ):
     optimizer = build_optimizer(list(model.parameters()) + list(head.parameters()), lr=lr, weight_decay=weight_decay)
@@ -149,24 +205,44 @@ def train_fold(
         head.train()
         total_loss = 0.0
         count = 0
+        accum = 0
+        optimizer.zero_grad()
         for ids, attn, temp, low, high, _ in train_loader:
             ids = ids.to(device)
             attn = attn.to(device)
             temp = temp.to(device)
             low = low.to(device)
             high = high.to(device)
-            pred = forward_batch(model, head, ids, attn, temp)
-            if loss_name == "interval":
-                loss = interval_loss(pred, low, high, loss_type="mse")
-            elif loss_name == "huber":
-                loss = torch.nn.functional.smooth_l1_loss(pred, (low + high) / 2.0)
+            with autocast_ctx():
+                pred = forward_batch(model, head, ids, attn, temp, pooling, default_timestep)
+                if loss_name == "interval":
+                    loss = interval_loss(pred, low, high, loss_type="mse")
+                elif loss_name == "huber":
+                    loss = torch.nn.functional.smooth_l1_loss(pred, (low + high) / 2.0)
+                else:
+                    loss = torch.nn.functional.mse_loss(pred, (low + high) / 2.0)
+                loss = loss / grad_accum_steps
+            if scaler is not None:
+                scaler.scale(loss).backward()
             else:
-                loss = torch.nn.functional.mse_loss(pred, (low + high) / 2.0)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+                loss.backward()
+            accum += 1
+            if accum % grad_accum_steps == 0:
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+            total_loss += loss.item() * grad_accum_steps
             count += 1
+        if accum % grad_accum_steps != 0:
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
         train_losses.append(total_loss / max(1, count))
 
         # val
@@ -182,13 +258,14 @@ def train_fold(
                 temp = temp.to(device)
                 low = low.to(device)
                 high = high.to(device)
-                pred = forward_batch(model, head, ids, attn, temp)
-                if loss_name == "interval":
-                    loss = interval_loss(pred, low, high, loss_type="mse")
-                elif loss_name == "huber":
-                    loss = torch.nn.functional.smooth_l1_loss(pred, (low + high) / 2.0)
-                else:
-                    loss = torch.nn.functional.mse_loss(pred, (low + high) / 2.0)
+                with autocast_ctx():
+                    pred = forward_batch(model, head, ids, attn, temp, pooling, default_timestep)
+                    if loss_name == "interval":
+                        loss = interval_loss(pred, low, high, loss_type="mse")
+                    elif loss_name == "huber":
+                        loss = torch.nn.functional.smooth_l1_loss(pred, (low + high) / 2.0)
+                    else:
+                        loss = torch.nn.functional.mse_loss(pred, (low + high) / 2.0)
                 total_loss += loss.item()
                 count += 1
                 y_true.extend(((low + high) / 2.0).cpu().numpy().tolist())
@@ -237,6 +314,22 @@ def main():
     df = df.dropna(subset=["SMILES", "chi", "temperature"])
 
     device = args.device
+    train_cfg = cfg.get("training_property") or cfg.get("training_head", {})
+    head_cfg = cfg.get("property_head", {})
+    opt_cfg = cfg.get("optimization", {})
+    tuning_cfg = cfg.get("hyperparameter_tuning", {})
+    search_space = tuning_cfg.get("search_space", {})
+    chi_cfg = cfg.get("chi_head", {})
+    chi_model = chi_cfg.get("model", "M1")
+    use_amp = bool(opt_cfg.get("use_amp", False)) and device.startswith("cuda")
+    grad_accum_steps = max(1, int(opt_cfg.get("gradient_accumulation_steps", 1)))
+    pooling = head_cfg.get("pooling", "cls")
+    default_timestep = int(train_cfg.get("default_timestep", 0))
+    cache_tokenization = bool(train_cfg.get("cache_tokenization", opt_cfg.get("cache_tokenization", False)))
+    compile_in_tuning = bool(opt_cfg.get("compile_in_tuning", False))
+    num_workers = int(opt_cfg.get("num_workers", 0))
+    pin_memory = bool(opt_cfg.get("pin_memory", True))
+    prefetch_factor = int(opt_cfg.get("prefetch_factor", 2))
     groups = df["SMILES"].astype(str).tolist()
     unique_groups = sorted(set(groups))
 
@@ -251,8 +344,21 @@ def main():
         num_steps=cfg["diffusion"]["num_steps"],
     )
 
+    def make_loader(dataset, batch_size, shuffle):
+        loader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "persistent_workers": num_workers > 0,
+        }
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+        return DataLoader(dataset, **loader_kwargs)
+
     def objective(trial: optuna.Trial):
-        model_type = trial.suggest_categorical("model", ["M1", "M2"])
+        # chi head model is chosen via config: M1 (A + B/T) or M2 (A + B/T + C*T)
+        model_type = chi_model
         lr = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
         dropout = trial.suggest_float("dropout", 0.0, 0.3)
@@ -277,16 +383,28 @@ def main():
             df_train = df[df["SMILES"].isin(train_groups)].reset_index(drop=True)
             df_val = df[df["SMILES"].isin(val_groups)].reset_index(drop=True)
 
-            train_loader = DataLoader(ChiDataset(df_train, tokenizer), batch_size=cfg["training_head"]["batch_size"], shuffle=True)
-            val_loader = DataLoader(ChiDataset(df_val, tokenizer), batch_size=cfg["training_head"]["batch_size"], shuffle=False)
+            train_loader = make_loader(
+                ChiDataset(df_train, tokenizer, cache_tokenization=cache_tokenization),
+                batch_size=train_cfg.get("batch_size", cfg["training_head"]["batch_size"]),
+                shuffle=True,
+            )
+            val_loader = make_loader(
+                ChiDataset(df_val, tokenizer, cache_tokenization=cache_tokenization),
+                batch_size=train_cfg.get("batch_size", cfg["training_head"]["batch_size"]),
+                shuffle=False,
+            )
 
             model = DiT(config).to(device)
             ckpt = torch.load(Path(cfg["paths"]["results_dir"]) / "step1_dit_pretrain_D8" / "checkpoints" / "model_best.pt", map_location="cpu")
-            model.load_state_dict(ckpt["model_state"], strict=False)
+            model.load_state_dict(strip_compile_prefix(ckpt["model_state"]), strict=False)
             model.set_freeze_mode(freeze_mode)
-            model = maybe_compile(model, cfg.get("optimization", {}))
+            if compile_in_tuning:
+                model = maybe_compile(model, cfg.get("optimization", {}))
             head = ChiHead(config.hidden_size, [head_dim] * head_layers, dropout, mode=model_type).to(device)
-            head = maybe_compile(head, cfg.get("optimization", {}))
+            if compile_in_tuning:
+                head = maybe_compile(head, cfg.get("optimization", {}))
+
+            trial_scaler, trial_autocast = _amp_helpers(device, use_amp)
 
             best_val, best_state, _, _ = train_fold(
                 model,
@@ -299,6 +417,11 @@ def main():
                 loss_name,
                 lr,
                 weight_decay,
+                pooling,
+                default_timestep,
+                trial_autocast,
+                trial_scaler,
+                grad_accum_steps,
                 trial=trial,
             )
 
@@ -306,21 +429,23 @@ def main():
             if best_state:
                 model.load_state_dict(best_state["model"], strict=False)
                 head.load_state_dict(best_state["head"], strict=False)
-            y_true, y_pred, temps, polymers = eval_dataset(model, head, val_loader, device)
+            y_true, y_pred, temps, polymers = eval_dataset(model, head, val_loader, device, pooling, default_timestep, trial_autocast)
             metrics = regression_metrics(y_true, y_pred)
             fold_mae.append(metrics["mae"])
             fold_rmse.append(metrics["rmse"])
             fold_trend.append(trend_error_by_polymer(polymers, temps, y_true, y_pred))
 
         mean_mae = float(np.mean(fold_mae))
+        trial.set_user_attr("chi_model", model_type)
         trial.set_user_attr("rmse", float(np.mean(fold_rmse)))
         trial.set_user_attr("trend", float(np.mean(fold_trend)))
         return mean_mae
 
     study = create_study("step3_chiT", direction="min")
-    study.optimize(objective, n_trials=cfg["optuna"]["n_trials"])
+    study.optimize(objective, n_trials=cfg["optuna"]["n_trials"], callbacks=[trial_logger(str(metrics_dir / "trial.txt"))])
 
     best_params = study.best_trial.params
+    best_params["model"] = chi_model
     with open(results_dir / "best_params.json", "w") as f:
         json.dump(best_params, f, indent=2)
     save_study(study, str(metrics_dir / "optuna_study.csv"))
@@ -346,13 +471,25 @@ def main():
         df_val = df[df["SMILES"].isin(val_groups)].reset_index(drop=True)
         df_test = df[df["SMILES"].isin([test_group])].reset_index(drop=True)
 
-        train_loader = DataLoader(ChiDataset(df_train, tokenizer), batch_size=cfg["training_head"]["batch_size"], shuffle=True)
-        val_loader = DataLoader(ChiDataset(df_val, tokenizer), batch_size=cfg["training_head"]["batch_size"], shuffle=False)
-        test_loader = DataLoader(ChiDataset(df_test, tokenizer), batch_size=cfg["training_head"]["batch_size"], shuffle=False)
+        train_loader = make_loader(
+            ChiDataset(df_train, tokenizer, cache_tokenization=cache_tokenization),
+            batch_size=train_cfg.get("batch_size", cfg["training_head"]["batch_size"]),
+            shuffle=True,
+        )
+        val_loader = make_loader(
+            ChiDataset(df_val, tokenizer, cache_tokenization=cache_tokenization),
+            batch_size=train_cfg.get("batch_size", cfg["training_head"]["batch_size"]),
+            shuffle=False,
+        )
+        test_loader = make_loader(
+            ChiDataset(df_test, tokenizer, cache_tokenization=cache_tokenization),
+            batch_size=train_cfg.get("batch_size", cfg["training_head"]["batch_size"]),
+            shuffle=False,
+        )
 
         model = DiT(config).to(device)
         ckpt = torch.load(Path(cfg["paths"]["results_dir"]) / "step1_dit_pretrain_D8" / "checkpoints" / "model_best.pt", map_location="cpu")
-        model.load_state_dict(ckpt["model_state"], strict=False)
+        model.load_state_dict(strip_compile_prefix(ckpt["model_state"]), strict=False)
         model.set_freeze_mode(best_params["freeze_mode"])
         model = maybe_compile(model, cfg.get("optimization", {}))
         head = ChiHead(config.hidden_size, [best_params["head_dim"]] * best_params["head_layers"], best_params["dropout"], mode=best_params["model"]).to(device)
@@ -360,46 +497,73 @@ def main():
 
         optimizer = build_optimizer(list(model.parameters()) + list(head.parameters()), best_params["lr"], best_params["weight_decay"])
         stopper = EarlyStopping(cfg["optuna"]["patience"], mode="min")
+        fold_scaler, fold_autocast = _amp_helpers(device, use_amp)
 
         for epoch in range(cfg["optuna"]["max_epochs"]):
             model.train()
             head.train()
             total_loss = 0.0
             count = 0
+            accum = 0
+            optimizer.zero_grad()
             for ids, attn, temp, low, high, _ in train_loader:
                 ids = ids.to(device)
                 attn = attn.to(device)
                 temp = temp.to(device)
                 low = low.to(device)
                 high = high.to(device)
-                pred = forward_batch(model, head, ids, attn, temp)
-                if best_params["loss"] == "interval":
-                    loss = interval_loss(pred, low, high, loss_type="mse")
-                elif best_params["loss"] == "huber":
-                    loss = torch.nn.functional.smooth_l1_loss(pred, (low + high) / 2.0)
+                with fold_autocast():
+                    pred = forward_batch(model, head, ids, attn, temp, pooling, default_timestep)
+                    if best_params["loss"] == "interval":
+                        loss = interval_loss(pred, low, high, loss_type="mse")
+                    elif best_params["loss"] == "huber":
+                        loss = torch.nn.functional.smooth_l1_loss(pred, (low + high) / 2.0)
+                    else:
+                        loss = torch.nn.functional.mse_loss(pred, (low + high) / 2.0)
+                    loss = loss / grad_accum_steps
+                if fold_scaler is not None:
+                    fold_scaler.scale(loss).backward()
                 else:
-                    loss = torch.nn.functional.mse_loss(pred, (low + high) / 2.0)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
+                    loss.backward()
+                accum += 1
+                if accum % grad_accum_steps == 0:
+                    if fold_scaler is not None:
+                        fold_scaler.step(optimizer)
+                        fold_scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad()
+                total_loss += loss.item() * grad_accum_steps
                 count += 1
             train_loss = total_loss / max(1, count)
+            if accum % grad_accum_steps != 0:
+                if fold_scaler is not None:
+                    fold_scaler.step(optimizer)
+                    fold_scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
 
             # val MAE
-            y_true, y_pred, _, _ = eval_dataset(model, head, val_loader, device)
+            y_true, y_pred, _, _ = eval_dataset(model, head, val_loader, device, pooling, default_timestep, fold_autocast)
             val_mae = regression_metrics(y_true, y_pred)["mae"]
             train_log_rows.append({"fold": fold_idx, "epoch": epoch + 1, "train_loss": train_loss, "val_mae": val_mae})
             if stopper.step(val_mae):
                 break
 
         # save checkpoint per fold
-        torch.save({"model_state": model.state_dict(), "head_state": head.state_dict()}, results_dir / "checkpoints" / f"model_best_fold{fold_idx}.pt")
+        torch.save(
+            {
+                "model_state": strip_compile_prefix(model.state_dict()),
+                "head_state": strip_compile_prefix(head.state_dict()),
+            },
+            results_dir / "checkpoints" / f"model_best_fold{fold_idx}.pt",
+        )
 
         # predictions
-        y_true_tr, y_pred_tr, _, _ = eval_dataset(model, head, train_loader, device)
-        y_true_va, y_pred_va, _, _ = eval_dataset(model, head, val_loader, device)
-        y_true_te, y_pred_te, temps, polymers = eval_dataset(model, head, test_loader, device)
+        y_true_tr, y_pred_tr, _, _ = eval_dataset(model, head, train_loader, device, pooling, default_timestep, fold_autocast)
+        y_true_va, y_pred_va, _, _ = eval_dataset(model, head, val_loader, device, pooling, default_timestep, fold_autocast)
+        y_true_te, y_pred_te, temps, polymers = eval_dataset(model, head, test_loader, device, pooling, default_timestep, fold_autocast)
 
         all_train_true.extend(y_true_tr)
         all_train_pred.extend(y_pred_tr)
@@ -415,7 +579,7 @@ def main():
             ids = ids.to(device)
             attn = attn.to(device)
             temp = temp.to(device)
-            mean, std = mc_dropout_predict(model, head, ids, attn, temp, k=50)
+            mean, std = mc_dropout_predict(model, head, ids, attn, temp, pooling, default_timestep, k=50)
             all_test_std.extend(std.tolist())
 
         m = regression_metrics(y_true_te, y_pred_te)

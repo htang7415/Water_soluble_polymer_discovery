@@ -46,7 +46,7 @@ def build_scheduler(optimizer, warmup_steps: int, total_steps: int):
 
 
 def save_checkpoint(path: str, model, optimizer=None, meta: Optional[Dict] = None):
-    payload = {"model_state": model.state_dict()}
+    payload = {"model_state": strip_compile_prefix(model.state_dict())}
     if optimizer is not None:
         payload["optimizer_state"] = optimizer.state_dict()
     if meta:
@@ -56,10 +56,16 @@ def save_checkpoint(path: str, model, optimizer=None, meta: Optional[Dict] = Non
 
 def load_checkpoint(path: str, model, optimizer=None):
     payload = torch.load(path, map_location="cpu")
-    model.load_state_dict(payload["model_state"])
+    model.load_state_dict(strip_compile_prefix(payload["model_state"]))
     if optimizer is not None and "optimizer_state" in payload:
         optimizer.load_state_dict(payload["optimizer_state"])
     return payload
+
+
+def strip_compile_prefix(state_dict: Dict) -> Dict:
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        return {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    return state_dict
 
 
 def set_requires_grad(module, requires_grad: bool) -> None:
