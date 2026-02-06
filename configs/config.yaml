@@ -1,44 +1,26 @@
-# Configuration for Water-soluble polymer discovery pipeline
+# Configuration file for Inverse Polymer Design Pipeline
+
+# Paths
 paths:
-  data_dir: "data"
+  data_dir: "Data"
+  polymer_file: "Data/Polymer/SMiPoly_polymers.gz"
+  property_dir: "Data/Property"
   results_dir: "results"
-  d8_file: "data/SMiPoly_polymers.gz"
-  d5_file: "data/OMG_DFT_COSMOSAC_chi.csv"  # fallback handled in code
-  d6_file: "data/Experiment_chi.csv"
-  d1_file: "data/Watersoluble_Polymers_Hansen.csv"
-  d2_file: "data/Watersoluble_Polymers_no_Hansen.csv"
-  d3_file: "data/Waterinsoluble_Polymers_Hansen.csv"
-  d4_file: "data/Waterinsoluble_Polymers_no_Hansen.csv"
-  polymer_file: "data/SMiPoly_polymers.gz"
-  property_dir: "data"
   checkpoints_dir: "results/checkpoints"
   figures_dir: "results/figures"
   metrics_dir: "results/metrics"
 
-seed: 42
-
-# Data prep
+# Data processing
 data:
   random_seed: 42
+  train_fraction: 1.0
   unlabeled_train_ratio: 0.95
   unlabeled_val_ratio: 0.05
   property_train_ratio: 0.8
   property_val_ratio: 0.1
   property_test_ratio: 0.1
-  save_unlabeled_csv: true
-  use_preprocessed_csv: true
 
 # Tokenizer
-model:
-  max_length: 128
-
-special_tokens:
-  pad: "[PAD]"
-  mask: "[MASK]"
-  bos: "[BOS]"
-  eos: "[EOS]"
-  unk: "[UNK]"
-
 tokenizer:
   special_tokens:
     pad: "[PAD]"
@@ -48,160 +30,177 @@ tokenizer:
     unk: "[UNK]"
   max_length: 128
 
-# Backbone architecture (DiT)
+# Backbone model (GPT-2-small-like)
 backbone:
-  hidden_size: 768
-  num_layers: 12
-  num_heads: 12
-  ffn_hidden_size: 3072
+  hidden_size: 384
+  num_layers: 8
+  num_heads: 8
+  ffn_hidden_size: 1536
   dropout: 0.1
   max_position_embeddings: 256
 
-# Model size presets for Bi_Diffusion-style scaling (optional)
+# Small proxy model for hyperparameter tuning
+proxy_backbone:
+  hidden_size: 256
+  num_layers: 4
+  num_heads: 4
+  ffn_hidden_size: 1024
+  dropout: 0.1
+  max_position_embeddings: 256
+
+# Model size presets for scaling law experiments
 model_sizes:
   small:
+    # Architecture (~10M params)
     hidden_size: 384
     num_layers: 6
     num_heads: 6
     ffn_hidden_size: 1536
     dropout: 0.1
     max_position_embeddings: 256
+    # Training
     max_steps: 300000
     warmup_steps: 1000
     batch_size: 128
     gradient_accumulation_steps: 4
     learning_rate: 3.0e-4
   medium:
+    # Architecture (~49M params)
     hidden_size: 640
     num_layers: 10
     num_heads: 10
     ffn_hidden_size: 2560
     dropout: 0.1
     max_position_embeddings: 256
+    # Training
     max_steps: 300000
     warmup_steps: 2000
     batch_size: 128
     gradient_accumulation_steps: 4
     learning_rate: 3.0e-4
   large:
+    # Architecture (~155M params)
     hidden_size: 960
     num_layers: 14
     num_heads: 12
     ffn_hidden_size: 3840
     dropout: 0.1
     max_position_embeddings: 256
+    # Training
     max_steps: 300000
     warmup_steps: 3000
     batch_size: 128
     gradient_accumulation_steps: 8
     learning_rate: 1.0e-4
   xl:
+    # Architecture (~393M params)
     hidden_size: 1280
     num_layers: 20
     num_heads: 16
     ffn_hidden_size: 5120
     dropout: 0.1
     max_position_embeddings: 256
+    # Training
     max_steps: 300000
     warmup_steps: 4000
     batch_size: 64
     gradient_accumulation_steps: 16
     learning_rate: 1.0e-4
 
-# Diffusion schedule
+# Diffusion
 diffusion:
   num_steps: 50
   beta_min: 0.05
   beta_max: 0.95
 
-# Training defaults
+# Training backbone
 training_backbone:
-  batch_size: 512
-  grad_accum_steps: 1
-  use_amp: true
-  learning_rate: 1.0e-4
+  batch_size: 256
+  learning_rate: 3e-4
   weight_decay: 0.01
   warmup_steps: 1000
-  max_steps: 3000
+  max_steps: 300000
   gradient_clip_norm: 1.0
   eval_every: 1000
   save_every: 100000
+  num_epochs: 50
 
-training_head:
-  batch_size: 64
-  learning_rate: 1.0e-3
-  weight_decay: 1.0e-4
-  num_epochs: 200
-  patience: 10
-  gradient_clip_norm: 1.0
-
-# Property head training (Bi_Diffusion-style)
+# Training property heads
 training_property:
   batch_size: 128
-  learning_rate: 1.0e-3
-  weight_decay: 1.0e-2
+  learning_rate: 1e-3
+  weight_decay: 0.01
   num_epochs: 500
   patience: 30
   freeze_backbone: true
   finetune_last_layers: 6
   default_timestep: 1
-  normalize_targets: true
-  cache_tokenization: true
 
-# Chi(T) head configuration (Step3)
-chi_head:
-  model: "M1"  # M1: chi(T) = A + B/T, M2: chi(T) = A + B/T + C*T
+# Checkpointing
+checkpointing:
+  save_best_only: true         # default: only best checkpoint
+  save_last: false             # set true to save *_last.pt
+  save_periodic: false         # set true to save *_step_*.pt
+
+# Optimization settings for A100 GPU
+optimization:
+  use_amp: true                    # Mixed precision (BF16)
+  compile_model: true              # torch.compile()
+  compile_mode: default            # torch.compile() mode; avoid cudagraph issues
+  gradient_accumulation_steps: 4   # Effective batch = 256 * 4 = 1024
+  num_workers: 4                   # DataLoader workers
+  pin_memory: true                 # GPU memory pinning
+  cudnn_benchmark: true            # cuDNN autotuning
+  prefetch_factor: 2               # DataLoader prefetching
+  cache_tokenization: true         # Pre-tokenize dataset
 
 # Property head architecture
 property_head:
   hidden_sizes: [256, 1024, 128]
   dropout: 0.1
-  pooling: "mean"   # mean | cls | max
-  loss: "mse"       # mse | huber
 
-optuna:
-  n_trials: 50
-  max_epochs: 50
-  patience: 10
-  pruner: "median"
-
-# Hyperparameter tuning for property head (Step2)
+# Hyperparameter tuning for property head (Step 3) using Optuna
 hyperparameter_tuning:
-  enabled: true
-  n_trials: 50
-  tuning_epochs: 50
-  tuning_patience: 10
-  metric: "r2"  # maximize
+  enabled: true                    # Enable via config or --tune flag
+  n_trials: 50                      # Number of Optuna trials
+  tuning_epochs: 50                 # Max epochs per trial
+  tuning_patience: 10               # Early stopping patience per trial
+  metric: "r2"                      # Optimization metric: maximize R² on validation
+
+  # Search space
   search_space:
-    num_layers: [2, 3, 4]
-    neurons: [64, 128, 256, 512]
+    # Property head architecture: 3-5 layers, each layer size from [64, 128, 256, 512, 1024]
+    num_layers: [3, 4, 5]
+    neurons: [64, 128, 256, 512, 1024]
+
+    # Training hyperparameters
     learning_rate: [4.0e-4, 6.0e-4, 8.0e-4, 1.0e-3]
-    weight_decay: [1.0e-6, 1.0e-5, 1.0e-4, 1.0e-3]
-    dropout: [0.0, 0.1, 0.2, 0.3]
+    dropout: [0.1, 0.2, 0.3]
     finetune_last_layers_ratios: [0.0, 0.25, 0.5, 0.75, 1.0]
-    batch_size: [16, 32, 64, 128]
-    loss: ["mse", "huber"]
+    batch_size: [8, 16, 32, 64, 128]  # 2^3 to 2^7
 
-plotting:
-  figure_size: [5, 5]
-  font_size: 12
-  dpi: 600
-
+# Sampling
 sampling:
   num_samples: 10000
   batch_size: 256
   temperature: 1.0
   use_constraints: true
-  novelty_max: 20000
 
-optimization:
-  use_amp: true
-  compile_model: true
-  compile_mode: "default"
-  gradient_accumulation_steps: 1
-  num_workers: 4
-  pin_memory: true
-  cudnn_benchmark: true
-  prefetch_factor: 2
-  cache_tokenization: false
-  compile_in_tuning: false
+# Inverse design
+inverse_design:
+  num_candidates: 10000
+  epsilon: 30.0  # tolerance for property matching
+
+# Polymer classes (SMARTS patterns)
+polymer_classes:
+  polyimide: "[#6](=O)-[#7]-[#6](=O)"
+  polyester: "[#6](=O)-[#8]-[#6]"
+  polyamide: "[#6](=O)-[#7]-[#6]"
+  polyurethane: "[#8]-[#6](=O)-[#7]"
+  polyether: "[#6]-[#8]-[#6]"
+
+# Plotting
+plotting:
+  figure_size: [4.5, 4.5]
+  font_size: 12
+  dpi: 600

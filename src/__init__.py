@@ -1,1 +1,5 @@
-"""Core utilities for water-soluble polymer discovery pipeline."""
+"""
+Inverse Polymer Design using Discrete Masking Diffusion Models
+"""
+
+__version__ = "0.1.0"
