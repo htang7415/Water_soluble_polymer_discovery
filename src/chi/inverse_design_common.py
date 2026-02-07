@@ -26,6 +26,10 @@ def default_chi_config(config: Dict) -> Dict:
         "epsilon": 0.05,
         "class_weight": 0.25,
         "polymer_class_weight": 0.50,
+        "candidate_source": "novel",
+        "property_rule": "upper_bound",
+        "coverage_topk": 5,
+        "target_polymer_class": "all",
         "embedding_batch_size": 128,
         "embedding_timestep": int(config.get("training_property", {}).get("default_timestep", 1)),
     }
@@ -256,12 +260,20 @@ def infer_coefficients_for_novel_candidates(
 def load_soluble_targets(
     targets_csv: str | None,
     results_dir: Path,
+    base_results_dir: Path | None,
     split_mode: str,
 ) -> Tuple[pd.DataFrame, str | None]:
     if targets_csv:
         target_path = Path(targets_csv)
     else:
-        target_path = results_dir / "step3_chi_target_learning" / split_mode / "metrics" / "chi_target_for_inverse_design.csv"
+        candidate_paths = [
+            results_dir / "step3_chi_target_learning" / split_mode / "metrics" / "chi_target_for_inverse_design.csv"
+        ]
+        if base_results_dir is not None:
+            base_path = Path(base_results_dir) / "step3_chi_target_learning" / split_mode / "metrics" / "chi_target_for_inverse_design.csv"
+            if str(base_path) not in {str(p) for p in candidate_paths}:
+                candidate_paths.append(base_path)
+        target_path = next((p for p in candidate_paths if p.exists()), candidate_paths[0])
     if not target_path.exists():
         raise FileNotFoundError(
             "Learned χ_target file not found. "

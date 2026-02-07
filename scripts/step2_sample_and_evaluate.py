@@ -28,6 +28,7 @@ from src.model.diffusion import DiscreteMaskingDiffusion
 from src.sampling.sampler import ConstrainedSampler
 from src.evaluation.generative_metrics import GenerativeEvaluator
 from src.utils.reproducibility import seed_everything, save_run_metadata
+from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
 
 
 
@@ -121,10 +122,26 @@ def compute_smiles_constraint_metrics(smiles_list, method, representation, model
             "violation_rate": round(rate, 4),
         })
     return rows
+
+
 def main(args):
     """Main function."""
     # Load config
     config = load_config(args.config)
+    sampling_cfg = config.get('sampling', {})
+    num_samples = int(args.num_samples if args.num_samples is not None else config.get('sampling', {}).get('num_samples', 10000))
+    temperature = float(args.temperature if args.temperature is not None else sampling_cfg.get('temperature', 1.0))
+    top_k = args.top_k if args.top_k is not None else sampling_cfg.get('top_k', None)
+    top_k = int(top_k) if top_k is not None else None
+    if top_k is not None and top_k <= 0:
+        top_k = None
+    top_p = args.top_p if args.top_p is not None else sampling_cfg.get('top_p', None)
+    top_p = float(top_p) if top_p is not None else None
+    if top_p is not None and not (0.0 < top_p <= 1.0):
+        raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+    target_stars = int(args.target_stars if args.target_stars is not None else sampling_cfg.get('target_stars', 2))
+    if target_stars < 0:
+        raise ValueError(f"target_stars must be >= 0, got {target_stars}")
 
     # Set device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -145,6 +162,21 @@ def main(args):
     seed_info = seed_everything(config['data']['random_seed'])
     save_config(config, step_dir / 'config_used.yaml')
     save_run_metadata(step_dir, args.config, seed_info)
+    write_initial_log(
+        step_dir=step_dir,
+        step_name="step2_sampling",
+        context={
+            "config_path": args.config,
+            "model_size": args.model_size,
+            "results_dir": str(results_dir),
+            "num_samples": num_samples,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "target_stars": target_stars,
+            "random_seed": config['data']['random_seed'],
+        },
+    )
 
     print("=" * 50)
     print("Step 2: Sampling and Generative Evaluation")
@@ -208,11 +240,15 @@ def main(args):
 
     # Create sampler
     print("\n4. Creating sampler...")
+    print(f"   temperature={temperature}, top_k={top_k}, top_p={top_p}, target_stars={target_stars}")
     sampler = ConstrainedSampler(
         diffusion_model=model,
         tokenizer=tokenizer,
         num_steps=config['diffusion']['num_steps'],
-        temperature=config['sampling']['temperature'],
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        target_stars=target_stars,
         use_constraints=config['sampling'].get('use_constraints', True),
         device=device
     )
@@ -220,11 +256,11 @@ def main(args):
     # Sample
     sampling_start = time.time()
     batch_size = args.batch_size or config['sampling']['batch_size']
-    print(f"\n5. Sampling {args.num_samples} polymers (batch_size={batch_size})...")
+    print(f"\n5. Sampling {num_samples} polymers (batch_size={batch_size})...")
     if args.variable_length:
         print(f"   Using variable length sampling (range: {args.min_length}-{args.max_length})")
         _, generated_smiles = sampler.sample_variable_length(
-            num_samples=args.num_samples,
+            num_samples=num_samples,
             length_range=(args.min_length, args.max_length),
             batch_size=batch_size,
             samples_per_length=args.samples_per_length,
@@ -232,9 +268,9 @@ def main(args):
         )
     else:
         # Sample lengths from training distribution (token length + BOS/EOS)
-        replace = args.num_samples > len(train_df)
+        replace = num_samples > len(train_df)
         sampled = train_df['p_smiles'].sample(
-            n=args.num_samples,
+            n=num_samples,
             replace=replace,
             random_state=config['data']['random_seed']
         )
@@ -244,7 +280,7 @@ def main(args):
         ]
         print(f"   Using training length distribution (min={min(lengths)}, max={max(lengths)})")
         _, generated_smiles = sampler.sample_batch(
-            num_samples=args.num_samples,
+            num_samples=num_samples,
             seq_length=tokenizer.max_length,
             batch_size=batch_size,
             show_progress=True,
@@ -262,11 +298,11 @@ def main(args):
     print("\n6. Evaluating generative metrics...")
     method_name = "Bi_Diffusion"
     representation_name = "SMILES"
-    model_size_label = args.model_size or "base"
+    model_size_label = args.model_size or "small"
     evaluator = GenerativeEvaluator(training_smiles)
     metrics = evaluator.evaluate(
         generated_smiles,
-        sample_id=f'uncond_{args.num_samples}_best_checkpoint',
+        sample_id=f'uncond_{num_samples}_best_checkpoint',
         show_progress=True,
         sampling_time_sec=sampling_time_sec,
         method=method_name,
@@ -370,6 +406,30 @@ def main(args):
         save_path=figures_dir / 'star_count_hist_uncond.png'
     )
 
+    # Save standardized summary and artifact manifest.
+    summary = {
+        "step": "step2_sampling",
+        "model_size": model_size_label,
+        "num_samples_requested": int(num_samples),
+        "num_samples_generated": int(len(generated_smiles)),
+        "temperature": float(temperature),
+        "top_k": int(top_k) if top_k is not None else None,
+        "top_p": float(top_p) if top_p is not None else None,
+        "target_stars": int(target_stars),
+        "sampling_time_sec": float(sampling_time_sec),
+        "samples_per_sec": float(metrics.get("samples_per_sec", 0.0)),
+        "validity": float(metrics.get("validity", 0.0)),
+        "validity_two_stars": float(metrics.get("validity_two_stars", 0.0)),
+        "uniqueness": float(metrics.get("uniqueness", 0.0)),
+        "novelty": float(metrics.get("novelty", 0.0)),
+        "avg_diversity": float(metrics.get("avg_diversity", 0.0)),
+        "frac_star_eq_2": float(metrics.get("frac_star_eq_2", 0.0)),
+        "mean_sa": float(metrics.get("mean_sa", 0.0)),
+        "std_sa": float(metrics.get("std_sa", 0.0)),
+    }
+    save_step_summary(summary, metrics_dir)
+    save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figures_dir)
+
     print("\n" + "=" * 50)
     print("Sampling and evaluation complete!")
     print(f"Results saved to: {metrics_dir}")
@@ -381,15 +441,23 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Sample and evaluate generative model')
     parser.add_argument('--config', type=str, default='configs/config.yaml',
                         help='Path to config file')
-    parser.add_argument('--model_size', type=str, default=None,
+    parser.add_argument('--model_size', type=str, default='small',
                         choices=['small', 'medium', 'large', 'xl'],
                         help='Model size preset (small: ~12M, medium: ~50M, large: ~150M, xl: ~400M)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint')
-    parser.add_argument('--num_samples', type=int, default=10000,
-                        help='Number of samples to generate')
+    parser.add_argument('--num_samples', type=int, default=None,
+                        help='Number of samples to generate (default: sampling.num_samples in config)')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='Batch size for sampling (default: from config)')
+    parser.add_argument('--temperature', type=float, default=None,
+                        help='Sampling temperature (default: sampling.temperature in config)')
+    parser.add_argument('--top_k', type=int, default=None,
+                        help='Top-k token filter (default: sampling.top_k in config)')
+    parser.add_argument('--top_p', type=float, default=None,
+                        help='Top-p nucleus filter (default: sampling.top_p in config)')
+    parser.add_argument('--target_stars', type=int, default=None,
+                        help='Target number of "*" tokens (default: sampling.target_stars in config)')
     parser.add_argument('--variable_length', action='store_true',
                         help='Enable variable length sampling')
     parser.add_argument('--min_length', type=int, default=20,

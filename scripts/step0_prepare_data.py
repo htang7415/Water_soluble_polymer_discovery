@@ -18,6 +18,7 @@ from src.utils.plotting import PlotUtils
 from src.data.data_loader import PolymerDataLoader
 from src.data.tokenizer import PSmilesTokenizer
 from src.utils.reproducibility import seed_everything, save_run_metadata
+from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
 
 
 def main(args):
@@ -38,6 +39,15 @@ def main(args):
     seed_info = seed_everything(config['data']['random_seed'])
     save_config(config, step_dir / 'config_used.yaml')
     save_run_metadata(step_dir, args.config, seed_info)
+    write_initial_log(
+        step_dir=step_dir,
+        step_name="step0_data_prep",
+        context={
+            "config_path": args.config,
+            "results_dir": str(results_dir),
+            "random_seed": config['data']['random_seed'],
+        },
+    )
 
     # Initialize data loader
     data_loader = PolymerDataLoader(config)
@@ -186,6 +196,22 @@ def main(args):
     print("\n7. Saving processed data...")
     train_df.to_csv(results_dir / 'train_unlabeled.csv', index=False)
     val_df.to_csv(results_dir / 'val_unlabeled.csv', index=False)
+
+    # Save standardized step summary and artifact manifest.
+    summary = {
+        "step": "step0_data_prep",
+        "train_samples": int(len(train_df)),
+        "val_samples": int(len(val_df)),
+        "vocab_size": int(tokenizer.vocab_size),
+        "train_roundtrip_pct": float(100 * train_valid / train_total) if train_total > 0 else np.nan,
+        "val_roundtrip_pct": float(100 * val_valid / val_total) if val_total > 0 else np.nan,
+        "train_mean_length": float(np.mean(train_lengths)) if len(train_lengths) > 0 else np.nan,
+        "val_mean_length": float(np.mean(val_lengths)) if len(val_lengths) > 0 else np.nan,
+        "train_mean_sa": float(np.mean(train_sa)) if len(train_sa) > 0 else np.nan,
+        "val_mean_sa": float(np.mean(val_sa)) if len(val_sa) > 0 else np.nan,
+    }
+    save_step_summary(summary, metrics_dir)
+    save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figures_dir)
 
     print("\n" + "=" * 50)
     print("Data preparation complete!")

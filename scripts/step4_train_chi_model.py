@@ -32,6 +32,7 @@ from src.chi.model import PhysicsGuidedChiModel
 from src.utils.config import load_config, save_config
 from src.utils.model_scales import get_results_dir
 from src.utils.reproducibility import save_run_metadata, seed_everything
+from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
 
 
 @dataclass
@@ -54,6 +55,7 @@ class TrainConfig:
     tuning_epochs: int
     tuning_patience: int
     timestep_for_embedding: int
+    optuna_search_space: Dict[str, object]
 
 
 class ChiDataset(Dataset):
@@ -84,6 +86,48 @@ class ChiDataset(Dataset):
 
 
 
+def _resolve_optuna_search_space(config: Dict, chi_cfg: Dict) -> Dict[str, object]:
+    """Resolve Step 4 Optuna search space with legacy fallback support."""
+    defaults: Dict[str, object] = {
+        "num_layers": [1, 2, 3],
+        "hidden_units": [64, 128, 256, 512],
+        "dropout": [0.0, 0.1, 0.2, 0.3],
+        "learning_rate": [1e-4, 5e-3],   # continuous range when len==2
+        "learning_rate_log": True,
+        "weight_decay": [1e-7, 1e-3],    # continuous range when len==2
+        "weight_decay_log": True,
+        "lambda_bce": [0.01, 0.05, 0.1, 0.2, 0.5],
+        "batch_size": [16, 32, 64, 128, 256],
+    }
+
+    # Preferred: chi_training.optuna_search_space
+    user_space = chi_cfg.get("optuna_search_space", {})
+    if not isinstance(user_space, dict):
+        user_space = {}
+
+    # Backward compatibility: hyperparameter_tuning.search_space
+    if not user_space:
+        legacy = config.get("hyperparameter_tuning", {}).get("search_space", {})
+        if isinstance(legacy, dict) and legacy:
+            mapped = {}
+            if "num_layers" in legacy:
+                mapped["num_layers"] = legacy["num_layers"]
+            if "neurons" in legacy:
+                mapped["hidden_units"] = legacy["neurons"]
+            if "dropout" in legacy:
+                mapped["dropout"] = legacy["dropout"]
+            if "learning_rate" in legacy:
+                mapped["learning_rate"] = legacy["learning_rate"]
+            if "batch_size" in legacy:
+                mapped["batch_size"] = legacy["batch_size"]
+            user_space = mapped
+
+    out = defaults.copy()
+    for key, val in user_space.items():
+        out[key] = val
+    return out
+
+
 def _default_chi_config(config: Dict) -> Dict:
     chi_cfg = config.get("chi_training", {})
     defaults = {
@@ -109,13 +153,16 @@ def _default_chi_config(config: Dict) -> Dict:
     }
     out = defaults.copy()
     out.update(chi_cfg)
+    out["optuna_search_space"] = _resolve_optuna_search_space(config, chi_cfg)
     return out
 
 
 
 def build_train_config(args, config: Dict) -> TrainConfig:
     chi_cfg = _default_chi_config(config)
-    split_mode = args.split_mode or chi_cfg["split_mode"]
+    split_mode = str(chi_cfg["split_mode"]).strip().lower()
+    if split_mode not in {"polymer", "random"}:
+        raise ValueError("chi_training.split_mode must be one of {'polymer','random'}")
     tune_cfg = bool(chi_cfg.get("tune", False))
     tune_flag = bool(args.tune or (tune_cfg and not args.no_tune))
 
@@ -138,6 +185,7 @@ def build_train_config(args, config: Dict) -> TrainConfig:
         tuning_epochs=int(chi_cfg.get("tuning_epochs", 80)),
         tuning_patience=int(chi_cfg.get("tuning_patience", 15)),
         timestep_for_embedding=int(chi_cfg.get("embedding_timestep", 1)),
+        optuna_search_space=dict(chi_cfg.get("optuna_search_space", {})),
     )
 
 
@@ -336,6 +384,8 @@ def tune_hyperparameters(
     train_cfg: TrainConfig,
     device: str,
     tuning_dir: Path,
+    dpi: int = 300,
+    font_size: int = 12,
 ) -> Dict:
     try:
         import optuna
@@ -345,15 +395,47 @@ def tune_hyperparameters(
         ) from exc
 
     tuning_dir.mkdir(parents=True, exist_ok=True)
+    search_space = train_cfg.optuna_search_space
+
+    def _as_list(key: str, default: List[float]) -> List[float]:
+        values = search_space.get(key, default)
+        if isinstance(values, list) and len(values) > 0:
+            return values
+        return default
+
+    num_layers_space = _as_list("num_layers", [1, 2, 3])
+    hidden_units_space = [int(v) for v in _as_list("hidden_units", [64, 128, 256, 512])]
+    dropout_space = [float(v) for v in _as_list("dropout", [0.0, 0.1, 0.2, 0.3])]
+    lr_space = [float(v) for v in _as_list("learning_rate", [1e-4, 5e-3])]
+    wd_space = [float(v) for v in _as_list("weight_decay", [1e-7, 1e-3])]
+    lambda_bce_space = [float(v) for v in _as_list("lambda_bce", [0.01, 0.05, 0.1, 0.2, 0.5])]
+    batch_size_space = [int(v) for v in _as_list("batch_size", [16, 32, 64, 128, 256])]
+    lr_log = bool(search_space.get("learning_rate_log", True))
+    wd_log = bool(search_space.get("weight_decay_log", True))
 
     def objective(trial: optuna.Trial) -> float:
-        num_layers = trial.suggest_int("num_layers", 1, 3)
-        hidden_sizes = [trial.suggest_categorical(f"hidden_{i}", [64, 128, 256, 512]) for i in range(num_layers)]
-        dropout = trial.suggest_categorical("dropout", [0.0, 0.1, 0.2, 0.3])
-        lr = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)
-        wd = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
-        lambda_bce = trial.suggest_categorical("lambda_bce", [0.01, 0.05, 0.1, 0.2, 0.5])
-        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128, 256])
+        if len(num_layers_space) == 2:
+            lo = int(min(num_layers_space))
+            hi = int(max(num_layers_space))
+            num_layers = trial.suggest_int("num_layers", lo, hi)
+        else:
+            num_layers = int(trial.suggest_categorical("num_layers", [int(v) for v in num_layers_space]))
+
+        hidden_sizes = [int(trial.suggest_categorical(f"hidden_{i}", hidden_units_space)) for i in range(num_layers)]
+        dropout = float(trial.suggest_categorical("dropout", dropout_space))
+
+        if len(lr_space) == 2:
+            lr = float(trial.suggest_float("learning_rate", min(lr_space), max(lr_space), log=lr_log))
+        else:
+            lr = float(trial.suggest_categorical("learning_rate", lr_space))
+
+        if len(wd_space) == 2:
+            wd = float(trial.suggest_float("weight_decay", min(wd_space), max(wd_space), log=wd_log))
+        else:
+            wd = float(trial.suggest_categorical("weight_decay", wd_space))
+
+        lambda_bce = float(trial.suggest_categorical("lambda_bce", lambda_bce_space))
+        batch_size = int(trial.suggest_categorical("batch_size", batch_size_space))
 
         _, _, preds = train_one_model(
             split_df=split_df,
@@ -388,6 +470,48 @@ def tune_hyperparameters(
         trials.append(row)
 
     pd.DataFrame(trials).to_csv(tuning_dir / "optuna_trials.csv", index=False)
+    trial_df = pd.DataFrame(trials).sort_values("trial").reset_index(drop=True)
+    if "val_r2" in trial_df.columns:
+        trial_df["chi_val_r2"] = trial_df["val_r2"]
+    else:
+        trial_df["chi_val_r2"] = np.nan
+    if "value_rmse" in trial_df.columns:
+        trial_df["chi_val_rmse"] = trial_df["value_rmse"]
+    else:
+        trial_df["chi_val_rmse"] = np.nan
+
+    # Running best R2 over completed trials (higher is better).
+    chi_r2_numeric = pd.to_numeric(trial_df["chi_val_r2"], errors="coerce")
+    trial_df["best_chi_val_r2_so_far"] = chi_r2_numeric.cummax()
+    trial_df.to_csv(tuning_dir / "optuna_optimization_chi_r2.csv", index=False)
+
+    # Figure: trial-by-trial chi R2 and running best chi R2.
+    plt.rcParams.update(
+        {
+            "font.size": font_size,
+            "axes.titlesize": font_size,
+            "axes.labelsize": font_size,
+            "legend.fontsize": font_size,
+        }
+    )
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(trial_df["trial"], trial_df["chi_val_r2"], "o", color="#1f77b4", label="Trial chi R2", alpha=0.85)
+    ax.plot(
+        trial_df["trial"],
+        trial_df["best_chi_val_r2_so_far"],
+        "-",
+        color="#d62728",
+        linewidth=2,
+        label="Best chi R2 so far",
+    )
+    ax.set_xlabel("Optuna trial")
+    ax.set_ylabel("Validation chi R2")
+    ax.set_title("Optuna optimization process based on chi R2")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(tuning_dir / "optuna_optimization_chi_r2.png", dpi=dpi)
+    plt.close(fig)
+
     with open(tuning_dir / "optuna_best.json", "w") as f:
         json.dump(
             {
@@ -603,6 +727,20 @@ def main(args):
     seed_info = seed_everything(train_cfg.seed)
     save_config(config, step_dir / "config_used.yaml")
     save_run_metadata(step_dir, args.config, seed_info)
+    write_initial_log(
+        step_dir=step_dir,
+        step_name="step4_chi_training",
+        context={
+            "config_path": args.config,
+            "model_size": args.model_size,
+            "results_dir": str(results_dir),
+            "split_mode": train_cfg.split_mode,
+            "dataset_path": args.dataset_path or _default_chi_config(config)["dataset_path"],
+            "tune": train_cfg.tune,
+            "n_trials": train_cfg.n_trials,
+            "random_seed": train_cfg.seed,
+        },
+    )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -656,11 +794,15 @@ def main(args):
             train_cfg=train_cfg,
             device=device,
             tuning_dir=tuning_dir,
+            dpi=int(config.get("plotting", {}).get("dpi", 300)),
+            font_size=int(config.get("plotting", {}).get("font_size", 12)),
         )
         print("Best params:")
         print(best_params)
+        print("Retraining final Step 4 model with the best Optuna hyperparameters...")
 
     if best_params is None:
+        print("Optuna disabled. Training final Step 4 model with config hyperparameters...")
         chosen = {
             "hidden_sizes": train_cfg.hidden_sizes,
             "dropout": train_cfg.dropout,
@@ -682,6 +824,18 @@ def main(args):
 
     with open(metrics_dir / "chosen_hyperparameters.json", "w") as f:
         json.dump(chosen, f, indent=2)
+    with open(metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
+        json.dump(
+            {
+                "used_optuna": bool(train_cfg.tune),
+                "optuna_best_params": best_params,
+                "final_training_hyperparameters": chosen,
+                "final_training_num_epochs": int(train_cfg.num_epochs),
+                "final_training_patience": int(train_cfg.patience),
+            },
+            f,
+            indent=2,
+        )
 
     # Final training.
     model, history, predictions = train_one_model(
@@ -704,7 +858,12 @@ def main(args):
         "embedding_dim": int(embedding_table.shape[1]),
         "hidden_sizes": chosen["hidden_sizes"],
         "dropout": chosen["dropout"],
+        "learning_rate": chosen["learning_rate"],
+        "weight_decay": chosen["weight_decay"],
+        "batch_size": chosen["batch_size"],
         "lambda_bce": chosen["lambda_bce"],
+        "used_optuna": bool(train_cfg.tune),
+        "optuna_best_params": best_params,
         "split_mode": train_cfg.split_mode,
         "timestep_for_embedding": train_cfg.timestep_for_embedding,
         "dataset_path": str(chi_csv),
@@ -724,6 +883,26 @@ def main(args):
         font_size=int(config.get("plotting", {}).get("font_size", 12)),
     )
 
+    overall_metrics_df = pd.read_csv(metrics_dir / "chi_metrics_overall.csv")
+    test_rows = overall_metrics_df[overall_metrics_df["split"] == "test"]
+    test_row = test_rows.iloc[0] if len(test_rows) > 0 else overall_metrics_df.iloc[-1]
+    summary = {
+        "step": "step4_chi_training",
+        "model_size": args.model_size or "small",
+        "split_mode": train_cfg.split_mode,
+        "n_data_rows": int(len(split_df)),
+        "n_polymers": int(split_df["polymer_id"].nunique()),
+        "n_epochs": int(len(history["epoch"])),
+        "best_val_loss": float(np.nanmin(history["val_loss"])) if len(history["val_loss"]) > 0 else np.nan,
+        "test_mae": float(test_row["mae"]) if "mae" in test_row else np.nan,
+        "test_rmse": float(test_row["rmse"]) if "rmse" in test_row else np.nan,
+        "test_r2": float(test_row["r2"]) if "r2" in test_row else np.nan,
+        "test_balanced_accuracy": float(test_row["balanced_accuracy"]) if "balanced_accuracy" in test_row else np.nan,
+        "test_auroc": float(test_row["auroc"]) if "auroc" in test_row else np.nan,
+    }
+    save_step_summary(summary, metrics_dir)
+    save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figures_dir)
+
     print("Training complete.")
     print(f"Outputs: {step_dir}")
     print(f"Checkpoint: {checkpoint_dir / 'chi_physics_best.pt'}")
@@ -732,9 +911,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 4: train physics-guided chi model")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Config path")
-    parser.add_argument("--model_size", type=str, default=None, choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
+    parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to chi dataset CSV")
-    parser.add_argument("--split_mode", type=str, default=None, choices=["polymer", "random"], help="Split mode")
     parser.add_argument("--backbone_checkpoint", type=str, default=None, help="Optional backbone checkpoint override")
     parser.add_argument("--tune", action="store_true", help="Enable Optuna tuning")
     parser.add_argument("--no_tune", action="store_true", help="Disable Optuna tuning even if config enables it")

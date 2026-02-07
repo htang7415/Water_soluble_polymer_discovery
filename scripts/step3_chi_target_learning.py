@@ -18,8 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.chi.data import load_chi_dataset
 from src.utils.config import load_config, save_config
-from src.utils.model_scales import get_results_dir
 from src.utils.reproducibility import save_run_metadata, seed_everything
+from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
 
 
 CLASS_NAME_MAP = {1: "Water-soluble", 0: "Water-insoluble"}
@@ -279,7 +279,7 @@ def main(args):
     config = load_config(args.config)
     chi_cfg = _default_chi_config(config)
 
-    split_mode = (args.split_mode or chi_cfg["split_mode"]).strip().lower()
+    split_mode = str(chi_cfg["split_mode"]).strip().lower()
     if split_mode not in {"polymer", "random"}:
         raise ValueError("split_mode must be one of {'polymer','random'}")
 
@@ -294,7 +294,7 @@ def main(args):
 
     positive_when_low = True  # physical rule requested by user: soluble if chi <= chi_target
 
-    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"]))
+    results_dir = Path(config["paths"]["results_dir"])
     step_dir = results_dir / "step3_chi_target_learning" / split_mode
     metrics_dir = step_dir / "metrics"
     figures_dir = step_dir / "figures"
@@ -305,6 +305,20 @@ def main(args):
     seed_info = seed_everything(seed)
     save_config(config, step_dir / "config_used.yaml")
     save_run_metadata(step_dir, args.config, seed_info)
+    write_initial_log(
+        step_dir=step_dir,
+        step_name="step3_chi_target_learning",
+        context={
+            "config_path": args.config,
+            "results_dir": str(results_dir),
+            "split_mode": split_mode,
+            "dataset_path": dataset_path,
+            "objective": objective,
+            "bootstrap_repeats": n_bootstrap,
+            "include_insoluble_targets": args.include_insoluble_targets,
+            "random_seed": seed,
+        },
+    )
 
     print("=" * 70)
     print("Step 3: χ_target learning from data + water-soluble labels")
@@ -433,11 +447,13 @@ def main(args):
     }
     with open(metrics_dir / "chi_target_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
+    save_step_summary(summary, metrics_dir)
 
     # figures
     dpi = int(config.get("plotting", {}).get("dpi", 600))
     font_size = int(config.get("plotting", {}).get("font_size", 12))
     _make_figures(cond_best, global_best, df, objective, figures_dir, dpi=dpi, font_size=font_size)
+    save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figures_dir)
 
     print("Step 3 complete.")
     print(f"Recommended targets: {metrics_dir / 'chi_target_for_inverse_design.csv'}")
@@ -446,8 +462,6 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 3: learn chi_target from labeled dataset")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Config path")
-    parser.add_argument("--model_size", type=str, default=None, choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
-    parser.add_argument("--split_mode", type=str, default=None, choices=["polymer", "random"], help="Namespace for outputs")
     parser.add_argument("--dataset_path", type=str, default=None, help="Override path to chi dataset")
     parser.add_argument("--objective", type=str, default=None, choices=["balanced_accuracy", "youden_j", "f1", "accuracy"], help="Threshold selection objective")
     parser.add_argument("--bootstrap_repeats", type=int, default=None, help="Bootstrap repeats for threshold CI")

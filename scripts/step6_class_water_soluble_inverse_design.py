@@ -31,6 +31,7 @@ from src.utils.chemistry import compute_sa_score
 from src.utils.config import load_config, save_config
 from src.utils.model_scales import get_results_dir
 from src.utils.reproducibility import save_run_metadata, seed_everything
+from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
 
 
 K_LIST = [1, 3, 5, 10]
@@ -367,7 +368,7 @@ def main(args):
     config = load_config(args.config)
     chi_cfg = default_chi_config(config)
 
-    split_mode = (args.split_mode or chi_cfg["split_mode"]).strip().lower()
+    split_mode = str(chi_cfg["split_mode"]).strip().lower()
     if split_mode not in {"polymer", "random"}:
         raise ValueError("split_mode must be one of {'polymer','random'}")
 
@@ -376,13 +377,18 @@ def main(args):
     polymer_class_weight = float(
         args.polymer_class_weight if args.polymer_class_weight is not None else chi_cfg.get("polymer_class_weight", 0.50)
     )
-    candidate_source = parse_candidate_source(args.candidate_source)
+    candidate_source_value = args.candidate_source if args.candidate_source is not None else str(chi_cfg.get("candidate_source", "novel"))
+    candidate_source = parse_candidate_source(candidate_source_value)
+    args.candidate_source = candidate_source
+    default_property_rule = str(args.property_rule if args.property_rule is not None else chi_cfg.get("property_rule", "upper_bound")).strip().lower()
+    coverage_topk = int(args.coverage_topk if args.coverage_topk is not None else chi_cfg.get("coverage_topk", 5))
 
     polymer_patterns = config.get("polymer_classes", {})
     if not polymer_patterns:
         raise ValueError("config.yaml polymer_classes is empty; Step 6 needs polymer family SMARTS patterns")
     available_classes = sorted([k.lower() for k in polymer_patterns.keys()])
-    selected_classes = _parse_target_polymer_classes(args.target_polymer_class, available_classes)
+    target_polymer_class_value = args.target_polymer_class if args.target_polymer_class is not None else str(chi_cfg.get("target_polymer_class", "all"))
+    selected_classes = _parse_target_polymer_classes(target_polymer_class_value, available_classes)
 
     results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"]))
     base_results_dir = Path(config["paths"]["results_dir"])
@@ -399,6 +405,24 @@ def main(args):
     seed_info = seed_everything(int(config["data"]["random_seed"]))
     save_config(config, step_dir / "config_used.yaml")
     save_run_metadata(step_dir, args.config, seed_info)
+    write_initial_log(
+        step_dir=step_dir,
+        step_name="step6_polymer_class_water_soluble_inverse_design",
+        context={
+            "config_path": args.config,
+            "model_size": args.model_size,
+            "results_dir": str(results_dir),
+            "split_mode": split_mode,
+            "candidate_source": candidate_source,
+            "target_polymer_classes": ",".join(selected_classes),
+            "epsilon": epsilon,
+            "class_weight": class_weight,
+            "polymer_class_weight": polymer_class_weight,
+            "property_rule_default": default_property_rule,
+            "coverage_topk": coverage_topk,
+            "random_seed": config["data"]["random_seed"],
+        },
+    )
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -416,6 +440,7 @@ def main(args):
     base_target_df, target_path_used = load_soluble_targets(
         targets_csv=args.targets_csv,
         results_dir=results_dir,
+        base_results_dir=base_results_dir,
         split_mode=split_mode,
     )
     target_df = _build_targets_for_step6(base_target_df, selected_classes)
@@ -456,7 +481,7 @@ def main(args):
             epsilon=epsilon,
             class_weight=class_weight,
             polymer_class_weight=polymer_class_weight,
-            default_property_rule=args.property_rule,
+            default_property_rule=default_property_rule,
         )
         all_candidates.append(cand)
         target_metrics.append(_target_metrics(cand))
@@ -473,7 +498,7 @@ def main(args):
     post["by_condition"].to_csv(metrics_dir / "inverse_metrics_by_class_condition.csv", index=False)
     post["top1_sa"].to_csv(metrics_dir / "inverse_top1_sa_scores.csv", index=False)
 
-    topk = candidate_df[candidate_df["rank"] <= args.coverage_topk].copy()
+    topk = candidate_df[candidate_df["rank"] <= coverage_topk].copy()
     coverage = (
         topk.groupby(["target_polymer_class", "candidate_source", "polymer_id", "Polymer"], as_index=False)
         .agg(
@@ -500,7 +525,8 @@ def main(args):
         "target_polymer_classes": selected_classes,
         "device": device,
         "targets_csv_used": target_path_used,
-        "property_rule_default": args.property_rule,
+        "property_rule_default": default_property_rule,
+        "coverage_topk": coverage_topk,
         **pool_summary,
     }
     overall_row = aggregate_df[aggregate_df["scope"] == "overall"].iloc[0].to_dict()
@@ -516,6 +542,7 @@ def main(args):
 
     with open(metrics_dir / "step6_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
+    save_step_summary(summary, metrics_dir)
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
     font_size = int(config.get("plotting", {}).get("font_size", 12))
@@ -527,6 +554,7 @@ def main(args):
         dpi=dpi,
         font_size=font_size,
     )
+    save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figures_dir)
 
     print("Step 6 complete.")
     print(f"Outputs: {step_dir}")
@@ -535,17 +563,16 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 6: polymer-class + water-soluble inverse design")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Config path")
-    parser.add_argument("--model_size", type=str, default=None, choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
-    parser.add_argument("--split_mode", type=str, default=None, choices=["polymer", "random"], help="Split mode (must match Step 4 output)")
+    parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
     parser.add_argument("--step4_dir", type=str, default=None, help="Optional direct path to Step 4 directory")
     parser.add_argument("--step4_checkpoint", type=str, default=None, help="Optional explicit path to Step4 chi checkpoint")
     parser.add_argument("--backbone_checkpoint", type=str, default=None, help="Optional explicit path to Step1 backbone checkpoint")
 
     parser.add_argument("--targets_csv", type=str, default=None, help="Custom χ_target CSV. If omitted, auto-uses Step 3 output.")
-    parser.add_argument("--target_polymer_class", type=str, default="all", help="One class, comma list, or all")
-    parser.add_argument("--property_rule", type=str, default="upper_bound", choices=["band", "upper_bound", "lower_bound"], help="Default property rule when targets file has none")
+    parser.add_argument("--target_polymer_class", type=str, default=None, help="One class, comma list, or all")
+    parser.add_argument("--property_rule", type=str, default=None, choices=["band", "upper_bound", "lower_bound"], help="Default property rule when targets file has none")
 
-    parser.add_argument("--candidate_source", type=str, default="novel", help="known | novel | hybrid")
+    parser.add_argument("--candidate_source", type=str, default=None, help="known | novel | hybrid")
     parser.add_argument("--generated_csv", type=str, default=None, help="Step2 generated samples CSV")
     parser.add_argument("--generated_smiles_column", type=str, default="smiles", help="SMILES column name in generated_csv")
     parser.add_argument("--allow_non_two_stars", action="store_true", help="Allow generated candidates without exactly two '*' tokens")
@@ -554,7 +581,7 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon", type=float, default=None, help="Property tolerance for 'band' rule")
     parser.add_argument("--class_weight", type=float, default=None, help="Weight for soluble-confidence penalty in score")
     parser.add_argument("--polymer_class_weight", type=float, default=None, help="Weight for polymer-class mismatch penalty")
-    parser.add_argument("--coverage_topk", type=int, default=5, help="Top-k used for coverage summary")
+    parser.add_argument("--coverage_topk", type=int, default=None, help="Top-k used for coverage summary")
 
     parser.add_argument("--embedding_pooling", type=str, default="mean", choices=["mean", "cls", "max"], help="Pooling for embedding extraction on novel candidates")
     parser.add_argument("--embedding_batch_size", type=int, default=None, help="Batch size for novel embedding extraction")

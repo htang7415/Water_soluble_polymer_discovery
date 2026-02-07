@@ -20,6 +20,9 @@ class ConstrainedSampler:
         tokenizer,
         num_steps: int = 100,
         temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        target_stars: int = 2,
         use_constraints: bool = True,
         device: str = 'cuda'
     ):
@@ -30,6 +33,9 @@ class ConstrainedSampler:
             tokenizer: Tokenizer instance.
             num_steps: Number of diffusion steps.
             temperature: Sampling temperature.
+            top_k: Keep only top-k tokens per position during sampling (None disables).
+            top_p: Keep minimal token set with cumulative probability <= top-p (None disables).
+            target_stars: Target number of '*' tokens for p-SMILES outputs.
             use_constraints: Whether to apply chemistry constraints during sampling.
             device: Device for computation.
         """
@@ -37,6 +43,9 @@ class ConstrainedSampler:
         self.tokenizer = tokenizer
         self.num_steps = num_steps
         self.temperature = temperature
+        self.top_k = int(top_k) if top_k is not None else None
+        self.top_p = float(top_p) if top_p is not None else None
+        self.target_stars = int(target_stars)
         self.use_constraints = use_constraints
         self.device = device
 
@@ -67,6 +76,24 @@ class ConstrainedSampler:
              'Cl', 'Br', 'Si', 'Na', 'Li', 'Ca', 'Mg', 'Al', '*']
         } - {-1}
         self.atom_ids.update(self.bracket_token_ids)  # Bracket tokens are also atoms
+
+    def _best_replacement_token(
+        self,
+        pos_logits: torch.Tensor,
+        forbidden_tokens: set[int]
+    ) -> Optional[int]:
+        """Return the best token ID after masking forbidden IDs.
+
+        Returns None when no valid replacement is available.
+        """
+        candidate = pos_logits.clone()
+        vocab_size = candidate.shape[0]
+        for tok in forbidden_tokens:
+            if 0 <= tok < vocab_size:
+                candidate[tok] = float('-inf')
+        if not torch.isfinite(candidate).any():
+            return None
+        return int(candidate.argmax().item())
 
     def _count_stars(self, ids: torch.Tensor) -> torch.Tensor:
         """Count '*' tokens in each sequence.
@@ -412,6 +439,71 @@ class ConstrainedSampler:
 
         return logits
 
+    def _apply_exact_star_budget_constraint(
+        self,
+        logits: torch.Tensor,
+        current_ids: torch.Tensor,
+        target_stars: int = 2
+    ) -> torch.Tensor:
+        """Enforce an exact star budget over remaining masked positions.
+
+        Rules:
+        - If no stars are needed, forbid '*' in all remaining masked positions.
+        - If stars needed >= remaining masked positions, force '*' in all masked positions.
+        """
+        if self.star_id < 0:
+            return logits
+
+        is_masked = current_ids == self.mask_id
+        remaining_masked = is_masked.sum(dim=1)
+        current_stars = (current_ids == self.star_id).sum(dim=1)
+        needed_stars = target_stars - current_stars
+
+        batch_size = current_ids.shape[0]
+        for i in range(batch_size):
+            mask_positions = is_masked[i]
+            n_masked = int(remaining_masked[i].item())
+            if n_masked <= 0:
+                continue
+
+            needed = int(needed_stars[i].item())
+            if needed <= 0:
+                logits[i, mask_positions, self.star_id] = float('-inf')
+                continue
+
+            if needed >= n_masked:
+                logits[i, mask_positions, :] = float('-inf')
+                logits[i, mask_positions, self.star_id] = 0.0
+
+        return logits
+
+    def _apply_sampling_filters(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply top-k/top-p filtering to logits."""
+        filtered = logits
+        original = logits
+
+        if self.top_k is not None and self.top_k > 0 and self.top_k < filtered.shape[-1]:
+            topk_vals = torch.topk(filtered, self.top_k, dim=-1).values
+            kth = topk_vals[..., -1].unsqueeze(-1)
+            filtered = filtered.masked_fill(filtered < kth, float('-inf'))
+
+        if self.top_p is not None and 0.0 < self.top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+            sorted_remove = cumulative_probs > self.top_p
+            sorted_remove[..., 0] = False
+
+            remove_mask = torch.zeros_like(sorted_remove, dtype=torch.bool)
+            remove_mask.scatter_(dim=-1, index=sorted_indices, src=sorted_remove)
+            filtered = filtered.masked_fill(remove_mask, float('-inf'))
+
+        # Guard: keep at least one valid token per position if filters over-prune.
+        has_valid = torch.isfinite(filtered).any(dim=-1, keepdim=True)
+        filtered = torch.where(has_valid, filtered, original)
+        return filtered
+
     def _fix_star_count(
         self,
         ids: torch.Tensor,
@@ -442,18 +534,26 @@ class ConstrainedSampler:
 
                 # Get indices of stars to keep (highest probability)
                 _, keep_indices = torch.topk(star_probs, target_stars)
-                keep_positions = star_positions[keep_indices]
+                keep_positions = {
+                    int(p.item()) for p in star_positions[keep_indices]
+                }
 
                 # Replace extra stars with second-best token
                 for pos in star_positions:
-                    if pos not in keep_positions:
-                        # Get second-best token (excluding star)
-                        pos_logits = logits[i, pos].clone()
-                        pos_logits[self.star_id] = float('-inf')
-                        pos_logits[self.mask_id] = float('-inf')
-                        pos_logits[self.pad_id] = float('-inf')
-                        best_token = pos_logits.argmax()
-                        fixed_ids[i, pos] = best_token
+                    pos_idx = int(pos.item())
+                    if pos_idx not in keep_positions:
+                        best_token = self._best_replacement_token(
+                            pos_logits=logits[i, pos_idx],
+                            forbidden_tokens={
+                                self.star_id,
+                                self.mask_id,
+                                self.pad_id,
+                                self.bos_id,
+                                self.eos_id,
+                            },
+                        )
+                        if best_token is not None:
+                            fixed_ids[i, pos_idx] = best_token
 
             elif num_stars < target_stars:
                 # Find best positions to add stars
@@ -511,14 +611,20 @@ class ConstrainedSampler:
                         depth -= 1
                     else:
                         # No matching '(' to the left - replace with best alternative
-                        pos_logits = logits[i, j].clone()
-                        pos_logits[self.close_paren_id] = float('-inf')
-                        pos_logits[self.open_paren_id] = float('-inf')
-                        pos_logits[self.mask_id] = float('-inf')
-                        pos_logits[self.pad_id] = float('-inf')
-                        pos_logits[self.bos_id] = float('-inf')
-                        pos_logits[self.eos_id] = float('-inf')
-                        fixed_ids[i, j] = pos_logits.argmax()
+                        best_token = self._best_replacement_token(
+                            pos_logits=logits[i, j],
+                            forbidden_tokens={
+                                self.close_paren_id,
+                                self.open_paren_id,
+                                self.mask_id,
+                                self.pad_id,
+                                self.bos_id,
+                                self.eos_id,
+                                self.star_id,
+                            },
+                        )
+                        if best_token is not None:
+                            fixed_ids[i, j] = best_token
 
             # Second pass (right-to-left): remove unclosed '('
             depth = 0
@@ -531,14 +637,20 @@ class ConstrainedSampler:
                         depth -= 1
                     else:
                         # No matching ')' to the right - replace with best alternative
-                        pos_logits = logits[i, j].clone()
-                        pos_logits[self.close_paren_id] = float('-inf')
-                        pos_logits[self.open_paren_id] = float('-inf')
-                        pos_logits[self.mask_id] = float('-inf')
-                        pos_logits[self.pad_id] = float('-inf')
-                        pos_logits[self.bos_id] = float('-inf')
-                        pos_logits[self.eos_id] = float('-inf')
-                        fixed_ids[i, j] = pos_logits.argmax()
+                        best_token = self._best_replacement_token(
+                            pos_logits=logits[i, j],
+                            forbidden_tokens={
+                                self.close_paren_id,
+                                self.open_paren_id,
+                                self.mask_id,
+                                self.pad_id,
+                                self.bos_id,
+                                self.eos_id,
+                                self.star_id,
+                            },
+                        )
+                        if best_token is not None:
+                            fixed_ids[i, j] = best_token
 
         return fixed_ids
 
@@ -580,22 +692,71 @@ class ConstrainedSampler:
                 if len(positions) % 2 != 0:  # Odd count - unpaired
                     # Replace last occurrence with best non-ring alternative
                     last_pos = positions[-1]
-                    pos_logits = logits[i, last_pos].clone()
+                    forbidden = set(all_ring_ids)
+                    forbidden.update(
+                        {
+                            self.mask_id,
+                            self.pad_id,
+                            self.bos_id,
+                            self.eos_id,
+                            self.open_paren_id,
+                            self.close_paren_id,
+                            self.star_id,
+                        }
+                    )
+                    best_token = self._best_replacement_token(
+                        pos_logits=logits[i, last_pos],
+                        forbidden_tokens=forbidden,
+                    )
+                    if best_token is not None:
+                        fixed_ids[i, last_pos] = best_token
 
-                    # Forbid all ring digits
-                    for r_id in all_ring_ids:
-                        pos_logits[r_id] = float('-inf')
-                    # Forbid special tokens
-                    for tok in [self.mask_id, self.pad_id, self.bos_id, self.eos_id]:
-                        if tok >= 0:
-                            pos_logits[tok] = float('-inf')
-                    # Forbid parentheses (to not break paren balance)
-                    if self.open_paren_id >= 0:
-                        pos_logits[self.open_paren_id] = float('-inf')
-                    if self.close_paren_id >= 0:
-                        pos_logits[self.close_paren_id] = float('-inf')
+        return fixed_ids
 
-                    fixed_ids[i, last_pos] = pos_logits.argmax()
+    def _fix_bond_placement(
+        self,
+        ids: torch.Tensor,
+        logits: torch.Tensor
+    ) -> torch.Tensor:
+        """Repair obvious invalid bond placements in final sequences."""
+        if not self.bond_ids:
+            return ids
+
+        batch_size, seq_len = ids.shape
+        fixed_ids = ids.clone()
+        bond_ids = set(self.bond_ids)
+
+        for i in range(batch_size):
+            for j in range(seq_len):
+                token_id = int(fixed_ids[i, j].item())
+                if token_id not in bond_ids:
+                    continue
+
+                prev_id = int(fixed_ids[i, j - 1].item()) if j > 0 else -1
+                next_id = int(fixed_ids[i, j + 1].item()) if (j + 1) < seq_len else -1
+
+                invalid_prev = (
+                    j == 0
+                    or prev_id in bond_ids
+                    or prev_id in {self.bos_id, self.eos_id, self.pad_id, self.open_paren_id, self.close_paren_id}
+                )
+                invalid_next = (
+                    (j + 1) >= seq_len
+                    or next_id in bond_ids
+                    or next_id in {self.eos_id, self.pad_id, self.close_paren_id}
+                )
+
+                if not (invalid_prev or invalid_next):
+                    continue
+
+                forbidden = set(bond_ids)
+                forbidden.update({self.mask_id, self.pad_id, self.bos_id, self.eos_id, self.star_id})
+                best_token = self._best_replacement_token(
+                    pos_logits=logits[i, j],
+                    forbidden_tokens=forbidden,
+                )
+                if best_token is not None:
+                    fixed_ids[i, j] = best_token
 
         return fixed_ids
 
@@ -634,10 +795,12 @@ class ConstrainedSampler:
 
             logits = logits / self.temperature
             if self.use_constraints:
-                logits = self._apply_star_constraint(logits, ids, max_stars=2)
+                logits = self._apply_star_constraint(logits, ids, max_stars=self.target_stars)
+                logits = self._apply_exact_star_budget_constraint(logits, ids, target_stars=self.target_stars)
                 logits = self._apply_position_aware_paren_constraints(logits, ids)
                 logits = self._apply_ring_constraints(logits, ids)
                 logits = self._apply_bond_placement_constraints(logits, ids)
+            logits = self._apply_sampling_filters(logits)
             logits = self._apply_special_token_constraints(logits, ids)
 
             probs = F.softmax(logits, dim=-1)
@@ -665,7 +828,7 @@ class ConstrainedSampler:
                             non_mask = ids[i] != self.mask_id
                             current_stars = ((ids[i] == self.star_id) & non_mask).sum().item()
 
-                            if current_stars >= 2:
+                            if current_stars >= self.target_stars:
                                 remaining_mask = (ids[i] == self.mask_id) & (~fixed_mask[i])
                                 logits[i, remaining_mask, self.star_id] = float('-inf')
                                 probs[i] = F.softmax(logits[i], dim=-1)
@@ -687,9 +850,10 @@ class ConstrainedSampler:
                 final_logits = logits
 
         if self.use_constraints:
-            ids = self._fix_star_count(ids, final_logits, target_stars=2)
             ids = self._fix_paren_balance(ids, final_logits)
             ids = self._fix_ring_closures(ids, final_logits)
+            ids = self._fix_bond_placement(ids, final_logits)
+            ids = self._fix_star_count(ids, final_logits, target_stars=self.target_stars)
         smiles_list = self.tokenizer.batch_decode(ids.cpu().tolist(), skip_special_tokens=True)
 
         return ids, smiles_list

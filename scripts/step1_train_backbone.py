@@ -26,6 +26,7 @@ from src.model.backbone import DiffusionBackbone
 from src.model.diffusion import DiscreteMaskingDiffusion
 from src.training.trainer_backbone import BackboneTrainer
 from src.utils.reproducibility import seed_everything, save_run_metadata
+from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
 
 
 def init_distributed():
@@ -75,6 +76,18 @@ def main(args):
     if is_main_process:
         save_config(config, step_dir / 'config_used.yaml')
         save_run_metadata(step_dir, args.config, seed_info)
+        write_initial_log(
+            step_dir=step_dir,
+            step_name="step1_backbone",
+            context={
+                "config_path": args.config,
+                "model_size": args.model_size,
+                "results_dir": str(results_dir),
+                "random_seed": config['data']['random_seed'],
+                "distributed": distributed,
+                "world_size": world_size,
+            },
+        )
 
     if is_main_process:
         print("=" * 50)
@@ -254,6 +267,24 @@ def main(args):
             save_path=figures_dir / 'backbone_loss_curve.png'
         )
 
+        # Save standardized summary and artifact manifest.
+        summary = {
+            "step": "step1_backbone",
+            "model_size": args.model_size or "small",
+            "distributed": int(distributed),
+            "world_size": int(world_size),
+            "train_samples": int(len(train_df)),
+            "val_samples": int(len(val_df)),
+            "num_params": int(num_params),
+            "num_trainable_params": int(num_trainable),
+            "best_val_loss": float(history['best_val_loss']),
+            "n_train_loss_points": int(len(history['train_losses'])),
+            "n_val_loss_points": int(len(history['val_losses'])),
+            "max_steps": int(config['training_backbone']['max_steps']),
+        }
+        save_step_summary(summary, metrics_dir)
+        save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figures_dir)
+
         print("\n" + "=" * 50)
         print("Backbone training complete!")
         print(f"Best validation loss: {history['best_val_loss']:.4f}")
@@ -268,7 +299,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train diffusion backbone')
     parser.add_argument('--config', type=str, default='configs/config.yaml',
                         help='Path to config file')
-    parser.add_argument('--model_size', type=str, default=None,
+    parser.add_argument('--model_size', type=str, default='small',
                         choices=['small', 'medium', 'large', 'xl'],
                         help='Model size preset (small: ~12M, medium: ~50M, large: ~150M, xl: ~400M)')
     parser.add_argument('--resume', type=str, default=None,
