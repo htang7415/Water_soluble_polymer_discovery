@@ -171,8 +171,8 @@ sampling:
   num_samples: 10000
   target_stars: 2
   temperature: 0.9
-  top_k: 64
-  top_p: 0.95
+  top_k: null
+  top_p: null
   use_constraints: true
 tokenizer:
   max_length: 128

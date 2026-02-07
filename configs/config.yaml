@@ -192,8 +192,8 @@ sampling:
   num_samples: 10000
   batch_size: 256
   temperature: 0.9
-  top_k: 64
-  top_p: 0.95
+  top_k: null
+  top_p: null
   target_stars: 2
   use_constraints: true
 

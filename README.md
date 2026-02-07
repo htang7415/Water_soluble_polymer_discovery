@@ -52,6 +52,12 @@ To improve `Frac star=2` and validity, Step 2 now uses:
 - top-k/top-p token filtering (`top_k`, `top_p`);
 - post-fix order: paren/ring/bond repair first, then final star-count correction.
 
+Recommended default for this repo (better validity in quick checks):
+- `temperature: 0.9`
+- `top_k: null`
+- `top_p: null`
+- `target_stars: 2`
+
 Main config keys in `configs/config.yaml`:
 - `sampling.temperature`
 - `sampling.top_k`

@@ -76,6 +76,20 @@ class ConstrainedSampler:
              'Cl', 'Br', 'Si', 'Na', 'Li', 'Ca', 'Mg', 'Al', '*']
         } - {-1}
         self.atom_ids.update(self.bracket_token_ids)  # Bracket tokens are also atoms
+        self.fallback_non_star_id = self._resolve_fallback_non_star_id()
+
+    def _resolve_fallback_non_star_id(self) -> int:
+        """Choose a stable fallback token ID that is not special and not '*'."""
+        preferred = self.tokenizer.vocab.get('C', -1)
+        forbidden = {self.star_id, self.mask_id, self.pad_id, self.bos_id, self.eos_id}
+        if preferred >= 0 and preferred not in forbidden:
+            return int(preferred)
+
+        vocab_size = self.tokenizer.vocab_size
+        for tok in range(vocab_size):
+            if tok not in forbidden:
+                return int(tok)
+        return 0
 
     def _best_replacement_token(
         self,
@@ -504,6 +518,26 @@ class ConstrainedSampler:
         filtered = torch.where(has_valid, filtered, original)
         return filtered
 
+    def _logits_to_probs(self, logits: torch.Tensor) -> torch.Tensor:
+        """Convert logits to valid probability vectors with robust fallbacks."""
+        probs = F.softmax(logits, dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        sums = probs.sum(dim=-1, keepdim=True)
+        valid_rows = sums > 0
+
+        finite = torch.isfinite(logits)
+        finite_count = finite.sum(dim=-1, keepdim=True)
+        uniform_over_finite = finite.float() / finite_count.clamp(min=1).float()
+
+        fallback_token = self.star_id if self.star_id >= 0 else 0
+        hard_fallback = torch.zeros_like(probs)
+        hard_fallback[..., fallback_token] = 1.0
+        row_fallback = torch.where(finite_count > 0, uniform_over_finite, hard_fallback)
+
+        normalized = probs / sums.clamp(min=1e-12)
+        return torch.where(valid_rows, normalized, row_fallback)
+
     def _fix_star_count(
         self,
         ids: torch.Tensor,
@@ -550,10 +584,16 @@ class ConstrainedSampler:
                                 self.pad_id,
                                 self.bos_id,
                                 self.eos_id,
+                                self.open_paren_id,
+                                self.close_paren_id,
+                                *self.bond_ids,
+                                *self.ring_digit_ids,
+                                *self.ring_percent_ids,
                             },
                         )
-                        if best_token is not None:
-                            fixed_ids[i, pos_idx] = best_token
+                        if best_token is None:
+                            best_token = self.fallback_non_star_id
+                        fixed_ids[i, pos_idx] = best_token
 
             elif num_stars < target_stars:
                 # Find best positions to add stars
@@ -575,6 +615,20 @@ class ConstrainedSampler:
 
                     for pos in best_positions:
                         fixed_ids[i, pos] = self.star_id
+                elif needed > 0:
+                    eligible_mask = (
+                        (fixed_ids[i] != self.bos_id) &
+                        (fixed_ids[i] != self.eos_id) &
+                        (fixed_ids[i] != self.pad_id)
+                    )
+                    eligible_positions = torch.where(eligible_mask)[0]
+                    if len(eligible_positions) > 0:
+                        k = min(needed, len(eligible_positions))
+                        star_probs = logits[i, eligible_positions, self.star_id]
+                        _, best_indices = torch.topk(star_probs, k)
+                        best_positions = eligible_positions[best_indices]
+                        for pos in best_positions:
+                            fixed_ids[i, pos] = self.star_id
 
         return fixed_ids
 
@@ -750,7 +804,19 @@ class ConstrainedSampler:
                     continue
 
                 forbidden = set(bond_ids)
-                forbidden.update({self.mask_id, self.pad_id, self.bos_id, self.eos_id, self.star_id})
+                forbidden.update(
+                    {
+                        self.mask_id,
+                        self.pad_id,
+                        self.bos_id,
+                        self.eos_id,
+                        self.star_id,
+                        self.open_paren_id,
+                        self.close_paren_id,
+                    }
+                )
+                forbidden.update(self.ring_digit_ids)
+                forbidden.update(self.ring_percent_ids)
                 best_token = self._best_replacement_token(
                     pos_logits=logits[i, j],
                     forbidden_tokens=forbidden,
@@ -803,7 +869,7 @@ class ConstrainedSampler:
             logits = self._apply_sampling_filters(logits)
             logits = self._apply_special_token_constraints(logits, ids)
 
-            probs = F.softmax(logits, dim=-1)
+            probs = self._logits_to_probs(logits)
             is_masked = (ids == self.mask_id) & (~fixed_mask)
             unmask_prob = 1.0 / t
 
@@ -831,29 +897,32 @@ class ConstrainedSampler:
                             if current_stars >= self.target_stars:
                                 remaining_mask = (ids[i] == self.mask_id) & (~fixed_mask[i])
                                 logits[i, remaining_mask, self.star_id] = float('-inf')
-                                probs[i] = F.softmax(logits[i], dim=-1)
+                                probs[i] = self._logits_to_probs(logits[i])
 
                         elif sampled_token in self.bond_ids:
                             next_pos = pos + 1
                             if next_pos < len(ids[i]) and ids[i, next_pos] == self.mask_id:
                                 for bond_id in self.bond_ids:
                                     logits[i, next_pos, bond_id] = float('-inf')
-                                probs[i] = F.softmax(logits[i], dim=-1)
+                                probs[i] = self._logits_to_probs(logits[i])
 
                         elif sampled_token == self.open_paren_id:
                             next_pos = pos + 1
                             if next_pos < len(ids[i]) and ids[i, next_pos] == self.mask_id:
                                 logits[i, next_pos, self.close_paren_id] = float('-inf')
-                                probs[i] = F.softmax(logits[i], dim=-1)
+                                probs[i] = self._logits_to_probs(logits[i])
 
             if t == 1:
                 final_logits = logits
 
         if self.use_constraints:
-            ids = self._fix_paren_balance(ids, final_logits)
             ids = self._fix_ring_closures(ids, final_logits)
             ids = self._fix_bond_placement(ids, final_logits)
+            ids = self._fix_paren_balance(ids, final_logits)
             ids = self._fix_star_count(ids, final_logits, target_stars=self.target_stars)
+            # Final cleanup after token replacements.
+            ids = self._fix_ring_closures(ids, final_logits)
+            ids = self._fix_paren_balance(ids, final_logits)
         smiles_list = self.tokenizer.batch_decode(ids.cpu().tolist(), skip_special_tokens=True)
 
         return ids, smiles_list
