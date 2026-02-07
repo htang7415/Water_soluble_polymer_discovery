@@ -136,6 +136,37 @@ training_property:
   finetune_last_layers: 6
   default_timestep: 1
 
+# chi(T,phi) workflow (Steps 3-6)
+# Step 3: chi_target learning from labeled dataset
+# Step 4: physics-guided chi(T,phi) training + Optuna
+# Step 5: water-soluble inverse design
+# Step 6: polymer-family class + water-soluble inverse design
+chi_training:
+  dataset_path: "Data/chi/_50_polymers_T_phi.csv"
+  split_mode: "polymer"          # polymer | random
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  batch_size: 128
+  num_epochs: 500
+  patience: 60
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  lambda_bce: 0.1
+  hidden_sizes: [256, 128]
+  dropout: 0.1
+  tune: true
+  n_trials: 50
+  tuning_epochs: 120
+  tuning_patience: 20
+  embedding_timestep: 1
+  embedding_batch_size: 128
+  epsilon: 0.05                       # default chi tolerance for inverse design
+  class_weight: 0.25                  # soluble-confidence penalty weight (Steps 5-6)
+  polymer_class_weight: 0.50          # polymer-family mismatch penalty weight (Step 6)
+  target_objective: balanced_accuracy # Step 3 threshold objective
+  target_bootstrap_repeats: 800       # Step 3 bootstrap repeats for chi_target CI
+
 # Checkpointing
 checkpointing:
   save_best_only: true         # default: only best checkpoint
@@ -159,7 +190,7 @@ property_head:
   hidden_sizes: [256, 1024, 128]
   dropout: 0.1
 
-# Hyperparameter tuning for property head (Step 3) using Optuna
+# Hyperparameter tuning for chi head (Step 4) using Optuna
 hyperparameter_tuning:
   enabled: true                    # Enable via config or --tune flag
   n_trials: 50                      # Number of Optuna trials
