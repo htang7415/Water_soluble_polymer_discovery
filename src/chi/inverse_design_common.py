@@ -332,11 +332,14 @@ def build_candidate_pool(
     if source == "known":
         return known_df, summary, training_canonical
 
-    generated_csv = (
-        Path(args.generated_csv)
-        if args.generated_csv
-        else (results_dir / "step2_sampling" / "metrics" / "generated_samples.csv")
-    )
+    if args.generated_csv:
+        generated_csv = Path(args.generated_csv)
+    else:
+        default_candidates = [
+            results_dir / "step2_sampling" / "metrics" / "target_polymers.csv",
+            results_dir / "step2_sampling" / "metrics" / "generated_samples.csv",
+        ]
+        generated_csv = next((p for p in default_candidates if p.exists()), default_candidates[0])
 
     novel_df, novel_summary = prepare_novel_candidates(
         generated_csv=generated_csv,

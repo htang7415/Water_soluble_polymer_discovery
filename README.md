@@ -57,12 +57,34 @@ Recommended default for this repo (better validity in quick checks):
 - `top_k: null`
 - `top_p: null`
 - `target_stars: 2`
+- `batch_size: 128`
+- `valid_only: true` (resample until requested count is valid)
+- `target_polymer_count: 100`
+- `target_sa_max: 4.0`
+
+If you want raw acceptance metrics without resampling, disable it with:
+- config: `sampling.valid_only: false`
+- CLI: `--no_valid_only`
 
 Main config keys in `configs/config.yaml`:
 - `sampling.temperature`
 - `sampling.top_k`
 - `sampling.top_p`
 - `sampling.target_stars`
+- `sampling.batch_size`
+- `sampling.valid_only`
+- `sampling.valid_only_require_target_stars`
+- `sampling.valid_only_oversample_factor`
+- `sampling.valid_only_max_rounds`
+- `sampling.valid_only_min_samples_per_round`
+- `sampling.target_polymer_count`
+- `sampling.target_sa_max`
+
+Final target-polymer export (Step 2/5/6):
+- All three steps now write `metrics/target_polymers.csv` and `metrics/target_polymer_selection_summary.csv`.
+- Selection filters are fixed to: valid SMILES, star count = `target_stars`, novel vs training set, SA `< target_sa_max`, unique (canonical).
+- Each step appends key run statistics to `log.txt` (total sampled, selection success rate, diversity, mean SA).
+- Step 5/6 use Step 2 screened candidates by default (`step2_sampling/metrics/target_polymers.csv`) and fallback to `generated_samples.csv`.
 
 ## Step 4 Optuna outputs
 - Search space is controlled by `chi_training.optuna_search_space` in `configs/config.yaml`.

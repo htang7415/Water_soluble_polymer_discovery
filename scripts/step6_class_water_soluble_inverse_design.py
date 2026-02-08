@@ -27,7 +27,14 @@ from src.chi.inverse_design_common import (
 )
 from src.chi.model import predict_chi_from_coefficients
 from src.evaluation.polymer_class import PolymerClassifier
-from src.utils.chemistry import compute_sa_score
+from src.utils.chemistry import (
+    compute_sa_score,
+    check_validity,
+    count_stars,
+    canonicalize_smiles,
+    batch_compute_fingerprints,
+    compute_pairwise_diversity,
+)
 from src.utils.config import load_config, save_config
 from src.utils.model_scales import get_results_dir
 from src.utils.reproducibility import save_run_metadata, seed_everything
@@ -274,6 +281,142 @@ def _postprocess_metrics(candidate_df: pd.DataFrame, target_metrics_df: pd.DataF
     }
 
 
+def _build_polymer_family_map(coeff_df: pd.DataFrame) -> Dict[int, str]:
+    class_cols = [
+        c for c in coeff_df.columns
+        if c.startswith("polymer_class_") and c not in {"polymer_class_any"}
+    ]
+    out: Dict[int, str] = {}
+    if not class_cols:
+        return out
+
+    for _, row in coeff_df.iterrows():
+        pid = int(row["polymer_id"])
+        matched = [c.replace("polymer_class_", "") for c in class_cols if int(row[c]) == 1]
+        out[pid] = "|".join(sorted(matched)) if matched else "unclassified"
+    return out
+
+
+def _select_final_target_polymers(
+    candidate_df: pd.DataFrame,
+    training_canonical: set[str],
+    polymer_family_map: Dict[int, str],
+    target_count: int,
+    target_stars: int,
+    sa_max: float,
+) -> tuple[pd.DataFrame, Dict[str, float]]:
+    ranked = candidate_df.sort_values(
+        ["score", "rank", "polymer_class_hit", "property_error", "class_prob"],
+        ascending=[True, True, False, True, False],
+    ).copy()
+
+    dedup_key = "polymer_id" if "polymer_id" in ranked.columns else "SMILES"
+    ranked = ranked.drop_duplicates(subset=[dedup_key], keep="first").reset_index(drop=True)
+
+    rows = []
+    for _, row in ranked.iterrows():
+        smiles = str(row["SMILES"])
+        is_valid = check_validity(smiles)
+        canonical = row.get("canonical_smiles")
+        if not canonical or pd.isna(canonical):
+            canonical = canonicalize_smiles(smiles) if is_valid else None
+        star_count = count_stars(smiles)
+        is_novel = bool(canonical) and canonical not in training_canonical
+        if "is_novel_vs_train" in row and not pd.isna(row["is_novel_vs_train"]):
+            is_novel = bool(int(row["is_novel_vs_train"]))
+
+        sa_score = compute_sa_score(smiles) if is_valid else None
+        sa_ok = sa_score is not None and float(sa_score) < float(sa_max)
+        pid = int(row["polymer_id"]) if "polymer_id" in row else -1
+        polymer_family = polymer_family_map.get(pid, "unclassified")
+
+        rows.append(
+            {
+                "target_id": int(row["target_id"]),
+                "target_polymer_class": row["target_polymer_class"],
+                "Polymer": row["Polymer"],
+                "SMILES": smiles,
+                "canonical_smiles": canonical,
+                "candidate_source": row.get("candidate_source", "unknown"),
+                "temperature": float(row["temperature"]),
+                "phi": float(row["phi"]),
+                "target_chi": float(row["target_chi"]),
+                "chi_pred_target": float(row["chi_pred_target"]),
+                "property_error": float(row["property_error"]),
+                "abs_error": float(row["abs_error"]),
+                "class_prob": float(row["class_prob"]),
+                "score": float(row["score"]),
+                "rank_in_target": int(row["rank"]),
+                "polymer_class_hit": int(row["polymer_class_hit"]),
+                "is_valid": int(is_valid),
+                "star_count": int(star_count),
+                "is_novel_vs_train": int(is_novel),
+                "sa_score": float(sa_score) if sa_score is not None else np.nan,
+                "sa_ok": int(sa_ok),
+                "polymer_family": polymer_family,
+            }
+        )
+
+    all_df = pd.DataFrame(rows)
+    if all_df.empty:
+        return pd.DataFrame(), {
+            "target_count_requested": int(target_count),
+            "total_candidates_screened": 0,
+            "filter_pass_count": 0,
+            "filter_pass_unique": 0,
+            "target_count_selected": 0,
+            "selection_success_rate": 0.0,
+            "final_diversity": 0.0,
+            "final_mean_sa": np.nan,
+            "final_std_sa": np.nan,
+            "final_mean_property_error": np.nan,
+        }
+
+    filter_mask = (
+        (all_df["is_valid"] == 1)
+        & (all_df["star_count"] == int(target_stars))
+        & (all_df["is_novel_vs_train"] == 1)
+        & (all_df["sa_ok"] == 1)
+    )
+    filtered = all_df.loc[filter_mask].copy()
+    filtered = filtered.drop_duplicates(subset=["canonical_smiles"], keep="first").reset_index(drop=True)
+
+    selected = filtered.head(int(target_count)).copy()
+    selected.insert(0, "target_rank", np.arange(1, len(selected) + 1))
+    selected["is_unique"] = 1
+    selected["passes_all_filters"] = 1
+
+    diversity = 0.0
+    if len(selected) >= 2:
+        fps, _ = batch_compute_fingerprints(selected["SMILES"].astype(str).tolist())
+        if len(fps) >= 2:
+            diversity = float(compute_pairwise_diversity(fps))
+
+    sa_vals = selected["sa_score"].to_numpy(dtype=float) if not selected.empty else np.array([])
+    prop_vals = selected["property_error"].to_numpy(dtype=float) if not selected.empty else np.array([])
+    summary = {
+        "target_count_requested": int(target_count),
+        "total_candidates_screened": int(len(all_df)),
+        "filter_pass_count": int(filter_mask.sum()),
+        "filter_pass_unique": int(len(filtered)),
+        "target_count_selected": int(len(selected)),
+        "selection_success_rate": float(len(selected) / len(all_df)) if len(all_df) > 0 else 0.0,
+        "final_diversity": float(diversity),
+        "final_mean_sa": float(np.nanmean(sa_vals)) if sa_vals.size else np.nan,
+        "final_std_sa": float(np.nanstd(sa_vals)) if sa_vals.size else np.nan,
+        "final_mean_property_error": float(np.nanmean(prop_vals)) if prop_vals.size else np.nan,
+    }
+    return selected, summary
+
+
+def _append_step_log(step_dir: Path, lines: List[str]) -> None:
+    log_path = step_dir / "log.txt"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("\n")
+        for line in lines:
+            f.write(f"{line}\n")
+
+
 def _save_figures(
     target_metrics_df: pd.DataFrame,
     candidate_df: pd.DataFrame,
@@ -382,6 +525,10 @@ def main(args):
     args.candidate_source = candidate_source
     default_property_rule = str(args.property_rule if args.property_rule is not None else chi_cfg.get("property_rule", "upper_bound")).strip().lower()
     coverage_topk = int(args.coverage_topk if args.coverage_topk is not None else chi_cfg.get("coverage_topk", 5))
+    sampling_cfg = config.get("sampling", {})
+    target_polymer_count = int(chi_cfg.get("target_polymer_count", sampling_cfg.get("target_polymer_count", 100)))
+    target_sa_max = float(chi_cfg.get("target_sa_max", sampling_cfg.get("target_sa_max", 4.0)))
+    target_stars = int(sampling_cfg.get("target_stars", 2))
 
     polymer_patterns = config.get("polymer_classes", {})
     if not polymer_patterns:
@@ -420,6 +567,9 @@ def main(args):
             "polymer_class_weight": polymer_class_weight,
             "property_rule_default": default_property_rule,
             "coverage_topk": coverage_topk,
+            "target_polymer_count": target_polymer_count,
+            "target_sa_max": target_sa_max,
+            "target_stars": target_stars,
             "random_seed": config["data"]["random_seed"],
         },
     )
@@ -446,7 +596,7 @@ def main(args):
     target_df = _build_targets_for_step6(base_target_df, selected_classes)
     target_df.to_csv(metrics_dir / "inverse_targets.csv", index=False)
 
-    coeff_df, pool_summary, _ = build_candidate_pool(
+    coeff_df, pool_summary, training_canonical = build_candidate_pool(
         args=args,
         config=config,
         chi_cfg=chi_cfg,
@@ -460,6 +610,7 @@ def main(args):
 
     coeff_df = _annotate_polymer_family_matches(coeff_df, patterns={k.lower(): v for k, v in polymer_patterns.items()})
     coeff_df.to_csv(metrics_dir / "inverse_candidate_pool.csv", index=False)
+    polymer_family_map = _build_polymer_family_map(coeff_df)
 
     class_coverage = {
         cls: int(coeff_df[f"polymer_class_{cls}"].sum())
@@ -514,6 +665,23 @@ def main(args):
     coverage["selected_rate"] = coverage["selected_count"] / float(len(base_target_df))
     coverage.to_csv(metrics_dir / "inverse_polymer_coverage.csv", index=False)
 
+    target_poly_df, target_poly_summary = _select_final_target_polymers(
+        candidate_df=candidate_df,
+        training_canonical=training_canonical,
+        polymer_family_map=polymer_family_map,
+        target_count=target_polymer_count,
+        target_stars=target_stars,
+        sa_max=target_sa_max,
+    )
+    target_poly_df.to_csv(metrics_dir / "target_polymers.csv", index=False)
+    pd.DataFrame([target_poly_summary]).to_csv(metrics_dir / "target_polymer_selection_summary.csv", index=False)
+    if target_poly_summary["target_count_selected"] < target_poly_summary["target_count_requested"]:
+        print(
+            "Warning: selected target polymers are fewer than requested. "
+            f"selected={target_poly_summary['target_count_selected']}, "
+            f"requested={target_poly_summary['target_count_requested']}"
+        )
+
     summary = {
         "n_targets": int(len(target_df)),
         "n_base_conditions": int(len(base_target_df)),
@@ -527,6 +695,13 @@ def main(args):
         "targets_csv_used": target_path_used,
         "property_rule_default": default_property_rule,
         "coverage_topk": coverage_topk,
+        "target_polymer_count_requested": int(target_poly_summary["target_count_requested"]),
+        "target_polymer_count_selected": int(target_poly_summary["target_count_selected"]),
+        "target_polymer_selection_success_rate": float(target_poly_summary["selection_success_rate"]),
+        "target_polymer_diversity": float(target_poly_summary["final_diversity"]),
+        "target_polymer_mean_sa": float(target_poly_summary["final_mean_sa"]),
+        "target_polymer_std_sa": float(target_poly_summary["final_std_sa"]),
+        "target_polymer_mean_property_error": float(target_poly_summary["final_mean_property_error"]),
         **pool_summary,
     }
     overall_row = aggregate_df[aggregate_df["scope"] == "overall"].iloc[0].to_dict()
@@ -543,6 +718,21 @@ def main(args):
     with open(metrics_dir / "step6_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     save_step_summary(summary, metrics_dir)
+    _append_step_log(
+        step_dir=step_dir,
+        lines=[
+            "final_target_polymer_selection:",
+            f"total_sampling_examples: {target_poly_summary['total_candidates_screened']}",
+            f"target_count_requested: {target_poly_summary['target_count_requested']}",
+            f"target_count_selected: {target_poly_summary['target_count_selected']}",
+            f"success_rate: {target_poly_summary['selection_success_rate']:.6f}",
+            f"diversity: {target_poly_summary['final_diversity']:.6f}",
+            f"mean_sa: {target_poly_summary['final_mean_sa']:.6f}",
+            f"std_sa: {target_poly_summary['final_std_sa']:.6f}",
+            f"mean_property_error: {target_poly_summary['final_mean_property_error']:.6f}",
+            "target_csv: metrics/target_polymers.csv",
+        ],
+    )
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
     font_size = int(config.get("plotting", {}).get("font_size", 12))

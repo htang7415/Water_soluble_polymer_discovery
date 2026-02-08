@@ -71,6 +71,8 @@ chi_training:
   target_bootstrap_repeats: 800
   target_objective: balanced_accuracy
   target_polymer_class: all
+  target_polymer_count: 100
+  target_sa_max: 4.0
   test_ratio: 0.1
   train_ratio: 1.0
   tune: true
@@ -167,13 +169,20 @@ polymer_classes:
   polyimide: '[#6](=O)-[#7]-[#6](=O)'
   polyurethane: '[#8]-[#6](=O)-[#7]'
 sampling:
-  batch_size: 256
+  batch_size: 128
   num_samples: 10000
+  target_polymer_count: 100
+  target_sa_max: 4.0
   target_stars: 2
   temperature: 0.9
   top_k: null
   top_p: null
   use_constraints: true
+  valid_only: true
+  valid_only_max_rounds: 25
+  valid_only_min_samples_per_round: 256
+  valid_only_oversample_factor: 1.35
+  valid_only_require_target_stars: true
 tokenizer:
   max_length: 128
   special_tokens:

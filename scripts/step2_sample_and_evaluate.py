@@ -6,6 +6,7 @@ import sys
 import argparse
 import re
 import time
+import math
 from pathlib import Path
 
 # Add parent directory to path
@@ -20,7 +21,14 @@ from collections import Counter
 
 from src.utils.config import load_config, save_config
 from src.utils.plotting import PlotUtils
-from src.utils.chemistry import compute_sa_score, count_stars
+from src.utils.chemistry import (
+    compute_sa_score,
+    count_stars,
+    check_validity,
+    canonicalize_smiles,
+    batch_compute_fingerprints,
+    compute_pairwise_diversity,
+)
 from src.utils.model_scales import get_model_config, get_results_dir
 from src.data.tokenizer import PSmilesTokenizer
 from src.model.backbone import DiffusionBackbone
@@ -124,6 +132,114 @@ def compute_smiles_constraint_metrics(smiles_list, method, representation, model
     return rows
 
 
+def _filter_valid_samples(
+    smiles_list,
+    require_target_stars: bool,
+    target_stars: int,
+):
+    valid = []
+    for smiles in smiles_list:
+        if not check_validity(smiles):
+            continue
+        if require_target_stars and count_stars(smiles) != target_stars:
+            continue
+        valid.append(smiles)
+    return valid
+
+
+def _select_target_polymers(
+    generated_smiles,
+    training_smiles,
+    target_count: int,
+    target_stars: int,
+    sa_max: float,
+):
+    training_canonical = {canonicalize_smiles(s) or s for s in training_smiles}
+    rows = []
+    for idx, smiles in enumerate(generated_smiles, start=1):
+        is_valid = check_validity(smiles)
+        star_count = count_stars(smiles)
+        canonical = canonicalize_smiles(smiles) if is_valid else None
+        is_novel = bool(canonical) and canonical not in training_canonical
+        sa = compute_sa_score(smiles) if is_valid else None
+        sa_ok = sa is not None and float(sa) < float(sa_max)
+        rows.append(
+            {
+                "sample_index": idx,
+                "smiles": smiles,
+                "canonical_smiles": canonical,
+                "is_valid": int(is_valid),
+                "star_count": int(star_count),
+                "is_novel": int(is_novel),
+                "sa_score": float(sa) if sa is not None else np.nan,
+                "sa_ok": int(sa_ok),
+            }
+        )
+
+    all_df = pd.DataFrame(rows)
+    if all_df.empty:
+        summary = {
+            "target_count_requested": int(target_count),
+            "total_generated": 0,
+            "filter_pass_count": 0,
+            "filter_pass_unique": 0,
+            "target_count_selected": 0,
+            "selection_success_rate": 0.0,
+            "final_diversity": 0.0,
+            "final_mean_sa": np.nan,
+            "final_std_sa": np.nan,
+            "final_frac_star_eq_target": 0.0,
+            "final_novelty": 0.0,
+            "final_uniqueness": 0.0,
+        }
+        return pd.DataFrame(), summary
+
+    filter_mask = (
+        (all_df["is_valid"] == 1)
+        & (all_df["star_count"] == int(target_stars))
+        & (all_df["is_novel"] == 1)
+        & (all_df["sa_ok"] == 1)
+    )
+    filtered = all_df.loc[filter_mask].copy()
+    filtered = filtered.drop_duplicates(subset=["canonical_smiles"], keep="first").reset_index(drop=True)
+
+    selected = filtered.head(int(target_count)).copy()
+    selected.insert(0, "target_rank", np.arange(1, len(selected) + 1))
+    selected["is_unique"] = 1
+    selected["passes_all_filters"] = 1
+
+    diversity = 0.0
+    if len(selected) >= 2:
+        fps, _ = batch_compute_fingerprints(selected["smiles"].astype(str).tolist())
+        if len(fps) >= 2:
+            diversity = float(compute_pairwise_diversity(fps))
+
+    sa_vals = selected["sa_score"].to_numpy(dtype=float) if not selected.empty else np.array([])
+    summary = {
+        "target_count_requested": int(target_count),
+        "total_generated": int(len(all_df)),
+        "filter_pass_count": int(filter_mask.sum()),
+        "filter_pass_unique": int(len(filtered)),
+        "target_count_selected": int(len(selected)),
+        "selection_success_rate": float(len(selected) / len(all_df)) if len(all_df) > 0 else 0.0,
+        "final_diversity": float(diversity),
+        "final_mean_sa": float(np.nanmean(sa_vals)) if sa_vals.size else np.nan,
+        "final_std_sa": float(np.nanstd(sa_vals)) if sa_vals.size else np.nan,
+        "final_frac_star_eq_target": float(np.mean(selected["star_count"] == int(target_stars))) if len(selected) else 0.0,
+        "final_novelty": float(np.mean(selected["is_novel"])) if len(selected) else 0.0,
+        "final_uniqueness": 1.0 if len(selected) > 0 else 0.0,
+    }
+    return selected, summary
+
+
+def _append_step_log(step_dir: Path, lines) -> None:
+    log_path = Path(step_dir) / "log.txt"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("\n")
+        for line in lines:
+            f.write(f"{line}\n")
+
+
 def main(args):
     """Main function."""
     # Load config
@@ -142,6 +258,51 @@ def main(args):
     target_stars = int(args.target_stars if args.target_stars is not None else sampling_cfg.get('target_stars', 2))
     if target_stars < 0:
         raise ValueError(f"target_stars must be >= 0, got {target_stars}")
+    if args.valid_only and args.no_valid_only:
+        raise ValueError("Use only one of --valid_only or --no_valid_only")
+    if args.valid_only_require_target_stars and args.valid_only_allow_non_target_stars:
+        raise ValueError("Use only one of --valid_only_require_target_stars or --valid_only_allow_non_target_stars")
+    valid_only = bool(sampling_cfg.get('valid_only', False))
+    if args.valid_only:
+        valid_only = True
+    elif args.no_valid_only:
+        valid_only = False
+
+    valid_only_require_target_stars = bool(sampling_cfg.get('valid_only_require_target_stars', True))
+    if args.valid_only_require_target_stars:
+        valid_only_require_target_stars = True
+    elif args.valid_only_allow_non_target_stars:
+        valid_only_require_target_stars = False
+
+    valid_only_oversample_factor = float(
+        args.valid_only_oversample_factor
+        if args.valid_only_oversample_factor is not None
+        else sampling_cfg.get('valid_only_oversample_factor', 1.3)
+    )
+    if valid_only_oversample_factor < 1.0:
+        raise ValueError(f"valid_only_oversample_factor must be >= 1.0, got {valid_only_oversample_factor}")
+
+    valid_only_max_rounds = int(
+        args.valid_only_max_rounds
+        if args.valid_only_max_rounds is not None
+        else sampling_cfg.get('valid_only_max_rounds', 20)
+    )
+    if valid_only_max_rounds < 1:
+        raise ValueError(f"valid_only_max_rounds must be >= 1, got {valid_only_max_rounds}")
+
+    valid_only_min_samples_per_round = int(
+        args.valid_only_min_samples_per_round
+        if args.valid_only_min_samples_per_round is not None
+        else sampling_cfg.get('valid_only_min_samples_per_round', 256)
+    )
+    if valid_only_min_samples_per_round < 1:
+        raise ValueError(
+            f"valid_only_min_samples_per_round must be >= 1, got {valid_only_min_samples_per_round}"
+        )
+    target_polymer_count = int(sampling_cfg.get("target_polymer_count", 100))
+    target_sa_max = float(sampling_cfg.get("target_sa_max", 4.0))
+    if target_polymer_count < 1:
+        raise ValueError(f"sampling.target_polymer_count must be >=1, got {target_polymer_count}")
 
     # Set device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -174,6 +335,11 @@ def main(args):
             "top_k": top_k,
             "top_p": top_p,
             "target_stars": target_stars,
+            "valid_only": valid_only,
+            "valid_only_require_target_stars": valid_only_require_target_stars,
+            "valid_only_oversample_factor": valid_only_oversample_factor,
+            "valid_only_max_rounds": valid_only_max_rounds,
+            "valid_only_min_samples_per_round": valid_only_min_samples_per_round,
             "random_seed": config['data']['random_seed'],
         },
     )
@@ -257,34 +423,131 @@ def main(args):
     sampling_start = time.time()
     batch_size = args.batch_size or config['sampling']['batch_size']
     print(f"\n5. Sampling {num_samples} polymers (batch_size={batch_size})...")
-    if args.variable_length:
-        print(f"   Using variable length sampling (range: {args.min_length}-{args.max_length})")
-        _, generated_smiles = sampler.sample_variable_length(
-            num_samples=num_samples,
-            length_range=(args.min_length, args.max_length),
-            batch_size=batch_size,
-            samples_per_length=args.samples_per_length,
-            show_progress=True
-        )
-    else:
-        # Sample lengths from training distribution (token length + BOS/EOS)
-        replace = num_samples > len(train_df)
+
+    def sample_candidates(n_requested: int, show_progress: bool = True):
+        if args.variable_length:
+            if show_progress:
+                print(f"   Using variable length sampling (range: {args.min_length}-{args.max_length})")
+            _, sampled_smiles = sampler.sample_variable_length(
+                num_samples=n_requested,
+                length_range=(args.min_length, args.max_length),
+                batch_size=batch_size,
+                samples_per_length=args.samples_per_length,
+                show_progress=show_progress
+            )
+            return sampled_smiles
+
+        replace = n_requested > len(train_df)
         sampled = train_df['p_smiles'].sample(
-            n=num_samples,
+            n=n_requested,
             replace=replace,
-            random_state=config['data']['random_seed']
+            random_state=np.random.randint(0, 2**31 - 1)
         )
         lengths = [
             min(len(tokenizer.tokenize(s)) + 2, tokenizer.max_length)
             for s in sampled.tolist()
         ]
-        print(f"   Using training length distribution (min={min(lengths)}, max={max(lengths)})")
-        _, generated_smiles = sampler.sample_batch(
-            num_samples=num_samples,
+        if show_progress:
+            print(f"   Using training length distribution (min={min(lengths)}, max={max(lengths)})")
+        _, sampled_smiles = sampler.sample_batch(
+            num_samples=n_requested,
             seq_length=tokenizer.max_length,
             batch_size=batch_size,
-            show_progress=True,
+            show_progress=show_progress,
             lengths=lengths
+        )
+        return sampled_smiles
+
+    valid_only_stats = {
+        "valid_only": bool(valid_only),
+        "valid_only_rounds": 0,
+        "valid_only_raw_generated": 0,
+        "valid_only_acceptance_rate": None,
+        "valid_only_rejected_count": 0,
+    }
+    if valid_only:
+        print(
+            f"   Valid-only mode ON (require_target_stars={valid_only_require_target_stars}, "
+            f"oversample_factor={valid_only_oversample_factor}, max_rounds={valid_only_max_rounds})"
+        )
+        generated_smiles = []
+        total_raw_generated = 0
+        round_rows = []
+
+        for round_idx in range(1, valid_only_max_rounds + 1):
+            remaining = num_samples - len(generated_smiles)
+            if remaining <= 0:
+                break
+
+            n_requested = max(
+                remaining,
+                int(math.ceil(remaining * valid_only_oversample_factor)),
+                valid_only_min_samples_per_round,
+            )
+            print(
+                f"   Valid-only round {round_idx}/{valid_only_max_rounds}: "
+                f"request={n_requested}, remaining_target={remaining}"
+            )
+            batch_smiles = sample_candidates(n_requested=n_requested, show_progress=True)
+            total_raw_generated += len(batch_smiles)
+
+            batch_valid = _filter_valid_samples(
+                smiles_list=batch_smiles,
+                require_target_stars=valid_only_require_target_stars,
+                target_stars=target_stars,
+            )
+            accepted = min(remaining, len(batch_valid))
+            if accepted > 0:
+                generated_smiles.extend(batch_valid[:accepted])
+
+            round_acceptance = (len(batch_valid) / len(batch_smiles)) if len(batch_smiles) > 0 else 0.0
+            round_rows.append(
+                {
+                    "round": round_idx,
+                    "remaining_target_before_round": remaining,
+                    "requested_samples": int(len(batch_smiles)),
+                    "valid_candidates_found": int(len(batch_valid)),
+                    "accepted_this_round": int(accepted),
+                    "accepted_cumulative": int(len(generated_smiles)),
+                    "round_acceptance_rate": float(round_acceptance),
+                }
+            )
+            print(
+                f"     valid={len(batch_valid)}/{len(batch_smiles)} "
+                f"({100.0 * round_acceptance:.2f}%), accepted={accepted}, "
+                f"cumulative={len(generated_smiles)}/{num_samples}"
+            )
+
+        if len(generated_smiles) < num_samples:
+            raise RuntimeError(
+                "Valid-only sampling did not reach requested samples. "
+                f"accepted={len(generated_smiles)}, requested={num_samples}. "
+                "Increase valid_only_max_rounds or valid_only_oversample_factor."
+            )
+
+        generated_smiles = generated_smiles[:num_samples]
+        rounds_df = pd.DataFrame(round_rows)
+        rounds_df.to_csv(metrics_dir / 'valid_only_sampling_rounds.csv', index=False)
+        print(f"Saved valid-only round log: {metrics_dir / 'valid_only_sampling_rounds.csv'}")
+
+        acceptance_rate = (len(generated_smiles) / total_raw_generated) if total_raw_generated > 0 else 0.0
+        valid_only_stats.update(
+            {
+                "valid_only_rounds": int(len(round_rows)),
+                "valid_only_raw_generated": int(total_raw_generated),
+                "valid_only_acceptance_rate": float(acceptance_rate),
+                "valid_only_rejected_count": int(max(total_raw_generated - len(generated_smiles), 0)),
+            }
+        )
+    else:
+        generated_smiles = sample_candidates(n_requested=num_samples, show_progress=True)
+        valid_only_stats.update(
+            {
+                "valid_only_rounds": 1,
+                "valid_only_raw_generated": int(len(generated_smiles)),
+                "valid_only_acceptance_rate": 1.0,
+                "valid_only_rejected_count": 0,
+            }
         )
 
     sampling_time_sec = time.time() - sampling_start
@@ -293,6 +556,12 @@ def main(args):
     samples_df = pd.DataFrame({'smiles': generated_smiles})
     samples_df.to_csv(metrics_dir / 'generated_samples.csv', index=False)
     print(f"Saved {len(generated_smiles)} generated samples")
+    if valid_only_stats["valid_only"]:
+        print(
+            "Valid-only acceptance: "
+            f"{valid_only_stats['valid_only_raw_generated']} -> {len(generated_smiles)} "
+            f"(rate={100.0 * float(valid_only_stats['valid_only_acceptance_rate']):.2f}%)"
+        )
 
     # Evaluate
     print("\n6. Evaluating generative metrics...")
@@ -349,6 +618,31 @@ def main(args):
     print(f"  Mean SA: {metrics['mean_sa']:.4f}")
     print(f"  Std SA: {metrics['std_sa']:.4f}")
 
+    # Final target polymer selection for downstream inverse design
+    target_df, target_summary = _select_target_polymers(
+        generated_smiles=generated_smiles,
+        training_smiles=training_smiles,
+        target_count=target_polymer_count,
+        target_stars=target_stars,
+        sa_max=target_sa_max,
+    )
+    target_df.to_csv(metrics_dir / "target_polymers.csv", index=False)
+    pd.DataFrame([target_summary]).to_csv(metrics_dir / "target_polymer_selection_summary.csv", index=False)
+
+    if target_summary["target_count_selected"] < target_summary["target_count_requested"]:
+        print(
+            "Warning: selected target polymers are fewer than requested. "
+            f"selected={target_summary['target_count_selected']}, "
+            f"requested={target_summary['target_count_requested']}"
+        )
+
+    print("\nTarget polymer selection (valid + star=2 + novel + SA<4 + unique):")
+    print(f"  Requested: {target_summary['target_count_requested']}")
+    print(f"  Selected: {target_summary['target_count_selected']}")
+    print(f"  Success rate: {target_summary['selection_success_rate']:.4f}")
+    print(f"  Diversity: {target_summary['final_diversity']:.4f}")
+    print(f"  Mean SA: {target_summary['final_mean_sa']:.4f}")
+
     # Create plots
     print("\n7. Creating plots...")
     plotter = PlotUtils(
@@ -393,8 +687,6 @@ def main(args):
     )
 
     # Star count histogram
-    from src.utils.chemistry import count_stars
-
     star_counts = [count_stars(s) for s in valid_smiles]
 
     plotter.star_count_bar(
@@ -416,6 +708,11 @@ def main(args):
         "top_k": int(top_k) if top_k is not None else None,
         "top_p": float(top_p) if top_p is not None else None,
         "target_stars": int(target_stars),
+        "valid_only": bool(valid_only_stats["valid_only"]),
+        "valid_only_rounds": int(valid_only_stats["valid_only_rounds"]),
+        "valid_only_raw_generated": int(valid_only_stats["valid_only_raw_generated"]),
+        "valid_only_acceptance_rate": float(valid_only_stats["valid_only_acceptance_rate"]),
+        "valid_only_rejected_count": int(valid_only_stats["valid_only_rejected_count"]),
         "sampling_time_sec": float(sampling_time_sec),
         "samples_per_sec": float(metrics.get("samples_per_sec", 0.0)),
         "validity": float(metrics.get("validity", 0.0)),
@@ -426,9 +723,35 @@ def main(args):
         "frac_star_eq_2": float(metrics.get("frac_star_eq_2", 0.0)),
         "mean_sa": float(metrics.get("mean_sa", 0.0)),
         "std_sa": float(metrics.get("std_sa", 0.0)),
+        "target_polymer_count_requested": int(target_summary["target_count_requested"]),
+        "target_polymer_count_selected": int(target_summary["target_count_selected"]),
+        "target_polymer_selection_success_rate": float(target_summary["selection_success_rate"]),
+        "target_polymer_diversity": float(target_summary["final_diversity"]),
+        "target_polymer_mean_sa": float(target_summary["final_mean_sa"]),
+        "target_polymer_std_sa": float(target_summary["final_std_sa"]),
+        "target_polymer_novelty": float(target_summary["final_novelty"]),
+        "target_polymer_uniqueness": float(target_summary["final_uniqueness"]),
+        "target_polymer_frac_star_eq_target": float(target_summary["final_frac_star_eq_target"]),
     }
     save_step_summary(summary, metrics_dir)
     save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figures_dir)
+    _append_step_log(
+        step_dir=step_dir,
+        lines=[
+            "final_target_polymer_selection:",
+            f"total_sampling_examples: {target_summary['total_generated']}",
+            f"target_count_requested: {target_summary['target_count_requested']}",
+            f"target_count_selected: {target_summary['target_count_selected']}",
+            f"success_rate: {target_summary['selection_success_rate']:.6f}",
+            f"diversity: {target_summary['final_diversity']:.6f}",
+            f"mean_sa: {target_summary['final_mean_sa']:.6f}",
+            f"std_sa: {target_summary['final_std_sa']:.6f}",
+            f"novelty: {target_summary['final_novelty']:.6f}",
+            f"uniqueness: {target_summary['final_uniqueness']:.6f}",
+            f"frac_star_eq_{target_stars}: {target_summary['final_frac_star_eq_target']:.6f}",
+            "target_csv: metrics/target_polymers.csv",
+        ],
+    )
 
     print("\n" + "=" * 50)
     print("Sampling and evaluation complete!")
@@ -458,6 +781,20 @@ if __name__ == '__main__':
                         help='Top-p nucleus filter (default: sampling.top_p in config)')
     parser.add_argument('--target_stars', type=int, default=None,
                         help='Target number of "*" tokens (default: sampling.target_stars in config)')
+    parser.add_argument('--valid_only', action='store_true',
+                        help='Enable valid-only resampling mode')
+    parser.add_argument('--no_valid_only', action='store_true',
+                        help='Disable valid-only resampling mode')
+    parser.add_argument('--valid_only_require_target_stars', action='store_true',
+                        help='In valid-only mode, require star count == target_stars')
+    parser.add_argument('--valid_only_allow_non_target_stars', action='store_true',
+                        help='In valid-only mode, do not enforce target star count')
+    parser.add_argument('--valid_only_oversample_factor', type=float, default=None,
+                        help='Oversampling factor per valid-only round (default: sampling.valid_only_oversample_factor)')
+    parser.add_argument('--valid_only_max_rounds', type=int, default=None,
+                        help='Maximum rounds in valid-only mode (default: sampling.valid_only_max_rounds)')
+    parser.add_argument('--valid_only_min_samples_per_round', type=int, default=None,
+                        help='Minimum requested samples per valid-only round (default: sampling.valid_only_min_samples_per_round)')
     parser.add_argument('--variable_length', action='store_true',
                         help='Enable variable length sampling')
     parser.add_argument('--min_length', type=int, default=20,

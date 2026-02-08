@@ -167,6 +167,8 @@ chi_training:
   epsilon: 0.05
   class_weight: 0.25
   polymer_class_weight: 0.50
+  target_polymer_count: 100
+  target_sa_max: 4.0
   candidate_source: "novel"
   property_rule: "upper_bound"
   coverage_topk: 5
@@ -190,11 +192,18 @@ optimization:
 
 sampling:
   num_samples: 10000
-  batch_size: 256
+  batch_size: 128
   temperature: 0.9
   top_k: null
   top_p: null
   target_stars: 2
+  target_polymer_count: 100
+  target_sa_max: 4.0
+  valid_only: true
+  valid_only_require_target_stars: true
+  valid_only_oversample_factor: 1.35
+  valid_only_max_rounds: 25
+  valid_only_min_samples_per_round: 256
   use_constraints: true
 
 # SMARTS-like family tags used in Step 6.
