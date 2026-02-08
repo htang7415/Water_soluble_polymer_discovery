@@ -452,19 +452,25 @@ def tune_hyperparameters(
             patience=train_cfg.tuning_patience,
         )
         val_reg = regression_metrics(preds["val"]["chi_true"], preds["val"]["chi_pred"])
-        trial.set_user_attr("val_r2", float(val_reg["r2"]))
-        return float(val_reg["rmse"])
+        val_r2 = float(val_reg["r2"])
+        val_rmse = float(val_reg["rmse"])
+        trial.set_user_attr("val_r2", val_r2)
+        trial.set_user_attr("val_rmse", val_rmse)
+        return val_r2
 
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=train_cfg.n_trials, show_progress_bar=True)
 
     trials = []
     for t in study.trials:
+        val_r2 = t.user_attrs.get("val_r2", t.value)
+        val_rmse = t.user_attrs.get("val_rmse", np.nan)
         row = {
             "trial": t.number,
             "state": str(t.state),
-            "value_rmse": t.value,
-            "val_r2": t.user_attrs.get("val_r2", np.nan),
+            "value_val_r2": t.value,
+            "val_r2": val_r2,
+            "val_rmse": val_rmse,
         }
         row.update(t.params)
         trials.append(row)
@@ -475,8 +481,8 @@ def tune_hyperparameters(
         trial_df["chi_val_r2"] = trial_df["val_r2"]
     else:
         trial_df["chi_val_r2"] = np.nan
-    if "value_rmse" in trial_df.columns:
-        trial_df["chi_val_rmse"] = trial_df["value_rmse"]
+    if "val_rmse" in trial_df.columns:
+        trial_df["chi_val_rmse"] = trial_df["val_rmse"]
     else:
         trial_df["chi_val_rmse"] = np.nan
 
@@ -516,7 +522,9 @@ def tune_hyperparameters(
         json.dump(
             {
                 "best_trial": int(study.best_trial.number),
-                "best_value_rmse": float(study.best_value),
+                "objective": "maximize_val_r2",
+                "best_value_r2": float(study.best_value),
+                "best_value_rmse_at_best_trial": float(study.best_trial.user_attrs.get("val_rmse", np.nan)),
                 "best_params": study.best_params,
             },
             f,
@@ -604,6 +612,55 @@ def _collect_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
 
 
 
+def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> None:
+    if sub.empty:
+        ax.set_axis_off()
+        ax.set_title(f"{split.upper()} (empty)")
+        return
+
+    sns.scatterplot(
+        data=sub,
+        x="chi",
+        y="chi_pred",
+        hue="water_soluble",
+        palette={1: "#1f77b4", 0: "#d62728"},
+        alpha=0.75,
+        s=18,
+        ax=ax,
+        legend=show_legend,
+    )
+    lo = float(min(sub["chi"].min(), sub["chi_pred"].min()))
+    hi = float(max(sub["chi"].max(), sub["chi_pred"].max()))
+    span = max(hi - lo, 1e-8)
+    pad = 0.04 * span
+    lo_plot = lo - pad
+    hi_plot = hi + pad
+    ax.plot([lo_plot, hi_plot], [lo_plot, hi_plot], "k--", linewidth=1.1)
+    ax.set_xlim(lo_plot, hi_plot)
+    ax.set_ylim(lo_plot, hi_plot)
+    ax.set_xlabel("True χ")
+    ax.set_ylabel("Predicted χ")
+
+    reg = regression_metrics(sub["chi"], sub["chi_pred"])
+    metrics_text = (
+        f"MAE={reg['mae']:.3f}\n"
+        f"RMSE={reg['rmse']:.3f}\n"
+        f"R2={reg['r2']:.3f}"
+    )
+    ax.text(
+        0.03,
+        0.97,
+        metrics_text,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
+    )
+    ax.set_title(f"{split.upper()} parity (n={len(sub)})")
+    if not show_legend and ax.get_legend() is not None:
+        ax.get_legend().remove()
+
+
 def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_dir: Path, dpi: int, font_size: int) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style="whitegrid")
@@ -620,30 +677,26 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     ax.plot(history["epoch"], history["val_loss"], label="Val loss")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
-    ax.set_title("Step3 chi training loss")
+    ax.set_title("Step4 chi training loss")
     ax.legend()
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_loss_curve.png", dpi=dpi)
     plt.close(fig)
 
-    # Parity plot (test)
+    # Combined parity plot (train/val/test) with MAE, RMSE, and R2 per split.
+    split_order = ["train", "val", "test"]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
+    for i, split in enumerate(split_order):
+        sub = pred_df[pred_df["split"] == split].copy()
+        _plot_parity_panel(axes[i], sub=sub, split=split, show_legend=(i == 0))
+    fig.tight_layout()
+    fig.savefig(fig_dir / "chi_parity_by_split.png", dpi=dpi)
+    plt.close(fig)
+
+    # Keep test-only parity figure for backward compatibility.
     test = pred_df[pred_df["split"] == "test"].copy()
     fig, ax = plt.subplots(figsize=(6, 5))
-    sns.scatterplot(
-        data=test,
-        x="chi",
-        y="chi_pred",
-        hue="water_soluble",
-        palette={1: "#1f77b4", 0: "#d62728"},
-        alpha=0.8,
-        ax=ax,
-    )
-    lo = float(min(test["chi"].min(), test["chi_pred"].min()))
-    hi = float(max(test["chi"].max(), test["chi_pred"].max()))
-    ax.plot([lo, hi], [lo, hi], "k--", linewidth=1.2)
-    ax.set_xlabel("True χ")
-    ax.set_ylabel("Predicted χ")
-    ax.set_title("Parity plot (test)")
+    _plot_parity_panel(ax, sub=test, split="test", show_legend=True)
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_parity_test.png", dpi=dpi)
     plt.close(fig)
@@ -828,6 +881,7 @@ def main(args):
         json.dump(
             {
                 "used_optuna": bool(train_cfg.tune),
+                "optuna_objective": "maximize_val_r2",
                 "optuna_best_params": best_params,
                 "final_training_hyperparameters": chosen,
                 "final_training_num_epochs": int(train_cfg.num_epochs),

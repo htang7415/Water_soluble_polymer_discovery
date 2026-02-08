@@ -6,7 +6,6 @@ import sys
 import argparse
 import re
 import time
-import math
 from pathlib import Path
 
 # Add parent directory to path
@@ -147,12 +146,48 @@ def _filter_valid_samples(
     return valid
 
 
+def _filter_step2_target_candidates(
+    smiles_list,
+    training_canonical: set[str],
+    seen_canonical: set[str],
+    require_target_stars: bool,
+    target_stars: int,
+    sa_max: float,
+):
+    accepted = []
+    for smiles in smiles_list:
+        if not check_validity(smiles):
+            continue
+        if require_target_stars and count_stars(smiles) != target_stars:
+            continue
+        canonical = canonicalize_smiles(smiles)
+        if canonical is None:
+            continue
+        if canonical in training_canonical:
+            continue
+        if canonical in seen_canonical:
+            continue
+        sa = compute_sa_score(smiles)
+        if sa is None or float(sa) >= float(sa_max):
+            continue
+        seen_canonical.add(canonical)
+        accepted.append(
+            {
+                "smiles": smiles,
+                "canonical_smiles": canonical,
+                "sa_score": float(sa),
+            }
+        )
+    return accepted
+
+
 def _select_target_polymers(
     generated_smiles,
     training_smiles,
     target_count: int,
     target_stars: int,
     sa_max: float,
+    total_sampling_points: int | None = None,
 ):
     training_canonical = {canonicalize_smiles(s) or s for s in training_smiles}
     rows = []
@@ -177,10 +212,12 @@ def _select_target_polymers(
         )
 
     all_df = pd.DataFrame(rows)
+    real_total_generated = int(total_sampling_points) if total_sampling_points is not None else int(len(all_df))
     if all_df.empty:
         summary = {
             "target_count_requested": int(target_count),
-            "total_generated": 0,
+            "total_generated": int(real_total_generated),
+            "total_evaluated_for_filters": 0,
             "filter_pass_count": 0,
             "filter_pass_unique": 0,
             "target_count_selected": 0,
@@ -217,11 +254,12 @@ def _select_target_polymers(
     sa_vals = selected["sa_score"].to_numpy(dtype=float) if not selected.empty else np.array([])
     summary = {
         "target_count_requested": int(target_count),
-        "total_generated": int(len(all_df)),
+        "total_generated": int(real_total_generated),
+        "total_evaluated_for_filters": int(len(all_df)),
         "filter_pass_count": int(filter_mask.sum()),
         "filter_pass_unique": int(len(filtered)),
         "target_count_selected": int(len(selected)),
-        "selection_success_rate": float(len(selected) / len(all_df)) if len(all_df) > 0 else 0.0,
+        "selection_success_rate": float(len(selected) / real_total_generated) if real_total_generated > 0 else 0.0,
         "final_diversity": float(diversity),
         "final_mean_sa": float(np.nanmean(sa_vals)) if sa_vals.size else np.nan,
         "final_std_sa": float(np.nanstd(sa_vals)) if sa_vals.size else np.nan,
@@ -245,7 +283,6 @@ def main(args):
     # Load config
     config = load_config(args.config)
     sampling_cfg = config.get('sampling', {})
-    num_samples = int(args.num_samples if args.num_samples is not None else config.get('sampling', {}).get('num_samples', 10000))
     temperature = float(args.temperature if args.temperature is not None else sampling_cfg.get('temperature', 1.0))
     top_k = args.top_k if args.top_k is not None else sampling_cfg.get('top_k', None)
     top_k = int(top_k) if top_k is not None else None
@@ -258,6 +295,38 @@ def main(args):
     target_stars = int(args.target_stars if args.target_stars is not None else sampling_cfg.get('target_stars', 2))
     if target_stars < 0:
         raise ValueError(f"target_stars must be >= 0, got {target_stars}")
+    variable_length = bool(sampling_cfg.get('variable_length', False))
+    if args.variable_length:
+        variable_length = True
+    variable_length_min_tokens = int(
+        args.min_length
+        if args.min_length is not None
+        else sampling_cfg.get('variable_length_min_tokens', 20)
+    )
+    variable_length_max_tokens = int(
+        args.max_length
+        if args.max_length is not None
+        else sampling_cfg.get('variable_length_max_tokens', 100)
+    )
+    variable_length_samples_per_length = int(
+        args.samples_per_length
+        if args.samples_per_length is not None
+        else sampling_cfg.get('variable_length_samples_per_length', 16)
+    )
+    if variable_length_min_tokens < 1:
+        raise ValueError(f"variable_length_min_tokens must be >= 1, got {variable_length_min_tokens}")
+    if variable_length_max_tokens < 1:
+        raise ValueError(f"variable_length_max_tokens must be >= 1, got {variable_length_max_tokens}")
+    if variable_length_max_tokens < variable_length_min_tokens:
+        raise ValueError(
+            "variable_length_max_tokens must be >= variable_length_min_tokens, "
+            f"got {variable_length_max_tokens} < {variable_length_min_tokens}"
+        )
+    if variable_length_samples_per_length < 1:
+        raise ValueError(
+            "variable_length_samples_per_length must be >= 1, "
+            f"got {variable_length_samples_per_length}"
+        )
     if args.valid_only and args.no_valid_only:
         raise ValueError("Use only one of --valid_only or --no_valid_only")
     if args.valid_only_require_target_stars and args.valid_only_allow_non_target_stars:
@@ -273,14 +342,6 @@ def main(args):
         valid_only_require_target_stars = True
     elif args.valid_only_allow_non_target_stars:
         valid_only_require_target_stars = False
-
-    valid_only_oversample_factor = float(
-        args.valid_only_oversample_factor
-        if args.valid_only_oversample_factor is not None
-        else sampling_cfg.get('valid_only_oversample_factor', 1.3)
-    )
-    if valid_only_oversample_factor < 1.0:
-        raise ValueError(f"valid_only_oversample_factor must be >= 1.0, got {valid_only_oversample_factor}")
 
     valid_only_max_rounds = int(
         args.valid_only_max_rounds
@@ -303,6 +364,7 @@ def main(args):
     target_sa_max = float(sampling_cfg.get("target_sa_max", 4.0))
     if target_polymer_count < 1:
         raise ValueError(f"sampling.target_polymer_count must be >=1, got {target_polymer_count}")
+    generation_goal = int(target_polymer_count)
 
     # Set device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -330,14 +392,19 @@ def main(args):
             "config_path": args.config,
             "model_size": args.model_size,
             "results_dir": str(results_dir),
-            "num_samples": num_samples,
+            "target_polymer_goal": generation_goal,
+            "target_polymer_count_config": target_polymer_count,
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p,
             "target_stars": target_stars,
+            "target_sa_max": target_sa_max,
+            "variable_length": variable_length,
+            "variable_length_min_tokens": variable_length_min_tokens,
+            "variable_length_max_tokens": variable_length_max_tokens,
+            "variable_length_samples_per_length": variable_length_samples_per_length,
             "valid_only": valid_only,
             "valid_only_require_target_stars": valid_only_require_target_stars,
-            "valid_only_oversample_factor": valid_only_oversample_factor,
             "valid_only_max_rounds": valid_only_max_rounds,
             "valid_only_min_samples_per_round": valid_only_min_samples_per_round,
             "random_seed": config['data']['random_seed'],
@@ -356,6 +423,17 @@ def main(args):
     if not tokenizer_path.exists():
         tokenizer_path = Path(base_results_dir) / 'tokenizer.json'
     tokenizer = PSmilesTokenizer.load(tokenizer_path)
+    if variable_length and variable_length_max_tokens > int(tokenizer.max_length):
+        print(
+            "   variable_length_max_tokens exceeds tokenizer.max_length; "
+            f"clipping {variable_length_max_tokens} -> {tokenizer.max_length}"
+        )
+        variable_length_max_tokens = int(tokenizer.max_length)
+    if variable_length and variable_length_min_tokens > int(tokenizer.max_length):
+        raise ValueError(
+            "variable_length_min_tokens exceeds tokenizer.max_length: "
+            f"{variable_length_min_tokens} > {tokenizer.max_length}"
+        )
 
     # Load training data for novelty computation (from base results dir)
     print("\n2. Loading training data...")
@@ -422,17 +500,21 @@ def main(args):
     # Sample
     sampling_start = time.time()
     batch_size = args.batch_size or config['sampling']['batch_size']
-    print(f"\n5. Sampling {num_samples} polymers (batch_size={batch_size})...")
+    print(f"\n5. Sampling target polymers (goal={generation_goal}, batch_size={batch_size})...")
 
     def sample_candidates(n_requested: int, show_progress: bool = True):
-        if args.variable_length:
+        if variable_length:
             if show_progress:
-                print(f"   Using variable length sampling (range: {args.min_length}-{args.max_length})")
+                print(
+                    "   Using variable length sampling "
+                    f"(range: {variable_length_min_tokens}-{variable_length_max_tokens}, "
+                    f"samples_per_length={variable_length_samples_per_length})"
+                )
             _, sampled_smiles = sampler.sample_variable_length(
-                num_samples=n_requested,
-                length_range=(args.min_length, args.max_length),
+                n_requested,
+                length_range=(variable_length_min_tokens, variable_length_max_tokens),
                 batch_size=batch_size,
-                samples_per_length=args.samples_per_length,
+                samples_per_length=variable_length_samples_per_length,
                 show_progress=show_progress
             )
             return sampled_smiles
@@ -450,7 +532,7 @@ def main(args):
         if show_progress:
             print(f"   Using training length distribution (min={min(lengths)}, max={max(lengths)})")
         _, sampled_smiles = sampler.sample_batch(
-            num_samples=n_requested,
+            n_requested,
             seq_length=tokenizer.max_length,
             batch_size=batch_size,
             show_progress=show_progress,
@@ -465,23 +547,24 @@ def main(args):
         "valid_only_acceptance_rate": None,
         "valid_only_rejected_count": 0,
     }
+    training_canonical = {canonicalize_smiles(s) or s for s in training_smiles}
     if valid_only:
         print(
             f"   Valid-only mode ON (require_target_stars={valid_only_require_target_stars}, "
-            f"oversample_factor={valid_only_oversample_factor}, max_rounds={valid_only_max_rounds})"
+            f"max_rounds={valid_only_max_rounds})"
         )
         generated_smiles = []
+        seen_canonical = set()
         total_raw_generated = 0
         round_rows = []
 
         for round_idx in range(1, valid_only_max_rounds + 1):
-            remaining = num_samples - len(generated_smiles)
+            remaining = generation_goal - len(generated_smiles)
             if remaining <= 0:
                 break
 
             n_requested = max(
                 remaining,
-                int(math.ceil(remaining * valid_only_oversample_factor)),
                 valid_only_min_samples_per_round,
             )
             print(
@@ -491,41 +574,44 @@ def main(args):
             batch_smiles = sample_candidates(n_requested=n_requested, show_progress=True)
             total_raw_generated += len(batch_smiles)
 
-            batch_valid = _filter_valid_samples(
+            batch_accepted = _filter_step2_target_candidates(
                 smiles_list=batch_smiles,
+                training_canonical=training_canonical,
+                seen_canonical=seen_canonical,
                 require_target_stars=valid_only_require_target_stars,
                 target_stars=target_stars,
+                sa_max=target_sa_max,
             )
-            accepted = min(remaining, len(batch_valid))
+            accepted = min(remaining, len(batch_accepted))
             if accepted > 0:
-                generated_smiles.extend(batch_valid[:accepted])
+                generated_smiles.extend([row["smiles"] for row in batch_accepted[:accepted]])
 
-            round_acceptance = (len(batch_valid) / len(batch_smiles)) if len(batch_smiles) > 0 else 0.0
+            round_acceptance = (len(batch_accepted) / len(batch_smiles)) if len(batch_smiles) > 0 else 0.0
             round_rows.append(
                 {
                     "round": round_idx,
                     "remaining_target_before_round": remaining,
                     "requested_samples": int(len(batch_smiles)),
-                    "valid_candidates_found": int(len(batch_valid)),
+                    "strict_candidates_found": int(len(batch_accepted)),
                     "accepted_this_round": int(accepted),
                     "accepted_cumulative": int(len(generated_smiles)),
                     "round_acceptance_rate": float(round_acceptance),
                 }
             )
             print(
-                f"     valid={len(batch_valid)}/{len(batch_smiles)} "
+                f"     strict={len(batch_accepted)}/{len(batch_smiles)} "
                 f"({100.0 * round_acceptance:.2f}%), accepted={accepted}, "
-                f"cumulative={len(generated_smiles)}/{num_samples}"
+                f"cumulative={len(generated_smiles)}/{generation_goal}"
             )
 
-        if len(generated_smiles) < num_samples:
+        if len(generated_smiles) < generation_goal:
             raise RuntimeError(
                 "Valid-only sampling did not reach requested samples. "
-                f"accepted={len(generated_smiles)}, requested={num_samples}. "
-                "Increase valid_only_max_rounds or valid_only_oversample_factor."
+                f"accepted={len(generated_smiles)}, requested={generation_goal}. "
+                "Increase valid_only_max_rounds."
             )
 
-        generated_smiles = generated_smiles[:num_samples]
+        generated_smiles = generated_smiles[:generation_goal]
         rounds_df = pd.DataFrame(round_rows)
         rounds_df.to_csv(metrics_dir / 'valid_only_sampling_rounds.csv', index=False)
         print(f"Saved valid-only round log: {metrics_dir / 'valid_only_sampling_rounds.csv'}")
@@ -539,16 +625,24 @@ def main(args):
                 "valid_only_rejected_count": int(max(total_raw_generated - len(generated_smiles), 0)),
             }
         )
+        total_sampling_points = int(total_raw_generated)
     else:
-        generated_smiles = sample_candidates(n_requested=num_samples, show_progress=True)
+        raw_smiles = sample_candidates(n_requested=generation_goal, show_progress=True)
+        filtered = _filter_valid_samples(
+            smiles_list=raw_smiles,
+            require_target_stars=valid_only_require_target_stars,
+            target_stars=target_stars,
+        )
+        generated_smiles = filtered[:generation_goal]
         valid_only_stats.update(
             {
                 "valid_only_rounds": 1,
-                "valid_only_raw_generated": int(len(generated_smiles)),
-                "valid_only_acceptance_rate": 1.0,
-                "valid_only_rejected_count": 0,
+                "valid_only_raw_generated": int(len(raw_smiles)),
+                "valid_only_acceptance_rate": float(len(generated_smiles) / len(raw_smiles)) if raw_smiles else 0.0,
+                "valid_only_rejected_count": int(max(len(raw_smiles) - len(generated_smiles), 0)),
             }
         )
+        total_sampling_points = int(len(raw_smiles))
 
     sampling_time_sec = time.time() - sampling_start
 
@@ -571,7 +665,7 @@ def main(args):
     evaluator = GenerativeEvaluator(training_smiles)
     metrics = evaluator.evaluate(
         generated_smiles,
-        sample_id=f'uncond_{num_samples}_best_checkpoint',
+        sample_id=f'uncond_{generation_goal}_best_checkpoint',
         show_progress=True,
         sampling_time_sec=sampling_time_sec,
         method=method_name,
@@ -622,9 +716,10 @@ def main(args):
     target_df, target_summary = _select_target_polymers(
         generated_smiles=generated_smiles,
         training_smiles=training_smiles,
-        target_count=target_polymer_count,
+        target_count=generation_goal,
         target_stars=target_stars,
         sa_max=target_sa_max,
+        total_sampling_points=total_sampling_points,
     )
     target_df.to_csv(metrics_dir / "target_polymers.csv", index=False)
     pd.DataFrame([target_summary]).to_csv(metrics_dir / "target_polymer_selection_summary.csv", index=False)
@@ -702,8 +797,13 @@ def main(args):
     summary = {
         "step": "step2_sampling",
         "model_size": model_size_label,
-        "num_samples_requested": int(num_samples),
-        "num_samples_generated": int(len(generated_smiles)),
+        "generation_goal": int(generation_goal),
+        "generated_count": int(total_sampling_points),
+        "accepted_count_for_evaluation": int(len(generated_smiles)),
+        "variable_length": bool(variable_length),
+        "variable_length_min_tokens": int(variable_length_min_tokens),
+        "variable_length_max_tokens": int(variable_length_max_tokens),
+        "variable_length_samples_per_length": int(variable_length_samples_per_length),
         "temperature": float(temperature),
         "top_k": int(top_k) if top_k is not None else None,
         "top_p": float(top_p) if top_p is not None else None,
@@ -769,8 +869,6 @@ if __name__ == '__main__':
                         help='Model size preset (small: ~12M, medium: ~50M, large: ~150M, xl: ~400M)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint')
-    parser.add_argument('--num_samples', type=int, default=None,
-                        help='Number of samples to generate (default: sampling.num_samples in config)')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='Batch size for sampling (default: from config)')
     parser.add_argument('--temperature', type=float, default=None,
@@ -789,20 +887,18 @@ if __name__ == '__main__':
                         help='In valid-only mode, require star count == target_stars')
     parser.add_argument('--valid_only_allow_non_target_stars', action='store_true',
                         help='In valid-only mode, do not enforce target star count')
-    parser.add_argument('--valid_only_oversample_factor', type=float, default=None,
-                        help='Oversampling factor per valid-only round (default: sampling.valid_only_oversample_factor)')
     parser.add_argument('--valid_only_max_rounds', type=int, default=None,
                         help='Maximum rounds in valid-only mode (default: sampling.valid_only_max_rounds)')
     parser.add_argument('--valid_only_min_samples_per_round', type=int, default=None,
                         help='Minimum requested samples per valid-only round (default: sampling.valid_only_min_samples_per_round)')
     parser.add_argument('--variable_length', action='store_true',
-                        help='Enable variable length sampling')
-    parser.add_argument('--min_length', type=int, default=20,
-                        help='Minimum sequence length for variable length sampling')
-    parser.add_argument('--max_length', type=int, default=100,
-                        help='Maximum sequence length for variable length sampling')
-    parser.add_argument('--samples_per_length', type=int, default=16,
-                        help='Samples per length in variable length mode (controls diversity)')
+                        help='Enable variable length sampling (or set sampling.variable_length=true in config)')
+    parser.add_argument('--min_length', type=int, default=None,
+                        help='Minimum sequence length for variable length sampling (default: sampling.variable_length_min_tokens)')
+    parser.add_argument('--max_length', type=int, default=None,
+                        help='Maximum sequence length for variable length sampling (default: sampling.variable_length_max_tokens)')
+    parser.add_argument('--samples_per_length', type=int, default=None,
+                        help='Samples per length in variable length mode (default: sampling.variable_length_samples_per_length)')
     parser.add_argument("--evaluate_ood", action="store_true",
                         help="Compute OOD metrics if embeddings are available")
     parser.add_argument("--foundation_results_dir", type=str,

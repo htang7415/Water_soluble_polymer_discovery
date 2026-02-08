@@ -233,6 +233,7 @@ def _select_final_target_polymers(
     target_stars: int,
     sa_max: float,
     polymer_patterns: Dict[str, str],
+    total_sampling_points: int | None = None,
 ) -> tuple[pd.DataFrame, Dict[str, float]]:
     ranked = candidate_df.sort_values(
         ["score", "rank", "property_error", "class_prob"],
@@ -240,7 +241,35 @@ def _select_final_target_polymers(
     ).copy()
 
     dedup_key = "polymer_id" if "polymer_id" in ranked.columns else "SMILES"
+    required_targets = int(candidate_df["target_id"].nunique()) if "target_id" in candidate_df.columns else 1
+
+    by_polymer = candidate_df.copy()
+    by_polymer["joint_condition_hit"] = (
+        (by_polymer["soluble_hit"] == 1)
+        & (by_polymer["property_hit"] == 1)
+    ).astype(int)
+    if "target_id" in by_polymer.columns:
+        per_polymer = by_polymer.groupby(dedup_key, as_index=False).agg(
+            n_targets_evaluated=("target_id", "nunique"),
+            n_targets_joint_hit=("joint_condition_hit", "sum"),
+            mean_property_error_all_targets=("property_error", "mean"),
+            max_property_error_all_targets=("property_error", "max"),
+        )
+    else:
+        per_polymer = by_polymer.groupby(dedup_key, as_index=False).agg(
+            n_targets_evaluated=("joint_condition_hit", "size"),
+            n_targets_joint_hit=("joint_condition_hit", "sum"),
+            mean_property_error_all_targets=("property_error", "mean"),
+            max_property_error_all_targets=("property_error", "max"),
+        )
+    per_polymer["n_targets_required"] = int(required_targets)
+    per_polymer["passes_all_target_conditions"] = (
+        (per_polymer["n_targets_evaluated"] == int(required_targets))
+        & (per_polymer["n_targets_joint_hit"] == int(required_targets))
+    ).astype(int)
+
     ranked = ranked.drop_duplicates(subset=[dedup_key], keep="first").reset_index(drop=True)
+    ranked = ranked.merge(per_polymer, on=dedup_key, how="left")
 
     classifier = PolymerClassifier(patterns=polymer_patterns) if polymer_patterns else None
     class_order = list(polymer_patterns.keys())
@@ -281,6 +310,8 @@ def _select_final_target_polymers(
                 "property_error": float(row["property_error"]),
                 "abs_error": float(row["abs_error"]),
                 "class_prob": float(row["class_prob"]),
+                "soluble_hit": int(row["soluble_hit"]),
+                "property_hit": int(row["property_hit"]),
                 "score": float(row["score"]),
                 "rank_in_target": int(row["rank"]),
                 "is_valid": int(is_valid),
@@ -289,14 +320,24 @@ def _select_final_target_polymers(
                 "sa_score": float(sa_score) if sa_score is not None else np.nan,
                 "sa_ok": int(sa_ok),
                 "polymer_family": polymer_family,
+                "n_targets_required": int(row["n_targets_required"]) if not pd.isna(row.get("n_targets_required", np.nan)) else 0,
+                "n_targets_evaluated": int(row["n_targets_evaluated"]) if not pd.isna(row.get("n_targets_evaluated", np.nan)) else 0,
+                "n_targets_joint_hit": int(row["n_targets_joint_hit"]) if not pd.isna(row.get("n_targets_joint_hit", np.nan)) else 0,
+                "passes_all_target_conditions": int(row["passes_all_target_conditions"]) if not pd.isna(row.get("passes_all_target_conditions", np.nan)) else 0,
+                "mean_property_error_all_targets": float(row["mean_property_error_all_targets"]) if not pd.isna(row.get("mean_property_error_all_targets", np.nan)) else np.nan,
+                "max_property_error_all_targets": float(row["max_property_error_all_targets"]) if not pd.isna(row.get("max_property_error_all_targets", np.nan)) else np.nan,
             }
         )
 
     all_df = pd.DataFrame(rows)
+    real_total_sampling_points = int(total_sampling_points) if total_sampling_points is not None else int(len(all_df))
     if all_df.empty:
         return pd.DataFrame(), {
+            "required_targets_per_polymer": int(required_targets),
+            "n_polymers_pass_all_targets": 0,
             "target_count_requested": int(target_count),
-            "total_candidates_screened": 0,
+            "total_candidates_screened": int(real_total_sampling_points),
+            "total_candidates_evaluated_after_target_aggregation": 0,
             "filter_pass_count": 0,
             "filter_pass_unique": 0,
             "target_count_selected": 0,
@@ -312,6 +353,7 @@ def _select_final_target_polymers(
         & (all_df["star_count"] == int(target_stars))
         & (all_df["is_novel_vs_train"] == 1)
         & (all_df["sa_ok"] == 1)
+        & (all_df["passes_all_target_conditions"] == 1)
     )
     filtered = all_df.loc[filter_mask].copy()
     filtered = filtered.drop_duplicates(subset=["canonical_smiles"], keep="first").reset_index(drop=True)
@@ -328,14 +370,17 @@ def _select_final_target_polymers(
             diversity = float(compute_pairwise_diversity(fps))
 
     sa_vals = selected["sa_score"].to_numpy(dtype=float) if not selected.empty else np.array([])
-    prop_vals = selected["property_error"].to_numpy(dtype=float) if not selected.empty else np.array([])
+    prop_vals = selected["max_property_error_all_targets"].to_numpy(dtype=float) if not selected.empty else np.array([])
     summary = {
+        "required_targets_per_polymer": int(required_targets),
+        "n_polymers_pass_all_targets": int(all_df["passes_all_target_conditions"].sum()),
         "target_count_requested": int(target_count),
-        "total_candidates_screened": int(len(all_df)),
+        "total_candidates_screened": int(real_total_sampling_points),
+        "total_candidates_evaluated_after_target_aggregation": int(len(all_df)),
         "filter_pass_count": int(filter_mask.sum()),
         "filter_pass_unique": int(len(filtered)),
         "target_count_selected": int(len(selected)),
-        "selection_success_rate": float(len(selected) / len(all_df)) if len(all_df) > 0 else 0.0,
+        "selection_success_rate": float(len(selected) / real_total_sampling_points) if real_total_sampling_points > 0 else 0.0,
         "final_diversity": float(diversity),
         "final_mean_sa": float(np.nanmean(sa_vals)) if sa_vals.size else np.nan,
         "final_std_sa": float(np.nanstd(sa_vals)) if sa_vals.size else np.nan,
@@ -475,7 +520,7 @@ def main(args):
 
     epsilon = float(args.epsilon if args.epsilon is not None else chi_cfg.get("epsilon", 0.05))
     class_weight = float(args.class_weight if args.class_weight is not None else chi_cfg.get("class_weight", 0.25))
-    candidate_source_value = args.candidate_source if args.candidate_source is not None else str(chi_cfg.get("candidate_source", "novel"))
+    candidate_source_value = args.candidate_source if args.candidate_source is not None else str(chi_cfg.get("candidate_source", "known"))
     candidate_source = parse_candidate_source(candidate_source_value)
     args.candidate_source = candidate_source
     default_property_rule = str(args.property_rule if args.property_rule is not None else chi_cfg.get("property_rule", "upper_bound")).strip().lower()
@@ -605,6 +650,7 @@ def main(args):
         target_stars=target_stars,
         sa_max=target_sa_max,
         polymer_patterns=polymer_patterns,
+        total_sampling_points=int(len(coeff_df)),
     )
     target_poly_df.to_csv(metrics_dir / "target_polymers.csv", index=False)
     pd.DataFrame([target_poly_summary]).to_csv(metrics_dir / "target_polymer_selection_summary.csv", index=False)
@@ -692,8 +738,8 @@ if __name__ == "__main__":
     parser.add_argument("--targets_csv", type=str, default=None, help="Custom χ_target CSV. If omitted, auto-uses Step 3 output.")
     parser.add_argument("--property_rule", type=str, default=None, choices=["band", "upper_bound", "lower_bound"], help="Default property rule when targets file has none")
 
-    parser.add_argument("--candidate_source", type=str, default=None, help="known | novel | hybrid")
-    parser.add_argument("--generated_csv", type=str, default=None, help="Step2 generated samples CSV")
+    parser.add_argument("--candidate_source", type=str, default=None, help="known | novel | hybrid (default from chi_training.candidate_source)")
+    parser.add_argument("--generated_csv", type=str, default=None, help="Generated samples CSV (used when candidate_source is novel/hybrid)")
     parser.add_argument("--generated_smiles_column", type=str, default="smiles", help="SMILES column name in generated_csv")
     parser.add_argument("--allow_non_two_stars", action="store_true", help="Allow generated candidates without exactly two '*' tokens")
     parser.add_argument("--max_novel_candidates", type=int, default=50000, help="Max number of novel generated candidates to keep")

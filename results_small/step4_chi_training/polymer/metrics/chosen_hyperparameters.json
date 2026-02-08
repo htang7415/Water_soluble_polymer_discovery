@@ -1,0 +1,12 @@
+{
+  "hidden_sizes": [
+    64,
+    64,
+    1024
+  ],
+  "dropout": 0.3,
+  "learning_rate": 0.00446519881876913,
+  "weight_decay": 1.0021176970002639e-07,
+  "lambda_bce": 0.5,
+  "batch_size": 8
+}

@@ -275,6 +275,14 @@ def _make_figures(
     plt.close(fig)
 
 
+def _round_float_columns(df: pd.DataFrame, ndigits: int = 4) -> pd.DataFrame:
+    out = df.copy()
+    float_cols = out.select_dtypes(include=["float16", "float32", "float64"]).columns
+    if len(float_cols) > 0:
+        out.loc[:, float_cols] = out[float_cols].round(ndigits)
+    return out
+
+
 def main(args):
     config = load_config(args.config)
     chi_cfg = _default_chi_config(config)
@@ -420,12 +428,12 @@ def main(args):
     targets_df = pd.DataFrame(target_rows)
     targets_df.insert(0, "target_id", np.arange(1, len(targets_df) + 1))
 
-    # save metrics
-    global_scan.to_csv(metrics_dir / "chi_target_global_scan.csv", index=False)
-    global_best.to_csv(metrics_dir / "chi_target_global_best.csv", index=False)
-    scan_df.to_csv(metrics_dir / "chi_target_scan_by_condition.csv", index=False)
-    cond_best.to_csv(metrics_dir / "chi_target_best_by_condition.csv", index=False)
-    targets_df.to_csv(metrics_dir / "chi_target_for_inverse_design.csv", index=False)
+    # Save CSV metrics rounded to 4 decimals for readability.
+    _round_float_columns(global_scan, ndigits=4).to_csv(metrics_dir / "chi_target_global_scan.csv", index=False)
+    _round_float_columns(global_best, ndigits=4).to_csv(metrics_dir / "chi_target_global_best.csv", index=False)
+    _round_float_columns(scan_df, ndigits=4).to_csv(metrics_dir / "chi_target_scan_by_condition.csv", index=False)
+    _round_float_columns(cond_best, ndigits=4).to_csv(metrics_dir / "chi_target_best_by_condition.csv", index=False)
+    _round_float_columns(targets_df, ndigits=4).to_csv(metrics_dir / "chi_target_for_inverse_design.csv", index=False)
 
     summary = {
         "dataset_path": str(dataset_path),
@@ -447,7 +455,11 @@ def main(args):
     }
     with open(metrics_dir / "chi_target_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
-    save_step_summary(summary, metrics_dir)
+    summary_csv = {
+        k: (round(v, 4) if isinstance(v, float) and np.isfinite(v) else v)
+        for k, v in summary.items()
+    }
+    save_step_summary(summary_csv, metrics_dir)
 
     # figures
     dpi = int(config.get("plotting", {}).get("dpi", 600))

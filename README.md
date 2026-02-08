@@ -74,7 +74,10 @@ Main config keys in `configs/config.yaml`:
 - `sampling.batch_size`
 - `sampling.valid_only`
 - `sampling.valid_only_require_target_stars`
-- `sampling.valid_only_oversample_factor`
+- `sampling.variable_length`
+- `sampling.variable_length_min_tokens`
+- `sampling.variable_length_max_tokens`
+- `sampling.variable_length_samples_per_length`
 - `sampling.valid_only_max_rounds`
 - `sampling.valid_only_min_samples_per_round`
 - `sampling.target_polymer_count`
@@ -82,12 +85,17 @@ Main config keys in `configs/config.yaml`:
 
 Final target-polymer export (Step 2/5/6):
 - All three steps now write `metrics/target_polymers.csv` and `metrics/target_polymer_selection_summary.csv`.
-- Selection filters are fixed to: valid SMILES, star count = `target_stars`, novel vs training set, SA `< target_sa_max`, unique (canonical).
+- Target count goal is `target_polymer_count` (default `100`).
+- Step 2 final filters: valid SMILES, star count = `target_stars`, novel vs training set, SA `< target_sa_max`, unique vs sampled candidates (canonical dedup).
+- Step 5 final filters: valid SMILES + star count + novel vs training set + SA + unique vs screened candidates (canonical dedup) + pass `soluble_hit=1` and `property_hit=1` on all target conditions.
+- Step 6 final filters: Step 5 filters + pass `polymer_class_hit=1` on all target conditions.
 - Each step appends key run statistics to `log.txt` (total sampled, selection success rate, diversity, mean SA).
-- Step 5/6 use Step 2 screened candidates by default (`step2_sampling/metrics/target_polymers.csv`) and fallback to `generated_samples.csv`.
+- Selection success rate uses `target_count_selected / total_sampled_points` (real raw sampled points before filtering).
+- Step 5/6 use Step 4 coefficients by default (`candidate_source=known`); `novel`/`hybrid` optionally use generated samples (`step2_sampling/metrics/target_polymers.csv`, fallback `generated_samples.csv`).
 
 ## Step 4 Optuna outputs
 - Search space is controlled by `chi_training.optuna_search_space` in `configs/config.yaml`.
+- Optuna objective is **maximize validation chi R2**.
 - Trial records:
   - `step4_chi_training/<split_mode>/tuning/optuna_trials.csv`
   - `step4_chi_training/<split_mode>/tuning/optuna_optimization_chi_r2.csv`
@@ -95,6 +103,9 @@ Final target-polymer export (Step 2/5/6):
 - Final selected training hyperparameters:
   - `step4_chi_training/<split_mode>/metrics/chosen_hyperparameters.json`
   - `step4_chi_training/<split_mode>/metrics/hyperparameter_selection_summary.json`
+- Parity plots:
+  - `step4_chi_training/<split_mode>/figures/chi_parity_by_split.png` (train/val/test panels, each with MAE/RMSE/R2)
+  - `step4_chi_training/<split_mode>/figures/chi_parity_test.png` (test-only view)
 
 ## HPC submit wrappers
 - Euler: `scripts/submit_all_euler.sh`

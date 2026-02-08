@@ -26,7 +26,7 @@ def default_chi_config(config: Dict) -> Dict:
         "epsilon": 0.05,
         "class_weight": 0.25,
         "polymer_class_weight": 0.50,
-        "candidate_source": "novel",
+        "candidate_source": "known",
         "property_rule": "upper_bound",
         "coverage_topk": 5,
         "target_polymer_class": "all",

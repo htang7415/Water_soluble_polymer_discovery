@@ -1,0 +1,28 @@
+{
+  "used_optuna": true,
+  "optuna_best_params": {
+    "num_layers": 3,
+    "hidden_0": 64,
+    "hidden_1": 64,
+    "hidden_2": 1024,
+    "dropout": 0.3,
+    "learning_rate": 0.00446519881876913,
+    "weight_decay": 1.0021176970002639e-07,
+    "lambda_bce": 0.5,
+    "batch_size": 8
+  },
+  "final_training_hyperparameters": {
+    "hidden_sizes": [
+      64,
+      64,
+      1024
+    ],
+    "dropout": 0.3,
+    "learning_rate": 0.00446519881876913,
+    "weight_decay": 1.0021176970002639e-07,
+    "lambda_bce": 0.5,
+    "batch_size": 8
+  },
+  "final_training_num_epochs": 500,
+  "final_training_patience": 20
+}
