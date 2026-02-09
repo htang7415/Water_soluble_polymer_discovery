@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -116,4 +116,44 @@ class PhysicsGuidedChiModel(nn.Module):
         bce = F.binary_cross_entropy_with_logits(out["class_logit"], class_label)
         total = mse + float(lambda_bce) * bce
         out.update({"loss": total, "loss_mse": mse, "loss_bce": bce})
+        return out
+
+
+class SolubilityClassifier(nn.Module):
+    """Map polymer embedding to soluble/insoluble class logit."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_sizes: List[int] | Tuple[int, ...] = (256, 128),
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        self.hidden_sizes = list(hidden_sizes)
+        self.dropout = float(dropout)
+
+        self.encoder = _build_mlp(self.embedding_dim, self.hidden_sizes, self.dropout)
+        head_dim = self.embedding_dim if not self.hidden_sizes else self.hidden_sizes[-1]
+        self.class_head = nn.Linear(head_dim, 1)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
+        features = self.encoder(embedding)
+        class_logit = self.class_head(features).squeeze(-1)
+        return {
+            "class_logit": class_logit,
+        }
+
+    def compute_loss(self, embedding: torch.Tensor, class_label: torch.Tensor) -> Dict[str, torch.Tensor]:
+        out = self.forward(embedding=embedding)
+        bce = F.binary_cross_entropy_with_logits(out["class_logit"], class_label)
+        out.update({"loss": bce})
         return out

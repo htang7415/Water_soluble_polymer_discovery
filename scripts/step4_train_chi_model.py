@@ -30,7 +30,7 @@ from src.chi.embeddings import (
     load_backbone_from_step1,
 )
 from src.chi.metrics import classification_metrics, hit_metrics, metrics_by_group, regression_metrics
-from src.chi.model import PhysicsGuidedChiModel
+from src.chi.model import PhysicsGuidedChiModel, SolubilityClassifier
 from src.utils.config import load_config, save_config
 from src.utils.model_scales import get_model_config, get_results_dir
 from src.utils.reproducibility import save_run_metadata, seed_everything
@@ -332,28 +332,38 @@ def build_train_config(args, config: Dict) -> TrainConfig:
 
 
 
-def make_dataloaders(split_df: pd.DataFrame, embedding_table: np.ndarray, batch_size: int) -> Dict[str, DataLoader]:
+def make_dataloaders(
+    split_df: pd.DataFrame,
+    embedding_table: np.ndarray,
+    batch_size: int,
+    shuffle_train: bool = True,
+) -> Dict[str, DataLoader]:
     loaders = {}
     for split in ["train", "val", "test"]:
         ds = ChiDataset(split_df[split_df["split"] == split], embedding_table)
         loaders[split] = DataLoader(
             ds,
             batch_size=batch_size,
-            shuffle=(split == "train"),
+            shuffle=(split == "train" and shuffle_train),
             num_workers=0,
             pin_memory=False,
         )
     return loaders
 
 
-def make_token_dataloaders(split_df: pd.DataFrame, tokenizer, batch_size: int) -> Dict[str, DataLoader]:
+def make_token_dataloaders(
+    split_df: pd.DataFrame,
+    tokenizer,
+    batch_size: int,
+    shuffle_train: bool = True,
+) -> Dict[str, DataLoader]:
     loaders = {}
     for split in ["train", "val", "test"]:
         ds = ChiTokenDataset(split_df[split_df["split"] == split], tokenizer)
         loaders[split] = DataLoader(
             ds,
             batch_size=batch_size,
-            shuffle=(split == "train"),
+            shuffle=(split == "train" and shuffle_train),
             num_workers=0,
             pin_memory=False,
         )
@@ -495,7 +505,12 @@ def train_one_model(
             raise ValueError("config is required when finetune_last_layers > 0")
         if tokenizer is None:
             raise ValueError("tokenizer is required when finetune_last_layers > 0")
-        dataloaders = make_token_dataloaders(split_df, tokenizer, batch_size=batch_size)
+        dataloaders = make_token_dataloaders(
+            split_df,
+            tokenizer,
+            batch_size=batch_size,
+            shuffle_train=True,
+        )
         _, backbone, _ = load_backbone_from_step1(
             config=config,
             model_size=model_size,
@@ -517,7 +532,12 @@ def train_one_model(
     else:
         if embedding_table is None:
             raise ValueError("embedding_table is required when finetune_last_layers == 0")
-        dataloaders = make_dataloaders(split_df, embedding_table, batch_size=batch_size)
+        dataloaders = make_dataloaders(
+            split_df,
+            embedding_table,
+            batch_size=batch_size,
+            shuffle_train=True,
+        )
         model = PhysicsGuidedChiModel(
             embedding_dim=int(embedding_table.shape[1]),
             hidden_sizes=hidden_sizes,
@@ -585,9 +605,25 @@ def train_one_model(
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    # Use deterministic (non-shuffled) loaders for split-level prediction CSVs and metrics.
+    if finetune_last_layers > 0:
+        pred_loaders = make_token_dataloaders(
+            split_df,
+            tokenizer,
+            batch_size=batch_size,
+            shuffle_train=False,
+        )
+    else:
+        pred_loaders = make_dataloaders(
+            split_df,
+            embedding_table,
+            batch_size=batch_size,
+            shuffle_train=False,
+        )
+
     predictions = {
         split: predict_split(model, loader, device)
-        for split, loader in dataloaders.items()
+        for split, loader in pred_loaders.items()
     }
     return model, history, predictions
 
@@ -1255,6 +1291,504 @@ def _save_coefficient_summary(
     df["class_prob"] = prob
     df.to_csv(out_csv, index=False)
 
+
+def run_classifier_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer | None,
+    device: str,
+) -> Dict[str, float]:
+    train_mode = optimizer is not None
+    model.train(mode=train_mode)
+    losses: List[float] = []
+    for batch in loader:
+        embedding = batch["embedding"].to(device)
+        label = batch["label"].to(device)
+        if train_mode:
+            optimizer.zero_grad(set_to_none=True)
+        out = model.compute_loss(embedding=embedding, class_label=label)
+        loss = out["loss"]
+        if train_mode:
+            loss.backward()
+            optimizer.step()
+        losses.append(float(loss.item()))
+    return {"loss": float(np.mean(losses)) if losses else np.nan}
+
+
+@torch.no_grad()
+def predict_classifier_split(model: nn.Module, loader: DataLoader, device: str) -> Dict[str, np.ndarray]:
+    model.eval()
+    logits: List[np.ndarray] = []
+    probs: List[np.ndarray] = []
+    labels: List[np.ndarray] = []
+    for batch in loader:
+        embedding = batch["embedding"].to(device)
+        label = batch["label"].to(device)
+        out = model(embedding=embedding)
+        logit = out["class_logit"]
+        logits.append(logit.detach().cpu().numpy())
+        probs.append(torch.sigmoid(logit).detach().cpu().numpy())
+        labels.append(label.detach().cpu().numpy())
+    return {
+        "label": np.concatenate(labels, axis=0) if labels else np.array([]),
+        "logit": np.concatenate(logits, axis=0) if logits else np.array([]),
+        "prob": np.concatenate(probs, axis=0) if probs else np.array([]),
+    }
+
+
+def train_one_classifier_model(
+    split_df: pd.DataFrame,
+    embedding_table: np.ndarray,
+    device: str,
+    hidden_sizes: List[int],
+    dropout: float,
+    learning_rate: float,
+    weight_decay: float,
+    batch_size: int,
+    num_epochs: int,
+    patience: int,
+) -> Tuple[nn.Module, Dict[str, List[float]], Dict[str, Dict[str, np.ndarray]]]:
+    dataloaders = make_dataloaders(
+        split_df=split_df,
+        embedding_table=embedding_table,
+        batch_size=batch_size,
+        shuffle_train=True,
+    )
+    model = SolubilityClassifier(
+        embedding_dim=int(embedding_table.shape[1]),
+        hidden_sizes=hidden_sizes,
+        dropout=dropout,
+    ).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+
+    history = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "val_balanced_accuracy": [],
+    }
+
+    best_state = None
+    best_val_loss = np.inf
+    wait = 0
+
+    for epoch in range(1, num_epochs + 1):
+        train_stats = run_classifier_epoch(model=model, loader=dataloaders["train"], optimizer=optimizer, device=device)
+        val_stats = run_classifier_epoch(model=model, loader=dataloaders["val"], optimizer=None, device=device)
+        val_pred = predict_classifier_split(model, dataloaders["val"], device)
+        val_cls = classification_metrics(val_pred["label"], val_pred["prob"])
+        val_bal_acc = float(val_cls["balanced_accuracy"])
+
+        history["epoch"].append(epoch)
+        history["train_loss"].append(train_stats["loss"])
+        history["val_loss"].append(val_stats["loss"])
+        history["val_balanced_accuracy"].append(val_bal_acc)
+
+        val_loss = float(val_stats["loss"])
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    pred_loaders = make_dataloaders(
+        split_df=split_df,
+        embedding_table=embedding_table,
+        batch_size=batch_size,
+        shuffle_train=False,
+    )
+    predictions = {
+        split: predict_classifier_split(model, loader, device)
+        for split, loader in pred_loaders.items()
+    }
+    return model, history, predictions
+
+
+def _evaluate_classifier_trial_with_cv(
+    cv_folds: List[pd.DataFrame],
+    embedding_table: np.ndarray,
+    train_cfg: TrainConfig,
+    device: str,
+    hidden_sizes: List[int],
+    dropout: float,
+    learning_rate: float,
+    weight_decay: float,
+    batch_size: int,
+) -> Dict[str, object]:
+    fold_rows = []
+    for fold_id, fold_df in enumerate(cv_folds, start=1):
+        _, _, preds = train_one_classifier_model(
+            split_df=fold_df,
+            embedding_table=embedding_table,
+            device=device,
+            hidden_sizes=hidden_sizes,
+            dropout=dropout,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            batch_size=batch_size,
+            num_epochs=train_cfg.tuning_epochs,
+            patience=train_cfg.tuning_patience,
+        )
+        val_pred = preds["val"]
+        val_cls = classification_metrics(val_pred["label"], val_pred["prob"])
+        fold_rows.append(
+            {
+                "fold": fold_id,
+                "val_n": int(len(val_pred["label"])),
+                "val_balanced_accuracy": float(val_cls["balanced_accuracy"]),
+                "val_auroc": float(val_cls["auroc"]),
+                "val_auprc": float(val_cls["auprc"]),
+                "val_brier": float(val_cls["brier"]),
+            }
+        )
+    fold_metrics_df = pd.DataFrame(fold_rows)
+    return {
+        "cv_val_balanced_accuracy": float(np.nanmean(fold_metrics_df["val_balanced_accuracy"])) if not fold_metrics_df.empty else np.nan,
+        "cv_val_auroc": float(np.nanmean(fold_metrics_df["val_auroc"])) if not fold_metrics_df.empty else np.nan,
+        "cv_val_auprc": float(np.nanmean(fold_metrics_df["val_auprc"])) if not fold_metrics_df.empty else np.nan,
+        "cv_val_brier": float(np.nanmean(fold_metrics_df["val_brier"])) if not fold_metrics_df.empty else np.nan,
+        "fold_metrics": fold_metrics_df,
+    }
+
+
+def tune_classifier_hyperparameters(
+    split_df: pd.DataFrame,
+    embedding_table: np.ndarray,
+    train_cfg: TrainConfig,
+    device: str,
+    tuning_dir: Path,
+    dpi: int = 300,
+    font_size: int = 12,
+) -> Dict:
+    try:
+        import optuna
+    except ImportError as exc:
+        raise ImportError(
+            "Optuna is required for --tune. Install it with `pip install optuna` or disable tuning."
+        ) from exc
+
+    tuning_dir.mkdir(parents=True, exist_ok=True)
+    search_space = train_cfg.optuna_search_space
+
+    def _as_list(key: str, default: List[float]) -> List[float]:
+        values = search_space.get(key, default)
+        if isinstance(values, list) and len(values) > 0:
+            return values
+        return default
+
+    num_layers_space = _as_list("num_layers", [1, 2, 3])
+    hidden_units_space = [int(v) for v in _as_list("hidden_units", [64, 128, 256, 512])]
+    dropout_space = [float(v) for v in _as_list("dropout", [0.0, 0.1, 0.2, 0.3])]
+    lr_space = [float(v) for v in _as_list("learning_rate", [1e-4, 5e-3])]
+    wd_space = [float(v) for v in _as_list("weight_decay", [1e-7, 1e-3])]
+    batch_size_space = [int(v) for v in _as_list("batch_size", [16, 32, 64, 128, 256])]
+    lr_log = bool(search_space.get("learning_rate_log", True))
+    wd_log = bool(search_space.get("weight_decay_log", True))
+
+    cv_folds, cv_info = _build_tuning_cv_folds(split_df=split_df, train_cfg=train_cfg)
+    _summarize_tuning_cv_folds(cv_folds).to_csv(tuning_dir / "optuna_tuning_cv_folds.csv", index=False)
+
+    objective_name = "val_balanced_accuracy"
+    objective_direction = "maximize"
+
+    def objective(trial: optuna.Trial) -> float:
+        if len(num_layers_space) == 2:
+            lo = int(min(num_layers_space))
+            hi = int(max(num_layers_space))
+            num_layers = trial.suggest_int("num_layers", lo, hi)
+        else:
+            num_layers = int(trial.suggest_categorical("num_layers", [int(v) for v in num_layers_space]))
+        hidden_sizes = [int(trial.suggest_categorical(f"hidden_{i}", hidden_units_space)) for i in range(num_layers)]
+        dropout = float(trial.suggest_categorical("dropout", dropout_space))
+        if len(lr_space) == 2:
+            lr = float(trial.suggest_float("learning_rate", min(lr_space), max(lr_space), log=lr_log))
+        else:
+            lr = float(trial.suggest_categorical("learning_rate", lr_space))
+        if len(wd_space) == 2:
+            wd = float(trial.suggest_float("weight_decay", min(wd_space), max(wd_space), log=wd_log))
+        else:
+            wd = float(trial.suggest_categorical("weight_decay", wd_space))
+        batch_size = int(trial.suggest_categorical("batch_size", batch_size_space))
+
+        cv_eval = _evaluate_classifier_trial_with_cv(
+            cv_folds=cv_folds,
+            embedding_table=embedding_table,
+            train_cfg=train_cfg,
+            device=device,
+            hidden_sizes=hidden_sizes,
+            dropout=dropout,
+            learning_rate=lr,
+            weight_decay=wd,
+            batch_size=batch_size,
+        )
+        val_bal_acc = float(cv_eval["cv_val_balanced_accuracy"])
+        trial.set_user_attr("cv_val_balanced_accuracy", val_bal_acc)
+        trial.set_user_attr("cv_val_auroc", float(cv_eval["cv_val_auroc"]))
+        trial.set_user_attr("cv_val_auprc", float(cv_eval["cv_val_auprc"]))
+        trial.set_user_attr("cv_val_brier", float(cv_eval["cv_val_brier"]))
+        trial.set_user_attr("cv_n_folds", int(len(cv_folds)))
+        trial.set_user_attr("tuning_objective", objective_name)
+        return val_bal_acc
+
+    study = optuna.create_study(direction=objective_direction)
+    study.optimize(objective, n_trials=train_cfg.n_trials, show_progress_bar=True)
+
+    trials = []
+    for t in study.trials:
+        row = {
+            "trial": t.number,
+            "state": str(t.state),
+            "objective_name": objective_name,
+            "objective_direction": objective_direction,
+            "objective_value": t.value,
+            "val_balanced_accuracy": t.user_attrs.get("cv_val_balanced_accuracy", np.nan),
+            "val_auroc": t.user_attrs.get("cv_val_auroc", np.nan),
+            "val_auprc": t.user_attrs.get("cv_val_auprc", np.nan),
+            "val_brier": t.user_attrs.get("cv_val_brier", np.nan),
+            "cv_n_folds": int(t.user_attrs.get("cv_n_folds", len(cv_folds))),
+        }
+        row.update(t.params)
+        trials.append(row)
+    trial_df = pd.DataFrame(trials).sort_values("trial").reset_index(drop=True)
+    trial_df.to_csv(tuning_dir / "optuna_trials.csv", index=False)
+    objective_numeric = pd.to_numeric(trial_df["objective_value"], errors="coerce")
+    trial_df["best_objective_so_far"] = objective_numeric.cummax()
+    trial_df.to_csv(tuning_dir / "optuna_optimization_objective.csv", index=False)
+
+    plt.rcParams.update(
+        {
+            "font.size": font_size,
+            "axes.titlesize": font_size,
+            "axes.labelsize": font_size,
+            "legend.fontsize": font_size,
+        }
+    )
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(trial_df["trial"], trial_df["objective_value"], "o", color="#2a9d8f", label="Trial balanced accuracy", alpha=0.85)
+    ax.plot(
+        trial_df["trial"],
+        trial_df["best_objective_so_far"],
+        "-",
+        color="#e76f51",
+        linewidth=2,
+        label="Best balanced accuracy so far",
+    )
+    ax.set_xlabel("Optuna trial")
+    ax.set_ylabel("Validation balanced accuracy")
+    ax.set_title("Optuna optimization objective: val_balanced_accuracy")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(tuning_dir / "optuna_optimization_objective.png", dpi=dpi)
+    plt.close(fig)
+
+    with open(tuning_dir / "optuna_best.json", "w") as f:
+        json.dump(
+            {
+                "best_trial": int(study.best_trial.number),
+                "objective": "maximize_val_balanced_accuracy",
+                "objective_name": objective_name,
+                "objective_direction": objective_direction,
+                "objective_value_at_best_trial": float(study.best_value),
+                "best_value_balanced_accuracy": float(study.best_trial.user_attrs.get("cv_val_balanced_accuracy", np.nan)),
+                "best_value_auroc": float(study.best_trial.user_attrs.get("cv_val_auroc", np.nan)),
+                "best_value_auprc": float(study.best_trial.user_attrs.get("cv_val_auprc", np.nan)),
+                "best_value_brier": float(study.best_trial.user_attrs.get("cv_val_brier", np.nan)),
+                "tuning_cv_folds_requested": int(train_cfg.tuning_cv_folds),
+                "tuning_cv_folds_resolved": int(cv_info.get("resolved_folds", len(cv_folds))),
+                "tuning_cv_strategy": str(cv_info.get("strategy", "unknown")),
+                "best_params": study.best_params,
+            },
+            f,
+            indent=2,
+        )
+    return study.best_params
+
+
+def _save_classifier_prediction_csvs(
+    split_df: pd.DataFrame,
+    predictions: Dict[str, Dict[str, np.ndarray]],
+    out_dir: Path,
+) -> pd.DataFrame:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for split in ["train", "val", "test"]:
+        sub = split_df[split_df["split"] == split].copy().reset_index(drop=True)
+        pred = predictions[split]
+        sub["class_logit"] = pred["logit"]
+        sub["class_prob"] = pred["prob"]
+        sub["class_pred"] = (sub["class_prob"] >= 0.5).astype(int)
+        sub.to_csv(out_dir / f"class_predictions_{split}.csv", index=False)
+        frames.append(sub)
+    all_df = pd.concat(frames, axis=0, ignore_index=True)
+    all_df.to_csv(out_dir / "class_predictions_all.csv", index=False)
+    return all_df
+
+
+def _collect_classifier_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for split, sub in pred_df.groupby("split"):
+        cls = classification_metrics(sub["water_soluble"], sub["class_prob"])
+        row = {"split": split}
+        row.update(cls)
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(out_dir / "class_metrics_overall.csv", index=False)
+
+
+def _make_classifier_figures(
+    history: Dict[str, List[float]],
+    pred_df: pd.DataFrame,
+    fig_dir: Path,
+    dpi: int,
+    font_size: int,
+) -> None:
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    sns.set_theme(style="whitegrid")
+    plt.rcParams.update({
+        "font.size": font_size,
+        "axes.titlesize": font_size,
+        "axes.labelsize": font_size,
+        "legend.fontsize": font_size,
+    })
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(history["epoch"], history["train_loss"], label="Train BCE")
+    ax.plot(history["epoch"], history["val_loss"], label="Val BCE")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("BCE loss")
+    ax.set_title("Step4_2 classification loss")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(fig_dir / "class_loss_curve.png", dpi=dpi)
+    plt.close(fig)
+
+    test = pred_df[pred_df["split"] == "test"].copy()
+    if not test.empty:
+        fig, ax = plt.subplots(figsize=(6, 5))
+        sns.kdeplot(
+            data=test,
+            x="class_prob",
+            hue="water_soluble",
+            common_norm=False,
+            fill=True,
+            alpha=0.3,
+            ax=ax,
+        )
+        ax.set_xlabel("Predicted soluble probability")
+        ax.set_title("Class probability distribution (test)")
+        fig.tight_layout()
+        fig.savefig(fig_dir / "class_prob_distribution_test.png", dpi=dpi)
+        plt.close(fig)
+
+        y_true = test["water_soluble"].to_numpy(dtype=int)
+        y_prob = test["class_prob"].to_numpy(dtype=float)
+        if len(np.unique(y_true)) > 1:
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+            precision, recall, _ = precision_recall_curve(y_true, y_prob)
+
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ax.plot(fpr, tpr, color="#1f77b4", linewidth=2)
+            ax.plot([0, 1], [0, 1], "k--", linewidth=1)
+            ax.set_xlabel("FPR")
+            ax.set_ylabel("TPR")
+            ax.set_title("Classifier ROC (test)")
+            fig.tight_layout()
+            fig.savefig(fig_dir / "classifier_roc_test.png", dpi=dpi)
+            plt.close(fig)
+
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ax.plot(recall, precision, color="#d62728", linewidth=2)
+            ax.set_xlabel("Recall")
+            ax.set_ylabel("Precision")
+            ax.set_title("Classifier PR (test)")
+            fig.tight_layout()
+            fig.savefig(fig_dir / "classifier_pr_test.png", dpi=dpi)
+            plt.close(fig)
+
+
+def _merge_predictions(
+    reg_predictions: Dict[str, Dict[str, np.ndarray]],
+    cls_predictions: Dict[str, Dict[str, np.ndarray]],
+) -> Dict[str, Dict[str, np.ndarray]]:
+    merged: Dict[str, Dict[str, np.ndarray]] = {}
+    for split in ["train", "val", "test"]:
+        reg = reg_predictions[split]
+        cls = cls_predictions[split]
+        if len(reg["chi_pred"]) != len(cls["prob"]):
+            raise ValueError(
+                f"Prediction length mismatch on split={split}: regression={len(reg['chi_pred'])}, classification={len(cls['prob'])}"
+            )
+        merged[split] = {
+            "chi_true": reg["chi_true"],
+            "chi_pred": reg["chi_pred"],
+            "label": cls["label"],
+            "logit": cls["logit"],
+            "prob": cls["prob"],
+            "coefficients": reg["coefficients"],
+        }
+    return merged
+
+
+def _save_combined_polymer_coefficients(
+    reg_model: nn.Module,
+    cls_model: nn.Module,
+    embedding_cache_df: pd.DataFrame,
+    out_csv: Path,
+    device: str,
+    tokenizer=None,
+    timestep: int = 1,
+) -> None:
+    reg_model.eval()
+    cls_model.eval()
+
+    if isinstance(reg_model, BackbonePhysicsGuidedChiModel):
+        if tokenizer is None:
+            raise ValueError("tokenizer is required to save coefficients for backbone-finetuned model")
+        rec = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].copy().reset_index(drop=True)
+        encoded = tokenizer.batch_encode(rec["SMILES"].astype(str).tolist())
+        input_ids = torch.tensor(np.asarray(encoded["input_ids"], dtype=np.int64), dtype=torch.long, device=device)
+        attention_mask = torch.tensor(np.asarray(encoded["attention_mask"], dtype=np.int64), dtype=torch.long, device=device)
+        timesteps = torch.full((int(input_ids.shape[0]),), int(timestep), device=device, dtype=torch.long)
+        with torch.no_grad():
+            emb_t = reg_model.backbone.get_pooled_output(
+                input_ids=input_ids,
+                timesteps=timesteps,
+                attention_mask=attention_mask,
+                pooling="mean",
+            )
+            features = reg_model.chi_head.encoder(emb_t)
+            coeff = reg_model.chi_head.coeff_head(features).cpu().numpy()
+        df = rec
+    else:
+        emb = np.stack(embedding_cache_df["embedding"].to_list(), axis=0)
+        emb_t = torch.tensor(emb, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            features = reg_model.encoder(emb_t)
+            coeff = reg_model.coeff_head(features).cpu().numpy()
+        df = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].copy()
+
+    emb_for_cls = np.stack(embedding_cache_df["embedding"].to_list(), axis=0)
+    emb_cls_t = torch.tensor(emb_for_cls, dtype=torch.float32, device=device)
+    with torch.no_grad():
+        cls_out = cls_model(embedding=emb_cls_t)
+        class_logit = cls_out["class_logit"].detach().cpu().numpy()
+        class_prob = torch.sigmoid(cls_out["class_logit"]).detach().cpu().numpy()
+
+    for i, name in enumerate(COEFF_NAMES):
+        df[name] = coeff[:, i]
+    df["class_logit"] = class_logit
+    df["class_prob"] = class_prob
+    df.to_csv(out_csv, index=False)
 
 
 def main(args):
