@@ -19,6 +19,7 @@ chi_training:
   embedding_batch_size: 128
   embedding_timestep: 1
   epsilon: 0.05
+  finetune_last_layers: 0
   hidden_sizes:
   - 256
   - 512
@@ -77,7 +78,10 @@ chi_training:
   test_ratio: 0.1
   train_ratio: 0.8
   tune: true
+  tuning_class_penalty_weight: 0.25
+  tuning_cv_folds: 5
   tuning_epochs: 100
+  tuning_objective: val_r2
   tuning_patience: 20
   val_ratio: 0.1
   weight_decay: 1.0e-05

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -150,13 +151,16 @@ def compute_polymer_embeddings(
 
 def save_embedding_cache(cache_npz: Path, embedding_df: pd.DataFrame, metadata: Dict) -> None:
     cache_npz.parent.mkdir(parents=True, exist_ok=True)
+    # Force fixed-width unicode arrays so np.load(..., allow_pickle=False) is always valid.
+    polymer_arr = np.asarray(embedding_df["Polymer"].astype(str).to_list(), dtype=np.str_)
+    smiles_arr = np.asarray(embedding_df["SMILES"].astype(str).to_list(), dtype=np.str_)
     np.savez_compressed(
         cache_npz,
         polymer_id=embedding_df["polymer_id"].to_numpy(dtype=int),
-        polymer=embedding_df["Polymer"].astype(str).to_numpy(),
-        smiles=embedding_df["SMILES"].astype(str).to_numpy(),
+        polymer=polymer_arr,
+        smiles=smiles_arr,
         water_soluble=embedding_df["water_soluble"].to_numpy(dtype=int),
-        embedding=np.stack(embedding_df["embedding"].to_list(), axis=0),
+        embedding=np.stack(embedding_df["embedding"].to_list(), axis=0).astype(np.float32, copy=False),
     )
     with open(cache_npz.with_suffix(".json"), "w") as f:
         json.dump(metadata, f, indent=2)
@@ -164,14 +168,38 @@ def save_embedding_cache(cache_npz: Path, embedding_df: pd.DataFrame, metadata: 
 
 
 def load_embedding_cache(cache_npz: Path) -> Tuple[pd.DataFrame, Dict]:
-    arr = np.load(cache_npz, allow_pickle=False)
+    def _read_arrays(allow_pickle: bool):
+        with np.load(cache_npz, allow_pickle=allow_pickle) as arr:
+            return {
+                "polymer_id": np.asarray(arr["polymer_id"]).astype(int),
+                "Polymer": np.asarray(arr["polymer"]).astype(str),
+                "SMILES": np.asarray(arr["smiles"]).astype(str),
+                "water_soluble": np.asarray(arr["water_soluble"]).astype(int),
+                "embedding": np.asarray(arr["embedding"], dtype=np.float32),
+            }
+
+    used_pickle_fallback = False
+    try:
+        arrays = _read_arrays(allow_pickle=False)
+    except ValueError as exc:
+        # Backward compatibility for legacy caches that stored object-typed arrays.
+        if "Object arrays cannot be loaded when allow_pickle=False" not in str(exc):
+            raise
+        used_pickle_fallback = True
+        warnings.warn(
+            f"Legacy cache format detected at {cache_npz}; loading with allow_pickle=True. "
+            "Cache will be rewritten in safe format on next refresh.",
+            RuntimeWarning,
+        )
+        arrays = _read_arrays(allow_pickle=True)
+
     df = pd.DataFrame(
         {
-            "polymer_id": arr["polymer_id"].astype(int),
-            "Polymer": arr["polymer"].astype(str),
-            "SMILES": arr["smiles"].astype(str),
-            "water_soluble": arr["water_soluble"].astype(int),
-            "embedding": list(arr["embedding"]),
+            "polymer_id": arrays["polymer_id"],
+            "Polymer": arrays["Polymer"],
+            "SMILES": arrays["SMILES"],
+            "water_soluble": arrays["water_soluble"],
+            "embedding": list(arrays["embedding"]),
         }
     )
     meta_path = cache_npz.with_suffix(".json")
@@ -179,6 +207,7 @@ def load_embedding_cache(cache_npz: Path) -> Tuple[pd.DataFrame, Dict]:
     if meta_path.exists():
         with open(meta_path, "r") as f:
             metadata = json.load(f)
+    metadata["_loaded_with_pickle_fallback"] = bool(used_pickle_fallback)
     return df, metadata
 
 
@@ -214,6 +243,9 @@ def build_or_load_embedding_cache(
     if cache_npz.exists() and cache_npz.with_suffix(".json").exists():
         cached_df, cached_meta = load_embedding_cache(cache_npz)
         if cached_meta.get("cache_key") == cache_key:
+            if bool(cached_meta.get("_loaded_with_pickle_fallback", False)):
+                refreshed_meta = {k: v for k, v in cached_meta.items() if not k.startswith("_")}
+                save_embedding_cache(cache_npz, cached_df, refreshed_meta)
             return cached_df.sort_values("polymer_id").reset_index(drop=True)
 
     tokenizer, backbone, _ = load_backbone_from_step1(

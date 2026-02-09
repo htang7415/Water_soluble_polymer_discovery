@@ -116,7 +116,7 @@ training_property:
   num_epochs: 500
   patience: 30
   freeze_backbone: true
-  finetune_last_layers: 6
+  finetune_last_layers: 6  # legacy property-head setting; Step 4 uses chi_training.finetune_last_layers (fallback here if missing)
   default_timestep: 1
 
 # Step 3-6 chi workflow config
@@ -140,15 +140,20 @@ chi_training:
   lambda_bce: 0.1  # weight for soluble-class BCE term in joint loss
   hidden_sizes: [256, 512, 128]  # MLP hidden layer sizes for chi head
   dropout: 0.1  # dropout probability in chi head
+  finetune_last_layers: 0  # Step 4 fallback finetune depth when not tuned (integer in [0, num_layers(model_size)]); 0=freeze backbone
 
   # Step 4 Optuna
-  tune: true  # enable Optuna hyperparameter search (objective: maximize validation chi R2)
+  tune: true  # enable Optuna hyperparameter search
   n_trials: 50  # number of Optuna trials
   tuning_epochs: 100  # max epochs per tuning trial
   tuning_patience: 20  # early-stop patience per tuning trial
+  tuning_objective: "val_r2"  # tuning objective: val_r2 | rmse_class_penalty
+  tuning_class_penalty_weight: 0.25  # score term for (1 - balanced_accuracy) when tuning_objective=rmse_class_penalty
+  tuning_cv_folds: 5  # stratified CV folds over train+val subset used during tuning
   optuna_search_space:
     # If list has exactly 2 values, it is treated as a continuous range [min, max].
     # If list has >2 values, it is treated as categorical choices.
+    # finetune_last_layers defaults to dynamic range [0, num_layers(model_size)] if omitted.
     num_layers: [2, 3, 4, 5]
     hidden_units: [64, 128, 256, 512, 1024]
     dropout: [0.0, 0.1, 0.2, 0.3]

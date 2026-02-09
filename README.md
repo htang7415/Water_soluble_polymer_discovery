@@ -95,11 +95,17 @@ Final target-polymer export (Step 2/5/6):
 
 ## Step 4 Optuna outputs
 - Search space is controlled by `chi_training.optuna_search_space` in `configs/config.yaml`.
-- Optuna objective is **maximize validation chi R2**.
+- Optuna objective is controlled by `chi_training.tuning_objective`:
+  - `rmse_class_penalty` (default): minimize CV `RMSE + w*(1-balanced_accuracy)` where `w=chi_training.tuning_class_penalty_weight`
+  - `val_r2`: maximize validation/CV chi `R2`
+- Optuna uses stratified CV over the train+val subset (`chi_training.tuning_cv_folds`), improving robustness for small-polymer splits.
+- `chi_training.finetune_last_layers` is a Step 4 hyperparameter with valid range `0..num_layers(model_size)`; when Optuna search space omits it, Step 4 tunes it automatically over that full range.
 - Trial records:
   - `step4_chi_training/<split_mode>/tuning/optuna_trials.csv`
   - `step4_chi_training/<split_mode>/tuning/optuna_optimization_chi_r2.csv`
   - `step4_chi_training/<split_mode>/tuning/optuna_optimization_chi_r2.png`
+  - `step4_chi_training/<split_mode>/tuning/optuna_optimization_objective.csv`
+  - `step4_chi_training/<split_mode>/tuning/optuna_optimization_objective.png`
 - Final selected training hyperparameters:
   - `step4_chi_training/<split_mode>/metrics/chosen_hyperparameters.json`
   - `step4_chi_training/<split_mode>/metrics/hyperparameter_selection_summary.json`

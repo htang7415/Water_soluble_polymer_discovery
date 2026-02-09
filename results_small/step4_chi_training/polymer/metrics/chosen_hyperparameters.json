@@ -1,12 +1,15 @@
 {
   "hidden_sizes": [
-    64,
-    64,
-    1024
+    512,
+    128,
+    1024,
+    1024,
+    512
   ],
-  "dropout": 0.3,
-  "learning_rate": 0.00446519881876913,
-  "weight_decay": 1.0021176970002639e-07,
-  "lambda_bce": 0.5,
-  "batch_size": 8
+  "dropout": 0.0,
+  "learning_rate": 0.00032982825481824284,
+  "weight_decay": 0.00031185608979231047,
+  "lambda_bce": 0.01,
+  "batch_size": 8,
+  "finetune_last_layers": 0
 }
