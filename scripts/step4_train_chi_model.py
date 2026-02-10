@@ -296,6 +296,65 @@ def _describe_tuning_objective(train_cfg: TrainConfig) -> str:
     return "maximize_val_r2"
 
 
+def _normalize_water_soluble_column(df: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {}
+    for col in df.columns:
+        key = str(col).strip().lower()
+        if key in {"water_soluble", "water_solubel", "water_solubility"}:
+            rename_map[col] = "water_soluble"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def _load_step42_classification_dataset(
+    csv_path: str | Path,
+    default_temperature: float = 293.15,
+    default_phi: float = 0.2,
+    default_chi: float = 0.0,
+) -> pd.DataFrame:
+    """Load Step4_2 classification dataset and normalize required columns.
+
+    Step4_2 now supports classification-only CSV files that may only include
+    Polymer/SMILES/water_soluble. Missing physics columns are filled with
+    deterministic defaults so existing dataloader interfaces remain unchanged.
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Step4_2 classification dataset not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    df = _normalize_water_soluble_column(df)
+
+    required_base = {"Polymer", "SMILES", "water_soluble"}
+    missing_base = required_base - set(df.columns)
+    if missing_base:
+        raise ValueError(
+            f"Step4_2 classification dataset is missing required columns: {sorted(missing_base)}"
+        )
+
+    out = df.copy()
+    if "temperature" not in out.columns:
+        out["temperature"] = float(default_temperature)
+    if "phi" not in out.columns:
+        out["phi"] = float(default_phi)
+    if "chi" not in out.columns:
+        out["chi"] = float(default_chi)
+
+    out["temperature"] = out["temperature"].fillna(float(default_temperature)).astype(float)
+    out["phi"] = out["phi"].fillna(float(default_phi)).astype(float)
+    out["chi"] = out["chi"].fillna(float(default_chi)).astype(float)
+    out["water_soluble"] = out["water_soluble"].astype(int)
+
+    polymer_order = sorted(out["Polymer"].astype(str).unique())
+    polymer_to_id = {p: i for i, p in enumerate(polymer_order)}
+    out["polymer_id"] = out["Polymer"].map(polymer_to_id).astype(int)
+
+    out = out.reset_index(drop=True)
+    out["row_id"] = out.index.astype(int)
+    return out
+
+
 def _default_chi_config(config: Dict) -> Dict:
     chi_cfg = config.get("chi_training", {})
     shared = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared", {}), dict) else {}
@@ -314,6 +373,7 @@ def _default_chi_config(config: Dict) -> Dict:
 
     defaults = {
         "dataset_path": "Data/chi/_50_polymers_T_phi.csv",
+        "step4_2_dataset_path": "Data/water_solvent/water_solvent_polymers.csv",
         "split_mode": "polymer",
         "train_ratio": 0.70,
         "val_ratio": 0.14,
@@ -341,7 +401,14 @@ def _default_chi_config(config: Dict) -> Dict:
     }
     out = defaults.copy()
 
-    out["dataset_path"] = str(shared.get("dataset_path", chi_cfg.get("dataset_path", defaults["dataset_path"])))
+    shared_dataset_path = shared.get("dataset_path", chi_cfg.get("dataset_path", defaults["dataset_path"]))
+    out["dataset_path"] = str(shared_dataset_path)
+    out["step4_1_dataset_path"] = str(step41_cfg.get("dataset_path", shared_dataset_path))
+    step42_dataset_fallback = chi_cfg.get(
+        "step4_2_dataset_path",
+        chi_cfg.get("classification_dataset_path", defaults["step4_2_dataset_path"]),
+    )
+    out["step4_2_dataset_path"] = str(step42_cfg.get("dataset_path", step42_dataset_fallback))
     out["split_mode"] = str(shared.get("split_mode", chi_cfg.get("split_mode", defaults["split_mode"])))
     out["train_ratio"] = float(split_cfg.get("train_ratio", chi_cfg.get("train_ratio", defaults["train_ratio"])))
     out["val_ratio"] = float(split_cfg.get("val_ratio", chi_cfg.get("val_ratio", defaults["val_ratio"])))
@@ -2360,6 +2427,10 @@ def main(args):
     ]:
         d.mkdir(parents=True, exist_ok=True)
 
+    chi_cfg = _default_chi_config(config)
+    reg_csv = args.regression_dataset_path or args.dataset_path or chi_cfg["step4_1_dataset_path"]
+    cls_csv = args.classification_dataset_path or chi_cfg["step4_2_dataset_path"]
+
     seed_info = seed_everything(train_cfg.seed)
     save_config(config, step_dir / "config_used.yaml")
     save_run_metadata(step_dir, args.config, seed_info)
@@ -2371,7 +2442,9 @@ def main(args):
             "model_size": args.model_size,
             "results_dir": str(results_dir),
             "split_mode": train_cfg.split_mode,
-            "dataset_path": args.dataset_path or _default_chi_config(config)["dataset_path"],
+            "dataset_path": str(reg_csv),
+            "step4_1_dataset_path": str(reg_csv),
+            "step4_2_dataset_path": str(cls_csv),
             "tune": train_cfg.tune,
             "n_trials": train_cfg.n_trials,
             "tuning_objective": train_cfg.tuning_objective,
@@ -2394,16 +2467,15 @@ def main(args):
     print("  Step4_1: chi regression")
     print("  Step4_2: water-soluble classification")
     print(f"Split mode: {train_cfg.split_mode}")
+    print(f"Step4_1 dataset: {reg_csv}")
+    print(f"Step4_2 dataset: {cls_csv}")
     print(f"finetune_last_layers (regression): {train_cfg.finetune_last_layers}/{backbone_num_layers}")
     print(f"Device: {device}")
     print("=" * 70)
 
-    chi_cfg = _default_chi_config(config)
-    chi_csv = args.dataset_path or chi_cfg["dataset_path"]
-    df = load_chi_dataset(chi_csv)
-
-    split_assign = make_split_assignments(
-        df,
+    reg_df = load_chi_dataset(reg_csv)
+    reg_split_assign = make_split_assignments(
+        reg_df,
         SplitConfig(
             split_mode=train_cfg.split_mode,
             train_ratio=train_cfg.train_ratio,
@@ -2412,15 +2484,37 @@ def main(args):
             seed=train_cfg.seed,
         ),
     )
-    split_df = add_split_column(df, split_assign)
+    reg_split_df = add_split_column(reg_df, reg_split_assign)
 
-    for out_dir in [shared_dir, reg_metrics_dir, cls_metrics_dir]:
-        split_assign.to_csv(out_dir / "split_assignments.csv", index=False)
-        split_df.to_csv(out_dir / "chi_dataset_with_split.csv", index=False)
+    cls_df = _load_step42_classification_dataset(cls_csv)
+    cls_split_assign = make_split_assignments(
+        cls_df,
+        SplitConfig(
+            split_mode=train_cfg.split_mode,
+            train_ratio=train_cfg.train_ratio,
+            val_ratio=train_cfg.val_ratio,
+            test_ratio=train_cfg.test_ratio,
+            seed=train_cfg.seed,
+        ),
+    )
+    cls_split_df = add_split_column(cls_df, cls_split_assign)
 
-    polymer_df = split_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].drop_duplicates("polymer_id")
-    emb_cache = build_or_load_embedding_cache(
-        polymer_df=polymer_df,
+    # Shared outputs: keep legacy regression filenames plus explicit per-stage split files.
+    reg_split_assign.to_csv(shared_dir / "split_assignments.csv", index=False)
+    reg_split_df.to_csv(shared_dir / "chi_dataset_with_split.csv", index=False)
+    reg_split_assign.to_csv(shared_dir / "split_assignments_step4_1.csv", index=False)
+    reg_split_df.to_csv(shared_dir / "chi_dataset_with_split_step4_1.csv", index=False)
+    cls_split_assign.to_csv(shared_dir / "split_assignments_step4_2.csv", index=False)
+    cls_split_df.to_csv(shared_dir / "chi_dataset_with_split_step4_2.csv", index=False)
+
+    reg_split_assign.to_csv(reg_metrics_dir / "split_assignments.csv", index=False)
+    reg_split_df.to_csv(reg_metrics_dir / "chi_dataset_with_split.csv", index=False)
+    cls_split_assign.to_csv(cls_metrics_dir / "split_assignments.csv", index=False)
+    cls_split_df.to_csv(cls_metrics_dir / "chi_dataset_with_split.csv", index=False)
+
+    reg_polymer_df = reg_split_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].drop_duplicates("polymer_id")
+    reg_emb_cache = build_or_load_embedding_cache(
+        polymer_df=reg_polymer_df,
         config=config,
         cache_npz=shared_dir / "polymer_embeddings.npz",
         model_size=args.model_size,
@@ -2430,7 +2524,21 @@ def main(args):
         pooling="mean",
         batch_size=int(chi_cfg["embedding_batch_size"]),
     )
-    embedding_table = embedding_table_from_cache(emb_cache)
+    reg_embedding_table = embedding_table_from_cache(reg_emb_cache)
+
+    cls_polymer_df = cls_split_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].drop_duplicates("polymer_id")
+    cls_emb_cache = build_or_load_embedding_cache(
+        polymer_df=cls_polymer_df,
+        config=config,
+        cache_npz=shared_dir / "polymer_embeddings_step4_2_classification.npz",
+        model_size=args.model_size,
+        checkpoint_path=args.backbone_checkpoint,
+        device=device,
+        timestep=train_cfg.timestep_for_embedding,
+        pooling="mean",
+        batch_size=int(chi_cfg["embedding_batch_size"]),
+    )
+    cls_embedding_table = embedding_table_from_cache(cls_emb_cache)
 
     tokenizer_for_training = None
     if use_backbone_finetune or train_cfg.tune:
@@ -2458,8 +2566,8 @@ def main(args):
     if reg_cfg.tune:
         print("Running Optuna for Step4_1 (regression)...")
         reg_best_params = tune_hyperparameters(
-            split_df=split_df,
-            embedding_table=embedding_table,
+            split_df=reg_split_df,
+            embedding_table=reg_embedding_table,
             train_cfg=reg_cfg,
             config=config,
             model_size=args.model_size,
@@ -2525,8 +2633,8 @@ def main(args):
         )
 
     reg_model, reg_history, reg_predictions = train_one_model(
-        split_df=split_df,
-        embedding_table=embedding_table,
+        split_df=reg_split_df,
+        embedding_table=reg_embedding_table,
         train_cfg=reg_cfg,
         device=device,
         hidden_sizes=reg_chosen["hidden_sizes"],
@@ -2547,7 +2655,7 @@ def main(args):
 
     reg_checkpoint = {
         "model_state_dict": reg_model.state_dict(),
-        "embedding_dim": int(embedding_table.shape[1]),
+        "embedding_dim": int(reg_embedding_table.shape[1]),
         "hidden_sizes": reg_chosen["hidden_sizes"],
         "dropout": reg_chosen["dropout"],
         "learning_rate": reg_chosen["learning_rate"],
@@ -2561,7 +2669,7 @@ def main(args):
         "backbone_num_layers": int(backbone_num_layers),
         "finetune_last_layers": int(reg_finetune_last_layers),
         "backbone_finetune_enabled": bool(reg_use_backbone_finetune),
-        "dataset_path": str(chi_csv),
+        "dataset_path": str(reg_csv),
         "config": config,
     }
     reg_checkpoint_path = reg_checkpoint_dir / "chi_regression_best.pt"
@@ -2574,7 +2682,7 @@ def main(args):
     torch.save(reg_checkpoint, reg_legacy_joint_path)
 
     _save_history(reg_history, reg_metrics_dir / "chi_training_history.csv")
-    reg_pred_df = _save_regression_prediction_csvs(split_df=split_df, predictions=reg_predictions, out_dir=reg_metrics_dir)
+    reg_pred_df = _save_regression_prediction_csvs(split_df=reg_split_df, predictions=reg_predictions, out_dir=reg_metrics_dir)
     _collect_regression_metrics(reg_pred_df, out_dir=reg_metrics_dir)
     _make_regression_figures(
         history=reg_history,
@@ -2632,8 +2740,8 @@ def main(args):
     if cls_cfg.tune:
         print("Running Optuna for Step4_2 (classification)...")
         cls_best_params = tune_classifier_hyperparameters(
-            split_df=split_df,
-            embedding_table=embedding_table,
+            split_df=cls_split_df,
+            embedding_table=cls_embedding_table,
             train_cfg=cls_cfg,
             config=config,
             model_size=args.model_size,
@@ -2696,8 +2804,8 @@ def main(args):
         )
 
     cls_model, cls_history, cls_predictions = train_one_classifier_model(
-        split_df=split_df,
-        embedding_table=embedding_table,
+        split_df=cls_split_df,
+        embedding_table=cls_embedding_table,
         train_cfg=cls_cfg,
         device=device,
         hidden_sizes=cls_chosen["hidden_sizes"],
@@ -2717,7 +2825,7 @@ def main(args):
 
     cls_checkpoint = {
         "model_state_dict": cls_model.state_dict(),
-        "embedding_dim": int(embedding_table.shape[1]),
+        "embedding_dim": int(cls_embedding_table.shape[1]),
         "hidden_sizes": cls_chosen["hidden_sizes"],
         "dropout": cls_chosen["dropout"],
         "learning_rate": cls_chosen["learning_rate"],
@@ -2730,7 +2838,7 @@ def main(args):
         "backbone_num_layers": int(backbone_num_layers),
         "finetune_last_layers": int(cls_finetune_last_layers),
         "backbone_finetune_enabled": bool(cls_use_backbone_finetune),
-        "dataset_path": str(chi_csv),
+        "dataset_path": str(cls_csv),
         "config": config,
     }
     cls_checkpoint_path = cls_checkpoint_dir / "chi_classifier_best.pt"
@@ -2740,7 +2848,7 @@ def main(args):
     torch.save(cls_checkpoint, cls_legacy_path)
 
     _save_history(cls_history, cls_metrics_dir / "class_training_history.csv")
-    cls_pred_df = _save_classifier_prediction_csvs(split_df=split_df, predictions=cls_predictions, out_dir=cls_metrics_dir)
+    cls_pred_df = _save_classifier_prediction_csvs(split_df=cls_split_df, predictions=cls_predictions, out_dir=cls_metrics_dir)
     _collect_classifier_metrics(cls_pred_df, out_dir=cls_metrics_dir)
     _make_classifier_figures(
         history=cls_history,
@@ -2790,8 +2898,14 @@ def main(args):
         "step": "step4_chi_training",
         "model_size": args.model_size or "small",
         "split_mode": train_cfg.split_mode,
-        "n_data_rows": int(len(split_df)),
-        "n_polymers": int(split_df["polymer_id"].nunique()),
+        "step4_1_dataset_path": str(reg_csv),
+        "step4_2_dataset_path": str(cls_csv),
+        "n_data_rows": int(len(reg_split_df)),
+        "n_polymers": int(reg_split_df["polymer_id"].nunique()),
+        "n_data_rows_step4_1": int(len(reg_split_df)),
+        "n_polymers_step4_1": int(reg_split_df["polymer_id"].nunique()),
+        "n_data_rows_step4_2": int(len(cls_split_df)),
+        "n_polymers_step4_2": int(cls_split_df["polymer_id"].nunique()),
         "step4_1_backbone_num_layers": int(backbone_num_layers),
         "step4_1_finetune_last_layers": int(reg_finetune_last_layers),
         "step4_1_backbone_finetune_enabled": bool(reg_use_backbone_finetune),
@@ -2826,7 +2940,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 4: train Step4_1 regression + Step4_2 classification models")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Config path")
     parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
-    parser.add_argument("--dataset_path", type=str, default=None, help="Path to chi dataset CSV")
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default=None,
+        help="Legacy alias for --regression_dataset_path (Step4_1 dataset).",
+    )
+    parser.add_argument(
+        "--regression_dataset_path",
+        type=str,
+        default=None,
+        help="Path to Step4_1 regression dataset CSV (expects chi(T,phi) columns).",
+    )
+    parser.add_argument(
+        "--classification_dataset_path",
+        type=str,
+        default=None,
+        help="Path to Step4_2 classification dataset CSV (supports Polymer/SMILES/water_soluble).",
+    )
     parser.add_argument("--backbone_checkpoint", type=str, default=None, help="Optional backbone checkpoint override")
     parser.add_argument("--tune", action="store_true", help="Enable Optuna tuning")
     parser.add_argument("--no_tune", action="store_true", help="Disable Optuna tuning even if config enables it")

@@ -531,6 +531,10 @@ def main(args):
     args.candidate_source = candidate_source
     default_property_rule = str(args.property_rule if args.property_rule is not None else chi_cfg.get("property_rule", "upper_bound")).strip().lower()
     coverage_topk = int(args.coverage_topk if args.coverage_topk is not None else chi_cfg.get("coverage_topk", 5))
+    target_temperature_value = args.target_temperature if args.target_temperature is not None else chi_cfg.get("target_temperature", None)
+    target_temperature = None if target_temperature_value is None else float(target_temperature_value)
+    target_phi_value = args.target_phi if args.target_phi is not None else chi_cfg.get("target_phi", None)
+    target_phi = None if target_phi_value is None else float(target_phi_value)
     sampling_cfg = config.get("sampling", {})
     target_polymer_count = int(chi_cfg.get("target_polymer_count", sampling_cfg.get("target_polymer_count", 100)))
     target_sa_max = float(chi_cfg.get("target_sa_max", sampling_cfg.get("target_sa_max", 4.0)))
@@ -543,6 +547,8 @@ def main(args):
         raise ValueError("property_rule must be one of {'band', 'upper_bound', 'lower_bound'}")
     if coverage_topk < 1:
         raise ValueError("coverage_topk must be >= 1")
+    if target_phi is not None and not (0.0 <= target_phi <= 1.0):
+        raise ValueError("target_phi must be within [0, 1]")
     if target_polymer_count < 1:
         raise ValueError("target_polymer_count must be >= 1")
     if target_sa_max <= 0:
@@ -580,6 +586,8 @@ def main(args):
             "class_weight": class_weight,
             "property_rule_default": default_property_rule,
             "coverage_topk": coverage_topk,
+            "target_temperature": target_temperature,
+            "target_phi": target_phi,
             "target_polymer_count": target_polymer_count,
             "target_sa_max": target_sa_max,
             "target_stars": target_stars,
@@ -595,6 +603,8 @@ def main(args):
     print(f"candidate_source={candidate_source}")
     print(f"epsilon={epsilon}")
     print(f"class_weight={class_weight}")
+    print(f"target_temperature={target_temperature}")
+    print(f"target_phi={target_phi}")
     print(f"device={device}")
     print("=" * 70)
 
@@ -603,6 +613,8 @@ def main(args):
         results_dir=results_dir,
         base_results_dir=base_results_dir,
         split_mode=split_mode,
+        target_temperature=target_temperature,
+        target_phi=target_phi,
     )
     target_df.to_csv(metrics_dir / "inverse_targets.csv", index=False)
 
@@ -692,6 +704,8 @@ def main(args):
         "candidate_source": candidate_source,
         "device": device,
         "targets_csv_used": target_path_used,
+        "target_temperature": target_temperature,
+        "target_phi": target_phi,
         "property_rule_default": default_property_rule,
         "coverage_topk": coverage_topk,
         "target_polymer_count_requested": int(target_poly_summary["target_count_requested"]),
@@ -763,6 +777,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--targets_csv", type=str, default=None, help="Custom χ_target CSV. If omitted, auto-uses Step 3 output.")
     parser.add_argument("--property_rule", type=str, default=None, choices=["band", "upper_bound", "lower_bound"], help="Default property rule when targets file has none")
+    parser.add_argument("--target_temperature", type=float, default=None, help="Optional target temperature filter (e.g., 293.15 for room temperature)")
+    parser.add_argument("--target_phi", type=float, default=None, help="Optional target fraction filter (e.g., 0.2)")
 
     parser.add_argument(
         "--candidate_source",

@@ -44,6 +44,8 @@ def default_chi_config(config: Dict, step: str | None = None) -> Dict:
         "candidate_source": "novel",
         "property_rule": "upper_bound",
         "coverage_topk": 5,
+        "target_temperature": 293.15,
+        "target_phi": 0.2,
         "target_polymer_class": "all",
         "target_polymer_count": 100,
         "target_sa_max": 4.0,
@@ -77,6 +79,8 @@ def default_chi_config(config: Dict, step: str | None = None) -> Dict:
         "candidate_source",
         "property_rule",
         "coverage_topk",
+        "target_temperature",
+        "target_phi",
         "target_polymer_class",
         "target_polymer_count",
         "target_sa_max",
@@ -346,6 +350,8 @@ def load_soluble_targets(
     results_dir: Path,
     base_results_dir: Path | None,
     split_mode: str,
+    target_temperature: float | None = None,
+    target_phi: float | None = None,
 ) -> Tuple[pd.DataFrame, str | None]:
     if targets_csv:
         target_path = Path(targets_csv)
@@ -382,6 +388,30 @@ def load_soluble_targets(
         target_df["property_rule"] = "upper_bound"
     if "target_id" not in target_df.columns:
         target_df.insert(0, "target_id", np.arange(1, len(target_df) + 1))
+
+    target_df = target_df.copy()
+    target_df["temperature"] = target_df["temperature"].astype(float)
+    target_df["phi"] = target_df["phi"].astype(float)
+
+    if target_temperature is not None:
+        t_value = float(target_temperature)
+        t_mask = np.isclose(target_df["temperature"].to_numpy(dtype=float), t_value, atol=1.0e-8)
+        if not np.any(t_mask):
+            available_t = sorted(target_df["temperature"].astype(float).unique().tolist())
+            raise ValueError(
+                f"No targets found for target_temperature={t_value}. Available temperatures: {available_t}"
+            )
+        target_df = target_df.loc[t_mask].copy()
+
+    if target_phi is not None:
+        phi_value = float(target_phi)
+        phi_mask = np.isclose(target_df["phi"].to_numpy(dtype=float), phi_value, atol=1.0e-8)
+        if not np.any(phi_mask):
+            available_phi = sorted(target_df["phi"].astype(float).unique().tolist())
+            raise ValueError(
+                f"No targets found for target_phi={phi_value}. Available phi values: {available_phi}"
+            )
+        target_df = target_df.loc[phi_mask].copy()
 
     target_df = target_df.sort_values(["temperature", "phi"]).reset_index(drop=True)
     if target_df.empty:

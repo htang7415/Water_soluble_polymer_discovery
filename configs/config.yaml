@@ -122,7 +122,7 @@ training_property:
 # Step 3-6 chi workflow config (per-step structure)
 chi_training:
   shared:
-    dataset_path: "Data/chi/_50_polymers_T_phi.csv"  # labeled chi(T,phi) dataset used in Steps 3-6
+    dataset_path: "Data/chi/_50_polymers_T_phi.csv"  # labeled chi(T,phi) dataset used in Step 3 and Step4_1
     split_mode: "polymer"  # data split mode: polymer (hold out polymers) | random (row-wise random)
     split:
       train_ratio: 0.70  # train+val=84% dev pool for CV tuning; remaining 16% held-out test
@@ -138,6 +138,7 @@ chi_training:
 
   # Step4_1: chi(T,phi) regression
   step4_1_regression:
+    dataset_path: "Data/chi/_50_polymers_T_phi.csv"
     batch_size: 128
     num_epochs: 500
     patience: 20
@@ -173,6 +174,7 @@ chi_training:
 
   # Step4_2: water-soluble classification
   step4_2_classification:
+    dataset_path: "Data/water_solvent/water_solvent_polymers.csv"
     batch_size: 128
     num_epochs: 500
     patience: 20
@@ -205,6 +207,8 @@ chi_training:
 
   # Step 5 inverse-design scoring
   step5_inverse_design:
+    target_temperature: 293.15  # room temperature (K)
+    target_phi: 0.2             # polymer fraction
     epsilon: 0.05  # tolerance for property hit when property_rule=band
     class_weight: 0.25  # penalty weight for low soluble confidence in ranking score
     target_polymer_count: 100  # final number of exported target polymers
@@ -215,6 +219,8 @@ chi_training:
 
   # Step 6 inverse-design scoring (class + property)
   step6_class_inverse_design:
+    target_temperature: 293.15  # room temperature (K)
+    target_phi: 0.2             # polymer fraction
     epsilon: 0.05
     class_weight: 0.25
     polymer_class_weight: 0.50  # penalty weight for class mismatch in ranking score
