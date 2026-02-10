@@ -49,14 +49,12 @@ def _make_cache_key(
     return _sha256(json.dumps(payload, sort_keys=True))
 
 
-
-def load_backbone_from_step1(
+def resolve_step1_artifacts(
     config: Dict,
     model_size: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
-    device: str = "cpu",
-):
-    """Load tokenizer + backbone encoder from step1 checkpoint."""
+) -> Tuple[Path, Path]:
+    """Resolve tokenizer and Step1 checkpoint paths without loading model weights."""
     base_results_dir = Path(config["paths"]["results_dir"])
     results_dir = Path(get_results_dir(model_size, config["paths"]["results_dir"]))
 
@@ -65,7 +63,6 @@ def load_backbone_from_step1(
         tokenizer_path = base_results_dir / "tokenizer.json"
     if not tokenizer_path.exists():
         raise FileNotFoundError(f"Tokenizer not found at {tokenizer_path}")
-    tokenizer = PSmilesTokenizer.load(tokenizer_path)
 
     if checkpoint_path is not None:
         ckpt_path = Path(checkpoint_path)
@@ -73,9 +70,26 @@ def load_backbone_from_step1(
         ckpt_path = results_dir / "step1_backbone" / "checkpoints" / "backbone_best.pt"
         if not ckpt_path.exists():
             ckpt_path = base_results_dir / "step1_backbone" / "checkpoints" / "backbone_best.pt"
-
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Backbone checkpoint not found: {ckpt_path}")
+
+    return tokenizer_path, ckpt_path
+
+
+
+def load_backbone_from_step1(
+    config: Dict,
+    model_size: Optional[str] = None,
+    checkpoint_path: Optional[str] = None,
+    device: str = "cpu",
+):
+    """Load tokenizer + backbone encoder from step1 checkpoint."""
+    tokenizer_path, ckpt_path = resolve_step1_artifacts(
+        config=config,
+        model_size=model_size,
+        checkpoint_path=checkpoint_path,
+    )
+    tokenizer = PSmilesTokenizer.load(tokenizer_path)
 
     backbone_cfg = get_model_config(model_size, config, model_type="sequence")
     backbone = DiffusionBackbone(
@@ -226,11 +240,10 @@ def build_or_load_embedding_cache(
     """Load embedding cache if key matches; otherwise recompute and save."""
     cache_npz = Path(cache_npz)
 
-    _, _, resolved_ckpt = load_backbone_from_step1(
+    _, resolved_ckpt = resolve_step1_artifacts(
         config=config,
         model_size=model_size,
         checkpoint_path=checkpoint_path,
-        device=device,
     )
     cache_key = _make_cache_key(
         polymer_df=polymer_df,

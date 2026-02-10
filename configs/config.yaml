@@ -107,6 +107,8 @@ training_backbone:
   eval_every: 1000
   save_every: 100000
   num_epochs: 50
+  early_stopping_patience: 0  # 0 disables early stopping
+  early_stopping_min_delta: 0.0  # minimum epoch-level val-loss improvement to reset patience
 
 # Kept for embedding timestep and backward compatibility.
 training_property:
@@ -214,6 +216,12 @@ chi_training:
     candidate_source: "novel"  # known | novel | hybrid
     property_rule: "upper_bound"  # band | upper_bound | lower_bound
     coverage_topk: 5  # top-k used in coverage/frequency summaries
+    uncertainty_enabled: false  # if true, use MC-dropout uncertainty-aware ranking
+    uncertainty_mc_samples: 20  # number of stochastic forward passes when enabled
+    uncertainty_class_z: 1.0  # conservative class confidence: class_prob - z*std
+    uncertainty_property_z: 1.0  # conservative property bound via chi_pred +/- z*std
+    uncertainty_score_weight: 0.0  # optional score penalty multiplier for chi uncertainty
+    uncertainty_seed: 42  # random seed for MC-dropout inference
 
   # Step 6 inverse-design scoring (class + property)
   step6_class_inverse_design:
@@ -228,6 +236,12 @@ chi_training:
     property_rule: "upper_bound"
     coverage_topk: 5
     target_polymer_class: "polyamide"  # all | polyimide | polyester | polyamide | polyurethane | polyether
+    uncertainty_enabled: false
+    uncertainty_mc_samples: 20
+    uncertainty_class_z: 1.0
+    uncertainty_property_z: 1.0
+    uncertainty_score_weight: 0.0
+    uncertainty_seed: 42
 
 checkpointing:
   save_best_only: true

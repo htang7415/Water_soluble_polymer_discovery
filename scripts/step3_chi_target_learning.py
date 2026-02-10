@@ -187,10 +187,11 @@ def _bootstrap_threshold_ci(
         }
 
     thr = np.asarray(thresholds, dtype=float)
+    std_ddof = 1 if len(thr) > 1 else 0
     return {
         "bootstrap_n": int(len(thr)),
         "chi_target_boot_mean": float(np.mean(thr)),
-        "chi_target_boot_std": float(np.std(thr, ddof=0)),
+        "chi_target_boot_std": float(np.std(thr, ddof=std_ddof)),
         "chi_target_boot_q025": float(np.quantile(thr, 0.025)),
         "chi_target_boot_q500": float(np.quantile(thr, 0.500)),
         "chi_target_boot_q975": float(np.quantile(thr, 0.975)),

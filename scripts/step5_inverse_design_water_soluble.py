@@ -24,7 +24,8 @@ from src.chi.inverse_design_common import (
     parse_candidate_source,
     set_plot_style,
 )
-from src.chi.model import predict_chi_from_coefficients
+from src.chi.model import predict_chi_mean_std_from_coefficients
+from src.chi.constants import COEFF_NAMES
 from src.evaluation.polymer_class import PolymerClassifier
 from src.utils.chemistry import (
     compute_sa_score,
@@ -49,29 +50,55 @@ def _compute_target_candidates(
     epsilon: float,
     class_weight: float,
     default_property_rule: str,
+    uncertainty_enabled: bool,
+    uncertainty_class_z: float,
+    uncertainty_property_z: float,
+    uncertainty_score_weight: float,
 ) -> pd.DataFrame:
     target_chi = float(target_row["target_chi"])
     t = float(target_row["temperature"])
     phi = float(target_row["phi"])
 
-    required_cols = ["polymer_id", "Polymer", "SMILES", "class_prob", "a0", "a1", "a2", "a3", "b1", "b2"]
+    required_cols = ["polymer_id", "Polymer", "SMILES", "class_prob", *COEFF_NAMES]
     missing = [c for c in required_cols if c not in coeff_df.columns]
     if missing:
         raise ValueError(f"Candidate pool missing required columns: {missing}")
 
+    coeff_std_cols = [f"{name}_std" for name in COEFF_NAMES]
     copy_cols = required_cols + [
-        c for c in ["water_soluble", "candidate_source", "canonical_smiles", "class_logit", "is_novel_vs_train"] if c in coeff_df.columns
+        c
+        for c in [
+            "water_soluble",
+            "candidate_source",
+            "canonical_smiles",
+            "class_logit",
+            "class_logit_std",
+            "class_prob_std",
+            "is_novel_vs_train",
+            *coeff_std_cols,
+        ]
+        if c in coeff_df.columns
     ]
     out = coeff_df[copy_cols].copy()
+    for col in ["class_prob_std", "class_logit_std", *coeff_std_cols]:
+        if col not in out.columns:
+            out[col] = 0.0
 
-    coeff = out[["a0", "a1", "a2", "a3", "b1", "b2"]].to_numpy(dtype=float)
-    pred = predict_chi_from_coefficients(coeff, np.full(len(out), t), np.full(len(out), phi))
+    coeff_mean = out[COEFF_NAMES].to_numpy(dtype=float)
+    coeff_std = out[coeff_std_cols].to_numpy(dtype=float)
+    pred_mean, pred_std = predict_chi_mean_std_from_coefficients(
+        coeff_mean=coeff_mean,
+        coeff_std=coeff_std,
+        temperature=np.full(len(out), t, dtype=float),
+        phi=np.full(len(out), phi, dtype=float),
+    )
 
     out["target_id"] = int(target_row["target_id"])
     out["temperature"] = t
     out["phi"] = phi
     out["target_chi"] = target_chi
-    out["chi_pred_target"] = pred
+    out["chi_pred_target"] = pred_mean
+    out["chi_pred_std_target"] = pred_std
     out["chi_error"] = out["chi_pred_target"] - target_chi
     out["abs_error"] = np.abs(out["chi_error"])
 
@@ -80,28 +107,45 @@ def _compute_target_candidates(
         property_rule = default_property_rule
     out["property_rule"] = property_rule
 
-    out["soluble_confidence"] = out["class_prob"]
-    out["pred_soluble"] = (out["class_prob"] >= 0.5).astype(int)
+    out["class_prob_std"] = out["class_prob_std"].astype(float).fillna(0.0)
+    if uncertainty_enabled:
+        out["class_prob_lcb"] = np.clip(
+            out["class_prob"].astype(float) - float(uncertainty_class_z) * out["class_prob_std"],
+            0.0,
+            1.0,
+        )
+    else:
+        out["class_prob_lcb"] = out["class_prob"].astype(float)
+    out["soluble_confidence"] = out["class_prob_lcb"]
+    out["pred_soluble"] = (out["soluble_confidence"] >= 0.5).astype(int)
     out["soluble_hit"] = out["pred_soluble"].astype(int)
 
+    prop_z = float(uncertainty_property_z) if uncertainty_enabled else 0.0
     if property_rule == "upper_bound":
-        out["property_error"] = np.maximum(out["chi_pred_target"] - target_chi, 0.0)
-        out["property_hit"] = (out["chi_pred_target"] <= target_chi).astype(int)
+        out["chi_pred_conservative"] = out["chi_pred_target"] + prop_z * out["chi_pred_std_target"]
+        out["property_error"] = np.maximum(out["chi_pred_conservative"] - target_chi, 0.0)
+        out["property_hit"] = (out["chi_pred_conservative"] <= target_chi).astype(int)
     elif property_rule == "lower_bound":
-        out["property_error"] = np.maximum(target_chi - out["chi_pred_target"], 0.0)
-        out["property_hit"] = (out["chi_pred_target"] >= target_chi).astype(int)
+        out["chi_pred_conservative"] = out["chi_pred_target"] - prop_z * out["chi_pred_std_target"]
+        out["property_error"] = np.maximum(target_chi - out["chi_pred_conservative"], 0.0)
+        out["property_hit"] = (out["chi_pred_conservative"] >= target_chi).astype(int)
     else:
-        out["property_error"] = out["abs_error"]
-        out["property_hit"] = (out["abs_error"] <= float(epsilon)).astype(int)
+        out["chi_pred_conservative"] = out["chi_pred_target"]
+        out["property_error"] = out["abs_error"] + prop_z * out["chi_pred_std_target"]
+        out["property_hit"] = (out["property_error"] <= float(epsilon)).astype(int)
 
     out["requirement_hit_count"] = out["soluble_hit"] + out["property_hit"]
     out["requirement_miss_count"] = 2 - out["requirement_hit_count"]
     out["joint_hit"] = ((out["soluble_hit"] == 1) & (out["property_hit"] == 1)).astype(int)
-    out["score"] = out["property_error"] + float(class_weight) * (1.0 - out["soluble_confidence"])
+    out["score"] = (
+        out["property_error"]
+        + float(class_weight) * (1.0 - out["soluble_confidence"])
+        + float(uncertainty_score_weight) * out["chi_pred_std_target"]
+    )
 
     out = out.sort_values(
-        ["requirement_miss_count", "score", "property_error", "soluble_confidence"],
-        ascending=[True, True, True, False],
+        ["requirement_miss_count", "score", "property_error", "chi_pred_std_target", "soluble_confidence"],
+        ascending=[True, True, True, True, False],
     ).reset_index(drop=True)
     out["rank"] = np.arange(1, len(out) + 1)
     return out
@@ -124,12 +168,15 @@ def _target_metrics(cand: pd.DataFrame) -> Dict[str, float]:
         "top1_polymer": cand["Polymer"].iloc[0],
         "top1_candidate_source": cand["candidate_source"].iloc[0] if "candidate_source" in cand.columns else "unknown",
         "top1_class_prob": float(cand["class_prob"].iloc[0]),
+        "top1_class_prob_std": float(cand["class_prob_std"].iloc[0]) if "class_prob_std" in cand.columns else 0.0,
+        "top1_class_prob_lcb": float(cand["class_prob_lcb"].iloc[0]) if "class_prob_lcb" in cand.columns else float(cand["class_prob"].iloc[0]),
         "top1_soluble_hit": int(cand["soluble_hit"].iloc[0]),
         "top1_property_hit": int(cand["property_hit"].iloc[0]),
         "top1_joint_hit": int(cand["joint_hit"].iloc[0]),
         "top1_property_error": float(cand["property_error"].iloc[0]),
         "top1_abs_error": float(cand["abs_error"].iloc[0]),
         "top1_pred_chi": float(cand["chi_pred_target"].iloc[0]),
+        "top1_pred_chi_std": float(cand["chi_pred_std_target"].iloc[0]) if "chi_pred_std_target" in cand.columns else 0.0,
         "top1_is_novel_vs_train": int(cand["is_novel_vs_train"].iloc[0]) if "is_novel_vs_train" in cand.columns else np.nan,
     }
 
@@ -162,6 +209,10 @@ def _aggregate_metrics(target_metrics_df: pd.DataFrame) -> pd.DataFrame:
             "mean_soluble_hit_rate": float(np.mean(sub["soluble_hit_rate"])),
             "mean_property_hit_rate": float(np.mean(sub["property_hit_rate"])),
         }
+        if "top1_pred_chi_std" in sub.columns:
+            out["mean_top1_pred_chi_std"] = float(np.mean(sub["top1_pred_chi_std"]))
+        if "top1_class_prob_std" in sub.columns:
+            out["mean_top1_class_prob_std"] = float(np.mean(sub["top1_class_prob_std"]))
         for k in K_LIST:
             out[f"target_success_top{k}"] = float(np.mean(sub[f"top{k}_joint_hit"] > 0))
             if f"top{k}_novel_rate" in sub.columns:
@@ -193,17 +244,25 @@ def _postprocess_metrics(candidate_df: pd.DataFrame, target_metrics_df: pd.DataF
     topk_rows = []
     for k in K_LIST:
         topk = candidate_df[candidate_df["rank"] <= k].copy()
+        if "class_prob_lcb" not in topk.columns:
+            topk["class_prob_lcb"] = topk["class_prob"]
+        if "chi_pred_std_target" not in topk.columns:
+            topk["chi_pred_std_target"] = 0.0
         per_target = topk.groupby("target_id", as_index=False).agg(
             novel_rate=("is_novel_vs_train", "mean"),
             mean_class_prob=("class_prob", "mean"),
+            mean_class_prob_lcb=("class_prob_lcb", "mean"),
             mean_property_error=("property_error", "mean"),
+            mean_pred_chi_std=("chi_pred_std_target", "mean"),
         )
         topk_rows.append(
             {
                 "k": int(k),
                 "mean_novel_rate": float(per_target["novel_rate"].mean()) if len(per_target) else np.nan,
                 "mean_class_prob": float(per_target["mean_class_prob"].mean()) if len(per_target) else np.nan,
+                "mean_class_prob_lcb": float(per_target["mean_class_prob_lcb"].mean()) if len(per_target) else np.nan,
                 "mean_property_error": float(per_target["mean_property_error"].mean()) if len(per_target) else np.nan,
+                "mean_pred_chi_std": float(per_target["mean_pred_chi_std"].mean()) if len(per_target) else np.nan,
             }
         )
     topk_novelty = pd.DataFrame(topk_rows)
@@ -239,9 +298,10 @@ def _select_final_target_polymers(
     polymer_patterns: Dict[str, str],
     total_sampling_points: int | None = None,
 ) -> tuple[pd.DataFrame, Dict[str, float]]:
+    confidence_col = "soluble_confidence" if "soluble_confidence" in candidate_df.columns else "class_prob"
     ranked = candidate_df.sort_values(
-        ["requirement_miss_count", "score", "rank", "property_error", "class_prob"],
-        ascending=[True, True, True, True, False],
+        ["requirement_miss_count", "score", "rank", "property_error", "chi_pred_std_target", confidence_col],
+        ascending=[True, True, True, True, True, False],
     ).copy()
 
     dedup_key = "polymer_id" if "polymer_id" in ranked.columns else "SMILES"
@@ -314,12 +374,16 @@ def _select_final_target_polymers(
                 "property_error": float(row["property_error"]),
                 "abs_error": float(row["abs_error"]),
                 "class_prob": float(row["class_prob"]),
+                "class_prob_std": float(row["class_prob_std"]) if not pd.isna(row.get("class_prob_std", np.nan)) else 0.0,
+                "class_prob_lcb": float(row["class_prob_lcb"]) if not pd.isna(row.get("class_prob_lcb", np.nan)) else float(row["class_prob"]),
                 "soluble_hit": int(row["soluble_hit"]),
                 "property_hit": int(row["property_hit"]),
                 "requirement_hit_count": int(row.get("requirement_hit_count", row["soluble_hit"] + row["property_hit"])),
                 "requirement_miss_count": int(row.get("requirement_miss_count", 2 - (row["soluble_hit"] + row["property_hit"]))),
                 "score": float(row["score"]),
                 "rank_in_target": int(row["rank"]),
+                "chi_pred_std_target": float(row["chi_pred_std_target"]) if not pd.isna(row.get("chi_pred_std_target", np.nan)) else 0.0,
+                "chi_pred_conservative": float(row["chi_pred_conservative"]) if not pd.isna(row.get("chi_pred_conservative", np.nan)) else float(row["chi_pred_target"]),
                 "is_valid": int(is_valid),
                 "star_count": int(star_count),
                 "is_novel_vs_train": int(is_novel),
@@ -489,10 +553,11 @@ def _save_figures(
     # Top1 confidence vs error
     top1 = candidate_df[candidate_df["rank"] == 1].copy()
     if not top1.empty:
+        confidence_col = "class_prob_lcb" if "class_prob_lcb" in top1.columns else "class_prob"
         fig, ax = plt.subplots(figsize=(6, 5))
-        sns.scatterplot(data=top1, x="property_error", y="class_prob", hue="candidate_source", palette="Set2", s=70, ax=ax)
+        sns.scatterplot(data=top1, x="property_error", y=confidence_col, hue="candidate_source", palette="Set2", s=70, ax=ax)
         ax.set_xlabel("Top-1 property error")
-        ax.set_ylabel("Top-1 soluble confidence")
+        ax.set_ylabel("Top-1 soluble confidence (conservative)" if confidence_col == "class_prob_lcb" else "Top-1 soluble confidence")
         ax.set_title("Top-1 confidence vs error")
         fig.tight_layout()
         fig.savefig(out_dir / "top1_confidence_vs_error.png", dpi=dpi)
@@ -526,9 +591,38 @@ def main(args):
 
     epsilon = float(args.epsilon if args.epsilon is not None else chi_cfg.get("epsilon", 0.05))
     class_weight = float(args.class_weight if args.class_weight is not None else chi_cfg.get("class_weight", 0.25))
+    uncertainty_enabled = bool(args.uncertainty_enabled or chi_cfg.get("uncertainty_enabled", False))
+    uncertainty_mc_samples = int(
+        args.uncertainty_mc_samples
+        if args.uncertainty_mc_samples is not None
+        else chi_cfg.get("uncertainty_mc_samples", 20)
+    )
+    uncertainty_class_z = float(
+        args.uncertainty_class_z
+        if args.uncertainty_class_z is not None
+        else chi_cfg.get("uncertainty_class_z", 1.0)
+    )
+    uncertainty_property_z = float(
+        args.uncertainty_property_z
+        if args.uncertainty_property_z is not None
+        else chi_cfg.get("uncertainty_property_z", 1.0)
+    )
+    uncertainty_score_weight = float(
+        args.uncertainty_score_weight
+        if args.uncertainty_score_weight is not None
+        else chi_cfg.get("uncertainty_score_weight", 0.0)
+    )
+    uncertainty_seed = (
+        int(args.uncertainty_seed)
+        if args.uncertainty_seed is not None
+        else int(chi_cfg.get("uncertainty_seed", config["data"]["random_seed"]))
+    )
     candidate_source_value = args.candidate_source if args.candidate_source is not None else str(chi_cfg.get("candidate_source", "novel"))
     candidate_source = parse_candidate_source(candidate_source_value)
     args.candidate_source = candidate_source
+    args.uncertainty_enabled = uncertainty_enabled
+    args.uncertainty_mc_samples = uncertainty_mc_samples
+    args.uncertainty_seed = uncertainty_seed
     default_property_rule = str(args.property_rule if args.property_rule is not None else chi_cfg.get("property_rule", "upper_bound")).strip().lower()
     coverage_topk = int(args.coverage_topk if args.coverage_topk is not None else chi_cfg.get("coverage_topk", 5))
     target_temperature_value = args.target_temperature if args.target_temperature is not None else chi_cfg.get("target_temperature", None)
@@ -543,6 +637,16 @@ def main(args):
         raise ValueError("epsilon must be >= 0")
     if class_weight < 0:
         raise ValueError("class_weight must be >= 0")
+    if uncertainty_mc_samples < 1:
+        raise ValueError("uncertainty_mc_samples must be >= 1")
+    if uncertainty_enabled and uncertainty_mc_samples < 2:
+        raise ValueError("uncertainty_enabled=True requires uncertainty_mc_samples >= 2")
+    if uncertainty_class_z < 0:
+        raise ValueError("uncertainty_class_z must be >= 0")
+    if uncertainty_property_z < 0:
+        raise ValueError("uncertainty_property_z must be >= 0")
+    if uncertainty_score_weight < 0:
+        raise ValueError("uncertainty_score_weight must be >= 0")
     if default_property_rule not in {"band", "upper_bound", "lower_bound"}:
         raise ValueError("property_rule must be one of {'band', 'upper_bound', 'lower_bound'}")
     if coverage_topk < 1:
@@ -584,6 +688,12 @@ def main(args):
             "step4_classification_dir": str(step4_cls_dir),
             "epsilon": epsilon,
             "class_weight": class_weight,
+            "uncertainty_enabled": uncertainty_enabled,
+            "uncertainty_mc_samples": uncertainty_mc_samples,
+            "uncertainty_class_z": uncertainty_class_z,
+            "uncertainty_property_z": uncertainty_property_z,
+            "uncertainty_score_weight": uncertainty_score_weight,
+            "uncertainty_seed": uncertainty_seed,
             "property_rule_default": default_property_rule,
             "coverage_topk": coverage_topk,
             "target_temperature": target_temperature,
@@ -603,6 +713,15 @@ def main(args):
     print(f"candidate_source={candidate_source}")
     print(f"epsilon={epsilon}")
     print(f"class_weight={class_weight}")
+    print(f"uncertainty_enabled={uncertainty_enabled}")
+    if uncertainty_enabled:
+        print(
+            "uncertainty: "
+            f"mc_samples={uncertainty_mc_samples}, "
+            f"class_z={uncertainty_class_z}, "
+            f"property_z={uncertainty_property_z}, "
+            f"score_weight={uncertainty_score_weight}"
+        )
     print(f"target_temperature={target_temperature}")
     print(f"target_phi={target_phi}")
     print(f"device={device}")
@@ -645,6 +764,10 @@ def main(args):
             epsilon=epsilon,
             class_weight=class_weight,
             default_property_rule=default_property_rule,
+            uncertainty_enabled=uncertainty_enabled,
+            uncertainty_class_z=uncertainty_class_z,
+            uncertainty_property_z=uncertainty_property_z,
+            uncertainty_score_weight=uncertainty_score_weight,
         )
         all_candidates.append(cand)
         target_metrics.append(_target_metrics(cand))
@@ -663,13 +786,19 @@ def main(args):
     post["top1_sa"].to_csv(metrics_dir / "inverse_top1_sa_scores.csv", index=False)
 
     topk = candidate_df[candidate_df["rank"] <= coverage_topk].copy()
+    if "class_prob_lcb" not in topk.columns:
+        topk["class_prob_lcb"] = topk["class_prob"]
+    if "chi_pred_std_target" not in topk.columns:
+        topk["chi_pred_std_target"] = 0.0
     coverage = (
         topk.groupby(["candidate_source", "polymer_id", "Polymer"], as_index=False)
         .agg(
             selected_count=("rank", "size"),
             mean_class_prob=("class_prob", "mean"),
+            mean_class_prob_lcb=("class_prob_lcb", "mean"),
             mean_property_error=("property_error", "mean"),
             mean_abs_error=("abs_error", "mean"),
+            mean_pred_chi_std=("chi_pred_std_target", "mean"),
             mean_novel_rate=("is_novel_vs_train", "mean"),
         )
         .sort_values("selected_count", ascending=False)
@@ -700,6 +829,12 @@ def main(args):
         "n_targets": int(len(target_df)),
         "epsilon": epsilon,
         "class_weight": class_weight,
+        "uncertainty_enabled": bool(uncertainty_enabled),
+        "uncertainty_mc_samples": int(uncertainty_mc_samples),
+        "uncertainty_class_z": float(uncertainty_class_z),
+        "uncertainty_property_z": float(uncertainty_property_z),
+        "uncertainty_score_weight": float(uncertainty_score_weight),
+        "uncertainty_seed": int(uncertainty_seed),
         "split_mode": split_mode,
         "candidate_source": candidate_source,
         "device": device,
@@ -717,6 +852,10 @@ def main(args):
         "target_polymer_mean_property_error": float(target_poly_summary["final_mean_property_error"]),
         **pool_summary,
     }
+    if "chi_pred_std_target" in candidate_df.columns:
+        summary["mean_candidate_pred_chi_std"] = float(np.nanmean(candidate_df["chi_pred_std_target"]))
+    if "class_prob_std" in coeff_df.columns:
+        summary["mean_candidate_class_prob_std"] = float(np.nanmean(coeff_df["class_prob_std"]))
     overall_row = aggregate_df[aggregate_df["scope"] == "overall"].iloc[0].to_dict()
     for key, value in overall_row.items():
         if isinstance(value, (np.floating, np.integer)):
@@ -793,6 +932,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--epsilon", type=float, default=None, help="Property tolerance for 'band' rule")
     parser.add_argument("--class_weight", type=float, default=None, help="Weight for soluble-confidence penalty in score")
+    parser.add_argument("--uncertainty_enabled", action="store_true", help="Enable MC-dropout uncertainty-aware ranking")
+    parser.add_argument("--uncertainty_mc_samples", type=int, default=None, help="MC-dropout forward passes when uncertainty is enabled")
+    parser.add_argument("--uncertainty_class_z", type=float, default=None, help="z-value for conservative soluble confidence (class_prob - z*std)")
+    parser.add_argument("--uncertainty_property_z", type=float, default=None, help="z-value for conservative property prediction bounds")
+    parser.add_argument("--uncertainty_score_weight", type=float, default=None, help="Additional score penalty weight for predictive chi std")
+    parser.add_argument("--uncertainty_seed", type=int, default=None, help="Random seed used for MC-dropout inference")
     parser.add_argument("--coverage_topk", type=int, default=None, help="Top-k used for coverage summary")
 
     parser.add_argument("--embedding_pooling", type=str, default="mean", choices=["mean", "cls", "max"], help="Pooling for embedding extraction on novel candidates")

@@ -152,7 +152,7 @@ def compute_fingerprint(
         smiles: Input SMILES string.
         fp_type: Type of fingerprint ('morgan' or 'maccs').
         radius: Radius for Morgan fingerprint.
-        n_bits: Number of bits for fingerprint.
+        n_bits: Number of bits for Morgan fingerprint. Ignored for MACCS.
 
     Returns:
         Fingerprint as numpy array or None if computation fails.
@@ -173,7 +173,7 @@ def compute_fingerprint(
         else:
             raise ValueError(f"Unknown fingerprint type: {fp_type}")
 
-        arr = np.zeros((n_bits,), dtype=np.int8)
+        arr = np.zeros((int(fp.GetNumBits()),), dtype=np.int8)
         DataStructs.ConvertToNumpyArray(fp, arr)
         return arr
     except Exception:

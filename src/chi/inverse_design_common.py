@@ -19,6 +19,7 @@ from src.chi.model import (
     PhysicsGuidedChiModel,
     SolubilityClassifier,
 )
+from src.chi.constants import COEFF_NAMES
 from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars
 from src.utils.numerics import stable_sigmoid
 
@@ -56,6 +57,12 @@ def default_chi_config(config: Dict, step: str | None = None) -> Dict:
         "target_sa_max": 4.0,
         "embedding_batch_size": 128,
         "embedding_timestep": int(config.get("training_property", {}).get("default_timestep", 1)),
+        "uncertainty_enabled": False,
+        "uncertainty_mc_samples": 20,
+        "uncertainty_class_z": 1.0,
+        "uncertainty_property_z": 1.0,
+        "uncertainty_score_weight": 0.0,
+        "uncertainty_seed": int(config.get("data", {}).get("random_seed", 42)),
     }
 
     out = defaults.copy()
@@ -89,6 +96,12 @@ def default_chi_config(config: Dict, step: str | None = None) -> Dict:
         "target_polymer_class",
         "target_polymer_count",
         "target_sa_max",
+        "uncertainty_enabled",
+        "uncertainty_mc_samples",
+        "uncertainty_class_z",
+        "uncertainty_property_z",
+        "uncertainty_score_weight",
+        "uncertainty_seed",
     ]:
         if key in chi_cfg:
             out[key] = chi_cfg[key]
@@ -147,7 +160,7 @@ def _load_known_candidates_from_step4_metrics(
         )
     reg_df = pd.read_csv(reg_path)
 
-    required_reg = {"polymer_id", "Polymer", "SMILES", "a0", "a1", "a2", "a3", "b1", "b2"}
+    required_reg = {"polymer_id", "Polymer", "SMILES", *COEFF_NAMES}
     missing_reg = sorted(required_reg - set(reg_df.columns))
     if missing_reg:
         raise ValueError(f"Regression known-candidate file missing columns: {missing_reg}")
@@ -176,13 +189,19 @@ def _load_known_candidates_from_step4_metrics(
     if missing_cls:
         raise ValueError(f"Classification known-candidate file missing columns: {missing_cls}")
 
-    agg_dict = {"class_prob": "mean"}
+    by_poly = cls_df.groupby("polymer_id", as_index=False)
+    cls_poly = by_poly["class_prob"].mean().rename(columns={"class_prob": "class_prob"})
+    cls_poly["class_prob_std"] = (
+        by_poly["class_prob"].std(ddof=0)["class_prob"].fillna(0.0).astype(float)
+    )
     if "class_logit" in cls_df.columns:
-        agg_dict["class_logit"] = "mean"
+        cls_poly["class_logit"] = by_poly["class_logit"].mean()["class_logit"]
+        cls_poly["class_logit_std"] = (
+            by_poly["class_logit"].std(ddof=0)["class_logit"].fillna(0.0).astype(float)
+        )
     if "water_soluble" in cls_df.columns:
-        agg_dict["water_soluble"] = "max"
+        cls_poly["water_soluble"] = by_poly["water_soluble"].max()["water_soluble"]
 
-    cls_poly = cls_df.groupby("polymer_id", as_index=False).agg(agg_dict)
     out = reg_df.merge(cls_poly, on="polymer_id", how="left")
     if out["class_prob"].isna().any():
         missing = int(out["class_prob"].isna().sum())
@@ -200,6 +219,18 @@ def _load_known_candidates_from_step4_metrics(
         out["water_soluble"] = -1
     if "class_logit" not in out.columns:
         out["class_logit"] = np.nan
+    if "class_prob_std" not in out.columns:
+        out["class_prob_std"] = 0.0
+    if "class_logit_std" not in out.columns:
+        out["class_logit_std"] = 0.0
+    for name in COEFF_NAMES:
+        std_col = f"{name}_std"
+        if std_col not in out.columns:
+            out[std_col] = 0.0
+    out["class_prob_std"] = out["class_prob_std"].fillna(0.0).astype(float)
+    out["class_logit_std"] = out["class_logit_std"].fillna(0.0).astype(float)
+    for name in COEFF_NAMES:
+        out[f"{name}_std"] = out[f"{name}_std"].fillna(0.0).astype(float)
 
     summary = {
         "known_regression_coefficients_csv": str(reg_path),
@@ -313,7 +344,11 @@ def infer_coefficients_for_novel_candidates(
     timestep: int,
     pooling: str,
     batch_size: int,
+    uncertainty_enabled: bool = False,
+    uncertainty_mc_samples: int = 20,
+    uncertainty_seed: int | None = None,
 ) -> pd.DataFrame:
+    mc_enabled = bool(uncertainty_enabled and int(uncertainty_mc_samples) >= 2)
     if novel_df.empty:
         return pd.DataFrame(
             columns=[
@@ -323,17 +358,20 @@ def infer_coefficients_for_novel_candidates(
                 "canonical_smiles",
                 "water_soluble",
                 "class_logit",
+                "class_logit_std",
                 "class_prob",
-                "a0",
-                "a1",
-                "a2",
-                "a3",
-                "b1",
-                "b2",
+                "class_prob_std",
+                *COEFF_NAMES,
+                *[f"{name}_std" for name in COEFF_NAMES],
                 "candidate_source",
                 "is_novel_vs_train",
             ]
         )
+
+    if uncertainty_seed is not None:
+        torch.manual_seed(int(uncertainty_seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(uncertainty_seed))
 
     tokenizer, step1_backbone, _ = load_backbone_from_step1(
         config=config,
@@ -380,7 +418,10 @@ def infer_coefficients_for_novel_candidates(
                 if str(k).startswith("chi_head.")
             }
         reg_model.load_state_dict(reg_state, strict=True)
-    reg_model.eval()
+    if mc_enabled:
+        reg_model.train()
+    else:
+        reg_model.eval()
 
     cls_model = None
     cls_finetune_last_layers = 0
@@ -422,7 +463,10 @@ def infer_coefficients_for_novel_candidates(
                     if str(k).startswith("classifier_head.")
                 }
             cls_model.load_state_dict(cls_state, strict=True)
-        cls_model.eval()
+        if mc_enabled:
+            cls_model.train()
+        else:
+            cls_model.eval()
 
     if reg_finetune_last_layers > 0:
         warnings.warn(
@@ -449,8 +493,12 @@ def infer_coefficients_for_novel_candidates(
         # Avoid keeping an unused backbone resident when both heads are end-to-end finetuned.
         step1_backbone = None
 
-    coeff_list: List[np.ndarray] = []
-    logit_list: List[np.ndarray] = []
+    coeff_mean_list: List[np.ndarray] = []
+    coeff_std_list: List[np.ndarray] = []
+    logit_mean_list: List[np.ndarray] = []
+    logit_std_list: List[np.ndarray] = []
+    prob_mean_list: List[np.ndarray] = []
+    prob_std_list: List[np.ndarray] = []
     smiles_list = novel_df["SMILES"].astype(str).tolist()
     for i in range(0, len(smiles_list), batch_size):
         batch_smiles = smiles_list[i : i + batch_size]
@@ -482,41 +530,76 @@ def infer_coefficients_for_novel_candidates(
 
         t_dummy = torch.full((input_ids.shape[0],), 300.0, dtype=torch.float32, device=device)
         phi_dummy = torch.full((input_ids.shape[0],), 0.5, dtype=torch.float32, device=device)
-        if reg_finetune_last_layers > 0:
-            reg_out = reg_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                temperature=t_dummy,
-                phi=phi_dummy,
-            )
-        else:
-            reg_out = reg_model(
-                embedding=emb_reg,
-                temperature=t_dummy,
-                phi=phi_dummy,
-            )
-        coeff_list.append(reg_out["coefficients"].detach().cpu().numpy())
 
-        if cls_model is not None:
-            if cls_finetune_last_layers > 0:
-                cls_out = cls_model(input_ids=input_ids, attention_mask=attention_mask)
+        def _forward_once() -> Tuple[np.ndarray, np.ndarray]:
+            if reg_finetune_last_layers > 0:
+                reg_out_local = reg_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    temperature=t_dummy,
+                    phi=phi_dummy,
+                )
             else:
-                cls_out = cls_model(embedding=emb_cls)
-            logit_batch = cls_out["class_logit"].detach().cpu().numpy()
-        else:
-            logit_batch = reg_out["class_logit"].detach().cpu().numpy()
-        logit_list.append(logit_batch)
+                reg_out_local = reg_model(
+                    embedding=emb_reg,
+                    temperature=t_dummy,
+                    phi=phi_dummy,
+                )
+            coeff_local = reg_out_local["coefficients"].detach().cpu().numpy()
+            if cls_model is not None:
+                if cls_finetune_last_layers > 0:
+                    cls_out_local = cls_model(input_ids=input_ids, attention_mask=attention_mask)
+                else:
+                    cls_out_local = cls_model(embedding=emb_cls)
+                logit_local = cls_out_local["class_logit"].detach().cpu().numpy()
+            else:
+                logit_local = reg_out_local["class_logit"].detach().cpu().numpy()
+            return coeff_local, logit_local
 
-    coeff = np.concatenate(coeff_list, axis=0) if coeff_list else np.zeros((0, 6), dtype=float)
-    logit = np.concatenate(logit_list, axis=0) if logit_list else np.zeros((0,), dtype=float)
-    prob = stable_sigmoid(logit)
+        if mc_enabled:
+            coeff_samples: List[np.ndarray] = []
+            logit_samples: List[np.ndarray] = []
+            prob_samples: List[np.ndarray] = []
+            for _ in range(int(uncertainty_mc_samples)):
+                coeff_s, logit_s = _forward_once()
+                coeff_samples.append(coeff_s)
+                logit_samples.append(logit_s)
+                prob_samples.append(stable_sigmoid(logit_s))
+            coeff_stack = np.stack(coeff_samples, axis=0)
+            logit_stack = np.stack(logit_samples, axis=0)
+            prob_stack = np.stack(prob_samples, axis=0)
+            coeff_mean_list.append(np.mean(coeff_stack, axis=0))
+            coeff_std_list.append(np.std(coeff_stack, axis=0, ddof=0))
+            logit_mean_list.append(np.mean(logit_stack, axis=0))
+            logit_std_list.append(np.std(logit_stack, axis=0, ddof=0))
+            prob_mean_list.append(np.mean(prob_stack, axis=0))
+            prob_std_list.append(np.std(prob_stack, axis=0, ddof=0))
+        else:
+            coeff_det, logit_det = _forward_once()
+            prob_det = stable_sigmoid(logit_det)
+            coeff_mean_list.append(coeff_det)
+            coeff_std_list.append(np.zeros_like(coeff_det))
+            logit_mean_list.append(logit_det)
+            logit_std_list.append(np.zeros_like(logit_det))
+            prob_mean_list.append(prob_det)
+            prob_std_list.append(np.zeros_like(prob_det))
+
+    coeff_mean = np.concatenate(coeff_mean_list, axis=0) if coeff_mean_list else np.zeros((0, 6), dtype=float)
+    coeff_std = np.concatenate(coeff_std_list, axis=0) if coeff_std_list else np.zeros((0, 6), dtype=float)
+    logit_mean = np.concatenate(logit_mean_list, axis=0) if logit_mean_list else np.zeros((0,), dtype=float)
+    logit_std = np.concatenate(logit_std_list, axis=0) if logit_std_list else np.zeros((0,), dtype=float)
+    prob_mean = np.concatenate(prob_mean_list, axis=0) if prob_mean_list else np.zeros((0,), dtype=float)
+    prob_std = np.concatenate(prob_std_list, axis=0) if prob_std_list else np.zeros((0,), dtype=float)
 
     result = novel_df[["polymer_id", "Polymer", "SMILES", "canonical_smiles"]].copy()
     result["water_soluble"] = -1
-    result["class_logit"] = logit
-    result["class_prob"] = prob
-    for idx, name in enumerate(["a0", "a1", "a2", "a3", "b1", "b2"]):
-        result[name] = coeff[:, idx]
+    result["class_logit"] = logit_mean
+    result["class_logit_std"] = logit_std
+    result["class_prob"] = prob_mean
+    result["class_prob_std"] = prob_std
+    for idx, name in enumerate(COEFF_NAMES):
+        result[name] = coeff_mean[:, idx]
+        result[f"{name}_std"] = coeff_std[:, idx]
     result["candidate_source"] = "novel_generated"
     result["is_novel_vs_train"] = 1
     return result
@@ -609,11 +692,20 @@ def build_candidate_pool(
 ) -> Tuple[pd.DataFrame, Dict[str, object], set[str]]:
     source = parse_candidate_source(args.candidate_source)
     training_canonical = resolve_training_smiles(results_dir, base_results_dir)
+    uncertainty_enabled = bool(getattr(args, "uncertainty_enabled", chi_cfg.get("uncertainty_enabled", False)))
+    uncertainty_mc_samples = int(
+        getattr(args, "uncertainty_mc_samples", chi_cfg.get("uncertainty_mc_samples", 20))
+        or chi_cfg.get("uncertainty_mc_samples", 20)
+    )
+    uncertainty_seed = getattr(args, "uncertainty_seed", chi_cfg.get("uncertainty_seed", None))
 
     summary: Dict[str, object] = {
         "candidate_source": source,
         "step4_regression_metrics_dir": str(step4_reg_metrics_dir),
         "step4_classification_metrics_dir": str(step4_cls_metrics_dir),
+        "uncertainty_enabled": bool(uncertainty_enabled),
+        "uncertainty_mc_samples": int(uncertainty_mc_samples),
+        "uncertainty_seed": None if uncertainty_seed is None else int(uncertainty_seed),
     }
 
     pool_frames: List[pd.DataFrame] = []
@@ -686,6 +778,9 @@ def build_candidate_pool(
             timestep=int(chi_cfg.get("embedding_timestep", 1)),
             pooling=args.embedding_pooling,
             batch_size=int(args.embedding_batch_size or chi_cfg.get("embedding_batch_size", 128)),
+            uncertainty_enabled=uncertainty_enabled,
+            uncertainty_mc_samples=uncertainty_mc_samples,
+            uncertainty_seed=uncertainty_seed,
         )
         summary["novel_candidate_count"] = int(len(novel_coeff_df))
         pool_frames.append(novel_coeff_df)
@@ -699,13 +794,11 @@ def build_candidate_pool(
                 "canonical_smiles",
                 "water_soluble",
                 "class_logit",
+                "class_logit_std",
                 "class_prob",
-                "a0",
-                "a1",
-                "a2",
-                "a3",
-                "b1",
-                "b2",
+                "class_prob_std",
+                *COEFF_NAMES,
+                *[f"{name}_std" for name in COEFF_NAMES],
                 "candidate_source",
                 "is_novel_vs_train",
             ]
@@ -725,6 +818,18 @@ def build_candidate_pool(
         coeff_df["candidate_source"] = "unknown"
     if "is_novel_vs_train" not in coeff_df.columns:
         coeff_df["is_novel_vs_train"] = (~coeff_df["canonical_smiles"].isin(training_canonical)).astype(int)
+    if "class_prob_std" not in coeff_df.columns:
+        coeff_df["class_prob_std"] = 0.0
+    if "class_logit_std" not in coeff_df.columns:
+        coeff_df["class_logit_std"] = 0.0
+    for name in COEFF_NAMES:
+        std_col = f"{name}_std"
+        if std_col not in coeff_df.columns:
+            coeff_df[std_col] = 0.0
+    coeff_df["class_prob_std"] = coeff_df["class_prob_std"].fillna(0.0).astype(float)
+    coeff_df["class_logit_std"] = coeff_df["class_logit_std"].fillna(0.0).astype(float)
+    for name in COEFF_NAMES:
+        coeff_df[f"{name}_std"] = coeff_df[f"{name}_std"].fillna(0.0).astype(float)
 
     summary["candidate_count_total"] = int(len(coeff_df))
     coeff_df = coeff_df.drop_duplicates(subset=["canonical_smiles"], keep="first").reset_index(drop=True)

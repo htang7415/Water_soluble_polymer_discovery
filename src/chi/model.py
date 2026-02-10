@@ -8,25 +8,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.chi.constants import COEFF_NAMES
 
-COEFF_NAMES = ["a0", "a1", "a2", "a3", "b1", "b2"]
-
-
-def _validate_formula_inputs_torch(temperature: torch.Tensor) -> None:
+def _validate_formula_inputs_torch(temperature: torch.Tensor, phi: torch.Tensor | None = None) -> None:
     if torch.any(~torch.isfinite(temperature)):
         raise ValueError("temperature contains non-finite values")
     if torch.any(temperature <= 0):
         raise ValueError("temperature must be > 0 for chi(T, phi) formula")
+    if phi is not None:
+        if torch.any(~torch.isfinite(phi)):
+            raise ValueError("phi contains non-finite values")
+        tol = 1.0e-8
+        if torch.any((phi < -tol) | (phi > 1.0 + tol)):
+            raise ValueError("phi must be within [0, 1] for chi(T, phi) formula")
 
 
-def _validate_formula_inputs_numpy(temperature) -> None:
+def _validate_formula_inputs_numpy(temperature, phi=None) -> None:
     import numpy as np
 
-    arr = np.asarray(temperature, dtype=float)
-    if np.any(~np.isfinite(arr)):
+    temp_arr = np.asarray(temperature, dtype=float)
+    if np.any(~np.isfinite(temp_arr)):
         raise ValueError("temperature contains non-finite values")
-    if np.any(arr <= 0):
+    if np.any(temp_arr <= 0):
         raise ValueError("temperature must be > 0 for chi(T, phi) formula")
+    if phi is not None:
+        phi_arr = np.asarray(phi, dtype=float)
+        if np.any(~np.isfinite(phi_arr)):
+            raise ValueError("phi contains non-finite values")
+        tol = 1.0e-8
+        if np.any((phi_arr < -tol) | (phi_arr > 1.0 + tol)):
+            raise ValueError("phi must be within [0, 1] for chi(T, phi) formula")
 
 
 
@@ -51,7 +62,7 @@ def chi_formula_torch(coefficients: torch.Tensor, temperature: torch.Tensor, phi
     temperature: [...]
     phi: [...]
     """
-    _validate_formula_inputs_torch(temperature)
+    _validate_formula_inputs_torch(temperature, phi=phi)
     a0, a1, a2, a3, b1, b2 = [coefficients[..., i] for i in range(6)]
     base = a0 + a1 / temperature + a2 * torch.log(temperature) + a3 * temperature
     one_minus_phi = 1.0 - phi
@@ -64,7 +75,7 @@ def predict_chi_from_coefficients(coefficients, temperature, phi):
     """Numpy-friendly chi formula wrapper used in analysis scripts."""
     import numpy as np
 
-    _validate_formula_inputs_numpy(temperature)
+    _validate_formula_inputs_numpy(temperature, phi=phi)
     coeffs = np.asarray(coefficients)
     temperature = np.asarray(temperature)
     phi = np.asarray(phi)
@@ -80,6 +91,55 @@ def predict_chi_from_coefficients(coefficients, temperature, phi):
     one_minus_phi = 1.0 - phi
     modifier = 1.0 + b1 * one_minus_phi + b2 * (one_minus_phi ** 2)
     return base * modifier
+
+
+def predict_chi_mean_std_from_coefficients(coeff_mean, coeff_std, temperature, phi):
+    """Approximate chi mean/std from coefficient mean/std using variance propagation.
+
+    This approximation ignores covariance terms between coefficients.
+    """
+    import numpy as np
+
+    _validate_formula_inputs_numpy(temperature, phi=phi)
+    mean = np.asarray(coeff_mean, dtype=float)
+    std = np.asarray(coeff_std, dtype=float)
+    if mean.shape != std.shape:
+        raise ValueError(
+            f"coeff_mean and coeff_std must have identical shape, got {mean.shape} vs {std.shape}"
+        )
+    if mean.shape[-1] != 6:
+        raise ValueError(f"Expected coefficient last dimension=6, got {mean.shape[-1]}")
+    if np.any(std < 0):
+        raise ValueError("coeff_std must be non-negative")
+
+    temperature = np.asarray(temperature, dtype=float)
+    phi = np.asarray(phi, dtype=float)
+
+    a0, a1, a2, a3, b1, b2 = [mean[..., i] for i in range(6)]
+    s0, s1, s2, s3, s4, s5 = [std[..., i] for i in range(6)]
+
+    log_t = np.log(temperature)
+    one_minus_phi = 1.0 - phi
+
+    base_mean = a0 + a1 / temperature + a2 * log_t + a3 * temperature
+    mod_mean = 1.0 + b1 * one_minus_phi + b2 * (one_minus_phi ** 2)
+    chi_mean = base_mean * mod_mean
+
+    var_base = (
+        (s0 ** 2)
+        + ((s1 / temperature) ** 2)
+        + ((s2 * log_t) ** 2)
+        + ((s3 * temperature) ** 2)
+    )
+    var_mod = (
+        ((s4 * one_minus_phi) ** 2)
+        + ((s5 * (one_minus_phi ** 2)) ** 2)
+    )
+    # Product variance approximation for independent factors:
+    # Var(XY) = E[X]^2 Var(Y) + E[Y]^2 Var(X) + Var(X)Var(Y)
+    var_chi = (mod_mean ** 2) * var_base + (base_mean ** 2) * var_mod + var_base * var_mod
+    chi_std = np.sqrt(np.clip(var_chi, a_min=0.0, a_max=None))
+    return chi_mean, chi_std
 
 
 class PhysicsGuidedChiModel(nn.Module):

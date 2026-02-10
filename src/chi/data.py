@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+from src.chi.constants import COEFF_NAMES
+
 REQUIRED_CHI_COLUMNS = [
     "Polymer",
     "SMILES",
@@ -19,8 +21,6 @@ REQUIRED_CHI_COLUMNS = [
     "chi",
     "water_soluble",
 ]
-
-COEFF_NAMES = ["a0", "a1", "a2", "a3", "b1", "b2"]
 
 
 @dataclass(frozen=True)

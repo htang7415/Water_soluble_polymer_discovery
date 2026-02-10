@@ -107,6 +107,7 @@ class BackboneTrainer:
         # Optimization config
         opt_config = config.get('optimization', {})
         self.use_amp = opt_config.get('use_amp', False) and _is_cuda_device(device)
+        self.amp_device_type = 'cuda' if _is_cuda_device(device) else 'cpu'
         self.compile_model = opt_config.get('compile_model', False)
         self.compile_mode = opt_config.get('compile_mode', 'default')
         self.grad_accum_steps = opt_config.get('gradient_accumulation_steps', 1)
@@ -145,6 +146,18 @@ class BackboneTrainer:
         self.eval_every = _to_int(train_config['eval_every'], 'eval_every')
         self.save_every = _to_int(train_config['save_every'], 'save_every')
         self.num_epochs = _to_int(train_config.get('num_epochs', 50), 'num_epochs')
+        self.early_stopping_patience = _to_int(
+            train_config.get('early_stopping_patience', 0),
+            'early_stopping_patience',
+        )
+        self.early_stopping_min_delta = _to_float(
+            train_config.get('early_stopping_min_delta', 0.0),
+            'early_stopping_min_delta',
+        )
+        if self.early_stopping_patience < 0:
+            raise ValueError("early_stopping_patience must be >= 0")
+        if self.early_stopping_min_delta < 0:
+            raise ValueError("early_stopping_min_delta must be >= 0")
 
         ckpt_cfg = config.get('checkpointing', {})
         self.save_best_only = ckpt_cfg.get('save_best_only', True)
@@ -179,6 +192,8 @@ class BackboneTrainer:
         # Training state
         self.global_step = 0
         self.best_val_loss = float('inf')
+        self.best_epoch_val_loss = float('inf')
+        self.early_stopping_counter = 0
         self.train_losses = []
         self.val_losses = []
         self.learning_rates = []
@@ -265,6 +280,12 @@ class BackboneTrainer:
             print(f"Starting training for {self.num_epochs} epochs...")
             print(f"Train batches: {len(self.train_dataloader)}")
             print(f"Val batches: {len(self.val_dataloader)}")
+            if self.early_stopping_patience > 0:
+                print(
+                    "Early stopping enabled: "
+                    f"patience={self.early_stopping_patience}, "
+                    f"min_delta={self.early_stopping_min_delta}"
+                )
 
         for epoch in range(self.num_epochs):
             # Training epoch
@@ -290,6 +311,21 @@ class BackboneTrainer:
                 if self.is_main_process:
                     print(f"Reached max steps ({self.max_steps}), stopping training.")
                 break
+
+            if self.early_stopping_patience > 0:
+                if val_loss < (self.best_epoch_val_loss - self.early_stopping_min_delta):
+                    self.best_epoch_val_loss = val_loss
+                    self.early_stopping_counter = 0
+                else:
+                    self.early_stopping_counter += 1
+                    if self.early_stopping_counter >= self.early_stopping_patience:
+                        if self.is_main_process:
+                            print(
+                                "Early stopping triggered: "
+                                f"no epoch-level validation improvement > {self.early_stopping_min_delta} "
+                                f"for {self.early_stopping_patience} consecutive epochs."
+                            )
+                        break
 
         # Save final checkpoint
         self._save_checkpoint(val_loss, epoch, final=True)
@@ -385,7 +421,7 @@ class BackboneTrainer:
 
         # Forward pass with AMP
         self._maybe_mark_cudagraph_step_begin()
-        with autocast('cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with autocast(self.amp_device_type, dtype=torch.bfloat16, enabled=self.use_amp):
             outputs = self.model(input_ids, attention_mask)
             loss = outputs['loss'] / self.grad_accum_steps
 
@@ -427,7 +463,7 @@ class BackboneTrainer:
                 attention_mask = batch['attention_mask'].to(self.device)
 
                 self._maybe_mark_cudagraph_step_begin()
-                with autocast('cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+                with autocast(self.amp_device_type, dtype=torch.bfloat16, enabled=self.use_amp):
                     outputs = self.model(input_ids, attention_mask)
                 total_loss += outputs['loss'].item()
                 num_batches += 1
