@@ -12,15 +12,28 @@ import matplotlib.pyplot as plt
 import torch
 
 from src.chi.embeddings import load_backbone_from_step1
-from src.chi.model import PhysicsGuidedChiModel
+from src.chi.model import PhysicsGuidedChiModel, SolubilityClassifier
 from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars
 
 
 CLASS_NAME_MAP = {1: "Water-soluble", 0: "Water-insoluble"}
 
 
-def default_chi_config(config: Dict) -> Dict:
+def default_chi_config(config: Dict, step: str | None = None) -> Dict:
     chi_cfg = config.get("chi_training", {})
+    shared = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared", {}), dict) else {}
+    shared_embedding = shared.get("embedding", {}) if isinstance(shared.get("embedding", {}), dict) else {}
+    step5_cfg = (
+        chi_cfg.get("step5_inverse_design", {})
+        if isinstance(chi_cfg.get("step5_inverse_design", {}), dict)
+        else {}
+    )
+    step6_cfg = (
+        chi_cfg.get("step6_class_inverse_design", {})
+        if isinstance(chi_cfg.get("step6_class_inverse_design", {}), dict)
+        else {}
+    )
+
     defaults = {
         "split_mode": "polymer",
         "epsilon": 0.05,
@@ -30,11 +43,45 @@ def default_chi_config(config: Dict) -> Dict:
         "property_rule": "upper_bound",
         "coverage_topk": 5,
         "target_polymer_class": "all",
+        "target_polymer_count": 100,
+        "target_sa_max": 4.0,
         "embedding_batch_size": 128,
         "embedding_timestep": int(config.get("training_property", {}).get("default_timestep", 1)),
     }
+
     out = defaults.copy()
-    out.update(chi_cfg)
+    out["split_mode"] = str(shared.get("split_mode", chi_cfg.get("split_mode", defaults["split_mode"])))
+    out["embedding_batch_size"] = int(
+        shared_embedding.get("batch_size", chi_cfg.get("embedding_batch_size", defaults["embedding_batch_size"]))
+    )
+    out["embedding_timestep"] = int(
+        shared_embedding.get("timestep", chi_cfg.get("embedding_timestep", defaults["embedding_timestep"]))
+    )
+
+    if step == "step5":
+        out.update(step5_cfg)
+    elif step == "step6":
+        out.update(step6_cfg)
+    else:
+        # Backward-compatible union if caller does not specify a step.
+        out.update(step5_cfg)
+        out.update(step6_cfg)
+
+    # Legacy flat keys still override defaults when present.
+    for key in [
+        "epsilon",
+        "class_weight",
+        "polymer_class_weight",
+        "candidate_source",
+        "property_rule",
+        "coverage_topk",
+        "target_polymer_class",
+        "target_polymer_count",
+        "target_sa_max",
+    ]:
+        if key in chi_cfg:
+            out[key] = chi_cfg[key]
+
     return out
 
 
@@ -177,6 +224,7 @@ def infer_coefficients_for_novel_candidates(
     config: Dict,
     model_size: str | None,
     chi_checkpoint_path: Path,
+    class_checkpoint_path: Path | None,
     backbone_checkpoint_path: str | None,
     device: str,
     timestep: int,
@@ -212,13 +260,31 @@ def infer_coefficients_for_novel_candidates(
     )
 
     ckpt = torch.load(chi_checkpoint_path, map_location=device, weights_only=False)
-    model = PhysicsGuidedChiModel(
+    reg_model = PhysicsGuidedChiModel(
         embedding_dim=int(ckpt["embedding_dim"]),
         hidden_sizes=list(ckpt["hidden_sizes"]),
         dropout=float(ckpt["dropout"]),
     ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
+    reg_state = ckpt["model_state_dict"]
+    if isinstance(reg_state, dict) and any(str(k).startswith("chi_head.") for k in reg_state.keys()):
+        reg_state = {
+            str(k)[len("chi_head."):]: v
+            for k, v in reg_state.items()
+            if str(k).startswith("chi_head.")
+        }
+    reg_model.load_state_dict(reg_state, strict=True)
+    reg_model.eval()
+
+    cls_model = None
+    if class_checkpoint_path is not None and class_checkpoint_path.exists():
+        cls_ckpt = torch.load(class_checkpoint_path, map_location=device, weights_only=False)
+        cls_model = SolubilityClassifier(
+            embedding_dim=int(cls_ckpt["embedding_dim"]),
+            hidden_sizes=list(cls_ckpt["hidden_sizes"]),
+            dropout=float(cls_ckpt["dropout"]),
+        ).to(device)
+        cls_model.load_state_dict(cls_ckpt["model_state_dict"])
+        cls_model.eval()
 
     embeddings = []
     smiles_list = novel_df["SMILES"].astype(str).tolist()
@@ -240,11 +306,16 @@ def infer_coefficients_for_novel_candidates(
     emb = torch.cat(embeddings, dim=0).to(device)
     t_dummy = torch.full((emb.shape[0],), 300.0, dtype=torch.float32, device=device)
     phi_dummy = torch.full((emb.shape[0],), 0.5, dtype=torch.float32, device=device)
-    out = model(embedding=emb, temperature=t_dummy, phi=phi_dummy)
+    out = reg_model(embedding=emb, temperature=t_dummy, phi=phi_dummy)
 
     coeff = out["coefficients"].detach().cpu().numpy()
-    logit = out["class_logit"].detach().cpu().numpy()
-    prob = 1.0 / (1.0 + np.exp(-logit))
+    if cls_model is not None:
+        cls_out = cls_model(embedding=emb)
+        logit = cls_out["class_logit"].detach().cpu().numpy()
+        prob = 1.0 / (1.0 + np.exp(-logit))
+    else:
+        logit = out["class_logit"].detach().cpu().numpy()
+        prob = 1.0 / (1.0 + np.exp(-logit))
 
     result = novel_df[["polymer_id", "Polymer", "SMILES", "canonical_smiles"]].copy()
     result["water_soluble"] = -1
@@ -351,19 +422,31 @@ def build_candidate_pool(
     summary.update(novel_summary)
     summary["generated_csv"] = str(generated_csv)
 
-    chi_checkpoint = (
-        Path(args.step4_checkpoint)
-        if getattr(args, "step4_checkpoint", None)
-        else (results_dir / "checkpoints" / "chi_physics_best.pt")
-    )
+    default_reg_checkpoint = results_dir / "checkpoints" / "chi_regression_best.pt"
+    legacy_joint_checkpoint = results_dir / "checkpoints" / "chi_physics_best.pt"
+    chi_checkpoint = Path(args.step4_checkpoint) if getattr(args, "step4_checkpoint", None) else default_reg_checkpoint
+    if not chi_checkpoint.exists() and not getattr(args, "step4_checkpoint", None) and legacy_joint_checkpoint.exists():
+        chi_checkpoint = legacy_joint_checkpoint
     if not chi_checkpoint.exists():
         raise FileNotFoundError(f"Step4 chi checkpoint not found: {chi_checkpoint}")
+    class_checkpoint = (
+        Path(args.step4_class_checkpoint)
+        if getattr(args, "step4_class_checkpoint", None)
+        else (results_dir / "checkpoints" / "chi_classifier_best.pt")
+    )
+    if not class_checkpoint.exists():
+        raise FileNotFoundError(
+            "Step4 classification checkpoint not found. "
+            f"Expected: {class_checkpoint}. "
+            "Run Step 4 to produce `chi_classifier_best.pt` or pass --step4_class_checkpoint."
+        )
 
     novel_coeff_df = infer_coefficients_for_novel_candidates(
         novel_df=novel_df,
         config=config,
         model_size=args.model_size,
         chi_checkpoint_path=chi_checkpoint,
+        class_checkpoint_path=class_checkpoint,
         backbone_checkpoint_path=args.backbone_checkpoint,
         device=device,
         timestep=int(chi_cfg.get("embedding_timestep", 1)),

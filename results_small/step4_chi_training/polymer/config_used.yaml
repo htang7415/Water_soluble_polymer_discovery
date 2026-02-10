@@ -10,81 +10,137 @@ checkpointing:
   save_last: false
   save_periodic: false
 chi_training:
-  batch_size: 128
-  candidate_source: known
-  class_weight: 0.25
-  coverage_topk: 5
-  dataset_path: Data/chi/_50_polymers_T_phi.csv
-  dropout: 0.1
-  embedding_batch_size: 128
-  embedding_timestep: 1
-  epsilon: 0.05
-  finetune_last_layers: 0
-  hidden_sizes:
-  - 256
-  - 512
-  - 128
-  lambda_bce: 0.1
-  learning_rate: 0.001
-  n_trials: 50
-  num_epochs: 500
-  optuna_search_space:
-    batch_size:
-    - 8
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
-    dropout:
-    - 0.0
-    - 0.1
-    - 0.2
-    - 0.3
-    hidden_units:
-    - 64
-    - 128
+  shared:
+    dataset_path: Data/chi/_50_polymers_T_phi.csv
+    embedding:
+      batch_size: 128
+      timestep: 1
+    split:
+      test_ratio: 0.16
+      train_ratio: 0.7
+      val_ratio: 0.14
+    split_mode: polymer
+  step3_target_learning:
+    target_bootstrap_repeats: 800
+    target_objective: balanced_accuracy
+  step4_1_regression:
+    batch_size: 128
+    dropout: 0.1
+    finetune_last_layers: 0
+    hidden_sizes:
     - 256
     - 512
-    - 1024
-    lambda_bce:
-    - 0.01
-    - 0.05
-    - 0.1
-    - 0.2
-    - 0.5
-    learning_rate:
-    - 0.0001
-    - 0.005
-    learning_rate_log: true
-    num_layers:
-    - 2
-    - 3
-    - 4
-    - 5
-    weight_decay:
-    - 1.0e-07
-    - 0.001
-    weight_decay_log: true
-  patience: 20
-  polymer_class_weight: 0.5
-  property_rule: upper_bound
-  split_mode: polymer
-  target_bootstrap_repeats: 800
-  target_objective: balanced_accuracy
-  target_polymer_class: polyamide
-  target_polymer_count: 100
-  target_sa_max: 4.0
-  test_ratio: 0.1
-  train_ratio: 0.8
-  tune: true
-  tuning_class_penalty_weight: 0.25
-  tuning_cv_folds: 5
-  tuning_epochs: 100
-  tuning_objective: val_r2
-  tuning_patience: 20
-  val_ratio: 0.1
-  weight_decay: 1.0e-05
+    - 128
+    lambda_bce: 0.0
+    learning_rate: 0.001
+    n_trials: 50
+    num_epochs: 500
+    optuna_search_space:
+      batch_size:
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      dropout:
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      hidden_units:
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      lambda_bce:
+      - 0.0
+      learning_rate:
+      - 0.0001
+      - 0.005
+      learning_rate_log: true
+      num_layers:
+      - 2
+      - 3
+      - 4
+      - 5
+      weight_decay:
+      - 1.0e-07
+      - 0.001
+      weight_decay_log: true
+    patience: 20
+    tune: true
+    tuning_cv_folds: 6
+    tuning_epochs: 100
+    tuning_objective: val_r2
+    tuning_patience: 20
+    weight_decay: 1.0e-05
+  step4_2_classification:
+    batch_size: 128
+    dropout: 0.1
+    hidden_sizes:
+    - 256
+    - 512
+    - 128
+    learning_rate: 0.001
+    n_trials: 50
+    num_epochs: 500
+    optuna_search_space:
+      batch_size:
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      dropout:
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      hidden_units:
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      learning_rate:
+      - 0.0001
+      - 0.005
+      learning_rate_log: true
+      num_layers:
+      - 2
+      - 3
+      - 4
+      - 5
+      weight_decay:
+      - 1.0e-07
+      - 0.001
+      weight_decay_log: true
+    patience: 20
+    tune: true
+    tuning_cv_folds: 6
+    tuning_epochs: 100
+    tuning_patience: 20
+    weight_decay: 1.0e-05
+  step5_inverse_design:
+    candidate_source: known
+    class_weight: 0.25
+    coverage_topk: 5
+    epsilon: 0.05
+    property_rule: upper_bound
+    target_polymer_count: 100
+    target_sa_max: 4.0
+  step6_class_inverse_design:
+    candidate_source: known
+    class_weight: 0.25
+    coverage_topk: 5
+    epsilon: 0.05
+    polymer_class_weight: 0.5
+    property_rule: upper_bound
+    target_polymer_class: polyamide
+    target_polymer_count: 100
+    target_sa_max: 4.0
 data:
   property_test_ratio: 0.1
   property_train_ratio: 0.8

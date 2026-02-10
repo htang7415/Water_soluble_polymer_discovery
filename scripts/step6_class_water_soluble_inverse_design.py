@@ -555,7 +555,7 @@ def _save_figures(
 
 def main(args):
     config = load_config(args.config)
-    chi_cfg = default_chi_config(config)
+    chi_cfg = default_chi_config(config, step="step6")
 
     split_mode = str(chi_cfg["split_mode"]).strip().lower()
     if split_mode not in {"polymer", "random"}:
@@ -803,13 +803,19 @@ if __name__ == "__main__":
     parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
     parser.add_argument("--step4_dir", type=str, default=None, help="Optional direct path to Step 4 directory")
     parser.add_argument("--step4_checkpoint", type=str, default=None, help="Optional explicit path to Step4 chi checkpoint")
+    parser.add_argument("--step4_class_checkpoint", type=str, default=None, help="Optional explicit path to Step4 class checkpoint")
     parser.add_argument("--backbone_checkpoint", type=str, default=None, help="Optional explicit path to Step1 backbone checkpoint")
 
     parser.add_argument("--targets_csv", type=str, default=None, help="Custom χ_target CSV. If omitted, auto-uses Step 3 output.")
     parser.add_argument("--target_polymer_class", type=str, default=None, help="One class, comma list, or all")
     parser.add_argument("--property_rule", type=str, default=None, choices=["band", "upper_bound", "lower_bound"], help="Default property rule when targets file has none")
 
-    parser.add_argument("--candidate_source", type=str, default=None, help="known | novel | hybrid (default from chi_training.candidate_source)")
+    parser.add_argument(
+        "--candidate_source",
+        type=str,
+        default=None,
+        help="known | novel | hybrid (default from chi_training.step6_class_inverse_design.candidate_source)",
+    )
     parser.add_argument("--generated_csv", type=str, default=None, help="Generated samples CSV (used when candidate_source is novel/hybrid)")
     parser.add_argument("--generated_smiles_column", type=str, default="smiles", help="SMILES column name in generated_csv")
     parser.add_argument("--allow_non_two_stars", action="store_true", help="Allow generated candidates without exactly two '*' tokens")

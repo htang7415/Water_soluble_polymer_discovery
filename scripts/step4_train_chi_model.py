@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Step 4: Train physics-guided chi(T, phi) model with Optuna."""
+"""Step 4: split training with Step4_1 regression and Step4_2 classification."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -57,7 +58,6 @@ class TrainConfig:
     tuning_epochs: int
     tuning_patience: int
     tuning_objective: str
-    tuning_class_penalty_weight: float
     tuning_cv_folds: int
     timestep_for_embedding: int
     finetune_last_layers: int
@@ -206,8 +206,11 @@ def _resolve_optuna_search_space(config: Dict, chi_cfg: Dict) -> Dict[str, objec
         "batch_size": [16, 32, 64, 128, 256],
     }
 
-    # Preferred: chi_training.optuna_search_space
-    user_space = chi_cfg.get("optuna_search_space", {})
+    # Preferred: chi_training.step4_1_regression.optuna_search_space
+    step41_cfg = chi_cfg.get("step4_1_regression", {}) if isinstance(chi_cfg.get("step4_1_regression", {}), dict) else {}
+    user_space = step41_cfg.get("optuna_search_space", {})
+    if not isinstance(user_space, dict) or len(user_space) == 0:
+        user_space = chi_cfg.get("optuna_search_space", {})
     if not isinstance(user_space, dict):
         user_space = {}
 
@@ -238,25 +241,36 @@ def _normalize_tuning_objective(value: str) -> str:
     v = str(value).strip().lower()
     if v in {"val_r2", "r2", "maximize_val_r2"}:
         return "val_r2"
-    if v in {"rmse_class_penalty", "rmse_plus_class", "robust"}:
-        return "rmse_class_penalty"
-    raise ValueError("chi_training.tuning_objective must be one of {'val_r2','rmse_class_penalty'}")
+    raise ValueError("chi_training.step4_1_regression.tuning_objective must be 'val_r2'")
 
 
 def _describe_tuning_objective(train_cfg: TrainConfig) -> str:
-    if train_cfg.tuning_objective == "val_r2":
-        return "maximize_val_r2"
-    return "minimize_rmse_plus_class_penalty"
+    _ = train_cfg
+    return "maximize_val_r2"
 
 
 def _default_chi_config(config: Dict) -> Dict:
     chi_cfg = config.get("chi_training", {})
+    shared = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared", {}), dict) else {}
+    split_cfg = shared.get("split", {}) if isinstance(shared.get("split", {}), dict) else {}
+    embedding_cfg = shared.get("embedding", {}) if isinstance(shared.get("embedding", {}), dict) else {}
+    step41_cfg = (
+        chi_cfg.get("step4_1_regression", {})
+        if isinstance(chi_cfg.get("step4_1_regression", {}), dict)
+        else {}
+    )
+    step42_cfg = (
+        chi_cfg.get("step4_2_classification", {})
+        if isinstance(chi_cfg.get("step4_2_classification", {}), dict)
+        else {}
+    )
+
     defaults = {
         "dataset_path": "Data/chi/_50_polymers_T_phi.csv",
         "split_mode": "polymer",
-        "train_ratio": 0.7,
-        "val_ratio": 0.15,
-        "test_ratio": 0.15,
+        "train_ratio": 0.70,
+        "val_ratio": 0.14,
+        "test_ratio": 0.16,
         "batch_size": 128,
         "num_epochs": 500,
         "patience": 60,
@@ -269,16 +283,68 @@ def _default_chi_config(config: Dict) -> Dict:
         "n_trials": 50,
         "tuning_epochs": 120,
         "tuning_patience": 20,
-        "tuning_objective": "rmse_class_penalty",
-        "tuning_class_penalty_weight": 0.25,
-        "tuning_cv_folds": 5,
+        "tuning_objective": "val_r2",
+        "tuning_cv_folds": 6,
         "embedding_batch_size": 128,
         "embedding_timestep": int(config.get("training_property", {}).get("default_timestep", 1)),
         "finetune_last_layers": int(config.get("training_property", {}).get("finetune_last_layers", 0)),
     }
     out = defaults.copy()
-    out.update(chi_cfg)
+
+    out["dataset_path"] = str(shared.get("dataset_path", chi_cfg.get("dataset_path", defaults["dataset_path"])))
+    out["split_mode"] = str(shared.get("split_mode", chi_cfg.get("split_mode", defaults["split_mode"])))
+    out["train_ratio"] = float(split_cfg.get("train_ratio", chi_cfg.get("train_ratio", defaults["train_ratio"])))
+    out["val_ratio"] = float(split_cfg.get("val_ratio", chi_cfg.get("val_ratio", defaults["val_ratio"])))
+    out["test_ratio"] = float(split_cfg.get("test_ratio", chi_cfg.get("test_ratio", defaults["test_ratio"])))
+    out["embedding_batch_size"] = int(
+        embedding_cfg.get("batch_size", chi_cfg.get("embedding_batch_size", defaults["embedding_batch_size"]))
+    )
+    out["embedding_timestep"] = int(
+        embedding_cfg.get("timestep", chi_cfg.get("embedding_timestep", defaults["embedding_timestep"]))
+    )
+
+    # Step 4_1 (regression) config with legacy flat-key fallback.
+    for key in [
+        "batch_size",
+        "num_epochs",
+        "patience",
+        "learning_rate",
+        "weight_decay",
+        "lambda_bce",
+        "hidden_sizes",
+        "dropout",
+        "tune",
+        "n_trials",
+        "tuning_epochs",
+        "tuning_patience",
+        "tuning_objective",
+        "tuning_cv_folds",
+        "finetune_last_layers",
+    ]:
+        out[key] = step41_cfg.get(key, chi_cfg.get(key, defaults[key]))
+
     out["optuna_search_space"] = _resolve_optuna_search_space(config, chi_cfg)
+
+    step42_defaults = {
+        "batch_size": int(out["batch_size"]),
+        "num_epochs": int(out["num_epochs"]),
+        "patience": int(out["patience"]),
+        "learning_rate": float(out["learning_rate"]),
+        "weight_decay": float(out["weight_decay"]),
+        "hidden_sizes": [int(v) for v in out["hidden_sizes"]],
+        "dropout": float(out["dropout"]),
+        "tune": bool(out["tune"]),
+        "n_trials": int(out["n_trials"]),
+        "tuning_epochs": int(out["tuning_epochs"]),
+        "tuning_patience": int(out["tuning_patience"]),
+        "tuning_cv_folds": int(out["tuning_cv_folds"]),
+        "optuna_search_space": dict(out["optuna_search_space"]),
+    }
+    step42_out = step42_defaults.copy()
+    step42_out.update(step42_cfg)
+    if not isinstance(step42_out.get("optuna_search_space", {}), dict):
+        step42_out["optuna_search_space"] = dict(out["optuna_search_space"])
+    out["step4_2"] = step42_out
     return out
 
 
@@ -291,16 +357,9 @@ def build_train_config(args, config: Dict) -> TrainConfig:
     tune_cfg = bool(chi_cfg.get("tune", False))
     tune_flag = bool(args.tune or (tune_cfg and not args.no_tune))
     tuning_objective = _normalize_tuning_objective(
-        args.tuning_objective if args.tuning_objective is not None else chi_cfg.get("tuning_objective", "rmse_class_penalty")
+        args.tuning_objective if args.tuning_objective is not None else chi_cfg.get("tuning_objective", "val_r2")
     )
-    tuning_class_penalty_weight = float(
-        args.tuning_class_penalty_weight
-        if args.tuning_class_penalty_weight is not None
-        else chi_cfg.get("tuning_class_penalty_weight", 0.25)
-    )
-    if tuning_class_penalty_weight < 0:
-        raise ValueError("chi_training.tuning_class_penalty_weight must be >= 0")
-    tuning_cv_folds = int(args.tuning_cv_folds if args.tuning_cv_folds is not None else chi_cfg.get("tuning_cv_folds", 5))
+    tuning_cv_folds = int(args.tuning_cv_folds if args.tuning_cv_folds is not None else chi_cfg.get("tuning_cv_folds", 6))
     if tuning_cv_folds < 2:
         raise ValueError("chi_training.tuning_cv_folds must be >= 2")
 
@@ -323,7 +382,6 @@ def build_train_config(args, config: Dict) -> TrainConfig:
         tuning_epochs=int(chi_cfg.get("tuning_epochs", 80)),
         tuning_patience=int(chi_cfg.get("tuning_patience", 15)),
         tuning_objective=tuning_objective,
-        tuning_class_penalty_weight=tuning_class_penalty_weight,
         tuning_cv_folds=tuning_cv_folds,
         timestep_for_embedding=int(chi_cfg.get("embedding_timestep", 1)),
         finetune_last_layers=int(chi_cfg.get("finetune_last_layers", 0)),
@@ -755,34 +813,21 @@ def _evaluate_trial_with_cv(
         )
         val_pred = preds["val"]
         val_reg = regression_metrics(val_pred["chi_true"], val_pred["chi_pred"])
-        val_cls = classification_metrics(val_pred["label"], val_pred["prob"])
         fold_rows.append(
             {
                 "fold": fold_id,
                 "val_n": int(len(val_pred["chi_true"])),
                 "val_r2": float(val_reg["r2"]),
                 "val_rmse": float(val_reg["rmse"]),
-                "val_balanced_accuracy": float(val_cls["balanced_accuracy"]),
             }
         )
 
     fold_metrics_df = pd.DataFrame(fold_rows)
     mean_r2 = float(np.nanmean(fold_metrics_df["val_r2"])) if not fold_metrics_df.empty else np.nan
     mean_rmse = float(np.nanmean(fold_metrics_df["val_rmse"])) if not fold_metrics_df.empty else np.nan
-    mean_bal_acc = (
-        float(np.nanmean(fold_metrics_df["val_balanced_accuracy"])) if not fold_metrics_df.empty else np.nan
-    )
-    bal_acc_for_score = mean_bal_acc if np.isfinite(mean_bal_acc) else 0.5
-    cv_score = (
-        float(mean_rmse + train_cfg.tuning_class_penalty_weight * (1.0 - bal_acc_for_score))
-        if np.isfinite(mean_rmse)
-        else np.inf
-    )
     return {
         "cv_val_r2": mean_r2,
         "cv_val_rmse": mean_rmse,
-        "cv_val_balanced_accuracy": mean_bal_acc,
-        "cv_score": cv_score,
         "fold_metrics": fold_metrics_df,
     }
 
@@ -852,7 +897,7 @@ def tune_hyperparameters(
     _summarize_tuning_cv_folds(cv_folds).to_csv(tuning_dir / "optuna_tuning_cv_folds.csv", index=False)
 
     objective_name = train_cfg.tuning_objective
-    objective_direction = "maximize" if objective_name == "val_r2" else "minimize"
+    objective_direction = "maximize"
 
     def objective(trial: optuna.Trial) -> float:
         if len(num_layers_space) == 2:
@@ -901,18 +946,13 @@ def tune_hyperparameters(
         )
         val_r2 = float(cv_eval["cv_val_r2"])
         val_rmse = float(cv_eval["cv_val_rmse"])
-        val_bal_acc = float(cv_eval["cv_val_balanced_accuracy"])
-        cv_score = float(cv_eval["cv_score"])
         trial.set_user_attr("val_r2", val_r2)
         trial.set_user_attr("val_rmse", val_rmse)
-        trial.set_user_attr("val_balanced_accuracy", val_bal_acc)
         trial.set_user_attr("cv_val_r2", val_r2)
         trial.set_user_attr("cv_val_rmse", val_rmse)
-        trial.set_user_attr("cv_val_balanced_accuracy", val_bal_acc)
-        trial.set_user_attr("cv_score", cv_score)
         trial.set_user_attr("cv_n_folds", int(len(cv_folds)))
         trial.set_user_attr("tuning_objective", objective_name)
-        return val_r2 if objective_name == "val_r2" else cv_score
+        return val_r2
 
     study = optuna.create_study(direction=objective_direction)
     study.optimize(objective, n_trials=train_cfg.n_trials, show_progress_bar=True)
@@ -921,8 +961,6 @@ def tune_hyperparameters(
     for t in study.trials:
         val_r2 = t.user_attrs.get("cv_val_r2", t.user_attrs.get("val_r2", np.nan))
         val_rmse = t.user_attrs.get("cv_val_rmse", t.user_attrs.get("val_rmse", np.nan))
-        val_bal_acc = t.user_attrs.get("cv_val_balanced_accuracy", t.user_attrs.get("val_balanced_accuracy", np.nan))
-        cv_score = t.user_attrs.get("cv_score", np.nan)
         row = {
             "trial": t.number,
             "state": str(t.state),
@@ -932,8 +970,6 @@ def tune_hyperparameters(
             "value_val_r2": val_r2,
             "val_r2": val_r2,
             "val_rmse": val_rmse,
-            "val_balanced_accuracy": val_bal_acc,
-            "cv_score": cv_score,
             "cv_n_folds": int(t.user_attrs.get("cv_n_folds", len(cv_folds))),
         }
         row.update(t.params)
@@ -1017,11 +1053,6 @@ def tune_hyperparameters(
                 "objective_value_at_best_trial": float(study.best_value),
                 "best_value_r2": float(study.best_trial.user_attrs.get("cv_val_r2", np.nan)),
                 "best_value_rmse_at_best_trial": float(study.best_trial.user_attrs.get("cv_val_rmse", np.nan)),
-                "best_value_balanced_accuracy_at_best_trial": float(
-                    study.best_trial.user_attrs.get("cv_val_balanced_accuracy", np.nan)
-                ),
-                "best_value_cv_score_at_best_trial": float(study.best_trial.user_attrs.get("cv_score", np.nan)),
-                "tuning_class_penalty_weight": float(train_cfg.tuning_class_penalty_weight),
                 "tuning_cv_folds_requested": int(train_cfg.tuning_cv_folds),
                 "tuning_cv_folds_resolved": int(cv_info.get("resolved_folds", len(cv_folds))),
                 "tuning_cv_strategy": str(cv_info.get("strategy", "unknown")),
@@ -1161,8 +1192,22 @@ def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> 
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
     )
     ax.set_title(f"{split.upper()} parity (n={len(sub)})")
-    if not show_legend and ax.get_legend() is not None:
-        ax.get_legend().remove()
+    legend = ax.get_legend()
+    if legend is not None:
+        if show_legend:
+            handles = legend.legendHandles
+            labels = [t.get_text() for t in legend.get_texts()]
+            legend.remove()
+            ax.legend(
+                handles=handles,
+                labels=labels,
+                title="water_soluble",
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0),
+                borderaxespad=0.0,
+            )
+        else:
+            legend.remove()
 
 
 def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_dir: Path, dpi: int, font_size: int) -> None:
@@ -1182,7 +1227,7 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.set_title("Step4 chi training loss")
-    ax.legend()
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_loss_curve.png", dpi=dpi)
     plt.close(fig)
@@ -1192,8 +1237,19 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
     for i, split in enumerate(split_order):
         sub = pred_df[pred_df["split"] == split].copy()
-        _plot_parity_panel(axes[i], sub=sub, split=split, show_legend=(i == 0))
-    fig.tight_layout()
+        _plot_parity_panel(axes[i], sub=sub, split=split, show_legend=False)
+    legend_handles = [
+        Line2D([0], [0], marker="o", linestyle="", color="#1f77b4", label="water_soluble=1", markersize=6),
+        Line2D([0], [0], marker="o", linestyle="", color="#d62728", label="water_soluble=0", markersize=6),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=2,
+        frameon=True,
+        bbox_to_anchor=(0.5, 0.0),
+    )
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig.savefig(fig_dir / "chi_parity_by_split.png", dpi=dpi)
     plt.close(fig)
 
@@ -1201,7 +1257,7 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     test = pred_df[pred_df["split"] == "test"].copy()
     fig, ax = plt.subplots(figsize=(6, 5))
     _plot_parity_panel(ax, sub=test, split="test", show_legend=True)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 0.82, 1))
     fig.savefig(fig_dir / "chi_parity_test.png", dpi=dpi)
     plt.close(fig)
 
@@ -1213,7 +1269,7 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
     ax.set_xlabel("χ prediction error")
     ax.set_title("Residual distribution by split")
-    ax.legend()
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_residual_distribution.png", dpi=dpi)
     plt.close(fig)
@@ -1645,6 +1701,132 @@ def _collect_classifier_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
     pd.DataFrame(rows).to_csv(out_dir / "class_metrics_overall.csv", index=False)
 
 
+def _save_regression_prediction_csvs(
+    split_df: pd.DataFrame,
+    predictions: Dict[str, Dict[str, np.ndarray]],
+    out_dir: Path,
+) -> pd.DataFrame:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for split in ["train", "val", "test"]:
+        sub = split_df[split_df["split"] == split].copy().reset_index(drop=True)
+        pred = predictions[split]
+        sub["chi_pred"] = pred["chi_pred"]
+        sub["chi_error"] = sub["chi_pred"] - sub["chi"]
+        coeff = pred["coefficients"]
+        for i, name in enumerate(COEFF_NAMES):
+            sub[name] = coeff[:, i]
+        sub.to_csv(out_dir / f"chi_predictions_{split}.csv", index=False)
+        frames.append(sub)
+    all_df = pd.concat(frames, axis=0, ignore_index=True)
+    all_df.to_csv(out_dir / "chi_predictions_all.csv", index=False)
+    return all_df
+
+
+def _collect_regression_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    class_rows = []
+    polymer_rows = []
+    for split, sub in pred_df.groupby("split"):
+        reg = regression_metrics(sub["chi"], sub["chi_pred"])
+        hit = hit_metrics(sub["chi_error"], epsilons=[0.02, 0.05, 0.1, 0.2])
+        row = {"split": split}
+        row.update(reg)
+        row.update(hit)
+        rows.append(row)
+
+        group_metrics = metrics_by_group(
+            sub,
+            y_true_col="chi",
+            y_pred_col="chi_pred",
+            group_col="water_soluble",
+        )
+        group_metrics.insert(0, "split", split)
+        class_rows.append(group_metrics)
+
+        poly = (
+            sub.groupby(["polymer_id", "Polymer"], as_index=False)[["chi", "chi_pred"]]
+            .mean()
+            .rename(columns={"chi": "chi_true_mean", "chi_pred": "chi_pred_mean"})
+        )
+        poly_metric = regression_metrics(poly["chi_true_mean"], poly["chi_pred_mean"], prefix="poly_")
+        poly_row = {"split": split}
+        poly_row.update(poly_metric)
+        polymer_rows.append(poly_row)
+
+    pd.DataFrame(rows).to_csv(out_dir / "chi_metrics_overall.csv", index=False)
+    pd.concat(class_rows, ignore_index=True).to_csv(out_dir / "chi_metrics_by_class.csv", index=False)
+    pd.DataFrame(polymer_rows).to_csv(out_dir / "chi_metrics_polymer_level.csv", index=False)
+
+
+def _make_regression_figures(
+    history: Dict[str, List[float]],
+    pred_df: pd.DataFrame,
+    fig_dir: Path,
+    dpi: int,
+    font_size: int,
+) -> None:
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    sns.set_theme(style="whitegrid")
+    plt.rcParams.update({
+        "font.size": font_size,
+        "axes.titlesize": font_size,
+        "axes.labelsize": font_size,
+        "legend.fontsize": font_size,
+    })
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(history["epoch"], history["train_loss"], label="Train loss")
+    ax.plot(history["epoch"], history["val_loss"], label="Val loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Step4_1 regression loss")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "chi_loss_curve.png", dpi=dpi)
+    plt.close(fig)
+
+    split_order = ["train", "val", "test"]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
+    for split, axis in zip(split_order, axes):
+        sub = pred_df[pred_df["split"] == split].copy()
+        _plot_parity_panel(axis, sub=sub, split=split, show_legend=False)
+    legend_handles = [
+        Line2D([0], [0], marker="o", linestyle="", color="#1f77b4", label="water_soluble=1", markersize=6),
+        Line2D([0], [0], marker="o", linestyle="", color="#d62728", label="water_soluble=0", markersize=6),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=2,
+        frameon=True,
+        bbox_to_anchor=(0.5, 0.0),
+    )
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    fig.savefig(fig_dir / "chi_parity_by_split.png", dpi=dpi)
+    plt.close(fig)
+
+    test = pred_df[pred_df["split"] == "test"].copy()
+    fig, ax = plt.subplots(figsize=(6, 5))
+    _plot_parity_panel(ax, sub=test, split="test", show_legend=True)
+    fig.tight_layout(rect=(0, 0, 0.82, 1))
+    fig.savefig(fig_dir / "chi_parity_test.png", dpi=dpi)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for split, color in [("train", "#4c78a8"), ("val", "#f58518"), ("test", "#54a24b")]:
+        sub = pred_df[pred_df["split"] == split]
+        sns.kdeplot(sub["chi_error"], ax=ax, label=split, color=color, linewidth=2)
+    ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
+    ax.set_xlabel("chi prediction error")
+    ax.set_title("Residual distribution by split")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    fig.tight_layout()
+    fig.savefig(fig_dir / "chi_residual_distribution.png", dpi=dpi)
+    plt.close(fig)
+
+
 def _make_classifier_figures(
     history: Dict[str, List[float]],
     pred_df: pd.DataFrame,
@@ -1667,7 +1849,7 @@ def _make_classifier_figures(
     ax.set_xlabel("Epoch")
     ax.set_ylabel("BCE loss")
     ax.set_title("Step4_2 classification loss")
-    ax.legend()
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     fig.tight_layout()
     fig.savefig(fig_dir / "class_loss_curve.png", dpi=dpi)
     plt.close(fig)
@@ -1686,7 +1868,20 @@ def _make_classifier_figures(
         )
         ax.set_xlabel("Predicted soluble probability")
         ax.set_title("Class probability distribution (test)")
-        fig.tight_layout()
+        legend = ax.get_legend()
+        if legend is not None:
+            handles = legend.legendHandles
+            labels = [t.get_text() for t in legend.get_texts()]
+            legend.remove()
+            ax.legend(
+                handles=handles,
+                labels=labels,
+                title="water_soluble",
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0),
+                borderaxespad=0.0,
+            )
+        fig.tight_layout(rect=(0, 0, 0.82, 1))
         fig.savefig(fig_dir / "class_prob_distribution_test.png", dpi=dpi)
         plt.close(fig)
 
@@ -1801,7 +1996,7 @@ def main(args):
     backbone_num_layers = int(backbone_cfg["num_layers"])
     if train_cfg.finetune_last_layers < 0 or train_cfg.finetune_last_layers > backbone_num_layers:
         raise ValueError(
-            f"chi_training.finetune_last_layers must be in [0, {backbone_num_layers}] "
+            f"chi_training.step4_1_regression.finetune_last_layers must be in [0, {backbone_num_layers}] "
             f"for model_size={args.model_size}, got {train_cfg.finetune_last_layers}"
         )
     use_backbone_finetune = bool(train_cfg.finetune_last_layers > 0)
@@ -1811,11 +2006,29 @@ def main(args):
     metrics_dir = step_dir / "metrics"
     figures_dir = step_dir / "figures"
     tuning_dir = step_dir / "tuning"
+    reg_dir = step_dir / "step4_1_regression"
+    cls_dir = step_dir / "step4_2_classification"
+    reg_metrics_dir = reg_dir / "metrics"
+    reg_figures_dir = reg_dir / "figures"
+    reg_tuning_dir = reg_dir / "tuning"
+    cls_metrics_dir = cls_dir / "metrics"
+    cls_figures_dir = cls_dir / "figures"
+    cls_tuning_dir = cls_dir / "tuning"
     checkpoint_dir = results_dir / "checkpoints"
 
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    figures_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for d in [
+        metrics_dir,
+        figures_dir,
+        tuning_dir,
+        reg_metrics_dir,
+        reg_figures_dir,
+        reg_tuning_dir,
+        cls_metrics_dir,
+        cls_figures_dir,
+        cls_tuning_dir,
+        checkpoint_dir,
+    ]:
+        d.mkdir(parents=True, exist_ok=True)
 
     seed_info = seed_everything(train_cfg.seed)
     save_config(config, step_dir / "config_used.yaml")
@@ -1832,10 +2045,11 @@ def main(args):
             "tune": train_cfg.tune,
             "n_trials": train_cfg.n_trials,
             "tuning_objective": train_cfg.tuning_objective,
-            "tuning_class_penalty_weight": train_cfg.tuning_class_penalty_weight,
             "tuning_cv_folds": train_cfg.tuning_cv_folds,
             "backbone_num_layers": backbone_num_layers,
             "finetune_last_layers": train_cfg.finetune_last_layers,
+            "stage4_1_dir": str(reg_dir),
+            "stage4_2_dir": str(cls_dir),
             "random_seed": train_cfg.seed,
         },
     )
@@ -1843,13 +2057,14 @@ def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 70)
-    print("Step 4: Physics-guided chi(T, phi) training")
+    print("Step 4 split pipeline:")
+    print("  Step4_1: chi regression")
+    print("  Step4_2: water-soluble classification")
     print(f"Split mode: {train_cfg.split_mode}")
-    print(f"finetune_last_layers: {train_cfg.finetune_last_layers}/{backbone_num_layers}")
+    print(f"finetune_last_layers (regression): {train_cfg.finetune_last_layers}/{backbone_num_layers}")
     print(f"Device: {device}")
     print("=" * 70)
 
-    # Load data and create splits.
     chi_cfg = _default_chi_config(config)
     chi_csv = args.dataset_path or chi_cfg["dataset_path"]
     df = load_chi_dataset(chi_csv)
@@ -1864,11 +2079,12 @@ def main(args):
             seed=train_cfg.seed,
         ),
     )
-    split_assign.to_csv(metrics_dir / "split_assignments.csv", index=False)
     split_df = add_split_column(df, split_assign)
-    split_df.to_csv(metrics_dir / "chi_dataset_with_split.csv", index=False)
 
-    # Embedding cache.
+    for out_dir in [metrics_dir, reg_metrics_dir, cls_metrics_dir]:
+        split_assign.to_csv(out_dir / "split_assignments.csv", index=False)
+        split_df.to_csv(out_dir / "chi_dataset_with_split.csv", index=False)
+
     polymer_df = split_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].drop_duplicates("polymer_id")
     emb_cache = build_or_load_embedding_cache(
         polymer_df=polymer_df,
@@ -1882,6 +2098,7 @@ def main(args):
         batch_size=int(chi_cfg["embedding_batch_size"]),
     )
     embedding_table = embedding_table_from_cache(emb_cache)
+
     tokenizer_for_training = None
     if use_backbone_finetune or train_cfg.tune:
         tokenizer_for_training, _, _ = load_backbone_from_step1(
@@ -1891,177 +2108,348 @@ def main(args):
             device="cpu",
         )
 
-    # Hyperparameter tuning.
-    best_params = None
-    if train_cfg.tune:
-        print("Running Optuna tuning...")
-        print(
-            f"Tuning objective={train_cfg.tuning_objective}, "
-            f"cv_folds={train_cfg.tuning_cv_folds}, "
-            f"class_penalty_weight={train_cfg.tuning_class_penalty_weight}"
-        )
-        best_params = tune_hyperparameters(
+    dpi = int(config.get("plotting", {}).get("dpi", 300))
+    font_size = int(config.get("plotting", {}).get("font_size", 12))
+
+    # -------------------------
+    # Step 4_1: Regression
+    # -------------------------
+    reg_cfg = copy.deepcopy(train_cfg)
+    reg_cfg.lambda_bce = 0.0
+    reg_cfg.tuning_objective = "val_r2"
+    reg_space = dict(reg_cfg.optuna_search_space)
+    reg_space["lambda_bce"] = [0.0]
+    reg_cfg.optuna_search_space = reg_space
+
+    reg_best_params = None
+    if reg_cfg.tune:
+        print("Running Optuna for Step4_1 (regression)...")
+        reg_best_params = tune_hyperparameters(
             split_df=split_df,
             embedding_table=embedding_table,
-            train_cfg=train_cfg,
+            train_cfg=reg_cfg,
             config=config,
             model_size=args.model_size,
             backbone_num_layers=backbone_num_layers,
             backbone_checkpoint=args.backbone_checkpoint,
             tokenizer=tokenizer_for_training,
             device=device,
-            tuning_dir=tuning_dir,
-            dpi=int(config.get("plotting", {}).get("dpi", 300)),
-            font_size=int(config.get("plotting", {}).get("font_size", 12)),
+            tuning_dir=reg_tuning_dir,
+            dpi=dpi,
+            font_size=font_size,
         )
-        print("Best params:")
-        print(best_params)
-        print("Retraining final Step 4 model with the best Optuna hyperparameters...")
+        print("Step4_1 best params:")
+        print(reg_best_params)
 
-    if best_params is None:
-        print("Optuna disabled. Training final Step 4 model with config hyperparameters...")
-        chosen = {
-            "hidden_sizes": train_cfg.hidden_sizes,
-            "dropout": train_cfg.dropout,
-            "learning_rate": train_cfg.learning_rate,
-            "weight_decay": train_cfg.weight_decay,
-            "lambda_bce": train_cfg.lambda_bce,
-            "batch_size": train_cfg.batch_size,
-            "finetune_last_layers": int(train_cfg.finetune_last_layers),
+    if reg_best_params is None:
+        reg_chosen = {
+            "hidden_sizes": reg_cfg.hidden_sizes,
+            "dropout": reg_cfg.dropout,
+            "learning_rate": reg_cfg.learning_rate,
+            "weight_decay": reg_cfg.weight_decay,
+            "lambda_bce": 0.0,
+            "batch_size": reg_cfg.batch_size,
+            "finetune_last_layers": int(reg_cfg.finetune_last_layers),
         }
     else:
-        num_layers = int(best_params["num_layers"])
-        chosen = {
-            "hidden_sizes": [int(best_params[f"hidden_{i}"]) for i in range(num_layers)],
-            "dropout": float(best_params["dropout"]),
-            "learning_rate": float(best_params["learning_rate"]),
-            "weight_decay": float(best_params["weight_decay"]),
-            "lambda_bce": float(best_params["lambda_bce"]),
-            "batch_size": int(best_params["batch_size"]),
-            "finetune_last_layers": int(best_params.get("finetune_last_layers", train_cfg.finetune_last_layers)),
+        reg_num_layers = int(reg_best_params["num_layers"])
+        reg_chosen = {
+            "hidden_sizes": [int(reg_best_params[f"hidden_{i}"]) for i in range(reg_num_layers)],
+            "dropout": float(reg_best_params["dropout"]),
+            "learning_rate": float(reg_best_params["learning_rate"]),
+            "weight_decay": float(reg_best_params["weight_decay"]),
+            "lambda_bce": 0.0,
+            "batch_size": int(reg_best_params["batch_size"]),
+            "finetune_last_layers": int(reg_best_params.get("finetune_last_layers", reg_cfg.finetune_last_layers)),
         }
 
-    chosen_finetune_last_layers = int(chosen["finetune_last_layers"])
-    if chosen_finetune_last_layers < 0 or chosen_finetune_last_layers > backbone_num_layers:
+    reg_finetune_last_layers = int(reg_chosen["finetune_last_layers"])
+    if reg_finetune_last_layers < 0 or reg_finetune_last_layers > backbone_num_layers:
         raise ValueError(
-            f"chosen finetune_last_layers must be in [0, {backbone_num_layers}], got {chosen_finetune_last_layers}"
+            f"chosen regression finetune_last_layers must be in [0, {backbone_num_layers}], got {reg_finetune_last_layers}"
         )
-    use_backbone_finetune = bool(chosen_finetune_last_layers > 0)
+    reg_use_backbone_finetune = bool(reg_finetune_last_layers > 0)
 
-    with open(metrics_dir / "chosen_hyperparameters.json", "w") as f:
-        json.dump(chosen, f, indent=2)
-    with open(metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
+    with open(reg_metrics_dir / "chosen_hyperparameters.json", "w") as f:
+        json.dump(reg_chosen, f, indent=2)
+    with open(reg_metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
         json.dump(
             {
-                "used_optuna": bool(train_cfg.tune),
-                "optuna_objective": _describe_tuning_objective(train_cfg),
-                "tuning_objective": train_cfg.tuning_objective,
-                "tuning_class_penalty_weight": float(train_cfg.tuning_class_penalty_weight),
-                "tuning_cv_folds": int(train_cfg.tuning_cv_folds),
-                "optuna_best_params": best_params,
+                "used_optuna": bool(reg_cfg.tune),
+                "optuna_objective": _describe_tuning_objective(reg_cfg),
+                "tuning_objective": "val_r2",
+                "tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
+                "optuna_best_params": reg_best_params,
                 "backbone_num_layers": int(backbone_num_layers),
-                "finetune_last_layers": int(chosen_finetune_last_layers),
-                "backbone_finetune_enabled": bool(use_backbone_finetune),
-                "final_training_hyperparameters": chosen,
-                "final_training_num_epochs": int(train_cfg.num_epochs),
-                "final_training_patience": int(train_cfg.patience),
+                "finetune_last_layers": int(reg_finetune_last_layers),
+                "backbone_finetune_enabled": bool(reg_use_backbone_finetune),
+                "final_training_hyperparameters": reg_chosen,
+                "final_training_num_epochs": int(reg_cfg.num_epochs),
+                "final_training_patience": int(reg_cfg.patience),
             },
             f,
             indent=2,
         )
 
-    # Final training.
-    model, history, predictions = train_one_model(
+    reg_model, reg_history, reg_predictions = train_one_model(
         split_df=split_df,
         embedding_table=embedding_table,
-        train_cfg=train_cfg,
+        train_cfg=reg_cfg,
         device=device,
-        hidden_sizes=chosen["hidden_sizes"],
-        dropout=chosen["dropout"],
-        learning_rate=chosen["learning_rate"],
-        weight_decay=chosen["weight_decay"],
-        lambda_bce=chosen["lambda_bce"],
-        batch_size=chosen["batch_size"],
-        num_epochs=train_cfg.num_epochs,
-        patience=train_cfg.patience,
+        hidden_sizes=reg_chosen["hidden_sizes"],
+        dropout=reg_chosen["dropout"],
+        learning_rate=reg_chosen["learning_rate"],
+        weight_decay=reg_chosen["weight_decay"],
+        lambda_bce=0.0,
+        batch_size=reg_chosen["batch_size"],
+        num_epochs=reg_cfg.num_epochs,
+        patience=reg_cfg.patience,
         config=config,
         model_size=args.model_size,
         backbone_checkpoint=args.backbone_checkpoint,
         tokenizer=tokenizer_for_training,
-        finetune_last_layers=chosen_finetune_last_layers,
-        timestep_for_embedding=train_cfg.timestep_for_embedding,
+        finetune_last_layers=reg_finetune_last_layers,
+        timestep_for_embedding=reg_cfg.timestep_for_embedding,
     )
 
-    checkpoint = {
-        "model_state_dict": model.state_dict(),
+    reg_checkpoint = {
+        "model_state_dict": reg_model.state_dict(),
         "embedding_dim": int(embedding_table.shape[1]),
-        "hidden_sizes": chosen["hidden_sizes"],
-        "dropout": chosen["dropout"],
-        "learning_rate": chosen["learning_rate"],
-        "weight_decay": chosen["weight_decay"],
-        "batch_size": chosen["batch_size"],
-        "lambda_bce": chosen["lambda_bce"],
-        "used_optuna": bool(train_cfg.tune),
-        "optuna_best_params": best_params,
-        "split_mode": train_cfg.split_mode,
-        "timestep_for_embedding": train_cfg.timestep_for_embedding,
+        "hidden_sizes": reg_chosen["hidden_sizes"],
+        "dropout": reg_chosen["dropout"],
+        "learning_rate": reg_chosen["learning_rate"],
+        "weight_decay": reg_chosen["weight_decay"],
+        "batch_size": reg_chosen["batch_size"],
+        "lambda_bce": 0.0,
+        "used_optuna": bool(reg_cfg.tune),
+        "optuna_best_params": reg_best_params,
+        "split_mode": reg_cfg.split_mode,
+        "timestep_for_embedding": reg_cfg.timestep_for_embedding,
         "backbone_num_layers": int(backbone_num_layers),
-        "finetune_last_layers": int(chosen_finetune_last_layers),
-        "backbone_finetune_enabled": bool(use_backbone_finetune),
+        "finetune_last_layers": int(reg_finetune_last_layers),
+        "backbone_finetune_enabled": bool(reg_use_backbone_finetune),
         "dataset_path": str(chi_csv),
         "config": config,
     }
-    torch.save(checkpoint, checkpoint_dir / "chi_physics_best.pt")
+    torch.save(reg_checkpoint, checkpoint_dir / "chi_regression_best.pt")
+    torch.save(reg_checkpoint, checkpoint_dir / "chi_physics_best.pt")
 
-    _save_history(history, metrics_dir / "chi_training_history.csv")
-    pred_df = _save_prediction_csvs(split_df=split_df, predictions=predictions, out_dir=metrics_dir)
+    _save_history(reg_history, reg_metrics_dir / "chi_training_history.csv")
+    reg_pred_df = _save_regression_prediction_csvs(split_df=split_df, predictions=reg_predictions, out_dir=reg_metrics_dir)
+    _collect_regression_metrics(reg_pred_df, out_dir=reg_metrics_dir)
+    _make_regression_figures(
+        history=reg_history,
+        pred_df=reg_pred_df,
+        fig_dir=reg_figures_dir,
+        dpi=dpi,
+        font_size=font_size,
+    )
+    reg_poly = reg_pred_df[["polymer_id", "Polymer", "SMILES", "water_soluble"] + COEFF_NAMES].drop_duplicates("polymer_id")
+    reg_poly.to_csv(reg_metrics_dir / "polymer_coefficients_regression_only.csv", index=False)
+
+    # -------------------------
+    # Step 4_2: Classification
+    # -------------------------
+    cls_cfg = copy.deepcopy(train_cfg)
+    cls_cfg.finetune_last_layers = 0
+    cls_section = chi_cfg.get("step4_2", {}) if isinstance(chi_cfg.get("step4_2", {}), dict) else {}
+    cls_cfg.batch_size = int(cls_section.get("batch_size", cls_cfg.batch_size))
+    cls_cfg.num_epochs = int(cls_section.get("num_epochs", cls_cfg.num_epochs))
+    cls_cfg.patience = int(cls_section.get("patience", cls_cfg.patience))
+    cls_cfg.learning_rate = float(cls_section.get("learning_rate", cls_cfg.learning_rate))
+    cls_cfg.weight_decay = float(cls_section.get("weight_decay", cls_cfg.weight_decay))
+    cls_cfg.hidden_sizes = [int(v) for v in cls_section.get("hidden_sizes", cls_cfg.hidden_sizes)]
+    cls_cfg.dropout = float(cls_section.get("dropout", cls_cfg.dropout))
+    cls_cfg.tune = bool(args.tune or (bool(cls_section.get("tune", cls_cfg.tune)) and not args.no_tune))
+    if args.n_trials is None:
+        cls_cfg.n_trials = int(cls_section.get("n_trials", cls_cfg.n_trials))
+    cls_cfg.tuning_epochs = int(cls_section.get("tuning_epochs", cls_cfg.tuning_epochs))
+    cls_cfg.tuning_patience = int(cls_section.get("tuning_patience", cls_cfg.tuning_patience))
+    if args.tuning_cv_folds is None:
+        cls_cfg.tuning_cv_folds = int(cls_section.get("tuning_cv_folds", cls_cfg.tuning_cv_folds))
+    cls_cfg.optuna_search_space = dict(cls_section.get("optuna_search_space", cls_cfg.optuna_search_space))
+
+    cls_best_params = None
+    if cls_cfg.tune:
+        print("Running Optuna for Step4_2 (classification)...")
+        cls_best_params = tune_classifier_hyperparameters(
+            split_df=split_df,
+            embedding_table=embedding_table,
+            train_cfg=cls_cfg,
+            device=device,
+            tuning_dir=cls_tuning_dir,
+            dpi=dpi,
+            font_size=font_size,
+        )
+        print("Step4_2 best params:")
+        print(cls_best_params)
+
+    if cls_best_params is None:
+        cls_chosen = {
+            "hidden_sizes": cls_cfg.hidden_sizes,
+            "dropout": cls_cfg.dropout,
+            "learning_rate": cls_cfg.learning_rate,
+            "weight_decay": cls_cfg.weight_decay,
+            "batch_size": cls_cfg.batch_size,
+        }
+    else:
+        cls_num_layers = int(cls_best_params["num_layers"])
+        cls_chosen = {
+            "hidden_sizes": [int(cls_best_params[f"hidden_{i}"]) for i in range(cls_num_layers)],
+            "dropout": float(cls_best_params["dropout"]),
+            "learning_rate": float(cls_best_params["learning_rate"]),
+            "weight_decay": float(cls_best_params["weight_decay"]),
+            "batch_size": int(cls_best_params["batch_size"]),
+        }
+
+    with open(cls_metrics_dir / "chosen_hyperparameters.json", "w") as f:
+        json.dump(cls_chosen, f, indent=2)
+    with open(cls_metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
+        json.dump(
+            {
+                "used_optuna": bool(cls_cfg.tune),
+                "optuna_objective": "maximize_val_balanced_accuracy",
+                "tuning_cv_folds": int(cls_cfg.tuning_cv_folds),
+                "optuna_best_params": cls_best_params,
+                "final_training_hyperparameters": cls_chosen,
+                "final_training_num_epochs": int(cls_cfg.num_epochs),
+                "final_training_patience": int(cls_cfg.patience),
+            },
+            f,
+            indent=2,
+        )
+
+    cls_model, cls_history, cls_predictions = train_one_classifier_model(
+        split_df=split_df,
+        embedding_table=embedding_table,
+        device=device,
+        hidden_sizes=cls_chosen["hidden_sizes"],
+        dropout=cls_chosen["dropout"],
+        learning_rate=cls_chosen["learning_rate"],
+        weight_decay=cls_chosen["weight_decay"],
+        batch_size=cls_chosen["batch_size"],
+        num_epochs=cls_cfg.num_epochs,
+        patience=cls_cfg.patience,
+    )
+
+    cls_checkpoint = {
+        "model_state_dict": cls_model.state_dict(),
+        "embedding_dim": int(embedding_table.shape[1]),
+        "hidden_sizes": cls_chosen["hidden_sizes"],
+        "dropout": cls_chosen["dropout"],
+        "learning_rate": cls_chosen["learning_rate"],
+        "weight_decay": cls_chosen["weight_decay"],
+        "batch_size": cls_chosen["batch_size"],
+        "used_optuna": bool(cls_cfg.tune),
+        "optuna_best_params": cls_best_params,
+        "split_mode": cls_cfg.split_mode,
+        "dataset_path": str(chi_csv),
+        "config": config,
+    }
+    torch.save(cls_checkpoint, checkpoint_dir / "chi_classifier_best.pt")
+
+    _save_history(cls_history, cls_metrics_dir / "class_training_history.csv")
+    cls_pred_df = _save_classifier_prediction_csvs(split_df=split_df, predictions=cls_predictions, out_dir=cls_metrics_dir)
+    _collect_classifier_metrics(cls_pred_df, out_dir=cls_metrics_dir)
+    _make_classifier_figures(
+        history=cls_history,
+        pred_df=cls_pred_df,
+        fig_dir=cls_figures_dir,
+        dpi=dpi,
+        font_size=font_size,
+    )
+
+    # -------------------------
+    # Combined legacy outputs for downstream steps
+    # -------------------------
+    merged_predictions = _merge_predictions(reg_predictions, cls_predictions)
+
+    _save_history(reg_history, metrics_dir / "chi_training_history.csv")
+    pred_df = _save_prediction_csvs(split_df=split_df, predictions=merged_predictions, out_dir=metrics_dir)
     _collect_metrics(pred_df, out_dir=metrics_dir)
-    _save_coefficient_summary(
-        model,
-        emb_cache,
-        metrics_dir / "polymer_coefficients.csv",
+    _collect_classifier_metrics(pred_df, out_dir=metrics_dir)
+    _save_combined_polymer_coefficients(
+        reg_model=reg_model,
+        cls_model=cls_model,
+        embedding_cache_df=emb_cache,
+        out_csv=metrics_dir / "polymer_coefficients.csv",
         device=device,
         tokenizer=tokenizer_for_training,
         timestep=train_cfg.timestep_for_embedding,
     )
     _make_figures(
-        history=history,
+        history=reg_history,
         pred_df=pred_df,
         fig_dir=figures_dir,
-        dpi=int(config.get("plotting", {}).get("dpi", 300)),
-        font_size=int(config.get("plotting", {}).get("font_size", 12)),
+        dpi=dpi,
+        font_size=font_size,
     )
 
+    with open(metrics_dir / "chosen_hyperparameters.json", "w") as f:
+        json.dump(
+            {
+                "step4_1_regression": reg_chosen,
+                "step4_2_classification": cls_chosen,
+            },
+            f,
+            indent=2,
+        )
+    with open(metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
+        json.dump(
+            {
+                "used_optuna": bool(train_cfg.tune),
+                "step4_1_regression": {
+                    "objective": "maximize_val_r2",
+                    "optuna_best_params": reg_best_params,
+                    "final_training_hyperparameters": reg_chosen,
+                },
+                "step4_2_classification": {
+                    "objective": "maximize_val_balanced_accuracy",
+                    "optuna_best_params": cls_best_params,
+                    "final_training_hyperparameters": cls_chosen,
+                },
+                "tuning_cv_folds": int(train_cfg.tuning_cv_folds),
+            },
+            f,
+            indent=2,
+        )
+
     overall_metrics_df = pd.read_csv(metrics_dir / "chi_metrics_overall.csv")
+    class_metrics_df = pd.read_csv(metrics_dir / "class_metrics_overall.csv")
     test_rows = overall_metrics_df[overall_metrics_df["split"] == "test"]
     test_row = test_rows.iloc[0] if len(test_rows) > 0 else overall_metrics_df.iloc[-1]
+    cls_test_rows = class_metrics_df[class_metrics_df["split"] == "test"]
+    cls_test_row = cls_test_rows.iloc[0] if len(cls_test_rows) > 0 else class_metrics_df.iloc[-1]
     summary = {
         "step": "step4_chi_training",
         "model_size": args.model_size or "small",
         "split_mode": train_cfg.split_mode,
-        "backbone_num_layers": int(backbone_num_layers),
-        "finetune_last_layers": int(chosen_finetune_last_layers),
-        "backbone_finetune_enabled": bool(use_backbone_finetune),
         "n_data_rows": int(len(split_df)),
         "n_polymers": int(split_df["polymer_id"].nunique()),
-        "n_epochs": int(len(history["epoch"])),
-        "best_val_loss": float(np.nanmin(history["val_loss"])) if len(history["val_loss"]) > 0 else np.nan,
+        "step4_1_backbone_num_layers": int(backbone_num_layers),
+        "step4_1_finetune_last_layers": int(reg_finetune_last_layers),
+        "step4_1_backbone_finetune_enabled": bool(reg_use_backbone_finetune),
+        "step4_1_n_epochs": int(len(reg_history["epoch"])),
+        "step4_2_n_epochs": int(len(cls_history["epoch"])),
         "test_mae": float(test_row["mae"]) if "mae" in test_row else np.nan,
         "test_rmse": float(test_row["rmse"]) if "rmse" in test_row else np.nan,
         "test_r2": float(test_row["r2"]) if "r2" in test_row else np.nan,
-        "test_balanced_accuracy": float(test_row["balanced_accuracy"]) if "balanced_accuracy" in test_row else np.nan,
-        "test_auroc": float(test_row["auroc"]) if "auroc" in test_row else np.nan,
+        "test_balanced_accuracy": float(cls_test_row["balanced_accuracy"]) if "balanced_accuracy" in cls_test_row else np.nan,
+        "test_auroc": float(cls_test_row["auroc"]) if "auroc" in cls_test_row else np.nan,
     }
     save_step_summary(summary, metrics_dir)
+    save_artifact_manifest(step_dir=reg_dir, metrics_dir=reg_metrics_dir, figures_dir=reg_figures_dir)
+    save_artifact_manifest(step_dir=cls_dir, metrics_dir=cls_metrics_dir, figures_dir=cls_figures_dir)
     save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figures_dir)
 
     print("Training complete.")
     print(f"Outputs: {step_dir}")
-    print(f"Checkpoint: {checkpoint_dir / 'chi_physics_best.pt'}")
+    print(f"Step4_1 checkpoint: {checkpoint_dir / 'chi_regression_best.pt'}")
+    print(f"Step4_2 checkpoint: {checkpoint_dir / 'chi_classifier_best.pt'}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Step 4: train physics-guided chi model")
+    parser = argparse.ArgumentParser(description="Step 4: train Step4_1 regression + Step4_2 classification models")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Config path")
     parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to chi dataset CSV")
@@ -2073,14 +2461,8 @@ if __name__ == "__main__":
         "--tuning_objective",
         type=str,
         default=None,
-        choices=["val_r2", "rmse_class_penalty"],
-        help="Optuna objective: val_r2 or rmse_class_penalty",
-    )
-    parser.add_argument(
-        "--tuning_class_penalty_weight",
-        type=float,
-        default=None,
-        help="Weight for (1-balanced_accuracy) in rmse_class_penalty objective",
+        choices=["val_r2"],
+        help="Regression Optuna objective for Step4_1 (Step4_2 always tunes balanced_accuracy)",
     )
     parser.add_argument(
         "--tuning_cv_folds",
@@ -2092,7 +2474,7 @@ if __name__ == "__main__":
         "--finetune_last_layers",
         type=int,
         default=None,
-        help="Override chi_training.finetune_last_layers (valid range: 0..num_layers)",
+        help="Override chi_training.step4_1_regression.finetune_last_layers (valid range: 0..num_layers)",
     )
     args = parser.parse_args()
     main(args)

@@ -27,9 +27,9 @@ class SplitConfig:
     """Split configuration for chi dataset."""
 
     split_mode: str = "polymer"
-    train_ratio: float = 0.7
-    val_ratio: float = 0.15
-    test_ratio: float = 0.15
+    train_ratio: float = 0.70
+    val_ratio: float = 0.14
+    test_ratio: float = 0.16
     seed: int = 42
 
 

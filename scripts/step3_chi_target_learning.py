@@ -27,14 +27,29 @@ CLASS_NAME_MAP = {1: "Water-soluble", 0: "Water-insoluble"}
 
 def _default_chi_config(config: Dict) -> Dict:
     chi_cfg = config.get("chi_training", {})
+    shared = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared", {}), dict) else {}
+    step3_cfg = (
+        chi_cfg.get("step3_target_learning", {})
+        if isinstance(chi_cfg.get("step3_target_learning", {}), dict)
+        else {}
+    )
+
     defaults = {
         "dataset_path": "Data/chi/_50_polymers_T_phi.csv",
         "split_mode": "polymer",
         "target_objective": "balanced_accuracy",
         "target_bootstrap_repeats": 800,
     }
+
     out = defaults.copy()
-    out.update(chi_cfg)
+    out["dataset_path"] = str(shared.get("dataset_path", chi_cfg.get("dataset_path", defaults["dataset_path"])))
+    out["split_mode"] = str(shared.get("split_mode", chi_cfg.get("split_mode", defaults["split_mode"])))
+    out["target_objective"] = str(
+        step3_cfg.get("target_objective", chi_cfg.get("target_objective", defaults["target_objective"]))
+    )
+    out["target_bootstrap_repeats"] = int(
+        step3_cfg.get("target_bootstrap_repeats", chi_cfg.get("target_bootstrap_repeats", defaults["target_bootstrap_repeats"]))
+    )
     return out
 
 

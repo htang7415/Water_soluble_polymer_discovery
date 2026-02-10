@@ -119,65 +119,101 @@ training_property:
   finetune_last_layers: 6  # legacy property-head setting; Step 4 uses chi_training.finetune_last_layers (fallback here if missing)
   default_timestep: 1
 
-# Step 3-6 chi workflow config
+# Step 3-6 chi workflow config (per-step structure)
 chi_training:
-  dataset_path: "Data/chi/_50_polymers_T_phi.csv"  # labeled chi(T,phi) dataset used in Steps 3-6
-  split_mode: "polymer"  # data split mode: polymer (hold out polymers) | random (row-wise random)
+  shared:
+    dataset_path: "Data/chi/_50_polymers_T_phi.csv"  # labeled chi(T,phi) dataset used in Steps 3-6
+    split_mode: "polymer"  # data split mode: polymer (hold out polymers) | random (row-wise random)
+    split:
+      train_ratio: 0.70  # train+val=84% dev pool for CV tuning; remaining 16% held-out test
+      val_ratio: 0.14
+      test_ratio: 0.16
+    embedding:
+      timestep: 1  # diffusion timestep used for embedding extraction
+      batch_size: 128  # batch size for embedding extraction
 
-  # Step 3: chi_target learning
-  target_objective: "balanced_accuracy"  # threshold objective: balanced_accuracy | youden_j | f1 | accuracy
-  target_bootstrap_repeats: 800  # bootstrap repeats for chi_target stability estimation
+  step3_target_learning:
+    target_objective: "balanced_accuracy"  # threshold objective: balanced_accuracy | youden_j | f1 | accuracy
+    target_bootstrap_repeats: 800  # bootstrap repeats for chi_target stability estimation
 
-  # Step 4: chi(T,phi) model training
-  train_ratio: 0.8  # fraction of available train split used for fitting
-  val_ratio: 0.1  # validation ratio within train split
-  test_ratio: 0.1  # test ratio for evaluation holdout
-  batch_size: 128  # Step 4 training batch size
-  num_epochs: 500  # max training epochs
-  patience: 20  # early-stop patience on validation metric
-  learning_rate: 1.0e-3  # optimizer learning rate
-  weight_decay: 1.0e-5  # L2 regularization
-  lambda_bce: 0.1  # weight for soluble-class BCE term in joint loss
-  hidden_sizes: [256, 512, 128]  # MLP hidden layer sizes for chi head
-  dropout: 0.1  # dropout probability in chi head
-  finetune_last_layers: 0  # Step 4 fallback finetune depth when not tuned (integer in [0, num_layers(model_size)]); 0=freeze backbone
+  # Step4_1: chi(T,phi) regression
+  step4_1_regression:
+    batch_size: 128
+    num_epochs: 500
+    patience: 20
+    learning_rate: 1.0e-3
+    weight_decay: 1.0e-5
+    lambda_bce: 0.0  # fixed to 0.0 for regression-only mode
+    hidden_sizes: [256, 512, 128]
+    dropout: 0.1
+    finetune_last_layers: 0  # integer in [0, num_layers(model_size)]; 0=freeze backbone
 
-  # Step 4 Optuna
-  tune: true  # enable Optuna hyperparameter search
-  n_trials: 50  # number of Optuna trials
-  tuning_epochs: 100  # max epochs per tuning trial
-  tuning_patience: 20  # early-stop patience per tuning trial
-  tuning_objective: "val_r2"  # tuning objective: val_r2 | rmse_class_penalty
-  tuning_class_penalty_weight: 0.25  # score term for (1 - balanced_accuracy) when tuning_objective=rmse_class_penalty
-  tuning_cv_folds: 5  # stratified CV folds over train+val subset used during tuning
-  optuna_search_space:
-    # If list has exactly 2 values, it is treated as a continuous range [min, max].
-    # If list has >2 values, it is treated as categorical choices.
-    # finetune_last_layers defaults to dynamic range [0, num_layers(model_size)] if omitted.
-    num_layers: [2, 3, 4, 5]
-    hidden_units: [64, 128, 256, 512, 1024]
-    dropout: [0.0, 0.1, 0.2, 0.3]
-    learning_rate: [1.0e-4, 5.0e-3]
-    learning_rate_log: true
-    weight_decay: [1.0e-7, 1.0e-3]
-    weight_decay_log: true
-    lambda_bce: [0.01, 0.05, 0.1, 0.2, 0.5]
-    batch_size: [8, 16, 32, 64, 128, 256]
+    tune: true
+    n_trials: 50
+    tuning_epochs: 100
+    tuning_patience: 20
+    tuning_objective: "val_r2"  # regression objective uses mean CV val_r2
+    tuning_cv_folds: 6
+    optuna_search_space:
+      # If list has exactly 2 values, it is treated as a continuous range [min, max].
+      # If list has >2 values, it is treated as categorical choices.
+      # finetune_last_layers defaults to dynamic range [0, num_layers(model_size)] if omitted.
+      num_layers: [2, 3, 4, 5]
+      hidden_units: [64, 128, 256, 512, 1024]
+      dropout: [0.0, 0.1, 0.2, 0.3]
+      learning_rate: [1.0e-4, 5.0e-3]
+      learning_rate_log: true
+      weight_decay: [1.0e-7, 1.0e-3]
+      weight_decay_log: true
+      lambda_bce: [0.0]
+      batch_size: [4, 8, 16, 32, 64, 128]
 
-  # Step 4/5/6 embedding extraction
-  embedding_timestep: 1  # diffusion timestep used for embedding extraction
-  embedding_batch_size: 128  # batch size for embedding extraction
+  # Step4_2: water-soluble classification
+  step4_2_classification:
+    batch_size: 128
+    num_epochs: 500
+    patience: 20
+    learning_rate: 1.0e-3
+    weight_decay: 1.0e-5
+    hidden_sizes: [256, 512, 128]
+    dropout: 0.1
 
-  # Step 5/6 inverse-design scoring
-  epsilon: 0.05  # tolerance for property hit when property_rule=band
-  class_weight: 0.25  # penalty weight for low soluble confidence in ranking score
-  polymer_class_weight: 0.50  # Step 6 only: penalty weight for class mismatch in ranking score
-  target_polymer_count: 100  # final number of exported target polymers
-  target_sa_max: 4.0  # SA upper bound for final target polymer export
-  candidate_source: "known"  # candidate pool source: known | novel | hybrid (recommended: known; novel/hybrid require Step 2 or --generated_csv)
-  property_rule: "upper_bound"  # property constraint mode: band | upper_bound | lower_bound
-  coverage_topk: 5  # top-k used in coverage/frequency summaries
-  target_polymer_class: "polyamide"  # Step 6 class target: all, polyimide, polyester, polyamide, polyurethane, polyether
+    tune: true
+    n_trials: 50
+    tuning_epochs: 100
+    tuning_patience: 20
+    tuning_cv_folds: 6
+    optuna_search_space:
+      num_layers: [2, 3, 4, 5]
+      hidden_units: [64, 128, 256, 512, 1024]
+      dropout: [0.0, 0.1, 0.2, 0.3]
+      learning_rate: [1.0e-4, 5.0e-3]
+      learning_rate_log: true
+      weight_decay: [1.0e-7, 1.0e-3]
+      weight_decay_log: true
+      batch_size: [4, 8, 16, 32, 64]
+
+  # Step 5 inverse-design scoring
+  step5_inverse_design:
+    epsilon: 0.05  # tolerance for property hit when property_rule=band
+    class_weight: 0.25  # penalty weight for low soluble confidence in ranking score
+    target_polymer_count: 100  # final number of exported target polymers
+    target_sa_max: 4.0  # SA upper bound for final target polymer export
+    candidate_source: "known"  # known | novel | hybrid
+    property_rule: "upper_bound"  # band | upper_bound | lower_bound
+    coverage_topk: 5  # top-k used in coverage/frequency summaries
+
+  # Step 6 inverse-design scoring (class + property)
+  step6_class_inverse_design:
+    epsilon: 0.05
+    class_weight: 0.25
+    polymer_class_weight: 0.50  # penalty weight for class mismatch in ranking score
+    target_polymer_count: 100
+    target_sa_max: 4.0
+    candidate_source: "known"
+    property_rule: "upper_bound"
+    coverage_topk: 5
+    target_polymer_class: "polyamide"  # all | polyimide | polyester | polyamide | polyurethane | polyether
 
 checkpointing:
   save_best_only: true
