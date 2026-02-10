@@ -9,11 +9,11 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+import torch
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -352,11 +352,46 @@ def _select_final_target_polymers(
             mean_property_error_all_targets=("property_error", "mean"),
             max_property_error_all_targets=("property_error", "max"),
         )
+
+    required_by_class: Dict[str, int] = {}
+    if {"target_id", "target_polymer_class"}.issubset(by_polymer.columns):
+        per_polymer_class = by_polymer.groupby(
+            [dedup_key, "target_polymer_class"], as_index=False
+        ).agg(
+            n_targets_evaluated=("target_id", "nunique"),
+            n_targets_joint_hit=("joint_condition_hit", "sum"),
+        )
+        required_by_class = (
+            by_polymer.groupby("target_polymer_class")["target_id"]
+            .nunique()
+            .astype(int)
+            .to_dict()
+        )
+        per_polymer_class["n_targets_required_for_class"] = per_polymer_class["target_polymer_class"].map(required_by_class).astype(int)
+        per_polymer_class["passes_target_class"] = (
+            (per_polymer_class["n_targets_evaluated"] == per_polymer_class["n_targets_required_for_class"])
+            & (per_polymer_class["n_targets_joint_hit"] == per_polymer_class["n_targets_required_for_class"])
+        ).astype(int)
+        class_level = per_polymer_class.groupby(dedup_key, as_index=False).agg(
+            n_target_classes_required=("target_polymer_class", "nunique"),
+            n_target_classes_pass=("passes_target_class", "sum"),
+        )
+        class_level["passes_any_target_class"] = (class_level["n_target_classes_pass"] >= 1).astype(int)
+    else:
+        class_level = per_polymer[[dedup_key]].copy()
+        class_level["n_target_classes_required"] = 1
+        class_level["n_target_classes_pass"] = (
+            (per_polymer["n_targets_evaluated"] == int(required_targets))
+            & (per_polymer["n_targets_joint_hit"] == int(required_targets))
+        ).astype(int)
+        class_level["passes_any_target_class"] = class_level["n_target_classes_pass"]
+
+    required_targets_for_any_class = int(max(required_by_class.values())) if required_by_class else int(required_targets)
+    n_target_classes_required = int(len(required_by_class)) if required_by_class else 1
+
     per_polymer["n_targets_required"] = int(required_targets)
-    per_polymer["passes_all_target_conditions"] = (
-        (per_polymer["n_targets_evaluated"] == int(required_targets))
-        & (per_polymer["n_targets_joint_hit"] == int(required_targets))
-    ).astype(int)
+    per_polymer = per_polymer.merge(class_level, on=dedup_key, how="left")
+    per_polymer["passes_all_target_conditions"] = per_polymer["passes_any_target_class"].astype(int)
 
     ranked = ranked.drop_duplicates(subset=[dedup_key], keep="first").reset_index(drop=True)
     ranked = ranked.merge(per_polymer, on=dedup_key, how="left")
@@ -419,6 +454,9 @@ def _select_final_target_polymers(
                 "n_targets_required": int(row["n_targets_required"]) if not pd.isna(row.get("n_targets_required", np.nan)) else 0,
                 "n_targets_evaluated": int(row["n_targets_evaluated"]) if not pd.isna(row.get("n_targets_evaluated", np.nan)) else 0,
                 "n_targets_joint_hit": int(row["n_targets_joint_hit"]) if not pd.isna(row.get("n_targets_joint_hit", np.nan)) else 0,
+                "n_target_classes_required": int(row["n_target_classes_required"]) if not pd.isna(row.get("n_target_classes_required", np.nan)) else 0,
+                "n_target_classes_pass": int(row["n_target_classes_pass"]) if not pd.isna(row.get("n_target_classes_pass", np.nan)) else 0,
+                "passes_any_target_class": int(row["passes_any_target_class"]) if not pd.isna(row.get("passes_any_target_class", np.nan)) else 0,
                 "passes_all_target_conditions": int(row["passes_all_target_conditions"]) if not pd.isna(row.get("passes_all_target_conditions", np.nan)) else 0,
                 "mean_property_error_all_targets": float(row["mean_property_error_all_targets"]) if not pd.isna(row.get("mean_property_error_all_targets", np.nan)) else np.nan,
                 "max_property_error_all_targets": float(row["max_property_error_all_targets"]) if not pd.isna(row.get("max_property_error_all_targets", np.nan)) else np.nan,
@@ -429,8 +467,10 @@ def _select_final_target_polymers(
     real_total_sampling_points = int(total_sampling_points) if total_sampling_points is not None else int(len(all_df))
     if all_df.empty:
         return pd.DataFrame(), {
-            "required_targets_per_polymer": int(required_targets),
+            "required_targets_per_polymer": int(required_targets_for_any_class),
+            "required_target_classes": int(n_target_classes_required),
             "n_polymers_pass_all_targets": 0,
+            "n_polymers_pass_any_target_class": 0,
             "target_count_requested": int(target_count),
             "total_candidates_screened": int(real_total_sampling_points),
             "total_candidates_evaluated_after_target_aggregation": 0,
@@ -468,8 +508,10 @@ def _select_final_target_polymers(
     sa_vals = selected["sa_score"].to_numpy(dtype=float) if not selected.empty else np.array([])
     prop_vals = selected["max_property_error_all_targets"].to_numpy(dtype=float) if not selected.empty else np.array([])
     summary = {
-        "required_targets_per_polymer": int(required_targets),
+        "required_targets_per_polymer": int(required_targets_for_any_class),
+        "required_target_classes": int(n_target_classes_required),
         "n_polymers_pass_all_targets": int(all_df["passes_all_target_conditions"].sum()),
+        "n_polymers_pass_any_target_class": int(all_df["passes_any_target_class"].sum()),
         "target_count_requested": int(target_count),
         "total_candidates_screened": int(real_total_sampling_points),
         "total_candidates_evaluated_after_target_aggregation": int(len(all_df)),
@@ -881,7 +923,7 @@ if __name__ == "__main__":
         "--candidate_source",
         type=str,
         default=None,
-        help="Only novel/generated/step2 are supported for Step 6.",
+        help="Candidate pool source: novel|known|hybrid (aliases: generated/step2->novel, step4/training->known).",
     )
     parser.add_argument("--generated_csv", type=str, default=None, help="Generated samples CSV from Step 2")
     parser.add_argument("--generated_smiles_column", type=str, default="smiles", help="SMILES column name in generated_csv")

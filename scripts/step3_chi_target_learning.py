@@ -9,17 +9,17 @@ import sys
 from pathlib import Path
 from typing import Dict, Tuple
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.chi.data import SplitConfig, add_split_column, load_chi_dataset, make_split_assignments
+from src.utils.config import load_config, save_config
+from src.utils.reproducibility import save_run_metadata, seed_everything
+from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from src.chi.data import load_chi_dataset
-from src.utils.config import load_config, save_config
-from src.utils.reproducibility import save_run_metadata, seed_everything
-from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
 
 
 CLASS_NAME_MAP = {1: "Water-soluble", 0: "Water-insoluble"}
@@ -28,6 +28,7 @@ CLASS_NAME_MAP = {1: "Water-soluble", 0: "Water-insoluble"}
 def _default_chi_config(config: Dict) -> Dict:
     chi_cfg = config.get("chi_training", {})
     shared = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared", {}), dict) else {}
+    split_cfg = shared.get("split", {}) if isinstance(shared.get("split", {}), dict) else {}
     step3_cfg = (
         chi_cfg.get("step3_target_learning", {})
         if isinstance(chi_cfg.get("step3_target_learning", {}), dict)
@@ -37,6 +38,9 @@ def _default_chi_config(config: Dict) -> Dict:
     defaults = {
         "dataset_path": "Data/chi/_50_polymers_T_phi.csv",
         "split_mode": "polymer",
+        "train_ratio": 0.70,
+        "val_ratio": 0.14,
+        "test_ratio": 0.16,
         "target_objective": "balanced_accuracy",
         "target_bootstrap_repeats": 800,
     }
@@ -44,6 +48,9 @@ def _default_chi_config(config: Dict) -> Dict:
     out = defaults.copy()
     out["dataset_path"] = str(shared.get("dataset_path", chi_cfg.get("dataset_path", defaults["dataset_path"])))
     out["split_mode"] = str(shared.get("split_mode", chi_cfg.get("split_mode", defaults["split_mode"])))
+    out["train_ratio"] = float(split_cfg.get("train_ratio", chi_cfg.get("train_ratio", defaults["train_ratio"])))
+    out["val_ratio"] = float(split_cfg.get("val_ratio", chi_cfg.get("val_ratio", defaults["val_ratio"])))
+    out["test_ratio"] = float(split_cfg.get("test_ratio", chi_cfg.get("test_ratio", defaults["test_ratio"])))
     out["target_objective"] = str(
         step3_cfg.get("target_objective", chi_cfg.get("target_objective", defaults["target_objective"]))
     )
@@ -388,7 +395,11 @@ def main(args):
     if objective not in {"balanced_accuracy", "youden_j", "f1", "accuracy"}:
         raise ValueError(f"Unsupported objective: {objective}")
 
-    n_bootstrap = int(args.bootstrap_repeats or chi_cfg.get("target_bootstrap_repeats", 800))
+    n_bootstrap = int(
+        args.bootstrap_repeats
+        if args.bootstrap_repeats is not None
+        else chi_cfg.get("target_bootstrap_repeats", 800)
+    )
     if n_bootstrap < 0:
         raise ValueError("bootstrap_repeats must be >= 0")
 
@@ -429,8 +440,34 @@ def main(args):
     print("=" * 70)
 
     df = load_chi_dataset(dataset_path)
-    x_all = df["chi"].to_numpy(dtype=float)
-    y_all = df["water_soluble"].to_numpy(dtype=int)
+    split_assignments = make_split_assignments(
+        df,
+        SplitConfig(
+            split_mode=split_mode,
+            train_ratio=float(chi_cfg.get("train_ratio", 0.70)),
+            val_ratio=float(chi_cfg.get("val_ratio", 0.14)),
+            test_ratio=float(chi_cfg.get("test_ratio", 0.16)),
+            seed=seed,
+        ),
+    )
+    df = add_split_column(df, split_assignments)
+    split_assignments.to_csv(metrics_dir / "split_assignments.csv", index=False)
+    df.to_csv(metrics_dir / "chi_dataset_with_split.csv", index=False)
+
+    dev_df = df[df["split"].isin(["train", "val"])].copy().reset_index(drop=True)
+    test_df = df[df["split"] == "test"].copy().reset_index(drop=True)
+    if dev_df.empty:
+        raise RuntimeError("No train/val rows available for Step 3 chi_target learning.")
+    if test_df.empty:
+        raise RuntimeError("No held-out test rows available for Step 3 chi_target evaluation.")
+
+    print(
+        f"Split rows: train={int((df['split'] == 'train').sum())}, "
+        f"val={int((df['split'] == 'val').sum())}, test={int((df['split'] == 'test').sum())}"
+    )
+
+    x_all = dev_df["chi"].to_numpy(dtype=float)
+    y_all = dev_df["water_soluble"].to_numpy(dtype=int)
 
     # global scan
     global_scan = _scan_thresholds(x_all, y_all, positive_when_low=positive_when_low)
@@ -452,7 +489,7 @@ def main(args):
     # condition-wise scan
     scan_rows = []
     best_rows = []
-    for idx, ((t, phi), sub) in enumerate(df.groupby(["temperature", "phi"])):
+    for idx, ((t, phi), sub) in enumerate(dev_df.groupby(["temperature", "phi"])):
         x = sub["chi"].to_numpy(dtype=float)
         y = sub["water_soluble"].to_numpy(dtype=int)
         scan = _scan_thresholds(x, y, positive_when_low=positive_when_low)
@@ -481,7 +518,57 @@ def main(args):
 
     cond_best = cond_best.rename(columns={"threshold": "chi_target"})
     cond_best = cond_best.sort_values(["temperature", "phi"]).reset_index(drop=True)
-    stability_df = _condition_stability_report(df, scan_df, cond_best, objective)
+    stability_df = _condition_stability_report(dev_df, scan_df, cond_best, objective)
+
+    # Hold-out test evaluation (thresholds learned on train+val dev split only).
+    global_thr = float(global_best["chi_target"].iloc[0])
+    y_test = test_df["water_soluble"].to_numpy(dtype=int)
+    x_test = test_df["chi"].to_numpy(dtype=float)
+    pred_test_global = (x_test <= global_thr).astype(int)
+    test_global = _confusion_metrics(y_test, pred_test_global)
+
+    test_cond_df = test_df.merge(
+        cond_best[["temperature", "phi", "chi_target"]],
+        on=["temperature", "phi"],
+        how="left",
+    )
+    matched_mask = test_cond_df["chi_target"].notna().to_numpy(dtype=bool)
+    if np.any(matched_mask):
+        y_test_cond = test_cond_df.loc[matched_mask, "water_soluble"].to_numpy(dtype=int)
+        x_test_cond = test_cond_df.loc[matched_mask, "chi"].to_numpy(dtype=float)
+        thr_test_cond = test_cond_df.loc[matched_mask, "chi_target"].to_numpy(dtype=float)
+        pred_test_cond = (x_test_cond <= thr_test_cond).astype(int)
+        test_conditional = _confusion_metrics(y_test_cond, pred_test_cond)
+    else:
+        test_conditional = {
+            "tp": 0,
+            "tn": 0,
+            "fp": 0,
+            "fn": 0,
+            "accuracy": np.nan,
+            "balanced_accuracy": np.nan,
+            "precision": np.nan,
+            "recall": np.nan,
+            "specificity": np.nan,
+            "f1": np.nan,
+            "youden_j": np.nan,
+        }
+
+    holdout_rows = [
+        {
+            "evaluation": "global_threshold_on_test",
+            "n_eval_rows": int(len(test_df)),
+            "coverage": 1.0,
+            **test_global,
+        },
+        {
+            "evaluation": "condition_thresholds_on_test",
+            "n_eval_rows": int(np.sum(matched_mask)),
+            "coverage": float(np.mean(matched_mask)) if len(test_df) > 0 else 0.0,
+            **test_conditional,
+        },
+    ]
+    holdout_df = pd.DataFrame(holdout_rows)
 
     # recommended targets for inverse design
     target_rows = []
@@ -527,15 +614,24 @@ def main(args):
     _round_float_columns(scan_df, ndigits=4).to_csv(metrics_dir / "chi_target_scan_by_condition.csv", index=False)
     _round_float_columns(cond_best, ndigits=4).to_csv(metrics_dir / "chi_target_best_by_condition.csv", index=False)
     _round_float_columns(stability_df, ndigits=4).to_csv(metrics_dir / "chi_target_condition_stability.csv", index=False)
+    _round_float_columns(holdout_df, ndigits=4).to_csv(metrics_dir / "chi_target_holdout_metrics.csv", index=False)
     _round_float_columns(targets_df, ndigits=4).to_csv(metrics_dir / "chi_target_for_inverse_design.csv", index=False)
 
     summary = {
         "dataset_path": str(dataset_path),
+        "split_mode": split_mode,
+        "split_train_ratio": float(chi_cfg.get("train_ratio", 0.70)),
+        "split_val_ratio": float(chi_cfg.get("val_ratio", 0.14)),
+        "split_test_ratio": float(chi_cfg.get("test_ratio", 0.16)),
         "objective": objective,
         "rule": "soluble_if_chi_leq_target",
         "bootstrap_repeats": int(n_bootstrap),
         "n_rows": int(len(df)),
+        "n_rows_dev": int(len(dev_df)),
+        "n_rows_test": int(len(test_df)),
         "n_polymers": int(df["Polymer"].nunique()),
+        "n_polymers_dev": int(dev_df["Polymer"].nunique()),
+        "n_polymers_test": int(test_df["Polymer"].nunique()),
         "n_soluble": int(df[df["water_soluble"] == 1]["Polymer"].nunique()),
         "n_insoluble": int(df[df["water_soluble"] == 0]["Polymer"].nunique()),
         "global_chi_target": float(global_best["chi_target"].iloc[0]),
@@ -543,6 +639,11 @@ def main(args):
         "global_youden_j": float(global_best["youden_j"].iloc[0]),
         "global_chi_target_boot_q025": float(global_best["chi_target_boot_q025"].iloc[0]),
         "global_chi_target_boot_q975": float(global_best["chi_target_boot_q975"].iloc[0]),
+        "global_test_balanced_accuracy": float(test_global["balanced_accuracy"]),
+        "global_test_accuracy": float(test_global["accuracy"]),
+        "condition_test_balanced_accuracy": float(test_conditional["balanced_accuracy"]),
+        "condition_test_accuracy": float(test_conditional["accuracy"]),
+        "condition_test_coverage": float(np.mean(matched_mask)) if len(test_df) > 0 else 0.0,
         "n_conditions": int(cond_best.shape[0]),
         "mean_condition_balanced_accuracy": float(cond_best["balanced_accuracy"].mean()),
         "std_condition_balanced_accuracy": float(cond_best["balanced_accuracy"].std()),
@@ -564,7 +665,7 @@ def main(args):
     # figures
     dpi = int(config.get("plotting", {}).get("dpi", 600))
     font_size = int(config.get("plotting", {}).get("font_size", 12))
-    _make_figures(cond_best, global_best, df, objective, figures_dir, dpi=dpi, font_size=font_size)
+    _make_figures(cond_best, global_best, dev_df, objective, figures_dir, dpi=dpi, font_size=font_size)
     save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figures_dir)
 
     print("Step 3 complete.")

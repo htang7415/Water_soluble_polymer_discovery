@@ -47,11 +47,11 @@ def _expected_files(split_mode: str) -> Dict[str, List[str]]:
             "figures/chi_target_heatmap.png",
         ],
         f"step4_chi_training/{split_mode}": [
-            "metrics/step_summary.csv",
-            "metrics/artifact_manifest.csv",
-            "metrics/chi_metrics_overall.csv",
-            "metrics/polymer_coefficients.csv",
-            "figures/chi_loss_curve.png",
+            "pipeline_metrics/step_summary.csv",
+            "step4_1_regression/metrics/chi_metrics_overall.csv",
+            "step4_1_regression/metrics/polymer_coefficients_regression_only.csv",
+            "step4_2_classification/metrics/class_metrics_overall.csv",
+            "step4_1_regression/figures/chi_loss_curve.png",
         ],
         f"step5_water_soluble_inverse_design/{split_mode}": [
             "metrics/step_summary.csv",
@@ -116,6 +116,7 @@ def _make_figures(check_df: pd.DataFrame, fig_dir: Path, dpi: int = 300) -> None
 
 def main(args):
     config = load_config(args.config)
+    base_results_dir = Path(config["paths"]["results_dir"])
     results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"]))
     split_mode = args.split_mode
 
@@ -132,8 +133,9 @@ def main(args):
     manifest_rows = []
 
     for step_rel, reqs in expected.items():
-        step_path = results_dir / step_rel
         step_name = step_rel.split("/")[0]
+        step_root = base_results_dir if step_name in {"step0_data_prep", "step3_chi_target_learning"} else results_dir
+        step_path = step_root / step_rel
         exists = step_path.exists()
 
         csv_count, fig_count, total_count = _count_artifacts(step_path)
@@ -148,6 +150,7 @@ def main(args):
                     {
                         "step_name": step_name,
                         "step_dir": str(step_path),
+                        "step_root": str(step_root),
                         "missing_relative_path": req,
                     }
                 )
@@ -159,6 +162,7 @@ def main(args):
                         {
                             "step_name": step_name,
                             "step_dir": str(step_path),
+                            "step_root": str(step_root),
                             "relative_path": str(p.relative_to(step_path)),
                             "suffix": p.suffix.lower(),
                             "size_bytes": int(p.stat().st_size),
@@ -169,6 +173,7 @@ def main(args):
             {
                 "step_name": step_name,
                 "step_dir": str(step_path),
+                "step_root": str(step_root),
                 "exists": int(exists),
                 "required_file_count": int(len(reqs)),
                 "missing_required_count": int(missing_count),
@@ -186,14 +191,14 @@ def main(args):
     if not missing_df.empty:
         missing_df.to_csv(metrics_dir / "missing_required_files.csv", index=False)
     else:
-        pd.DataFrame(columns=["step_name", "step_dir", "missing_relative_path"]).to_csv(
+        pd.DataFrame(columns=["step_name", "step_dir", "step_root", "missing_relative_path"]).to_csv(
             metrics_dir / "missing_required_files.csv", index=False
         )
 
     if not manifest_df.empty:
         manifest_df.to_csv(metrics_dir / "all_artifacts_manifest.csv", index=False)
     else:
-        pd.DataFrame(columns=["step_name", "step_dir", "relative_path", "suffix", "size_bytes"]).to_csv(
+        pd.DataFrame(columns=["step_name", "step_dir", "step_root", "relative_path", "suffix", "size_bytes"]).to_csv(
             metrics_dir / "all_artifacts_manifest.csv", index=False
         )
 

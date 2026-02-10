@@ -6,14 +6,19 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import warnings
 
+import torch
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-import torch
 
 from src.chi.embeddings import load_backbone_from_step1
-from src.chi.model import PhysicsGuidedChiModel, SolubilityClassifier
+from src.chi.model import (
+    BackbonePhysicsGuidedChiModel,
+    BackboneSolubilityClassifierModel,
+    PhysicsGuidedChiModel,
+    SolubilityClassifier,
+)
 from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars
 from src.utils.numerics import stable_sigmoid
 
@@ -109,7 +114,99 @@ def parse_candidate_source(value: str) -> str:
     v = value.strip().lower()
     if v in {"novel", "generated", "step2"}:
         return "novel"
-    raise ValueError("candidate_source supports only 'novel' (aliases: generated, step2)")
+    if v in {"known", "step4", "training"}:
+        return "known"
+    if v in {"hybrid", "both"}:
+        return "hybrid"
+    raise ValueError(
+        "candidate_source must be one of {'novel','known','hybrid'} "
+        "(aliases: generated/step2 -> novel, step4/training -> known, both -> hybrid)"
+    )
+
+
+def _normalize_checkpoint_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    if any(str(k).startswith("_orig_mod.") for k in state_dict.keys()):
+        return {str(k).replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+    return state_dict
+
+
+def _load_known_candidates_from_step4_metrics(
+    step4_reg_metrics_dir: Path,
+    step4_cls_metrics_dir: Path,
+    training_canonical: set[str],
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    reg_candidates = [
+        step4_reg_metrics_dir / "polymer_coefficients_regression_only.csv",
+        step4_reg_metrics_dir / "polymer_coefficients.csv",
+    ]
+    reg_path = next((p for p in reg_candidates if p.exists()), reg_candidates[0])
+    if not reg_path.exists():
+        raise FileNotFoundError(
+            "Known candidate source requires Step4 regression polymer coefficients. "
+            f"Expected one of: {', '.join(str(p) for p in reg_candidates)}"
+        )
+    reg_df = pd.read_csv(reg_path)
+
+    required_reg = {"polymer_id", "Polymer", "SMILES", "a0", "a1", "a2", "a3", "b1", "b2"}
+    missing_reg = sorted(required_reg - set(reg_df.columns))
+    if missing_reg:
+        raise ValueError(f"Regression known-candidate file missing columns: {missing_reg}")
+
+    cls_all = step4_cls_metrics_dir / "class_predictions_all.csv"
+    if cls_all.exists():
+        cls_df = pd.read_csv(cls_all)
+        cls_source = cls_all
+    else:
+        split_paths = [
+            step4_cls_metrics_dir / "class_predictions_train.csv",
+            step4_cls_metrics_dir / "class_predictions_val.csv",
+            step4_cls_metrics_dir / "class_predictions_test.csv",
+        ]
+        available = [p for p in split_paths if p.exists()]
+        if not available:
+            raise FileNotFoundError(
+                "Known candidate source requires Step4 classification predictions. "
+                f"Expected: {cls_all} or split files under {step4_cls_metrics_dir}"
+            )
+        cls_df = pd.concat([pd.read_csv(p) for p in available], ignore_index=True)
+        cls_source = available[0]
+
+    required_cls = {"polymer_id", "class_prob"}
+    missing_cls = sorted(required_cls - set(cls_df.columns))
+    if missing_cls:
+        raise ValueError(f"Classification known-candidate file missing columns: {missing_cls}")
+
+    agg_dict = {"class_prob": "mean"}
+    if "class_logit" in cls_df.columns:
+        agg_dict["class_logit"] = "mean"
+    if "water_soluble" in cls_df.columns:
+        agg_dict["water_soluble"] = "max"
+
+    cls_poly = cls_df.groupby("polymer_id", as_index=False).agg(agg_dict)
+    out = reg_df.merge(cls_poly, on="polymer_id", how="left")
+    if out["class_prob"].isna().any():
+        missing = int(out["class_prob"].isna().sum())
+        raise ValueError(
+            "Failed to attach class probabilities for known candidates: "
+            f"{missing} polymers missing class_prob after merge."
+        )
+
+    out = out.copy()
+    out["canonical_smiles"] = out["SMILES"].astype(str).map(canonicalize_smiles)
+    out["canonical_smiles"] = out["canonical_smiles"].where(out["canonical_smiles"].notna(), out["SMILES"].astype(str))
+    out["candidate_source"] = "known_step4"
+    out["is_novel_vs_train"] = (~out["canonical_smiles"].isin(training_canonical)).astype(int)
+    if "water_soluble" not in out.columns:
+        out["water_soluble"] = -1
+    if "class_logit" not in out.columns:
+        out["class_logit"] = np.nan
+
+    summary = {
+        "known_regression_coefficients_csv": str(reg_path),
+        "known_class_predictions_csv": str(cls_source),
+        "known_candidate_count": int(len(out)),
+    }
+    return out, summary
 
 
 def resolve_training_smiles(results_dir: Path, base_results_dir: Path) -> set[str]:
@@ -238,101 +335,181 @@ def infer_coefficients_for_novel_candidates(
             ]
         )
 
-    tokenizer, backbone, _ = load_backbone_from_step1(
+    tokenizer, step1_backbone, _ = load_backbone_from_step1(
         config=config,
         model_size=model_size,
         checkpoint_path=backbone_checkpoint_path,
         device=device,
     )
 
-    ckpt = torch.load(chi_checkpoint_path, map_location=device, weights_only=True)
-    finetune_last_layers = int(ckpt.get("finetune_last_layers", 0) or 0)
-    if finetune_last_layers > 0:
+    reg_ckpt = torch.load(chi_checkpoint_path, map_location=device, weights_only=True)
+    reg_state = _normalize_checkpoint_state_dict(reg_ckpt["model_state_dict"])
+    reg_finetune_last_layers = int(reg_ckpt.get("finetune_last_layers", 0) or 0)
+    reg_timestep = int(reg_ckpt.get("timestep_for_embedding", timestep))
+
+    reg_model = None
+    if reg_finetune_last_layers > 0:
+        _, reg_backbone, _ = load_backbone_from_step1(
+            config=config,
+            model_size=model_size,
+            checkpoint_path=backbone_checkpoint_path,
+            device=device,
+        )
+        reg_head = PhysicsGuidedChiModel(
+            embedding_dim=int(reg_ckpt["embedding_dim"]),
+            hidden_sizes=list(reg_ckpt["hidden_sizes"]),
+            dropout=float(reg_ckpt["dropout"]),
+        )
+        reg_model = BackbonePhysicsGuidedChiModel(
+            backbone=reg_backbone,
+            chi_head=reg_head,
+            timestep=reg_timestep,
+            pooling=pooling,
+        ).to(device)
+        reg_model.load_state_dict(reg_state, strict=True)
+    else:
+        reg_model = PhysicsGuidedChiModel(
+            embedding_dim=int(reg_ckpt["embedding_dim"]),
+            hidden_sizes=list(reg_ckpt["hidden_sizes"]),
+            dropout=float(reg_ckpt["dropout"]),
+        ).to(device)
+        if isinstance(reg_state, dict) and any(str(k).startswith("chi_head.") for k in reg_state.keys()):
+            reg_state = {
+                str(k)[len("chi_head."):]: v
+                for k, v in reg_state.items()
+                if str(k).startswith("chi_head.")
+            }
+        reg_model.load_state_dict(reg_state, strict=True)
+    reg_model.eval()
+
+    cls_model = None
+    cls_finetune_last_layers = 0
+    cls_timestep = int(timestep)
+    if class_checkpoint_path is not None and class_checkpoint_path.exists():
+        cls_ckpt = torch.load(class_checkpoint_path, map_location=device, weights_only=True)
+        cls_state = _normalize_checkpoint_state_dict(cls_ckpt["model_state_dict"])
+        cls_finetune_last_layers = int(cls_ckpt.get("finetune_last_layers", 0) or 0)
+        cls_timestep = int(cls_ckpt.get("timestep_for_embedding", timestep))
+        if cls_finetune_last_layers > 0:
+            _, cls_backbone, _ = load_backbone_from_step1(
+                config=config,
+                model_size=model_size,
+                checkpoint_path=backbone_checkpoint_path,
+                device=device,
+            )
+            cls_head = SolubilityClassifier(
+                embedding_dim=int(cls_ckpt["embedding_dim"]),
+                hidden_sizes=list(cls_ckpt["hidden_sizes"]),
+                dropout=float(cls_ckpt["dropout"]),
+            )
+            cls_model = BackboneSolubilityClassifierModel(
+                backbone=cls_backbone,
+                classifier_head=cls_head,
+                timestep=cls_timestep,
+                pooling=pooling,
+            ).to(device)
+            cls_model.load_state_dict(cls_state, strict=True)
+        else:
+            cls_model = SolubilityClassifier(
+                embedding_dim=int(cls_ckpt["embedding_dim"]),
+                hidden_sizes=list(cls_ckpt["hidden_sizes"]),
+                dropout=float(cls_ckpt["dropout"]),
+            ).to(device)
+            if isinstance(cls_state, dict) and any(str(k).startswith("classifier_head.") for k in cls_state.keys()):
+                cls_state = {
+                    str(k)[len("classifier_head."):]: v
+                    for k, v in cls_state.items()
+                    if str(k).startswith("classifier_head.")
+                }
+            cls_model.load_state_dict(cls_state, strict=True)
+        cls_model.eval()
+
+    if reg_finetune_last_layers > 0:
         warnings.warn(
             (
-                f"Step4 checkpoint {chi_checkpoint_path} was trained with "
-                f"finetune_last_layers={finetune_last_layers}. "
-                "Novel-candidate inference uses the Step1 backbone encoder by design, "
-                "so Step4 finetuned backbone weights are not applied here."
+                f"Loaded Step4 regression checkpoint with finetuned backbone "
+                f"(finetune_last_layers={reg_finetune_last_layers}) for novel-candidate inference."
             ),
             RuntimeWarning,
             stacklevel=2,
         )
-    reg_model = PhysicsGuidedChiModel(
-        embedding_dim=int(ckpt["embedding_dim"]),
-        hidden_sizes=list(ckpt["hidden_sizes"]),
-        dropout=float(ckpt["dropout"]),
-    ).to(device)
-    reg_state = ckpt["model_state_dict"]
-    if isinstance(reg_state, dict) and any(str(k).startswith("chi_head.") for k in reg_state.keys()):
-        reg_state = {
-            str(k)[len("chi_head."):]: v
-            for k, v in reg_state.items()
-            if str(k).startswith("chi_head.")
-        }
-    reg_model.load_state_dict(reg_state, strict=True)
-    reg_model.eval()
+    if cls_model is not None and cls_finetune_last_layers > 0:
+        warnings.warn(
+            (
+                f"Loaded Step4 classification checkpoint with finetuned backbone "
+                f"(finetune_last_layers={cls_finetune_last_layers}) for novel-candidate inference."
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
-    cls_model = None
-    if class_checkpoint_path is not None and class_checkpoint_path.exists():
-        cls_ckpt = torch.load(class_checkpoint_path, map_location=device, weights_only=True)
-        cls_finetune_last_layers = int(cls_ckpt.get("finetune_last_layers", 0) or 0)
-        if cls_finetune_last_layers > 0:
-            warnings.warn(
-                (
-                    f"Step4 classifier checkpoint {class_checkpoint_path} was trained with "
-                    f"finetune_last_layers={cls_finetune_last_layers}. "
-                    "Novel-candidate inference uses Step1 backbone embeddings by design, "
-                    "so Step4 finetuned classifier-backbone weights are not applied here."
-                ),
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        cls_model = SolubilityClassifier(
-            embedding_dim=int(cls_ckpt["embedding_dim"]),
-            hidden_sizes=list(cls_ckpt["hidden_sizes"]),
-            dropout=float(cls_ckpt["dropout"]),
-        ).to(device)
-        cls_state = cls_ckpt["model_state_dict"]
-        if isinstance(cls_state, dict) and any(str(k).startswith("classifier_head.") for k in cls_state.keys()):
-            cls_state = {
-                str(k)[len("classifier_head."):]: v
-                for k, v in cls_state.items()
-                if str(k).startswith("classifier_head.")
-            }
-        cls_model.load_state_dict(cls_state, strict=True)
-        cls_model.eval()
+    reg_needs_step1_embeddings = reg_finetune_last_layers == 0
+    cls_needs_step1_embeddings = cls_model is not None and cls_finetune_last_layers == 0
+    if not (reg_needs_step1_embeddings or cls_needs_step1_embeddings):
+        # Avoid keeping an unused backbone resident when both heads are end-to-end finetuned.
+        step1_backbone = None
 
-    embeddings = []
+    coeff_list: List[np.ndarray] = []
+    logit_list: List[np.ndarray] = []
     smiles_list = novel_df["SMILES"].astype(str).tolist()
     for i in range(0, len(smiles_list), batch_size):
         batch_smiles = smiles_list[i : i + batch_size]
         encoded = tokenizer.batch_encode(batch_smiles)
         input_ids = torch.tensor(encoded["input_ids"], dtype=torch.long, device=device)
         attention_mask = torch.tensor(encoded["attention_mask"], dtype=torch.long, device=device)
-        t = torch.full((input_ids.shape[0],), int(timestep), device=device, dtype=torch.long)
 
-        pooled = backbone.get_pooled_output(
-            input_ids=input_ids,
-            timesteps=t,
-            attention_mask=attention_mask,
-            pooling=pooling,
-        )
-        embeddings.append(pooled.detach().cpu())
+        emb_reg = None
+        emb_cls = None
+        if reg_needs_step1_embeddings:
+            t_reg = torch.full((input_ids.shape[0],), reg_timestep, device=device, dtype=torch.long)
+            emb_reg = step1_backbone.get_pooled_output(
+                input_ids=input_ids,
+                timesteps=t_reg,
+                attention_mask=attention_mask,
+                pooling=pooling,
+            )
+        if cls_needs_step1_embeddings:
+            if reg_needs_step1_embeddings and cls_timestep == reg_timestep:
+                emb_cls = emb_reg
+            else:
+                t_cls = torch.full((input_ids.shape[0],), cls_timestep, device=device, dtype=torch.long)
+                emb_cls = step1_backbone.get_pooled_output(
+                    input_ids=input_ids,
+                    timesteps=t_cls,
+                    attention_mask=attention_mask,
+                    pooling=pooling,
+                )
 
-    emb = torch.cat(embeddings, dim=0).to(device)
-    t_dummy = torch.full((emb.shape[0],), 300.0, dtype=torch.float32, device=device)
-    phi_dummy = torch.full((emb.shape[0],), 0.5, dtype=torch.float32, device=device)
-    out = reg_model(embedding=emb, temperature=t_dummy, phi=phi_dummy)
+        t_dummy = torch.full((input_ids.shape[0],), 300.0, dtype=torch.float32, device=device)
+        phi_dummy = torch.full((input_ids.shape[0],), 0.5, dtype=torch.float32, device=device)
+        if reg_finetune_last_layers > 0:
+            reg_out = reg_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                temperature=t_dummy,
+                phi=phi_dummy,
+            )
+        else:
+            reg_out = reg_model(
+                embedding=emb_reg,
+                temperature=t_dummy,
+                phi=phi_dummy,
+            )
+        coeff_list.append(reg_out["coefficients"].detach().cpu().numpy())
 
-    coeff = out["coefficients"].detach().cpu().numpy()
-    if cls_model is not None:
-        cls_out = cls_model(embedding=emb)
-        logit = cls_out["class_logit"].detach().cpu().numpy()
-        prob = stable_sigmoid(logit)
-    else:
-        logit = out["class_logit"].detach().cpu().numpy()
-        prob = stable_sigmoid(logit)
+        if cls_model is not None:
+            if cls_finetune_last_layers > 0:
+                cls_out = cls_model(input_ids=input_ids, attention_mask=attention_mask)
+            else:
+                cls_out = cls_model(embedding=emb_cls)
+            logit_batch = cls_out["class_logit"].detach().cpu().numpy()
+        else:
+            logit_batch = reg_out["class_logit"].detach().cpu().numpy()
+        logit_list.append(logit_batch)
+
+    coeff = np.concatenate(coeff_list, axis=0) if coeff_list else np.zeros((0, 6), dtype=float)
+    logit = np.concatenate(logit_list, axis=0) if logit_list else np.zeros((0,), dtype=float)
+    prob = stable_sigmoid(logit)
 
     result = novel_df[["polymer_id", "Polymer", "SMILES", "canonical_smiles"]].copy()
     result["water_soluble"] = -1
@@ -439,63 +616,119 @@ def build_candidate_pool(
         "step4_classification_metrics_dir": str(step4_cls_metrics_dir),
     }
 
-    if args.generated_csv:
-        generated_csv = Path(args.generated_csv)
-    else:
-        default_candidates = [
-            results_dir / "step2_sampling" / "metrics" / "target_polymers.csv",
-            results_dir / "step2_sampling" / "metrics" / "generated_samples.csv",
-        ]
-        generated_csv = next((p for p in default_candidates if p.exists()), default_candidates[0])
+    pool_frames: List[pd.DataFrame] = []
 
-    novel_df, novel_summary = prepare_novel_candidates(
-        generated_csv=generated_csv,
-        smiles_column=args.generated_smiles_column,
-        training_canonical=training_canonical,
-        require_two_stars=(not args.allow_non_two_stars),
-        max_novel_candidates=args.max_novel_candidates,
-    )
-    summary.update(novel_summary)
-    summary["generated_csv"] = str(generated_csv)
-
-    default_reg_candidates = [
-        step4_reg_metrics_dir.parent / "checkpoints" / "chi_regression_best.pt",
-        step4_reg_metrics_dir.parent / "checkpoints" / "chi_physics_best.pt",
-        results_dir / "checkpoints" / "chi_regression_best.pt",
-        results_dir / "checkpoints" / "chi_physics_best.pt",
-    ]
-    if getattr(args, "step4_checkpoint", None):
-        chi_checkpoint = Path(args.step4_checkpoint)
-    else:
-        chi_checkpoint = next((p for p in default_reg_candidates if p.exists()), default_reg_candidates[0])
-    if not chi_checkpoint.exists():
-        raise FileNotFoundError(f"Step4 chi checkpoint not found: {chi_checkpoint}")
-    if getattr(args, "step4_class_checkpoint", None):
-        class_checkpoint = Path(args.step4_class_checkpoint)
-    else:
-        default_cls_candidates = [
-            step4_cls_metrics_dir.parent / "checkpoints" / "chi_classifier_best.pt",
-            results_dir / "checkpoints" / "chi_classifier_best.pt",
-        ]
-        class_checkpoint = next((p for p in default_cls_candidates if p.exists()), default_cls_candidates[0])
-    if not class_checkpoint.exists():
-        raise FileNotFoundError(
-            "Step4 classification checkpoint not found. "
-            f"Expected: {class_checkpoint}. "
-            "Run Step 4 to produce Step4_2 checkpoint or pass --step4_class_checkpoint."
+    if source in {"known", "hybrid"}:
+        known_df, known_summary = _load_known_candidates_from_step4_metrics(
+            step4_reg_metrics_dir=step4_reg_metrics_dir,
+            step4_cls_metrics_dir=step4_cls_metrics_dir,
+            training_canonical=training_canonical,
         )
+        summary.update(known_summary)
+        pool_frames.append(known_df)
 
-    novel_coeff_df = infer_coefficients_for_novel_candidates(
-        novel_df=novel_df,
-        config=config,
-        model_size=args.model_size,
-        chi_checkpoint_path=chi_checkpoint,
-        class_checkpoint_path=class_checkpoint,
-        backbone_checkpoint_path=args.backbone_checkpoint,
-        device=device,
-        timestep=int(chi_cfg.get("embedding_timestep", 1)),
-        pooling=args.embedding_pooling,
-        batch_size=int(args.embedding_batch_size or chi_cfg.get("embedding_batch_size", 128)),
+    if source in {"novel", "hybrid"}:
+        if args.generated_csv:
+            generated_csv = Path(args.generated_csv)
+        else:
+            default_candidates = [
+                results_dir / "step2_sampling" / "metrics" / "target_polymers.csv",
+                results_dir / "step2_sampling" / "metrics" / "generated_samples.csv",
+            ]
+            generated_csv = next((p for p in default_candidates if p.exists()), default_candidates[0])
+
+        novel_df, novel_summary = prepare_novel_candidates(
+            generated_csv=generated_csv,
+            smiles_column=args.generated_smiles_column,
+            training_canonical=training_canonical,
+            require_two_stars=(not args.allow_non_two_stars),
+            max_novel_candidates=args.max_novel_candidates,
+        )
+        summary.update(novel_summary)
+        summary["generated_csv"] = str(generated_csv)
+
+        default_reg_candidates = [
+            step4_reg_metrics_dir.parent / "checkpoints" / "chi_regression_best.pt",
+            step4_reg_metrics_dir.parent / "checkpoints" / "chi_physics_best.pt",
+            results_dir / "checkpoints" / "chi_regression_best.pt",
+            results_dir / "checkpoints" / "chi_physics_best.pt",
+        ]
+        if getattr(args, "step4_checkpoint", None):
+            chi_checkpoint = Path(args.step4_checkpoint)
+        else:
+            chi_checkpoint = next((p for p in default_reg_candidates if p.exists()), default_reg_candidates[0])
+        if not chi_checkpoint.exists():
+            raise FileNotFoundError(f"Step4 chi checkpoint not found: {chi_checkpoint}")
+
+        if getattr(args, "step4_class_checkpoint", None):
+            class_checkpoint = Path(args.step4_class_checkpoint)
+        else:
+            default_cls_candidates = [
+                step4_cls_metrics_dir.parent / "checkpoints" / "chi_classifier_best.pt",
+                results_dir / "checkpoints" / "chi_classifier_best.pt",
+            ]
+            class_checkpoint = next((p for p in default_cls_candidates if p.exists()), default_cls_candidates[0])
+        if not class_checkpoint.exists():
+            raise FileNotFoundError(
+                "Step4 classification checkpoint not found. "
+                f"Expected: {class_checkpoint}. "
+                "Run Step 4 to produce Step4_2 checkpoint or pass --step4_class_checkpoint."
+            )
+
+        novel_coeff_df = infer_coefficients_for_novel_candidates(
+            novel_df=novel_df,
+            config=config,
+            model_size=args.model_size,
+            chi_checkpoint_path=chi_checkpoint,
+            class_checkpoint_path=class_checkpoint,
+            backbone_checkpoint_path=args.backbone_checkpoint,
+            device=device,
+            timestep=int(chi_cfg.get("embedding_timestep", 1)),
+            pooling=args.embedding_pooling,
+            batch_size=int(args.embedding_batch_size or chi_cfg.get("embedding_batch_size", 128)),
+        )
+        summary["novel_candidate_count"] = int(len(novel_coeff_df))
+        pool_frames.append(novel_coeff_df)
+
+    if not pool_frames:
+        empty = pd.DataFrame(
+            columns=[
+                "polymer_id",
+                "Polymer",
+                "SMILES",
+                "canonical_smiles",
+                "water_soluble",
+                "class_logit",
+                "class_prob",
+                "a0",
+                "a1",
+                "a2",
+                "a3",
+                "b1",
+                "b2",
+                "candidate_source",
+                "is_novel_vs_train",
+            ]
+        )
+        summary["candidate_count_total"] = 0
+        summary["candidate_count_after_dedup"] = 0
+        return empty, summary, training_canonical
+
+    coeff_df = pd.concat(pool_frames, ignore_index=True)
+    if "canonical_smiles" not in coeff_df.columns:
+        coeff_df["canonical_smiles"] = coeff_df["SMILES"].astype(str).map(canonicalize_smiles)
+    coeff_df["canonical_smiles"] = coeff_df["canonical_smiles"].where(
+        coeff_df["canonical_smiles"].notna(),
+        coeff_df["SMILES"].astype(str),
     )
-    summary["novel_candidate_count"] = int(len(novel_coeff_df))
-    return novel_coeff_df, summary, training_canonical
+    if "candidate_source" not in coeff_df.columns:
+        coeff_df["candidate_source"] = "unknown"
+    if "is_novel_vs_train" not in coeff_df.columns:
+        coeff_df["is_novel_vs_train"] = (~coeff_df["canonical_smiles"].isin(training_canonical)).astype(int)
+
+    summary["candidate_count_total"] = int(len(coeff_df))
+    coeff_df = coeff_df.drop_duplicates(subset=["canonical_smiles"], keep="first").reset_index(drop=True)
+    coeff_df["source_polymer_id"] = coeff_df.get("polymer_id", pd.Series([-1] * len(coeff_df))).astype(int)
+    coeff_df["polymer_id"] = np.arange(len(coeff_df), dtype=int)
+    summary["candidate_count_after_dedup"] = int(len(coeff_df))
+    return coeff_df, summary, training_canonical

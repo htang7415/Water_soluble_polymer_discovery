@@ -211,7 +211,7 @@ chi_training:
     class_weight: 0.25  # penalty weight for low soluble confidence in ranking score
     target_polymer_count: 100  # final number of exported target polymers
     target_sa_max: 4.0  # SA upper bound for final target polymer export
-    candidate_source: "novel"  # novel-only (Step 2 generated candidates)
+    candidate_source: "novel"  # known | novel | hybrid
     property_rule: "upper_bound"  # band | upper_bound | lower_bound
     coverage_topk: 5  # top-k used in coverage/frequency summaries
 
@@ -224,7 +224,7 @@ chi_training:
     polymer_class_weight: 0.50  # penalty weight for class mismatch in ranking score
     target_polymer_count: 100
     target_sa_max: 4.0
-    candidate_source: "novel"  # novel-only (Step 2 generated candidates)
+    candidate_source: "novel"  # known | novel | hybrid
     property_rule: "upper_bound"
     coverage_topk: 5
     target_polymer_class: "polyamide"  # all | polyimide | polyester | polyamide | polyurethane | polyether

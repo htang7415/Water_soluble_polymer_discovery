@@ -234,18 +234,21 @@ class BackboneTrainer:
         Returns:
             Dictionary with memory statistics in GB.
         """
-        if self.device != 'cuda' or not torch.cuda.is_available():
+        if not _is_cuda_device(self.device) or not torch.cuda.is_available():
             return {}
+
+        dev = torch.device(self.device)
+        device_index = dev.index if dev.index is not None else torch.cuda.current_device()
 
         stats = {
             'step': self.global_step,
-            'allocated_gb': torch.cuda.memory_allocated() / 1e9,
-            'reserved_gb': torch.cuda.memory_reserved() / 1e9,
-            'max_allocated_gb': torch.cuda.max_memory_allocated() / 1e9,
+            'allocated_gb': torch.cuda.memory_allocated(device_index) / 1e9,
+            'reserved_gb': torch.cuda.memory_reserved(device_index) / 1e9,
+            'max_allocated_gb': torch.cuda.max_memory_allocated(device_index) / 1e9,
         }
 
         # Get total GPU memory
-        total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        total_memory = torch.cuda.get_device_properties(device_index).total_memory / 1e9
         stats['total_gb'] = total_memory
         stats['free_gb'] = total_memory - stats['reserved_gb']
         stats['utilization_pct'] = (stats['allocated_gb'] / total_memory) * 100

@@ -9,11 +9,11 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+import torch
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -784,7 +784,7 @@ if __name__ == "__main__":
         "--candidate_source",
         type=str,
         default=None,
-        help="Only novel/generated/step2 are supported for Step 5.",
+        help="Candidate pool source: novel|known|hybrid (aliases: generated/step2->novel, step4/training->known).",
     )
     parser.add_argument("--generated_csv", type=str, default=None, help="Generated samples CSV from Step 2")
     parser.add_argument("--generated_smiles_column", type=str, default="smiles", help="SMILES column name in generated_csv")

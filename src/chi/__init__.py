@@ -1,5 +1,6 @@
 """Utilities for physics-guided polymer-water chi modeling."""
 
+from .model import PhysicsGuidedChiModel, predict_chi_from_coefficients, chi_formula_torch
 from .data import (
     COEFF_NAMES,
     REQUIRED_CHI_COLUMNS,
@@ -8,7 +9,6 @@ from .data import (
     add_split_column,
     physics_feature_columns,
 )
-from .model import PhysicsGuidedChiModel, predict_chi_from_coefficients, chi_formula_torch
 from .metrics import regression_metrics, classification_metrics
 
 __all__ = [

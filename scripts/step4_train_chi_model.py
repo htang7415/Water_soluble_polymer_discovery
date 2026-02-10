@@ -1715,6 +1715,7 @@ def train_one_classifier_model(
     }
 
     best_state = None
+    best_val_balanced_accuracy = -np.inf
     best_val_loss = np.inf
     wait = 0
 
@@ -1744,7 +1745,15 @@ def train_one_classifier_model(
         history["val_balanced_accuracy"].append(val_bal_acc)
 
         val_loss = float(val_stats["loss"])
-        if val_loss < best_val_loss:
+        improved = (
+            val_bal_acc > best_val_balanced_accuracy + 1e-12
+            or (
+                np.isclose(val_bal_acc, best_val_balanced_accuracy, atol=1e-12, rtol=1e-12)
+                and val_loss < best_val_loss
+            )
+        )
+        if improved:
+            best_val_balanced_accuracy = val_bal_acc
             best_val_loss = val_loss
             best_state = copy.deepcopy(model.state_dict())
             wait = 0

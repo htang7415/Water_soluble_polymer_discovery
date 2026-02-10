@@ -176,3 +176,80 @@ class SolubilityClassifier(nn.Module):
         bce = F.binary_cross_entropy_with_logits(out["class_logit"], class_label)
         out.update({"loss": bce})
         return out
+
+
+class BackbonePhysicsGuidedChiModel(nn.Module):
+    """Backbone encoder + physics-guided chi head used by Step 4 finetuning."""
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        chi_head: PhysicsGuidedChiModel,
+        timestep: int,
+        pooling: str = "mean",
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.chi_head = chi_head
+        self.timestep = int(timestep)
+        self.pooling = pooling
+
+    def _encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        batch_size = int(input_ids.shape[0])
+        timesteps = torch.full((batch_size,), self.timestep, device=input_ids.device, dtype=torch.long)
+        return self.backbone.get_pooled_output(
+            input_ids=input_ids,
+            timesteps=timesteps,
+            attention_mask=attention_mask,
+            pooling=self.pooling,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        temperature: torch.Tensor,
+        phi: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        embedding = self._encode(input_ids=input_ids, attention_mask=attention_mask)
+        return self.chi_head(embedding=embedding, temperature=temperature, phi=phi)
+
+
+class BackboneSolubilityClassifierModel(nn.Module):
+    """Backbone encoder + solubility classifier head used by Step 4 finetuning."""
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        classifier_head: SolubilityClassifier,
+        timestep: int,
+        pooling: str = "mean",
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.classifier_head = classifier_head
+        self.timestep = int(timestep)
+        self.pooling = pooling
+
+    def _encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        batch_size = int(input_ids.shape[0])
+        timesteps = torch.full((batch_size,), self.timestep, device=input_ids.device, dtype=torch.long)
+        return self.backbone.get_pooled_output(
+            input_ids=input_ids,
+            timesteps=timesteps,
+            attention_mask=attention_mask,
+            pooling=self.pooling,
+        )
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+        embedding = self._encode(input_ids=input_ids, attention_mask=attention_mask)
+        return self.classifier_head(embedding=embedding)
+
+    def compute_loss(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        class_label: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        embedding = self._encode(input_ids=input_ids, attention_mask=attention_mask)
+        return self.classifier_head.compute_loss(embedding=embedding, class_label=class_label)
