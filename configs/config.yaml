@@ -152,7 +152,7 @@ chi_training:
     finetune_last_layers: 0  # integer in [0, num_layers(model_size)]; 0=freeze backbone
 
     tune: true
-    n_trials: 50
+    n_trials: 200
     tuning_epochs: 100
     tuning_patience: 20
     tuning_objective: "val_r2"  # regression objective uses mean CV val_r2
@@ -183,13 +183,17 @@ chi_training:
     scheduler_min_lr: 1.0e-6
     hidden_sizes: [256, 512, 128]
     dropout: 0.1
+    finetune_last_layers: 0  # integer in [0, num_layers(model_size)]; 0=freeze backbone
 
     tune: true
-    n_trials: 50
+    n_trials: 200
     tuning_epochs: 100
     tuning_patience: 20
     tuning_cv_folds: 6
     optuna_search_space:
+      # If list has exactly 2 values, it is treated as a continuous range [min, max].
+      # If list has >2 values, it is treated as categorical choices.
+      # finetune_last_layers defaults to dynamic range [0, num_layers(model_size)] if omitted.
       num_layers: [2, 3, 4, 5]
       hidden_units: [64, 128, 256, 512, 1024]
       dropout: [0.0, 0.1, 0.2, 0.3]
@@ -205,7 +209,7 @@ chi_training:
     class_weight: 0.25  # penalty weight for low soluble confidence in ranking score
     target_polymer_count: 100  # final number of exported target polymers
     target_sa_max: 4.0  # SA upper bound for final target polymer export
-    candidate_source: "known"  # known | novel | hybrid
+    candidate_source: "novel"  # novel-only (Step 2 generated candidates)
     property_rule: "upper_bound"  # band | upper_bound | lower_bound
     coverage_topk: 5  # top-k used in coverage/frequency summaries
 
@@ -216,7 +220,7 @@ chi_training:
     polymer_class_weight: 0.50  # penalty weight for class mismatch in ranking score
     target_polymer_count: 100
     target_sa_max: 4.0
-    candidate_source: "known"
+    candidate_source: "novel"  # novel-only (Step 2 generated candidates)
     property_rule: "upper_bound"
     coverage_topk: 5
     target_polymer_class: "polyamide"  # all | polyimide | polyester | polyamide | polyurethane | polyether

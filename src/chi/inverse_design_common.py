@@ -41,7 +41,7 @@ def default_chi_config(config: Dict, step: str | None = None) -> Dict:
         "epsilon": 0.05,
         "class_weight": 0.25,
         "polymer_class_weight": 0.50,
-        "candidate_source": "known",
+        "candidate_source": "novel",
         "property_rule": "upper_bound",
         "coverage_topk": 5,
         "target_polymer_class": "all",
@@ -103,26 +103,9 @@ def set_plot_style(font_size: int) -> None:
 
 def parse_candidate_source(value: str) -> str:
     v = value.strip().lower()
-    if v in {"known", "step4", "in_dataset"}:
-        return "known"
     if v in {"novel", "generated", "step2"}:
         return "novel"
-    if v in {"hybrid", "both", "all"}:
-        return "hybrid"
-    raise ValueError("candidate_source must be one of: known, novel, hybrid")
-
-
-def check_required_step4_files(step4_metrics_dir: Path) -> None:
-    needed = [
-        step4_metrics_dir / "chi_predictions_all.csv",
-        step4_metrics_dir / "polymer_coefficients.csv",
-    ]
-    missing = [str(p) for p in needed if not p.exists()]
-    if missing:
-        raise FileNotFoundError(
-            "Inverse-design step requires Step 4 outputs. Missing files:\n"
-            + "\n".join(missing)
-        )
+    raise ValueError("candidate_source supports only 'novel' (aliases: generated, step2)")
 
 
 def resolve_training_smiles(results_dir: Path, base_results_dir: Path) -> set[str]:
@@ -289,12 +272,31 @@ def infer_coefficients_for_novel_candidates(
     cls_model = None
     if class_checkpoint_path is not None and class_checkpoint_path.exists():
         cls_ckpt = torch.load(class_checkpoint_path, map_location=device, weights_only=True)
+        cls_finetune_last_layers = int(cls_ckpt.get("finetune_last_layers", 0) or 0)
+        if cls_finetune_last_layers > 0:
+            warnings.warn(
+                (
+                    f"Step4 classifier checkpoint {class_checkpoint_path} was trained with "
+                    f"finetune_last_layers={cls_finetune_last_layers}. "
+                    "Novel-candidate inference uses Step1 backbone embeddings by design, "
+                    "so Step4 finetuned classifier-backbone weights are not applied here."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
         cls_model = SolubilityClassifier(
             embedding_dim=int(cls_ckpt["embedding_dim"]),
             hidden_sizes=list(cls_ckpt["hidden_sizes"]),
             dropout=float(cls_ckpt["dropout"]),
         ).to(device)
-        cls_model.load_state_dict(cls_ckpt["model_state_dict"])
+        cls_state = cls_ckpt["model_state_dict"]
+        if isinstance(cls_state, dict) and any(str(k).startswith("classifier_head.") for k in cls_state.keys()):
+            cls_state = {
+                str(k)[len("classifier_head."):]: v
+                for k, v in cls_state.items()
+                if str(k).startswith("classifier_head.")
+            }
+        cls_model.load_state_dict(cls_state, strict=True)
         cls_model.eval()
 
     embeddings = []
@@ -394,25 +396,18 @@ def build_candidate_pool(
     chi_cfg: Dict,
     results_dir: Path,
     base_results_dir: Path,
-    step4_metrics_dir: Path,
+    step4_reg_metrics_dir: Path,
+    step4_cls_metrics_dir: Path,
     device: str,
 ) -> Tuple[pd.DataFrame, Dict[str, object], set[str]]:
     source = parse_candidate_source(args.candidate_source)
-    known_df = pd.read_csv(step4_metrics_dir / "polymer_coefficients.csv")
-    known_df["candidate_source"] = "known_dataset"
-    known_df["canonical_smiles"] = known_df["SMILES"].astype(str).apply(lambda s: canonicalize_smiles(s) or s)
-
     training_canonical = resolve_training_smiles(results_dir, base_results_dir)
-    known_df["is_novel_vs_train"] = (~known_df["canonical_smiles"].isin(training_canonical)).astype(int)
 
     summary: Dict[str, object] = {
         "candidate_source": source,
-        "known_candidate_count": int(len(known_df)),
-        "known_novel_count": int(known_df["is_novel_vs_train"].sum()),
+        "step4_regression_metrics_dir": str(step4_reg_metrics_dir),
+        "step4_classification_metrics_dir": str(step4_cls_metrics_dir),
     }
-
-    if source == "known":
-        return known_df, summary, training_canonical
 
     if args.generated_csv:
         generated_csv = Path(args.generated_csv)
@@ -433,23 +428,31 @@ def build_candidate_pool(
     summary.update(novel_summary)
     summary["generated_csv"] = str(generated_csv)
 
-    default_reg_checkpoint = results_dir / "checkpoints" / "chi_regression_best.pt"
-    legacy_joint_checkpoint = results_dir / "checkpoints" / "chi_physics_best.pt"
-    chi_checkpoint = Path(args.step4_checkpoint) if getattr(args, "step4_checkpoint", None) else default_reg_checkpoint
-    if not chi_checkpoint.exists() and not getattr(args, "step4_checkpoint", None) and legacy_joint_checkpoint.exists():
-        chi_checkpoint = legacy_joint_checkpoint
+    default_reg_candidates = [
+        step4_reg_metrics_dir.parent / "checkpoints" / "chi_regression_best.pt",
+        step4_reg_metrics_dir.parent / "checkpoints" / "chi_physics_best.pt",
+        results_dir / "checkpoints" / "chi_regression_best.pt",
+        results_dir / "checkpoints" / "chi_physics_best.pt",
+    ]
+    if getattr(args, "step4_checkpoint", None):
+        chi_checkpoint = Path(args.step4_checkpoint)
+    else:
+        chi_checkpoint = next((p for p in default_reg_candidates if p.exists()), default_reg_candidates[0])
     if not chi_checkpoint.exists():
         raise FileNotFoundError(f"Step4 chi checkpoint not found: {chi_checkpoint}")
-    class_checkpoint = (
-        Path(args.step4_class_checkpoint)
-        if getattr(args, "step4_class_checkpoint", None)
-        else (results_dir / "checkpoints" / "chi_classifier_best.pt")
-    )
+    if getattr(args, "step4_class_checkpoint", None):
+        class_checkpoint = Path(args.step4_class_checkpoint)
+    else:
+        default_cls_candidates = [
+            step4_cls_metrics_dir.parent / "checkpoints" / "chi_classifier_best.pt",
+            results_dir / "checkpoints" / "chi_classifier_best.pt",
+        ]
+        class_checkpoint = next((p for p in default_cls_candidates if p.exists()), default_cls_candidates[0])
     if not class_checkpoint.exists():
         raise FileNotFoundError(
             "Step4 classification checkpoint not found. "
             f"Expected: {class_checkpoint}. "
-            "Run Step 4 to produce `chi_classifier_best.pt` or pass --step4_class_checkpoint."
+            "Run Step 4 to produce Step4_2 checkpoint or pass --step4_class_checkpoint."
         )
 
     novel_coeff_df = infer_coefficients_for_novel_candidates(
@@ -465,14 +468,4 @@ def build_candidate_pool(
         batch_size=int(args.embedding_batch_size or chi_cfg.get("embedding_batch_size", 128)),
     )
     summary["novel_candidate_count"] = int(len(novel_coeff_df))
-
-    if source == "novel":
-        return novel_coeff_df, summary, training_canonical
-
-    if not novel_coeff_df.empty:
-        novel_coeff_df = novel_coeff_df.copy()
-        offset = int(known_df["polymer_id"].max()) + 1
-        novel_coeff_df["polymer_id"] = novel_coeff_df["polymer_id"].astype(int) + offset
-    merged = pd.concat([known_df, novel_coeff_df], ignore_index=True)
-    summary["hybrid_candidate_count"] = int(len(merged))
-    return merged, summary, training_canonical
+    return novel_coeff_df, summary, training_canonical

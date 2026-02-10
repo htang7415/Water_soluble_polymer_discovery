@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.chi.inverse_design_common import (
     build_candidate_pool,
-    check_required_step4_files,
     default_chi_config,
     load_soluble_targets,
     parse_candidate_source,
@@ -95,10 +94,15 @@ def _compute_target_candidates(
         out["property_error"] = out["abs_error"]
         out["property_hit"] = (out["abs_error"] <= float(epsilon)).astype(int)
 
+    out["requirement_hit_count"] = out["soluble_hit"] + out["property_hit"]
+    out["requirement_miss_count"] = 2 - out["requirement_hit_count"]
     out["joint_hit"] = ((out["soluble_hit"] == 1) & (out["property_hit"] == 1)).astype(int)
     out["score"] = out["property_error"] + float(class_weight) * (1.0 - out["soluble_confidence"])
 
-    out = out.sort_values(["score", "property_error", "soluble_confidence"], ascending=[True, True, False]).reset_index(drop=True)
+    out = out.sort_values(
+        ["requirement_miss_count", "score", "property_error", "soluble_confidence"],
+        ascending=[True, True, True, False],
+    ).reset_index(drop=True)
     out["rank"] = np.arange(1, len(out) + 1)
     return out
 
@@ -236,8 +240,8 @@ def _select_final_target_polymers(
     total_sampling_points: int | None = None,
 ) -> tuple[pd.DataFrame, Dict[str, float]]:
     ranked = candidate_df.sort_values(
-        ["score", "rank", "property_error", "class_prob"],
-        ascending=[True, True, True, False],
+        ["requirement_miss_count", "score", "rank", "property_error", "class_prob"],
+        ascending=[True, True, True, True, False],
     ).copy()
 
     dedup_key = "polymer_id" if "polymer_id" in ranked.columns else "SMILES"
@@ -312,6 +316,8 @@ def _select_final_target_polymers(
                 "class_prob": float(row["class_prob"]),
                 "soluble_hit": int(row["soluble_hit"]),
                 "property_hit": int(row["property_hit"]),
+                "requirement_hit_count": int(row.get("requirement_hit_count", row["soluble_hit"] + row["property_hit"])),
+                "requirement_miss_count": int(row.get("requirement_miss_count", 2 - (row["soluble_hit"] + row["property_hit"]))),
                 "score": float(row["score"]),
                 "rank_in_target": int(row["rank"]),
                 "is_valid": int(is_valid),
@@ -520,7 +526,7 @@ def main(args):
 
     epsilon = float(args.epsilon if args.epsilon is not None else chi_cfg.get("epsilon", 0.05))
     class_weight = float(args.class_weight if args.class_weight is not None else chi_cfg.get("class_weight", 0.25))
-    candidate_source_value = args.candidate_source if args.candidate_source is not None else str(chi_cfg.get("candidate_source", "known"))
+    candidate_source_value = args.candidate_source if args.candidate_source is not None else str(chi_cfg.get("candidate_source", "novel"))
     candidate_source = parse_candidate_source(candidate_source_value)
     args.candidate_source = candidate_source
     default_property_rule = str(args.property_rule if args.property_rule is not None else chi_cfg.get("property_rule", "upper_bound")).strip().lower()
@@ -544,9 +550,11 @@ def main(args):
 
     results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"]))
     base_results_dir = Path(config["paths"]["results_dir"])
-    step4_dir = Path(args.step4_dir) if args.step4_dir else results_dir / "step4_chi_training" / split_mode
-    step4_metrics_dir = step4_dir / "metrics"
-    check_required_step4_files(step4_metrics_dir)
+    step4_base_dir = Path(args.step4_dir) if args.step4_dir else results_dir / "step4_chi_training" / split_mode
+    step4_reg_dir = Path(args.step4_reg_dir) if args.step4_reg_dir else step4_base_dir / "step4_1_regression"
+    step4_cls_dir = Path(args.step4_cls_dir) if args.step4_cls_dir else step4_base_dir / "step4_2_classification"
+    step4_reg_metrics_dir = step4_reg_dir / "metrics"
+    step4_cls_metrics_dir = step4_cls_dir / "metrics"
 
     step_dir = results_dir / "step5_water_soluble_inverse_design" / split_mode
     metrics_dir = step_dir / "metrics"
@@ -566,6 +574,8 @@ def main(args):
             "results_dir": str(results_dir),
             "split_mode": split_mode,
             "candidate_source": candidate_source,
+            "step4_regression_dir": str(step4_reg_dir),
+            "step4_classification_dir": str(step4_cls_dir),
             "epsilon": epsilon,
             "class_weight": class_weight,
             "property_rule_default": default_property_rule,
@@ -602,7 +612,8 @@ def main(args):
         chi_cfg=chi_cfg,
         results_dir=results_dir,
         base_results_dir=base_results_dir,
-        step4_metrics_dir=step4_metrics_dir,
+        step4_reg_metrics_dir=step4_reg_metrics_dir,
+        step4_cls_metrics_dir=step4_cls_metrics_dir,
         device=device,
     )
     if coeff_df.empty:
@@ -743,7 +754,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 5: water-soluble inverse design")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Config path")
     parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
-    parser.add_argument("--step4_dir", type=str, default=None, help="Optional direct path to Step 4 directory")
+    parser.add_argument("--step4_dir", type=str, default=None, help="Optional base path containing Step4_1 and Step4_2 directories")
+    parser.add_argument("--step4_reg_dir", type=str, default=None, help="Optional explicit Step4_1 regression directory")
+    parser.add_argument("--step4_cls_dir", type=str, default=None, help="Optional explicit Step4_2 classification directory")
     parser.add_argument("--step4_checkpoint", type=str, default=None, help="Optional explicit path to Step4 chi checkpoint")
     parser.add_argument("--step4_class_checkpoint", type=str, default=None, help="Optional explicit path to Step4 class checkpoint")
     parser.add_argument("--backbone_checkpoint", type=str, default=None, help="Optional explicit path to Step1 backbone checkpoint")
@@ -755,9 +768,9 @@ if __name__ == "__main__":
         "--candidate_source",
         type=str,
         default=None,
-        help="known | novel | hybrid (default from chi_training.step5_inverse_design.candidate_source)",
+        help="Only novel/generated/step2 are supported for Step 5.",
     )
-    parser.add_argument("--generated_csv", type=str, default=None, help="Generated samples CSV (used when candidate_source is novel/hybrid)")
+    parser.add_argument("--generated_csv", type=str, default=None, help="Generated samples CSV from Step 2")
     parser.add_argument("--generated_smiles_column", type=str, default="smiles", help="SMILES column name in generated_csv")
     parser.add_argument("--allow_non_two_stars", action="store_true", help="Allow generated candidates without exactly two '*' tokens")
     parser.add_argument("--max_novel_candidates", type=int, default=50000, help="Max number of novel generated candidates to keep")
