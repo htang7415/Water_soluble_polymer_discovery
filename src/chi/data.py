@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -52,7 +53,13 @@ def _safe_train_test_split(*args, stratify, random_state: int, test_size: float)
             random_state=random_state,
             stratify=stratify,
         )
-    except ValueError:
+    except ValueError as exc:
+        warnings.warn(
+            "Stratified split failed; falling back to unstratified split. "
+            f"reason={exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return train_test_split(
             *args,
             test_size=test_size,

@@ -350,7 +350,7 @@ class DiffusionBackbone(nn.Module):
         Returns:
             Loaded model.
         """
-        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
         config = checkpoint['config']
         config.update(kwargs)
 

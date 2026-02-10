@@ -1,0 +1,30 @@
+{
+  "best_trial": 43,
+  "objective": "maximize_val_r2",
+  "objective_name": "val_r2",
+  "objective_direction": "maximize",
+  "objective_value_at_best_trial": 0.7929395737043908,
+  "best_value_r2": 0.7929395737043908,
+  "best_value_rmse_at_best_trial": 0.1676020379644956,
+  "tuning_cv_folds_requested": 6,
+  "tuning_cv_folds_resolved": 6,
+  "tuning_cv_strategy": "polymer_group_stratified",
+  "backbone_num_layers": 6,
+  "finetune_last_layers_search_mode": "range",
+  "finetune_last_layers_min": 0,
+  "finetune_last_layers_max": 6,
+  "best_params": {
+    "num_layers": 5,
+    "hidden_0": 128,
+    "hidden_1": 512,
+    "hidden_2": 128,
+    "hidden_3": 1024,
+    "hidden_4": 256,
+    "dropout": 0.0,
+    "learning_rate": 0.0006351691948652155,
+    "weight_decay": 4.10095929607619e-05,
+    "lambda_bce": 0.0,
+    "batch_size": 4,
+    "finetune_last_layers": 5
+  }
+}

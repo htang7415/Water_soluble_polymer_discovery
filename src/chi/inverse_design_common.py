@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ import torch
 from src.chi.embeddings import load_backbone_from_step1
 from src.chi.model import PhysicsGuidedChiModel, SolubilityClassifier
 from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars
+from src.utils.numerics import stable_sigmoid
 
 
 CLASS_NAME_MAP = {1: "Water-soluble", 0: "Water-insoluble"}
@@ -138,12 +140,9 @@ def resolve_training_smiles(results_dir: Path, base_results_dir: Path) -> set[st
     else:
         raise ValueError(f"Training CSV missing smiles column: {train_path}")
 
-    canon = []
-    for s in train_df[smiles_col].astype(str).tolist():
-        c = canonicalize_smiles(s)
-        if c is not None:
-            canon.append(c)
-    return set(canon)
+    canonical = train_df[smiles_col].astype(str).map(canonicalize_smiles)
+    canonical = canonical[canonical.notna()]
+    return set(canonical.tolist())
 
 
 def prepare_novel_candidates(
@@ -259,7 +258,19 @@ def infer_coefficients_for_novel_candidates(
         device=device,
     )
 
-    ckpt = torch.load(chi_checkpoint_path, map_location=device, weights_only=False)
+    ckpt = torch.load(chi_checkpoint_path, map_location=device, weights_only=True)
+    finetune_last_layers = int(ckpt.get("finetune_last_layers", 0) or 0)
+    if finetune_last_layers > 0:
+        warnings.warn(
+            (
+                f"Step4 checkpoint {chi_checkpoint_path} was trained with "
+                f"finetune_last_layers={finetune_last_layers}. "
+                "Novel-candidate inference uses the Step1 backbone encoder by design, "
+                "so Step4 finetuned backbone weights are not applied here."
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
     reg_model = PhysicsGuidedChiModel(
         embedding_dim=int(ckpt["embedding_dim"]),
         hidden_sizes=list(ckpt["hidden_sizes"]),
@@ -277,7 +288,7 @@ def infer_coefficients_for_novel_candidates(
 
     cls_model = None
     if class_checkpoint_path is not None and class_checkpoint_path.exists():
-        cls_ckpt = torch.load(class_checkpoint_path, map_location=device, weights_only=False)
+        cls_ckpt = torch.load(class_checkpoint_path, map_location=device, weights_only=True)
         cls_model = SolubilityClassifier(
             embedding_dim=int(cls_ckpt["embedding_dim"]),
             hidden_sizes=list(cls_ckpt["hidden_sizes"]),
@@ -312,10 +323,10 @@ def infer_coefficients_for_novel_candidates(
     if cls_model is not None:
         cls_out = cls_model(embedding=emb)
         logit = cls_out["class_logit"].detach().cpu().numpy()
-        prob = 1.0 / (1.0 + np.exp(-logit))
+        prob = stable_sigmoid(logit)
     else:
         logit = out["class_logit"].detach().cpu().numpy()
-        prob = 1.0 / (1.0 + np.exp(-logit))
+        prob = stable_sigmoid(logit)
 
     result = novel_df[["polymer_id", "Polymer", "SMILES", "canonical_smiles"]].copy()
     result["water_soluble"] = -1

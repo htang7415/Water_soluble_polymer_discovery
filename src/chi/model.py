@@ -12,6 +12,23 @@ import torch.nn.functional as F
 COEFF_NAMES = ["a0", "a1", "a2", "a3", "b1", "b2"]
 
 
+def _validate_formula_inputs_torch(temperature: torch.Tensor) -> None:
+    if torch.any(~torch.isfinite(temperature)):
+        raise ValueError("temperature contains non-finite values")
+    if torch.any(temperature <= 0):
+        raise ValueError("temperature must be > 0 for chi(T, phi) formula")
+
+
+def _validate_formula_inputs_numpy(temperature) -> None:
+    import numpy as np
+
+    arr = np.asarray(temperature, dtype=float)
+    if np.any(~np.isfinite(arr)):
+        raise ValueError("temperature contains non-finite values")
+    if np.any(arr <= 0):
+        raise ValueError("temperature must be > 0 for chi(T, phi) formula")
+
+
 
 def _build_mlp(input_dim: int, hidden_sizes: Iterable[int], dropout: float) -> nn.Sequential:
     layers: List[nn.Module] = []
@@ -34,6 +51,7 @@ def chi_formula_torch(coefficients: torch.Tensor, temperature: torch.Tensor, phi
     temperature: [...]
     phi: [...]
     """
+    _validate_formula_inputs_torch(temperature)
     a0, a1, a2, a3, b1, b2 = [coefficients[..., i] for i in range(6)]
     base = a0 + a1 / temperature + a2 * torch.log(temperature) + a3 * temperature
     one_minus_phi = 1.0 - phi
@@ -46,6 +64,7 @@ def predict_chi_from_coefficients(coefficients, temperature, phi):
     """Numpy-friendly chi formula wrapper used in analysis scripts."""
     import numpy as np
 
+    _validate_formula_inputs_numpy(temperature)
     coeffs = np.asarray(coefficients)
     temperature = np.asarray(temperature)
     phi = np.asarray(phi)

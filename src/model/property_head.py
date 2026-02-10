@@ -219,7 +219,7 @@ class PropertyPredictor(nn.Module):
         Args:
             path: Path to checkpoint.
         """
-        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        checkpoint = torch.load(path, map_location='cpu', weights_only=True)
         if 'property_head_state_dict' in checkpoint:
             state_dict = checkpoint['property_head_state_dict']
         elif 'model_state_dict' in checkpoint:

@@ -575,6 +575,20 @@ def main(args):
     target_polymer_count = int(chi_cfg.get("target_polymer_count", sampling_cfg.get("target_polymer_count", 100)))
     target_sa_max = float(chi_cfg.get("target_sa_max", sampling_cfg.get("target_sa_max", 4.0)))
     target_stars = int(sampling_cfg.get("target_stars", 2))
+    if epsilon < 0:
+        raise ValueError("epsilon must be >= 0")
+    if class_weight < 0:
+        raise ValueError("class_weight must be >= 0")
+    if polymer_class_weight < 0:
+        raise ValueError("polymer_class_weight must be >= 0")
+    if default_property_rule not in {"band", "upper_bound", "lower_bound"}:
+        raise ValueError("property_rule must be one of {'band', 'upper_bound', 'lower_bound'}")
+    if coverage_topk < 1:
+        raise ValueError("coverage_topk must be >= 1")
+    if target_polymer_count < 1:
+        raise ValueError("target_polymer_count must be >= 1")
+    if target_sa_max <= 0:
+        raise ValueError("target_sa_max must be > 0")
 
     polymer_patterns = config.get("polymer_classes", {})
     if not polymer_patterns:

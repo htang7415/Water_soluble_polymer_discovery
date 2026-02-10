@@ -43,6 +43,13 @@ from src.utils.reporting import save_step_summary, save_artifact_manifest, write
 BOND_CHARS = set(['-', '=', '#', '/', '\\'])
 
 
+def _sa_score_cached(smiles: str, cache: dict[str, float | None]) -> float | None:
+    key = str(smiles)
+    if key not in cache:
+        cache[key] = compute_sa_score(key)
+    return cache[key]
+
+
 def _smiles_constraint_violations(smiles: str) -> dict:
     if not smiles:
         return {
@@ -153,7 +160,9 @@ def _filter_step2_target_candidates(
     require_target_stars: bool,
     target_stars: int,
     sa_max: float,
+    sa_cache: dict[str, float | None] | None = None,
 ):
+    sa_cache = sa_cache if sa_cache is not None else {}
     accepted = []
     for smiles in smiles_list:
         if not check_validity(smiles):
@@ -167,7 +176,7 @@ def _filter_step2_target_candidates(
             continue
         if canonical in seen_canonical:
             continue
-        sa = compute_sa_score(smiles)
+        sa = _sa_score_cached(smiles, sa_cache)
         if sa is None or float(sa) >= float(sa_max):
             continue
         seen_canonical.add(canonical)
@@ -188,7 +197,9 @@ def _select_target_polymers(
     target_stars: int,
     sa_max: float,
     total_sampling_points: int | None = None,
+    sa_cache: dict[str, float | None] | None = None,
 ):
+    sa_cache = sa_cache if sa_cache is not None else {}
     training_canonical = {canonicalize_smiles(s) or s for s in training_smiles}
     rows = []
     for idx, smiles in enumerate(generated_smiles, start=1):
@@ -196,7 +207,7 @@ def _select_target_polymers(
         star_count = count_stars(smiles)
         canonical = canonicalize_smiles(smiles) if is_valid else None
         is_novel = bool(canonical) and canonical not in training_canonical
-        sa = compute_sa_score(smiles) if is_valid else None
+        sa = _sa_score_cached(smiles, sa_cache) if is_valid else None
         sa_ok = sa is not None and float(sa) < float(sa_max)
         rows.append(
             {
@@ -447,7 +458,7 @@ def main(args):
     # Load model
     print("\n3. Loading model...")
     checkpoint_path = args.checkpoint or (results_dir / 'step1_backbone' / 'checkpoints' / 'backbone_best.pt')
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     # Get backbone config based on model_size
     backbone_config = get_model_config(args.model_size, config, model_type='sequence')
@@ -547,6 +558,7 @@ def main(args):
         "valid_only_acceptance_rate": None,
         "valid_only_rejected_count": 0,
     }
+    sa_cache: dict[str, float | None] = {}
     training_canonical = {canonicalize_smiles(s) or s for s in training_smiles}
     if valid_only:
         print(
@@ -581,6 +593,7 @@ def main(args):
                 require_target_stars=valid_only_require_target_stars,
                 target_stars=target_stars,
                 sa_max=target_sa_max,
+                sa_cache=sa_cache,
             )
             accepted = min(remaining, len(batch_accepted))
             if accepted > 0:
@@ -720,6 +733,7 @@ def main(args):
         target_stars=target_stars,
         sa_max=target_sa_max,
         total_sampling_points=total_sampling_points,
+        sa_cache=sa_cache,
     )
     target_df.to_csv(metrics_dir / "target_polymers.csv", index=False)
     pd.DataFrame([target_summary]).to_csv(metrics_dir / "target_polymer_selection_summary.csv", index=False)
@@ -750,9 +764,9 @@ def main(args):
     valid_smiles = evaluator.get_valid_samples(generated_smiles, require_two_stars=True)
 
     # SA histogram: train vs generated
-    train_sa = [compute_sa_score(s) for s in list(training_smiles)[:5000]]
+    train_sa = [_sa_score_cached(s, sa_cache) for s in list(training_smiles)[:5000]]
     train_sa = [s for s in train_sa if s is not None]
-    gen_sa = [compute_sa_score(s) for s in valid_smiles[:5000]]
+    gen_sa = [_sa_score_cached(s, sa_cache) for s in valid_smiles[:5000]]
     gen_sa = [s for s in gen_sa if s is not None]
 
     plotter.histogram(

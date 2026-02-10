@@ -532,7 +532,7 @@ class BackboneTrainer:
         Args:
             checkpoint_path: Path to checkpoint.
         """
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
         model = self.model.module if isinstance(self.model, DDP) else self.model
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod

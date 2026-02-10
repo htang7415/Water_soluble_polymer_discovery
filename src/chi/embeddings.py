@@ -101,7 +101,7 @@ def load_backbone_from_step1(
         eos_token_id=tokenizer.eos_token_id,
     )
 
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = _normalize_checkpoint_state(checkpoint["model_state_dict"])
     diffusion.load_state_dict(state_dict)
 

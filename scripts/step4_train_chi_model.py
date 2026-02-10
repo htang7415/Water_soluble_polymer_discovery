@@ -34,6 +34,7 @@ from src.chi.metrics import classification_metrics, hit_metrics, metrics_by_grou
 from src.chi.model import PhysicsGuidedChiModel, SolubilityClassifier
 from src.utils.config import load_config, save_config
 from src.utils.model_scales import get_model_config, get_results_dir
+from src.utils.numerics import stable_sigmoid
 from src.utils.reproducibility import save_run_metadata, seed_everything
 from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
 
@@ -50,6 +51,9 @@ class TrainConfig:
     patience: int
     learning_rate: float
     weight_decay: float
+    gradient_clip_norm: float
+    use_scheduler: bool
+    scheduler_min_lr: float
     lambda_bce: float
     hidden_sizes: List[int]
     dropout: float
@@ -276,6 +280,9 @@ def _default_chi_config(config: Dict) -> Dict:
         "patience": 60,
         "learning_rate": 1.0e-3,
         "weight_decay": 1.0e-5,
+        "gradient_clip_norm": 1.0,
+        "use_scheduler": True,
+        "scheduler_min_lr": 1.0e-6,
         "lambda_bce": 0.1,
         "hidden_sizes": [256, 128],
         "dropout": 0.1,
@@ -310,6 +317,9 @@ def _default_chi_config(config: Dict) -> Dict:
         "patience",
         "learning_rate",
         "weight_decay",
+        "gradient_clip_norm",
+        "use_scheduler",
+        "scheduler_min_lr",
         "lambda_bce",
         "hidden_sizes",
         "dropout",
@@ -331,6 +341,9 @@ def _default_chi_config(config: Dict) -> Dict:
         "patience": int(out["patience"]),
         "learning_rate": float(out["learning_rate"]),
         "weight_decay": float(out["weight_decay"]),
+        "gradient_clip_norm": float(out["gradient_clip_norm"]),
+        "use_scheduler": bool(out["use_scheduler"]),
+        "scheduler_min_lr": float(out["scheduler_min_lr"]),
         "hidden_sizes": [int(v) for v in out["hidden_sizes"]],
         "dropout": float(out["dropout"]),
         "tune": bool(out["tune"]),
@@ -362,6 +375,12 @@ def build_train_config(args, config: Dict) -> TrainConfig:
     tuning_cv_folds = int(args.tuning_cv_folds if args.tuning_cv_folds is not None else chi_cfg.get("tuning_cv_folds", 6))
     if tuning_cv_folds < 2:
         raise ValueError("chi_training.tuning_cv_folds must be >= 2")
+    gradient_clip_norm = float(chi_cfg.get("gradient_clip_norm", 1.0))
+    if gradient_clip_norm < 0:
+        raise ValueError("chi_training.gradient_clip_norm must be >= 0")
+    scheduler_min_lr = float(chi_cfg.get("scheduler_min_lr", 1.0e-6))
+    if scheduler_min_lr < 0:
+        raise ValueError("chi_training.scheduler_min_lr must be >= 0")
 
     return TrainConfig(
         split_mode=split_mode,
@@ -374,6 +393,9 @@ def build_train_config(args, config: Dict) -> TrainConfig:
         patience=int(chi_cfg["patience"]),
         learning_rate=float(chi_cfg["learning_rate"]),
         weight_decay=float(chi_cfg["weight_decay"]),
+        gradient_clip_norm=gradient_clip_norm,
+        use_scheduler=bool(chi_cfg.get("use_scheduler", True)),
+        scheduler_min_lr=scheduler_min_lr,
         lambda_bce=float(chi_cfg["lambda_bce"]),
         hidden_sizes=[int(x) for x in chi_cfg["hidden_sizes"]],
         dropout=float(chi_cfg["dropout"]),
@@ -435,6 +457,7 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None,
     device: str,
     lambda_bce: float,
+    gradient_clip_norm: float = 0.0,
 ) -> Dict[str, float]:
     train_mode = optimizer is not None
     model.train(mode=train_mode)
@@ -478,6 +501,8 @@ def run_epoch(
         loss = out["loss"]
         if train_mode:
             loss.backward()
+            if gradient_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(gradient_clip_norm))
             optimizer.step()
 
         losses.append(float(loss.item()))
@@ -607,9 +632,17 @@ def train_one_model(
         lr=learning_rate,
         weight_decay=weight_decay,
     )
+    scheduler = None
+    if train_cfg.use_scheduler:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, int(num_epochs)),
+            eta_min=float(train_cfg.scheduler_min_lr),
+        )
 
     history = {
         "epoch": [],
+        "learning_rate": [],
         "train_loss": [],
         "train_loss_mse": [],
         "train_loss_bce": [],
@@ -630,6 +663,7 @@ def train_one_model(
             optimizer=optimizer,
             device=device,
             lambda_bce=lambda_bce,
+            gradient_clip_norm=float(train_cfg.gradient_clip_norm),
         )
         val_stats = run_epoch(
             model=model,
@@ -637,12 +671,14 @@ def train_one_model(
             optimizer=None,
             device=device,
             lambda_bce=lambda_bce,
+            gradient_clip_norm=0.0,
         )
         val_pred = predict_split(model, dataloaders["val"], device)
         val_reg = regression_metrics(val_pred["chi_true"], val_pred["chi_pred"])
         val_rmse = float(val_reg["rmse"])
 
         history["epoch"].append(epoch)
+        history["learning_rate"].append(float(optimizer.param_groups[0]["lr"]))
         history["train_loss"].append(train_stats["loss"])
         history["train_loss_mse"].append(train_stats["loss_mse"])
         history["train_loss_bce"].append(train_stats["loss_bce"])
@@ -659,6 +695,8 @@ def train_one_model(
             wait += 1
             if wait >= patience:
                 break
+        if scheduler is not None:
+            scheduler.step()
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -946,12 +984,16 @@ def tune_hyperparameters(
         )
         val_r2 = float(cv_eval["cv_val_r2"])
         val_rmse = float(cv_eval["cv_val_rmse"])
+        invalid_metrics = int((not np.isfinite(val_r2)) or (not np.isfinite(val_rmse)))
         trial.set_user_attr("val_r2", val_r2)
         trial.set_user_attr("val_rmse", val_rmse)
         trial.set_user_attr("cv_val_r2", val_r2)
         trial.set_user_attr("cv_val_rmse", val_rmse)
         trial.set_user_attr("cv_n_folds", int(len(cv_folds)))
         trial.set_user_attr("tuning_objective", objective_name)
+        trial.set_user_attr("invalid_metrics", invalid_metrics)
+        if invalid_metrics:
+            return -1.0e12
         return val_r2
 
     study = optuna.create_study(direction=objective_direction)
@@ -970,6 +1012,7 @@ def tune_hyperparameters(
             "value_val_r2": val_r2,
             "val_r2": val_r2,
             "val_rmse": val_rmse,
+            "invalid_metrics": int(t.user_attrs.get("invalid_metrics", 0)),
             "cv_n_folds": int(t.user_attrs.get("cv_n_folds", len(cv_folds))),
         }
         row.update(t.params)
@@ -1044,6 +1087,7 @@ def tune_hyperparameters(
     plt.close(fig)
 
     with open(tuning_dir / "optuna_best.json", "w") as f:
+        invalid_trial_count = int(trial_df["invalid_metrics"].sum()) if "invalid_metrics" in trial_df.columns else 0
         json.dump(
             {
                 "best_trial": int(study.best_trial.number),
@@ -1056,6 +1100,7 @@ def tune_hyperparameters(
                 "tuning_cv_folds_requested": int(train_cfg.tuning_cv_folds),
                 "tuning_cv_folds_resolved": int(cv_info.get("resolved_folds", len(cv_folds))),
                 "tuning_cv_strategy": str(cv_info.get("strategy", "unknown")),
+                "invalid_trial_count": invalid_trial_count,
                 "backbone_num_layers": int(backbone_num_layers),
                 "finetune_last_layers_search_mode": finetune_mode,
                 "finetune_last_layers_min": int(finetune_lo),
@@ -1329,7 +1374,7 @@ def _save_coefficient_summary(
             features = model.chi_head.encoder(emb_t)
             coeff = model.chi_head.coeff_head(features).cpu().numpy()
             logit = model.chi_head.class_head(features).squeeze(-1).cpu().numpy()
-            prob = 1.0 / (1.0 + np.exp(-logit))
+            prob = stable_sigmoid(logit)
         df = rec
     else:
         emb = np.stack(embedding_cache_df["embedding"].to_list(), axis=0)
@@ -1338,7 +1383,7 @@ def _save_coefficient_summary(
             features = model.encoder(emb_t)
             coeff = model.coeff_head(features).cpu().numpy()
             logit = model.class_head(features).squeeze(-1).cpu().numpy()
-            prob = 1.0 / (1.0 + np.exp(-logit))
+            prob = stable_sigmoid(logit)
         df = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].copy()
 
     for i, name in enumerate(COEFF_NAMES):
@@ -1353,6 +1398,7 @@ def run_classifier_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer | None,
     device: str,
+    gradient_clip_norm: float = 0.0,
 ) -> Dict[str, float]:
     train_mode = optimizer is not None
     model.train(mode=train_mode)
@@ -1366,6 +1412,8 @@ def run_classifier_epoch(
         loss = out["loss"]
         if train_mode:
             loss.backward()
+            if gradient_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(gradient_clip_norm))
             optimizer.step()
         losses.append(float(loss.item()))
     return {"loss": float(np.mean(losses)) if losses else np.nan}
@@ -1400,6 +1448,9 @@ def train_one_classifier_model(
     dropout: float,
     learning_rate: float,
     weight_decay: float,
+    gradient_clip_norm: float,
+    use_scheduler: bool,
+    scheduler_min_lr: float,
     batch_size: int,
     num_epochs: int,
     patience: int,
@@ -1420,9 +1471,17 @@ def train_one_classifier_model(
         lr=learning_rate,
         weight_decay=weight_decay,
     )
+    scheduler = None
+    if use_scheduler:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, int(num_epochs)),
+            eta_min=float(scheduler_min_lr),
+        )
 
     history = {
         "epoch": [],
+        "learning_rate": [],
         "train_loss": [],
         "val_loss": [],
         "val_balanced_accuracy": [],
@@ -1433,13 +1492,26 @@ def train_one_classifier_model(
     wait = 0
 
     for epoch in range(1, num_epochs + 1):
-        train_stats = run_classifier_epoch(model=model, loader=dataloaders["train"], optimizer=optimizer, device=device)
-        val_stats = run_classifier_epoch(model=model, loader=dataloaders["val"], optimizer=None, device=device)
+        train_stats = run_classifier_epoch(
+            model=model,
+            loader=dataloaders["train"],
+            optimizer=optimizer,
+            device=device,
+            gradient_clip_norm=float(gradient_clip_norm),
+        )
+        val_stats = run_classifier_epoch(
+            model=model,
+            loader=dataloaders["val"],
+            optimizer=None,
+            device=device,
+            gradient_clip_norm=0.0,
+        )
         val_pred = predict_classifier_split(model, dataloaders["val"], device)
         val_cls = classification_metrics(val_pred["label"], val_pred["prob"])
         val_bal_acc = float(val_cls["balanced_accuracy"])
 
         history["epoch"].append(epoch)
+        history["learning_rate"].append(float(optimizer.param_groups[0]["lr"]))
         history["train_loss"].append(train_stats["loss"])
         history["val_loss"].append(val_stats["loss"])
         history["val_balanced_accuracy"].append(val_bal_acc)
@@ -1453,6 +1525,8 @@ def train_one_classifier_model(
             wait += 1
             if wait >= patience:
                 break
+        if scheduler is not None:
+            scheduler.step()
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -1491,6 +1565,9 @@ def _evaluate_classifier_trial_with_cv(
             dropout=dropout,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
+            gradient_clip_norm=float(train_cfg.gradient_clip_norm),
+            use_scheduler=bool(train_cfg.use_scheduler),
+            scheduler_min_lr=float(train_cfg.scheduler_min_lr),
             batch_size=batch_size,
             num_epochs=train_cfg.tuning_epochs,
             patience=train_cfg.tuning_patience,
@@ -1588,12 +1665,16 @@ def tune_classifier_hyperparameters(
             batch_size=batch_size,
         )
         val_bal_acc = float(cv_eval["cv_val_balanced_accuracy"])
+        invalid_metrics = int(not np.isfinite(val_bal_acc))
         trial.set_user_attr("cv_val_balanced_accuracy", val_bal_acc)
         trial.set_user_attr("cv_val_auroc", float(cv_eval["cv_val_auroc"]))
         trial.set_user_attr("cv_val_auprc", float(cv_eval["cv_val_auprc"]))
         trial.set_user_attr("cv_val_brier", float(cv_eval["cv_val_brier"]))
         trial.set_user_attr("cv_n_folds", int(len(cv_folds)))
         trial.set_user_attr("tuning_objective", objective_name)
+        trial.set_user_attr("invalid_metrics", invalid_metrics)
+        if invalid_metrics:
+            return -1.0e12
         return val_bal_acc
 
     study = optuna.create_study(direction=objective_direction)
@@ -1611,6 +1692,7 @@ def tune_classifier_hyperparameters(
             "val_auroc": t.user_attrs.get("cv_val_auroc", np.nan),
             "val_auprc": t.user_attrs.get("cv_val_auprc", np.nan),
             "val_brier": t.user_attrs.get("cv_val_brier", np.nan),
+            "invalid_metrics": int(t.user_attrs.get("invalid_metrics", 0)),
             "cv_n_folds": int(t.user_attrs.get("cv_n_folds", len(cv_folds))),
         }
         row.update(t.params)
@@ -1648,6 +1730,7 @@ def tune_classifier_hyperparameters(
     plt.close(fig)
 
     with open(tuning_dir / "optuna_best.json", "w") as f:
+        invalid_trial_count = int(trial_df["invalid_metrics"].sum()) if "invalid_metrics" in trial_df.columns else 0
         json.dump(
             {
                 "best_trial": int(study.best_trial.number),
@@ -1662,6 +1745,7 @@ def tune_classifier_hyperparameters(
                 "tuning_cv_folds_requested": int(train_cfg.tuning_cv_folds),
                 "tuning_cv_folds_resolved": int(cv_info.get("resolved_folds", len(cv_folds))),
                 "tuning_cv_strategy": str(cv_info.get("strategy", "unknown")),
+                "invalid_trial_count": invalid_trial_count,
                 "best_params": study.best_params,
             },
             f,
@@ -2046,6 +2130,9 @@ def main(args):
             "n_trials": train_cfg.n_trials,
             "tuning_objective": train_cfg.tuning_objective,
             "tuning_cv_folds": train_cfg.tuning_cv_folds,
+            "gradient_clip_norm": train_cfg.gradient_clip_norm,
+            "use_scheduler": train_cfg.use_scheduler,
+            "scheduler_min_lr": train_cfg.scheduler_min_lr,
             "backbone_num_layers": backbone_num_layers,
             "finetune_last_layers": train_cfg.finetune_last_layers,
             "stage4_1_dir": str(reg_dir),
@@ -2258,6 +2345,13 @@ def main(args):
     cls_cfg.patience = int(cls_section.get("patience", cls_cfg.patience))
     cls_cfg.learning_rate = float(cls_section.get("learning_rate", cls_cfg.learning_rate))
     cls_cfg.weight_decay = float(cls_section.get("weight_decay", cls_cfg.weight_decay))
+    cls_cfg.gradient_clip_norm = float(cls_section.get("gradient_clip_norm", cls_cfg.gradient_clip_norm))
+    if cls_cfg.gradient_clip_norm < 0:
+        raise ValueError("chi_training.step4_2_classification.gradient_clip_norm must be >= 0")
+    cls_cfg.use_scheduler = bool(cls_section.get("use_scheduler", cls_cfg.use_scheduler))
+    cls_cfg.scheduler_min_lr = float(cls_section.get("scheduler_min_lr", cls_cfg.scheduler_min_lr))
+    if cls_cfg.scheduler_min_lr < 0:
+        raise ValueError("chi_training.step4_2_classification.scheduler_min_lr must be >= 0")
     cls_cfg.hidden_sizes = [int(v) for v in cls_section.get("hidden_sizes", cls_cfg.hidden_sizes)]
     cls_cfg.dropout = float(cls_section.get("dropout", cls_cfg.dropout))
     cls_cfg.tune = bool(args.tune or (bool(cls_section.get("tune", cls_cfg.tune)) and not args.no_tune))
@@ -2327,6 +2421,9 @@ def main(args):
         dropout=cls_chosen["dropout"],
         learning_rate=cls_chosen["learning_rate"],
         weight_decay=cls_chosen["weight_decay"],
+        gradient_clip_norm=float(cls_cfg.gradient_clip_norm),
+        use_scheduler=bool(cls_cfg.use_scheduler),
+        scheduler_min_lr=float(cls_cfg.scheduler_min_lr),
         batch_size=cls_chosen["batch_size"],
         num_epochs=cls_cfg.num_epochs,
         patience=cls_cfg.patience,

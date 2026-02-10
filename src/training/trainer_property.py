@@ -396,7 +396,7 @@ class PropertyTrainer:
         """Load best checkpoint."""
         checkpoint_path = self.checkpoint_dir / f'{self.property_name}_best.pt'
         if checkpoint_path.exists():
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"Loaded best checkpoint with val_loss: {checkpoint['val_loss']:.4f}")
 

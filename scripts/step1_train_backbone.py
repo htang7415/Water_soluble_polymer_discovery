@@ -222,7 +222,7 @@ def main(args):
     if args.resume:
         if is_main_process:
             print(f"\nResuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
         # Handle torch.compile() state dict (keys have _orig_mod. prefix)
         state_dict = checkpoint['model_state_dict']
         if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
