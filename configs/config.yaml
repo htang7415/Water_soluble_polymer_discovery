@@ -147,7 +147,6 @@ chi_training:
     gradient_clip_norm: 1.0
     use_scheduler: true
     scheduler_min_lr: 1.0e-6
-    lambda_bce: 0.0  # fixed to 0.0 for regression-only mode
     hidden_sizes: [256, 512, 128]
     dropout: 0.1
     finetune_last_layers: 0  # integer in [0, num_layers(model_size)]; 0=freeze backbone
@@ -169,7 +168,6 @@ chi_training:
       learning_rate_log: true
       weight_decay: [1.0e-7, 1.0e-3]
       weight_decay_log: true
-      lambda_bce: [0.0]
       batch_size: [4, 8, 16, 32, 64, 128]
 
   # Step4_2: water-soluble classification

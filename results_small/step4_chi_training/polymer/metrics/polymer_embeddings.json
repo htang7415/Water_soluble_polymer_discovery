@@ -1,8 +1,0 @@
-{
-  "cache_key": "61344aff0b94104d64a2cfbe95544298360959d67dfcefb5df909635bfef24aa",
-  "checkpoint": "results_small/step1_backbone/checkpoints/backbone_best.pt",
-  "model_size": "small",
-  "timestep": 1,
-  "pooling": "mean",
-  "n_polymers": 50
-}

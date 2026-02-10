@@ -53,7 +53,6 @@ class TrainConfig:
     gradient_clip_norm: float
     use_scheduler: bool
     scheduler_min_lr: float
-    lambda_bce: float
     hidden_sizes: List[int]
     dropout: float
     tune: bool
@@ -157,27 +156,6 @@ class BackbonePhysicsGuidedChiModel(nn.Module):
         embedding = self._encode(input_ids=input_ids, attention_mask=attention_mask)
         return self.chi_head(embedding=embedding, temperature=temperature, phi=phi)
 
-    def compute_loss(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        temperature: torch.Tensor,
-        phi: torch.Tensor,
-        chi_true: torch.Tensor,
-        class_label: torch.Tensor,
-        lambda_bce: float = 0.1,
-    ):
-        embedding = self._encode(input_ids=input_ids, attention_mask=attention_mask)
-        return self.chi_head.compute_loss(
-            embedding=embedding,
-            temperature=temperature,
-            phi=phi,
-            chi_true=chi_true,
-            class_label=class_label,
-            lambda_bce=lambda_bce,
-        )
-
-
 class BackboneSolubilityClassifierModel(nn.Module):
     """End-to-end Step 4_2 model: backbone encoder + solubility classifier head."""
 
@@ -249,7 +227,6 @@ def _resolve_optuna_search_space(config: Dict, chi_cfg: Dict) -> Dict[str, objec
         "learning_rate_log": True,
         "weight_decay": [1e-7, 1e-3],    # continuous range when len==2
         "weight_decay_log": True,
-        "lambda_bce": [0.01, 0.05, 0.1, 0.2, 0.5],
         "batch_size": [16, 32, 64, 128, 256],
     }
 
@@ -386,7 +363,6 @@ def _default_chi_config(config: Dict) -> Dict:
         "gradient_clip_norm": 1.0,
         "use_scheduler": True,
         "scheduler_min_lr": 1.0e-6,
-        "lambda_bce": 0.1,
         "hidden_sizes": [256, 128],
         "dropout": 0.1,
         "tune": True,
@@ -430,7 +406,6 @@ def _default_chi_config(config: Dict) -> Dict:
         "gradient_clip_norm",
         "use_scheduler",
         "scheduler_min_lr",
-        "lambda_bce",
         "hidden_sizes",
         "dropout",
         "tune",
@@ -507,7 +482,6 @@ def build_train_config(args, config: Dict) -> TrainConfig:
         gradient_clip_norm=gradient_clip_norm,
         use_scheduler=bool(chi_cfg.get("use_scheduler", True)),
         scheduler_min_lr=scheduler_min_lr,
-        lambda_bce=float(chi_cfg["lambda_bce"]),
         hidden_sizes=[int(x) for x in chi_cfg["hidden_sizes"]],
         dropout=float(chi_cfg["dropout"]),
         tune=tune_flag,
@@ -567,7 +541,6 @@ def run_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer | None,
     device: str,
-    lambda_bce: float,
     gradient_clip_norm: float = 0.0,
 ) -> Dict[str, float]:
     train_mode = optimizer is not None
@@ -581,35 +554,29 @@ def run_epoch(
         temperature = batch["temperature"].to(device)
         phi = batch["phi"].to(device)
         chi_true = batch["chi"].to(device)
-        label = batch["label"].to(device)
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
 
         if "embedding" in batch:
             embedding = batch["embedding"].to(device)
-            out = model.compute_loss(
+            out = model(
                 embedding=embedding,
                 temperature=temperature,
                 phi=phi,
-                chi_true=chi_true,
-                class_label=label,
-                lambda_bce=lambda_bce,
             )
         else:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            out = model.compute_loss(
+            out = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 temperature=temperature,
                 phi=phi,
-                chi_true=chi_true,
-                class_label=label,
-                lambda_bce=lambda_bce,
             )
 
-        loss = out["loss"]
+        loss_mse = torch.nn.functional.mse_loss(out["chi_pred"], chi_true)
+        loss = loss_mse
         if train_mode:
             loss.backward()
             if gradient_clip_norm > 0:
@@ -617,8 +584,8 @@ def run_epoch(
             optimizer.step()
 
         losses.append(float(loss.item()))
-        losses_mse.append(float(out["loss_mse"].item()))
-        losses_bce.append(float(out["loss_bce"].item()))
+        losses_mse.append(float(loss_mse.item()))
+        losses_bce.append(0.0)
 
     return {
         "loss": float(np.mean(losses)) if losses else np.nan,
@@ -683,7 +650,6 @@ def train_one_model(
     dropout: float,
     learning_rate: float,
     weight_decay: float,
-    lambda_bce: float,
     batch_size: int,
     num_epochs: int,
     patience: int,
@@ -773,7 +739,6 @@ def train_one_model(
             loader=dataloaders["train"],
             optimizer=optimizer,
             device=device,
-            lambda_bce=lambda_bce,
             gradient_clip_norm=float(train_cfg.gradient_clip_norm),
         )
         val_stats = run_epoch(
@@ -781,7 +746,6 @@ def train_one_model(
             loader=dataloaders["val"],
             optimizer=None,
             device=device,
-            lambda_bce=lambda_bce,
             gradient_clip_norm=0.0,
         )
         val_pred = predict_split(model, dataloaders["val"], device)
@@ -934,7 +898,6 @@ def _evaluate_trial_with_cv(
     dropout: float,
     learning_rate: float,
     weight_decay: float,
-    lambda_bce: float,
     batch_size: int,
     finetune_last_layers: int,
     collect_val_predictions: bool = False,
@@ -951,7 +914,6 @@ def _evaluate_trial_with_cv(
             dropout=dropout,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
-            lambda_bce=lambda_bce,
             batch_size=batch_size,
             num_epochs=train_cfg.tuning_epochs,
             patience=train_cfg.tuning_patience,
@@ -1103,7 +1065,6 @@ def tune_hyperparameters(
     dropout_space = [float(v) for v in _as_list("dropout", [0.0, 0.1, 0.2, 0.3])]
     lr_space = [float(v) for v in _as_list("learning_rate", [1e-4, 5e-3])]
     wd_space = [float(v) for v in _as_list("weight_decay", [1e-7, 1e-3])]
-    lambda_bce_space = [float(v) for v in _as_list("lambda_bce", [0.01, 0.05, 0.1, 0.2, 0.5])]
     batch_size_space = [int(v) for v in _as_list("batch_size", [16, 32, 64, 128, 256])]
     lr_log = bool(search_space.get("learning_rate_log", True))
     wd_log = bool(search_space.get("weight_decay_log", True))
@@ -1161,7 +1122,6 @@ def tune_hyperparameters(
         else:
             wd = float(trial.suggest_categorical("weight_decay", wd_space))
 
-        lambda_bce = float(trial.suggest_categorical("lambda_bce", lambda_bce_space))
         batch_size = int(trial.suggest_categorical("batch_size", batch_size_space))
         if finetune_mode == "range":
             finetune_last_layers = int(trial.suggest_int("finetune_last_layers", finetune_lo, finetune_hi))
@@ -1181,7 +1141,6 @@ def tune_hyperparameters(
             dropout=dropout,
             learning_rate=lr,
             weight_decay=wd,
-            lambda_bce=lambda_bce,
             batch_size=batch_size,
             finetune_last_layers=finetune_last_layers,
         )
@@ -1249,7 +1208,6 @@ def tune_hyperparameters(
     best_dropout = float(best_params["dropout"])
     best_learning_rate = float(best_params["learning_rate"])
     best_weight_decay = float(best_params["weight_decay"])
-    best_lambda_bce = float(best_params["lambda_bce"])
     best_batch_size = int(best_params["batch_size"])
     best_finetune_last_layers = int(best_params.get("finetune_last_layers", train_cfg.finetune_last_layers))
     best_cv_eval = _evaluate_trial_with_cv(
@@ -1265,7 +1223,6 @@ def tune_hyperparameters(
         dropout=best_dropout,
         learning_rate=best_learning_rate,
         weight_decay=best_weight_decay,
-        lambda_bce=best_lambda_bce,
         batch_size=best_batch_size,
         finetune_last_layers=best_finetune_last_layers,
         collect_val_predictions=True,
@@ -2556,11 +2513,7 @@ def main(args):
     # Step 4_1: Regression
     # -------------------------
     reg_cfg = copy.deepcopy(train_cfg)
-    reg_cfg.lambda_bce = 0.0
     reg_cfg.tuning_objective = "val_r2"
-    reg_space = dict(reg_cfg.optuna_search_space)
-    reg_space["lambda_bce"] = [0.0]
-    reg_cfg.optuna_search_space = reg_space
 
     reg_best_params = None
     if reg_cfg.tune:
@@ -2588,7 +2541,6 @@ def main(args):
             "dropout": reg_cfg.dropout,
             "learning_rate": reg_cfg.learning_rate,
             "weight_decay": reg_cfg.weight_decay,
-            "lambda_bce": 0.0,
             "batch_size": reg_cfg.batch_size,
             "finetune_last_layers": int(reg_cfg.finetune_last_layers),
         }
@@ -2599,7 +2551,6 @@ def main(args):
             "dropout": float(reg_best_params["dropout"]),
             "learning_rate": float(reg_best_params["learning_rate"]),
             "weight_decay": float(reg_best_params["weight_decay"]),
-            "lambda_bce": 0.0,
             "batch_size": int(reg_best_params["batch_size"]),
             "finetune_last_layers": int(reg_best_params.get("finetune_last_layers", reg_cfg.finetune_last_layers)),
         }
@@ -2641,7 +2592,6 @@ def main(args):
         dropout=reg_chosen["dropout"],
         learning_rate=reg_chosen["learning_rate"],
         weight_decay=reg_chosen["weight_decay"],
-        lambda_bce=0.0,
         batch_size=reg_chosen["batch_size"],
         num_epochs=reg_cfg.num_epochs,
         patience=reg_cfg.patience,
@@ -2661,7 +2611,6 @@ def main(args):
         "learning_rate": reg_chosen["learning_rate"],
         "weight_decay": reg_chosen["weight_decay"],
         "batch_size": reg_chosen["batch_size"],
-        "lambda_bce": 0.0,
         "used_optuna": bool(reg_cfg.tune),
         "optuna_best_params": reg_best_params,
         "split_mode": reg_cfg.split_mode,

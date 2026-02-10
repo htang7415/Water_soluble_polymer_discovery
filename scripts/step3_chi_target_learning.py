@@ -222,12 +222,27 @@ def _make_figures(
 
     # quality heatmap
     pivot_obj = cond_best.pivot(index="temperature", columns="phi", values=objective)
+    obj_vals = cond_best[objective].to_numpy(dtype=float)
+    if np.isfinite(obj_vals).any():
+        obj_min = float(np.nanmin(obj_vals))
+        obj_max = float(np.nanmax(obj_vals))
+        if np.isclose(obj_min, obj_max):
+            pad = 0.02
+        else:
+            pad = max(0.01, 0.10 * (obj_max - obj_min))
+        obj_vmin = max(0.0, obj_min - pad)
+        obj_vmax = min(1.0, obj_max + pad)
+        if np.isclose(obj_vmin, obj_vmax):
+            obj_vmin = max(0.0, obj_vmin - 0.05)
+            obj_vmax = min(1.0, obj_vmax + 0.05)
+    else:
+        obj_vmin, obj_vmax = 0.0, 1.0
     fig, ax = plt.subplots(figsize=(5.8, 5))
     sns.heatmap(
         pivot_obj,
         cmap="YlGnBu",
-        vmin=0.0,
-        vmax=1.0,
+        vmin=obj_vmin,
+        vmax=obj_vmax,
         annot=True,
         fmt=".2f",
         cbar_kws={"label": objective.replace("_", " ").title()},
@@ -288,6 +303,68 @@ def _make_figures(
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_target_vs_temperature_with_ci.png", dpi=dpi)
     plt.close(fig)
+
+
+def _condition_stability_report(
+    raw_df: pd.DataFrame,
+    scan_df: pd.DataFrame,
+    cond_best: pd.DataFrame,
+    objective: str,
+) -> pd.DataFrame:
+    rows = []
+    for (t, phi), sub in raw_df.groupby(["temperature", "phi"]):
+        t = float(t)
+        phi = float(phi)
+        scan_sub = scan_df[(scan_df["temperature"] == t) & (scan_df["phi"] == phi)].copy()
+        best_sub = cond_best[(cond_best["temperature"] == t) & (cond_best["phi"] == phi)].copy()
+        if scan_sub.empty or best_sub.empty:
+            continue
+
+        max_obj = float(scan_sub[objective].max())
+        tie_mask = np.isclose(scan_sub[objective].to_numpy(dtype=float), max_obj, atol=1e-12, rtol=1e-12)
+        tie_df = scan_sub.loc[tie_mask].sort_values("threshold")
+
+        chosen = float(best_sub["chi_target"].iloc[0])
+        tie_thr_min = float(tie_df["threshold"].min()) if not tie_df.empty else np.nan
+        tie_thr_max = float(tie_df["threshold"].max()) if not tie_df.empty else np.nan
+        chosen_on_tie_edge = (
+            bool(np.isclose(chosen, tie_thr_min, atol=1e-12, rtol=1e-12))
+            or bool(np.isclose(chosen, tie_thr_max, atol=1e-12, rtol=1e-12))
+        )
+
+        ci_lo = float(best_sub.get("chi_target_boot_q025", pd.Series([np.nan])).iloc[0])
+        ci_hi = float(best_sub.get("chi_target_boot_q975", pd.Series([np.nan])).iloc[0])
+        ci_width = ci_hi - ci_lo if np.isfinite(ci_lo) and np.isfinite(ci_hi) else np.nan
+
+        rows.append(
+            {
+                "temperature": t,
+                "phi": phi,
+                "n_samples": int(len(sub)),
+                "n_soluble": int((sub["water_soluble"] == 1).sum()),
+                "n_insoluble": int((sub["water_soluble"] == 0).sum()),
+                "chosen_chi_target": chosen,
+                "chosen_balanced_accuracy": float(best_sub["balanced_accuracy"].iloc[0]),
+                "objective_max": max_obj,
+                "n_tied_thresholds": int(len(tie_df)),
+                "tie_threshold_min": tie_thr_min,
+                "tie_threshold_max": tie_thr_max,
+                "tie_threshold_span": (
+                    float(tie_thr_max - tie_thr_min)
+                    if np.isfinite(tie_thr_min) and np.isfinite(tie_thr_max)
+                    else np.nan
+                ),
+                "chosen_on_tie_edge": bool(chosen_on_tie_edge),
+                "chi_target_boot_q025": ci_lo,
+                "chi_target_boot_q975": ci_hi,
+                "chi_target_boot_ci_width": ci_width,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["temperature", "phi"]).reset_index(drop=True)
 
 
 def _round_float_columns(df: pd.DataFrame, ndigits: int = 4) -> pd.DataFrame:
@@ -404,6 +481,7 @@ def main(args):
 
     cond_best = cond_best.rename(columns={"threshold": "chi_target"})
     cond_best = cond_best.sort_values(["temperature", "phi"]).reset_index(drop=True)
+    stability_df = _condition_stability_report(df, scan_df, cond_best, objective)
 
     # recommended targets for inverse design
     target_rows = []
@@ -448,6 +526,7 @@ def main(args):
     _round_float_columns(global_best, ndigits=4).to_csv(metrics_dir / "chi_target_global_best.csv", index=False)
     _round_float_columns(scan_df, ndigits=4).to_csv(metrics_dir / "chi_target_scan_by_condition.csv", index=False)
     _round_float_columns(cond_best, ndigits=4).to_csv(metrics_dir / "chi_target_best_by_condition.csv", index=False)
+    _round_float_columns(stability_df, ndigits=4).to_csv(metrics_dir / "chi_target_condition_stability.csv", index=False)
     _round_float_columns(targets_df, ndigits=4).to_csv(metrics_dir / "chi_target_for_inverse_design.csv", index=False)
 
     summary = {
@@ -467,6 +546,12 @@ def main(args):
         "n_conditions": int(cond_best.shape[0]),
         "mean_condition_balanced_accuracy": float(cond_best["balanced_accuracy"].mean()),
         "std_condition_balanced_accuracy": float(cond_best["balanced_accuracy"].std()),
+        "n_conditions_with_tied_optimal_thresholds": int((stability_df["n_tied_thresholds"] > 1).sum()) if not stability_df.empty else 0,
+        "mean_condition_bootstrap_ci_width": (
+            float(stability_df["chi_target_boot_ci_width"].mean())
+            if not stability_df.empty
+            else np.nan
+        ),
     }
     with open(metrics_dir / "chi_target_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
