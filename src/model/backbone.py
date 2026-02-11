@@ -1,4 +1,4 @@
-"""GPT-2-small-like Transformer backbone for diffusion model."""
+"""Diffusion Transformer backbone for discrete masking diffusion."""
 
 import math
 import torch
@@ -123,7 +123,7 @@ class TransformerBlock(nn.Module):
 
 
 class DiffusionBackbone(nn.Module):
-    """GPT-2-small-like Transformer backbone for discrete masking diffusion.
+    """Diffusion Transformer backbone for discrete masking diffusion.
 
     Architecture:
     - Learned token embeddings

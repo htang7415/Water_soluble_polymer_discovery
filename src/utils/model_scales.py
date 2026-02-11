@@ -1,4 +1,4 @@
-"""Model scale definitions for GPT-style diffusion backbones.
+"""Model scale definitions for Diffusion Transformer backbones.
 
 This module provides model architecture and training configurations for
 scaling law experiments with 4 model sizes: small, medium, large, xl.
