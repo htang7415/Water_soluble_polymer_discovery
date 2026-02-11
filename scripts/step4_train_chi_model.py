@@ -1296,11 +1296,18 @@ def tune_hyperparameters(
             "legend.fontsize": font_size,
         }
     )
+    # Convert Series to NumPy arrays for matplotlib/pandas compatibility.
+    trial_numbers = trial_df["trial"].to_numpy()
+    chi_val_r2_values = pd.to_numeric(trial_df["chi_val_r2"], errors="coerce").to_numpy()
+    best_chi_val_r2_values = pd.to_numeric(trial_df["best_chi_val_r2_so_far"], errors="coerce").to_numpy()
+    objective_values = pd.to_numeric(trial_df["objective_value"], errors="coerce").to_numpy()
+    best_objective_values = pd.to_numeric(trial_df["best_objective_so_far"], errors="coerce").to_numpy()
+
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(trial_df["trial"], trial_df["chi_val_r2"], "o", color="#1f77b4", label="Trial chi R2", alpha=0.85)
+    ax.plot(trial_numbers, chi_val_r2_values, "o", color="#1f77b4", label="Trial chi R2", alpha=0.85)
     ax.plot(
-        trial_df["trial"],
-        trial_df["best_chi_val_r2_so_far"],
+        trial_numbers,
+        best_chi_val_r2_values,
         "-",
         color="#d62728",
         linewidth=2,
@@ -1316,10 +1323,10 @@ def tune_hyperparameters(
 
     # Figure: trial-by-trial objective and running best objective.
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(trial_df["trial"], trial_df["objective_value"], "o", color="#2a9d8f", label="Trial objective", alpha=0.85)
+    ax.plot(trial_numbers, objective_values, "o", color="#2a9d8f", label="Trial objective", alpha=0.85)
     ax.plot(
-        trial_df["trial"],
-        trial_df["best_objective_so_far"],
+        trial_numbers,
+        best_objective_values,
         "-",
         color="#e76f51",
         linewidth=2,
@@ -2063,11 +2070,16 @@ def tune_classifier_hyperparameters(
             "legend.fontsize": font_size,
         }
     )
+    # Convert Series to NumPy arrays for matplotlib/pandas compatibility.
+    trial_numbers = trial_df["trial"].to_numpy()
+    objective_values = pd.to_numeric(trial_df["objective_value"], errors="coerce").to_numpy()
+    best_objective_values = pd.to_numeric(trial_df["best_objective_so_far"], errors="coerce").to_numpy()
+
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(trial_df["trial"], trial_df["objective_value"], "o", color="#2a9d8f", label="Trial balanced accuracy", alpha=0.85)
+    ax.plot(trial_numbers, objective_values, "o", color="#2a9d8f", label="Trial balanced accuracy", alpha=0.85)
     ax.plot(
-        trial_df["trial"],
-        trial_df["best_objective_so_far"],
+        trial_numbers,
+        best_objective_values,
         "-",
         color="#e76f51",
         linewidth=2,
