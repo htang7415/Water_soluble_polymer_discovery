@@ -102,8 +102,6 @@ def _compute_target_candidates(
     target_row: pd.Series,
     coeff_df: pd.DataFrame,
     epsilon: float,
-    class_weight: float,
-    polymer_class_weight: float,
     default_property_rule: str,
     uncertainty_enabled: bool,
     uncertainty_class_z: float,
@@ -206,15 +204,13 @@ def _compute_target_candidates(
 
     out["score"] = (
         out["property_error"]
-        + float(class_weight) * (1.0 - out["soluble_confidence"])
-        + float(polymer_class_weight) * (1.0 - out["polymer_class_hit"])
         + float(uncertainty_score_weight) * out["chi_pred_std_target"]
     )
 
     out = out.sort_values(
         [
-            "step4_requirement_miss_count",
             "total_requirement_miss_count",
+            "step4_requirement_miss_count",
             "score",
             "polymer_class_hit",
             "property_error",
@@ -690,9 +686,13 @@ def main(args):
         raise ValueError("split_mode must be one of {'polymer','random'}")
 
     epsilon = float(args.epsilon if args.epsilon is not None else chi_cfg.get("epsilon", 0.05))
-    class_weight = float(args.class_weight if args.class_weight is not None else chi_cfg.get("class_weight", 0.25))
-    polymer_class_weight = float(
-        args.polymer_class_weight if args.polymer_class_weight is not None else chi_cfg.get("polymer_class_weight", 0.50)
+    legacy_class_weight_raw = args.class_weight if args.class_weight is not None else chi_cfg.get("class_weight", None)
+    legacy_polymer_class_weight_raw = (
+        args.polymer_class_weight if args.polymer_class_weight is not None else chi_cfg.get("polymer_class_weight", None)
+    )
+    legacy_class_weight = None if legacy_class_weight_raw is None else float(legacy_class_weight_raw)
+    legacy_polymer_class_weight = (
+        None if legacy_polymer_class_weight_raw is None else float(legacy_polymer_class_weight_raw)
     )
     uncertainty_enabled = bool(args.uncertainty_enabled or chi_cfg.get("uncertainty_enabled", False))
     uncertainty_mc_samples = int(
@@ -738,10 +738,10 @@ def main(args):
     target_stars = int(sampling_cfg.get("target_stars", 2))
     if epsilon < 0:
         raise ValueError("epsilon must be >= 0")
-    if class_weight < 0:
-        raise ValueError("class_weight must be >= 0")
-    if polymer_class_weight < 0:
-        raise ValueError("polymer_class_weight must be >= 0")
+    if legacy_class_weight is not None and legacy_class_weight < 0:
+        raise ValueError("class_weight must be >= 0 when provided")
+    if legacy_polymer_class_weight is not None and legacy_polymer_class_weight < 0:
+        raise ValueError("polymer_class_weight must be >= 0 when provided")
     if uncertainty_mc_samples < 1:
         raise ValueError("uncertainty_mc_samples must be >= 1")
     if uncertainty_enabled and uncertainty_mc_samples < 2:
@@ -762,6 +762,16 @@ def main(args):
         raise ValueError("target_polymer_count must be >= 1")
     if target_sa_max <= 0:
         raise ValueError("target_sa_max must be > 0")
+    if legacy_class_weight is not None and abs(legacy_class_weight) > 1e-12:
+        print(
+            "Note: class_weight is deprecated and ignored. "
+            "Step 6 now ranks by independent hard filters (soluble_hit, property_hit, polymer_class_hit) first."
+        )
+    if legacy_polymer_class_weight is not None and abs(legacy_polymer_class_weight) > 1e-12:
+        print(
+            "Note: polymer_class_weight is deprecated and ignored. "
+            "Step 6 now ranks by independent hard filters (soluble_hit, property_hit, polymer_class_hit) first."
+        )
 
     polymer_patterns = config.get("polymer_classes", {})
     if not polymer_patterns:
@@ -800,8 +810,8 @@ def main(args):
             "step4_classification_dir": str(step4_cls_dir),
             "target_polymer_classes": ",".join(selected_classes),
             "epsilon": epsilon,
-            "class_weight": class_weight,
-            "polymer_class_weight": polymer_class_weight,
+            "legacy_class_weight_ignored": legacy_class_weight,
+            "legacy_polymer_class_weight_ignored": legacy_polymer_class_weight,
             "uncertainty_enabled": uncertainty_enabled,
             "uncertainty_mc_samples": uncertainty_mc_samples,
             "uncertainty_class_z": uncertainty_class_z,
@@ -827,8 +837,10 @@ def main(args):
     print(f"candidate_source={candidate_source}")
     print(f"target_polymer_class={','.join(selected_classes)}")
     print(f"epsilon={epsilon}")
-    print(f"class_weight={class_weight}")
-    print(f"polymer_class_weight={polymer_class_weight}")
+    if legacy_class_weight is not None:
+        print(f"legacy_class_weight_ignored={legacy_class_weight}")
+    if legacy_polymer_class_weight is not None:
+        print(f"legacy_polymer_class_weight_ignored={legacy_polymer_class_weight}")
     print(f"uncertainty_enabled={uncertainty_enabled}")
     if uncertainty_enabled:
         print(
@@ -889,8 +901,6 @@ def main(args):
             target_row=row,
             coeff_df=coeff_df,
             epsilon=epsilon,
-            class_weight=class_weight,
-            polymer_class_weight=polymer_class_weight,
             default_property_rule=default_property_rule,
             uncertainty_enabled=uncertainty_enabled,
             uncertainty_class_z=uncertainty_class_z,
@@ -956,8 +966,8 @@ def main(args):
         "n_targets": int(len(target_df)),
         "n_base_conditions": int(len(base_target_df)),
         "epsilon": epsilon,
-        "class_weight": class_weight,
-        "polymer_class_weight": polymer_class_weight,
+        "legacy_class_weight_ignored": legacy_class_weight,
+        "legacy_polymer_class_weight_ignored": legacy_polymer_class_weight,
         "uncertainty_enabled": bool(uncertainty_enabled),
         "uncertainty_mc_samples": int(uncertainty_mc_samples),
         "uncertainty_class_z": float(uncertainty_class_z),
@@ -1061,8 +1071,18 @@ if __name__ == "__main__":
     parser.add_argument("--max_novel_candidates", type=int, default=50000, help="Max number of novel generated candidates to keep")
 
     parser.add_argument("--epsilon", type=float, default=None, help="Property tolerance for 'band' rule")
-    parser.add_argument("--class_weight", type=float, default=None, help="Weight for soluble-confidence penalty in score")
-    parser.add_argument("--polymer_class_weight", type=float, default=None, help="Weight for polymer-class mismatch penalty")
+    parser.add_argument(
+        "--class_weight",
+        type=float,
+        default=None,
+        help="Deprecated; ignored (ranking uses independent hard filters).",
+    )
+    parser.add_argument(
+        "--polymer_class_weight",
+        type=float,
+        default=None,
+        help="Deprecated; ignored (ranking uses independent hard filters).",
+    )
     parser.add_argument("--uncertainty_enabled", action="store_true", help="Enable MC-dropout uncertainty-aware ranking")
     parser.add_argument("--uncertainty_mc_samples", type=int, default=None, help="MC-dropout forward passes when uncertainty is enabled")
     parser.add_argument("--uncertainty_class_z", type=float, default=None, help="z-value for conservative soluble confidence (class_prob - z*std)")

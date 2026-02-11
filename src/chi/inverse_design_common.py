@@ -45,8 +45,8 @@ def default_chi_config(config: Dict, step: str | None = None) -> Dict:
     defaults = {
         "split_mode": "polymer",
         "epsilon": 0.05,
-        "class_weight": 0.25,
-        "polymer_class_weight": 0.50,
+        "class_weight": None,  # deprecated (kept for backward-compatible parsing)
+        "polymer_class_weight": None,  # deprecated (kept for backward-compatible parsing)
         "candidate_source": "novel",
         "property_rule": "upper_bound",
         "coverage_topk": 5,

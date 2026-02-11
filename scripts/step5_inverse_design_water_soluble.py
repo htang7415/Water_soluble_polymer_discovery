@@ -48,7 +48,6 @@ def _compute_target_candidates(
     target_row: pd.Series,
     coeff_df: pd.DataFrame,
     epsilon: float,
-    class_weight: float,
     default_property_rule: str,
     uncertainty_enabled: bool,
     uncertainty_class_z: float,
@@ -139,7 +138,6 @@ def _compute_target_candidates(
     out["joint_hit"] = ((out["soluble_hit"] == 1) & (out["property_hit"] == 1)).astype(int)
     out["score"] = (
         out["property_error"]
-        + float(class_weight) * (1.0 - out["soluble_confidence"])
         + float(uncertainty_score_weight) * out["chi_pred_std_target"]
     )
 
@@ -590,7 +588,8 @@ def main(args):
         raise ValueError("split_mode must be one of {'polymer','random'}")
 
     epsilon = float(args.epsilon if args.epsilon is not None else chi_cfg.get("epsilon", 0.05))
-    class_weight = float(args.class_weight if args.class_weight is not None else chi_cfg.get("class_weight", 0.25))
+    legacy_class_weight_raw = args.class_weight if args.class_weight is not None else chi_cfg.get("class_weight", None)
+    legacy_class_weight = None if legacy_class_weight_raw is None else float(legacy_class_weight_raw)
     uncertainty_enabled = bool(args.uncertainty_enabled or chi_cfg.get("uncertainty_enabled", False))
     uncertainty_mc_samples = int(
         args.uncertainty_mc_samples
@@ -635,8 +634,8 @@ def main(args):
     target_stars = int(sampling_cfg.get("target_stars", 2))
     if epsilon < 0:
         raise ValueError("epsilon must be >= 0")
-    if class_weight < 0:
-        raise ValueError("class_weight must be >= 0")
+    if legacy_class_weight is not None and legacy_class_weight < 0:
+        raise ValueError("class_weight must be >= 0 when provided")
     if uncertainty_mc_samples < 1:
         raise ValueError("uncertainty_mc_samples must be >= 1")
     if uncertainty_enabled and uncertainty_mc_samples < 2:
@@ -657,6 +656,11 @@ def main(args):
         raise ValueError("target_polymer_count must be >= 1")
     if target_sa_max <= 0:
         raise ValueError("target_sa_max must be > 0")
+    if legacy_class_weight is not None and abs(legacy_class_weight) > 1e-12:
+        print(
+            "Note: class_weight is deprecated and ignored. "
+            "Step 5 now ranks by independent hard filters (soluble_hit, property_hit) first."
+        )
 
     results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"]))
     base_results_dir = Path(config["paths"]["results_dir"])
@@ -687,7 +691,7 @@ def main(args):
             "step4_regression_dir": str(step4_reg_dir),
             "step4_classification_dir": str(step4_cls_dir),
             "epsilon": epsilon,
-            "class_weight": class_weight,
+            "legacy_class_weight_ignored": legacy_class_weight,
             "uncertainty_enabled": uncertainty_enabled,
             "uncertainty_mc_samples": uncertainty_mc_samples,
             "uncertainty_class_z": uncertainty_class_z,
@@ -712,7 +716,8 @@ def main(args):
     print(f"split_mode={split_mode}")
     print(f"candidate_source={candidate_source}")
     print(f"epsilon={epsilon}")
-    print(f"class_weight={class_weight}")
+    if legacy_class_weight is not None:
+        print(f"legacy_class_weight_ignored={legacy_class_weight}")
     print(f"uncertainty_enabled={uncertainty_enabled}")
     if uncertainty_enabled:
         print(
@@ -762,7 +767,6 @@ def main(args):
             target_row=row,
             coeff_df=coeff_df,
             epsilon=epsilon,
-            class_weight=class_weight,
             default_property_rule=default_property_rule,
             uncertainty_enabled=uncertainty_enabled,
             uncertainty_class_z=uncertainty_class_z,
@@ -828,7 +832,7 @@ def main(args):
     summary = {
         "n_targets": int(len(target_df)),
         "epsilon": epsilon,
-        "class_weight": class_weight,
+        "legacy_class_weight_ignored": legacy_class_weight,
         "uncertainty_enabled": bool(uncertainty_enabled),
         "uncertainty_mc_samples": int(uncertainty_mc_samples),
         "uncertainty_class_z": float(uncertainty_class_z),
@@ -931,7 +935,12 @@ if __name__ == "__main__":
     parser.add_argument("--max_novel_candidates", type=int, default=50000, help="Max number of novel generated candidates to keep")
 
     parser.add_argument("--epsilon", type=float, default=None, help="Property tolerance for 'band' rule")
-    parser.add_argument("--class_weight", type=float, default=None, help="Weight for soluble-confidence penalty in score")
+    parser.add_argument(
+        "--class_weight",
+        type=float,
+        default=None,
+        help="Deprecated; ignored (ranking uses independent hard filters).",
+    )
     parser.add_argument("--uncertainty_enabled", action="store_true", help="Enable MC-dropout uncertainty-aware ranking")
     parser.add_argument("--uncertainty_mc_samples", type=int, default=None, help="MC-dropout forward passes when uncertainty is enabled")
     parser.add_argument("--uncertainty_class_z", type=float, default=None, help="z-value for conservative soluble confidence (class_prob - z*std)")

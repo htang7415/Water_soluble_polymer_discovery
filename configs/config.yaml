@@ -127,9 +127,11 @@ chi_training:
     dataset_path: "Data/chi/_50_polymers_T_phi.csv"  # labeled chi(T,phi) dataset used in Step 3 and Step4_1
     split_mode: "polymer"  # data split mode: polymer (hold out polymers) | random (row-wise random)
     split:
-      train_ratio: 0.70  # train+val=84% dev pool for CV tuning; remaining 16% held-out test
-      val_ratio: 0.14
-      test_ratio: 0.16
+      # Step 4 split is CV-driven by default:
+      # holdout_test_ratio defaults to 1 / tuning_cv_folds if omitted.
+      # internal val slicing is automatic from tuning_cv_folds (not user-configured).
+      # CV tuning uses all non-test rows; final Step 4 fit also uses all non-test rows (train+val).
+      # holdout_test_ratio: 0.16
     embedding:
       timestep: 1  # diffusion timestep used for embedding extraction
       batch_size: 128  # batch size for embedding extraction
@@ -210,7 +212,7 @@ chi_training:
     target_temperature: 293.15  # room temperature (K)
     target_phi: 0.2             # polymer fraction
     epsilon: 0.05  # tolerance for property hit when property_rule=band
-    class_weight: 0.25  # penalty weight for low soluble confidence in ranking score
+    # ranking uses independent hard filters (soluble_hit and property_hit) first
     target_polymer_count: 100  # final number of exported target polymers
     target_sa_max: 4.0  # SA upper bound for final target polymer export
     candidate_source: "novel"  # known | novel | hybrid
@@ -228,8 +230,7 @@ chi_training:
     target_temperature: 293.15  # room temperature (K)
     target_phi: 0.2             # polymer fraction
     epsilon: 0.05
-    class_weight: 0.25
-    polymer_class_weight: 0.50  # penalty weight for class mismatch in ranking score
+    # ranking uses independent hard filters (soluble_hit, property_hit, polymer_class_hit) first
     target_polymer_count: 100
     target_sa_max: 4.0
     candidate_source: "novel"  # known | novel | hybrid
