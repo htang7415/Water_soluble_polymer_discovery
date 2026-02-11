@@ -53,6 +53,13 @@ def main(args):
     """Main function."""
     # Load config
     config = load_config(args.config)
+    shared_cfg = config.get("chi_training", {}).get("shared", {})
+    default_split_mode = str(shared_cfg.get("split_mode", "polymer")).strip().lower()
+    if default_split_mode not in {"polymer", "random"}:
+        default_split_mode = "polymer"
+    split_mode = str(args.split_mode).strip().lower() if args.split_mode is not None else default_split_mode
+    if split_mode not in {"polymer", "random"}:
+        raise ValueError(f"split_mode must be one of ['polymer', 'random'], got: {split_mode}")
 
     distributed, rank, world_size, local_rank, dist_device = init_distributed()
     is_main_process = (not distributed) or rank == 0
@@ -64,7 +71,7 @@ def main(args):
 
     # Override results_dir if model_size specified
     base_results_dir = config['paths']['results_dir']
-    results_dir = Path(get_results_dir(args.model_size, base_results_dir))
+    results_dir = Path(get_results_dir(args.model_size, base_results_dir, split_mode))
     step_dir = results_dir / 'step1_backbone'
     metrics_dir = step_dir / 'metrics'
     figures_dir = step_dir / 'figures'
@@ -82,6 +89,7 @@ def main(args):
             context={
                 "config_path": args.config,
                 "model_size": args.model_size,
+                "split_mode": split_mode,
                 "results_dir": str(results_dir),
                 "random_seed": config['data']['random_seed'],
                 "distributed": distributed,
@@ -302,6 +310,8 @@ if __name__ == '__main__':
     parser.add_argument('--model_size', type=str, default='small',
                         choices=['small', 'medium', 'large', 'xl'],
                         help='Model size preset (small: ~12M, medium: ~50M, large: ~150M, xl: ~400M)')
+    parser.add_argument('--split_mode', type=str, default=None, choices=['polymer', 'random'],
+                        help='Optional split-mode namespace for results dir (default: config chi_training.shared.split_mode)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     args = parser.parse_args()

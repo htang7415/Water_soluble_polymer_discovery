@@ -52,11 +52,12 @@ def _make_cache_key(
 def resolve_step1_artifacts(
     config: Dict,
     model_size: Optional[str] = None,
+    split_mode: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
 ) -> Tuple[Path, Path]:
     """Resolve tokenizer and Step1 checkpoint paths without loading model weights."""
     base_results_dir = Path(config["paths"]["results_dir"])
-    results_dir = Path(get_results_dir(model_size, config["paths"]["results_dir"]))
+    results_dir = Path(get_results_dir(model_size, config["paths"]["results_dir"], split_mode))
 
     tokenizer_path = results_dir / "tokenizer.json"
     if not tokenizer_path.exists():
@@ -80,6 +81,7 @@ def resolve_step1_artifacts(
 def load_backbone_from_step1(
     config: Dict,
     model_size: Optional[str] = None,
+    split_mode: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
     device: str = "cpu",
 ):
@@ -87,6 +89,7 @@ def load_backbone_from_step1(
     tokenizer_path, ckpt_path = resolve_step1_artifacts(
         config=config,
         model_size=model_size,
+        split_mode=split_mode,
         checkpoint_path=checkpoint_path,
     )
     tokenizer = PSmilesTokenizer.load(tokenizer_path)
@@ -231,6 +234,7 @@ def build_or_load_embedding_cache(
     config: Dict,
     cache_npz: str | Path,
     model_size: Optional[str] = None,
+    split_mode: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
     device: str = "cpu",
     timestep: int = 1,
@@ -243,6 +247,7 @@ def build_or_load_embedding_cache(
     _, resolved_ckpt = resolve_step1_artifacts(
         config=config,
         model_size=model_size,
+        split_mode=split_mode,
         checkpoint_path=checkpoint_path,
     )
     cache_key = _make_cache_key(
@@ -264,6 +269,7 @@ def build_or_load_embedding_cache(
     tokenizer, backbone, _ = load_backbone_from_step1(
         config=config,
         model_size=model_size,
+        split_mode=split_mode,
         checkpoint_path=checkpoint_path,
         device=device,
     )

@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """Step 2: Sample from backbone and evaluate generative metrics."""
 
+from __future__ import annotations
+
 import os
 import sys
 import argparse
@@ -293,6 +295,13 @@ def main(args):
     """Main function."""
     # Load config
     config = load_config(args.config)
+    shared_cfg = config.get("chi_training", {}).get("shared", {})
+    default_split_mode = str(shared_cfg.get("split_mode", "polymer")).strip().lower()
+    if default_split_mode not in {"polymer", "random"}:
+        default_split_mode = "polymer"
+    split_mode = str(args.split_mode).strip().lower() if args.split_mode is not None else default_split_mode
+    if split_mode not in {"polymer", "random"}:
+        raise ValueError(f"split_mode must be one of ['polymer', 'random'], got: {split_mode}")
     sampling_cfg = config.get('sampling', {})
     temperature = float(args.temperature if args.temperature is not None else sampling_cfg.get('temperature', 1.0))
     top_k = args.top_k if args.top_k is not None else sampling_cfg.get('top_k', None)
@@ -383,7 +392,7 @@ def main(args):
 
     # Override results_dir if model_size specified
     base_results_dir = config['paths']['results_dir']
-    results_dir = Path(get_results_dir(args.model_size, base_results_dir))
+    results_dir = Path(get_results_dir(args.model_size, base_results_dir, split_mode))
 
     # Create output directories
     step_dir = results_dir / 'step2_sampling'
@@ -402,6 +411,7 @@ def main(args):
         context={
             "config_path": args.config,
             "model_size": args.model_size,
+            "split_mode": split_mode,
             "results_dir": str(results_dir),
             "target_polymer_goal": generation_goal,
             "target_polymer_count_config": target_polymer_count,
@@ -881,6 +891,8 @@ if __name__ == '__main__':
     parser.add_argument('--model_size', type=str, default='small',
                         choices=['small', 'medium', 'large', 'xl'],
                         help='Model size preset (small: ~12M, medium: ~50M, large: ~150M, xl: ~400M)')
+    parser.add_argument('--split_mode', type=str, default=None, choices=['polymer', 'random'],
+                        help='Optional split-mode namespace for results dir (default: config chi_training.shared.split_mode)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint')
     parser.add_argument('--batch_size', type=int, default=None,

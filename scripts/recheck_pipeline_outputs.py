@@ -117,8 +117,8 @@ def _make_figures(check_df: pd.DataFrame, fig_dir: Path, dpi: int = 300) -> None
 def main(args):
     config = load_config(args.config)
     base_results_dir = Path(config["paths"]["results_dir"])
-    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"]))
     split_mode = args.split_mode
+    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], split_mode))
 
     out_dir = results_dir / "pipeline_recheck" / split_mode
     metrics_dir = out_dir / "metrics"

@@ -4,6 +4,7 @@ This module provides model architecture and training configurations for
 scaling law experiments with 4 model sizes: small, medium, large, xl.
 """
 
+import os
 from typing import Dict, Any, Optional
 
 # Valid model sizes
@@ -261,19 +262,31 @@ def estimate_params(
     return total
 
 
-def get_results_dir(model_size: Optional[str], base_dir: str = 'results') -> str:
-    """Get results directory path based on model size.
+def get_results_dir(
+    model_size: Optional[str],
+    base_dir: str = 'results',
+    split_mode: Optional[str] = None,
+) -> str:
+    """Get results directory path based on model size and split mode.
 
     Args:
         model_size: One of 'small', 'medium', 'large', 'xl', or None.
         base_dir: Base results directory name.
+        split_mode: Optional split namespace (e.g., 'polymer' or 'random').
+            When omitted, falls back to env `CHI_SPLIT_MODE` if set.
 
     Returns:
         Results directory path string.
     """
-    if model_size is None:
-        return base_dir
-    return f"{base_dir}_{model_size}"
+    resolved_split = split_mode if split_mode is not None else os.environ.get("CHI_SPLIT_MODE")
+    resolved_split = (str(resolved_split).strip().lower() if resolved_split is not None else "")
+
+    parts = [str(base_dir)]
+    if model_size is not None:
+        parts.append(str(model_size))
+    if resolved_split:
+        parts.append(resolved_split)
+    return "_".join(parts)
 
 
 def print_model_info(model_size: str, model_config: Dict[str, Any],

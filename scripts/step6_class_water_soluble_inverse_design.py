@@ -780,7 +780,7 @@ def main(args):
     target_polymer_class_value = args.target_polymer_class if args.target_polymer_class is not None else str(chi_cfg.get("target_polymer_class", "all"))
     selected_classes = _parse_target_polymer_classes(target_polymer_class_value, available_classes)
 
-    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"]))
+    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], split_mode))
     base_results_dir = Path(config["paths"]["results_dir"])
     step4_base_dir = Path(args.step4_dir) if args.step4_dir else results_dir / "step4_chi_training" / split_mode
     step4_reg_dir = Path(args.step4_reg_dir) if args.step4_reg_dir else step4_base_dir / "step4_1_regression"

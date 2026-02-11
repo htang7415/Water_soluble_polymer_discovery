@@ -8,3 +8,4 @@ Euler/NREL production submit chain:
 - NREL wrapper: `bash scripts/submit_all_nrel.sh <model_sizes> <split_mode>`
 
 Note: this chain expects Step 3 outputs to already exist and does not submit Step 0/Step 3.
+Results namespace: runs are separated by both model size and split mode, e.g. `results_small_polymer` and `results_small_random`.

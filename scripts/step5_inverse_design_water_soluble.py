@@ -662,7 +662,7 @@ def main(args):
             "Step 5 now ranks by independent hard filters (soluble_hit, property_hit) first."
         )
 
-    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"]))
+    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], split_mode))
     base_results_dir = Path(config["paths"]["results_dir"])
     step4_base_dir = Path(args.step4_dir) if args.step4_dir else results_dir / "step4_chi_training" / split_mode
     step4_reg_dir = Path(args.step4_reg_dir) if args.step4_reg_dir else step4_base_dir / "step4_1_regression"

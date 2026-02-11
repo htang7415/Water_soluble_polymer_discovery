@@ -713,6 +713,7 @@ def train_one_model(
         _, backbone, _ = load_backbone_from_step1(
             config=config,
             model_size=model_size,
+            split_mode=train_cfg.split_mode,
             checkpoint_path=backbone_checkpoint,
             device=device,
         )
@@ -1712,6 +1713,7 @@ def train_one_classifier_model(
         _, backbone, _ = load_backbone_from_step1(
             config=config,
             model_size=model_size,
+            split_mode=train_cfg.split_mode,
             checkpoint_path=backbone_checkpoint,
             device=device,
         )
@@ -2420,7 +2422,7 @@ def main(args):
             f"for model_size={args.model_size}, got {train_cfg.finetune_last_layers}"
         )
 
-    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"]))
+    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], train_cfg.split_mode))
     step_dir = results_dir / "step4_chi_training" / train_cfg.split_mode
     shared_dir = step_dir / "shared"
     pipeline_metrics_dir = step_dir / "pipeline_metrics"
@@ -2560,6 +2562,7 @@ def main(args):
             config=config,
             cache_npz=shared_dir / "polymer_embeddings.npz",
             model_size=args.model_size,
+            split_mode=train_cfg.split_mode,
             checkpoint_path=args.backbone_checkpoint,
             device=device,
             timestep=train_cfg.timestep_for_embedding,
@@ -2578,6 +2581,7 @@ def main(args):
             config=config,
             cache_npz=shared_dir / "polymer_embeddings_step4_2_classification.npz",
             model_size=args.model_size,
+            split_mode=train_cfg.split_mode,
             checkpoint_path=args.backbone_checkpoint,
             device=device,
             timestep=train_cfg.timestep_for_embedding,
@@ -2634,6 +2638,7 @@ def main(args):
             tokenizer_for_training, _, _ = load_backbone_from_step1(
                 config=config,
                 model_size=args.model_size,
+                split_mode=train_cfg.split_mode,
                 checkpoint_path=args.backbone_checkpoint,
                 device="cpu",
             )
@@ -2815,6 +2820,7 @@ def main(args):
             tokenizer_for_training, _, _ = load_backbone_from_step1(
                 config=config,
                 model_size=args.model_size,
+                split_mode=train_cfg.split_mode,
                 checkpoint_path=args.backbone_checkpoint,
                 device="cpu",
             )

@@ -337,6 +337,7 @@ def infer_coefficients_for_novel_candidates(
     novel_df: pd.DataFrame,
     config: Dict,
     model_size: str | None,
+    split_mode: str | None,
     chi_checkpoint_path: Path,
     class_checkpoint_path: Path | None,
     backbone_checkpoint_path: str | None,
@@ -376,6 +377,7 @@ def infer_coefficients_for_novel_candidates(
     tokenizer, step1_backbone, _ = load_backbone_from_step1(
         config=config,
         model_size=model_size,
+        split_mode=split_mode,
         checkpoint_path=backbone_checkpoint_path,
         device=device,
     )
@@ -390,6 +392,7 @@ def infer_coefficients_for_novel_candidates(
         _, reg_backbone, _ = load_backbone_from_step1(
             config=config,
             model_size=model_size,
+            split_mode=split_mode,
             checkpoint_path=backbone_checkpoint_path,
             device=device,
         )
@@ -435,6 +438,7 @@ def infer_coefficients_for_novel_candidates(
             _, cls_backbone, _ = load_backbone_from_step1(
                 config=config,
                 model_size=model_size,
+                split_mode=split_mode,
                 checkpoint_path=backbone_checkpoint_path,
                 device=device,
             )
@@ -771,6 +775,7 @@ def build_candidate_pool(
             novel_df=novel_df,
             config=config,
             model_size=args.model_size,
+            split_mode=getattr(args, "split_mode", None),
             chi_checkpoint_path=chi_checkpoint,
             class_checkpoint_path=class_checkpoint,
             backbone_checkpoint_path=args.backbone_checkpoint,
