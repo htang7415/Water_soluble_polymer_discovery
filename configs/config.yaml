@@ -131,7 +131,7 @@ chi_training:
       # holdout_test_ratio defaults to 1 / tuning_cv_folds if omitted.
       # internal val slicing is automatic from tuning_cv_folds (not user-configured).
       # CV tuning uses all non-test rows; final Step 4 fit also uses all non-test rows (train+val).
-      # holdout_test_ratio: 0.16
+      holdout_test_ratio: 0.16
     embedding:
       timestep: 1  # diffusion timestep used for embedding extraction
       batch_size: 128  # batch size for embedding extraction
