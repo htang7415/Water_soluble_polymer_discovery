@@ -451,7 +451,7 @@ def _default_chi_config(config: Dict) -> Dict:
 
 def build_train_config(args, config: Dict) -> TrainConfig:
     chi_cfg = _default_chi_config(config)
-    split_mode = str(chi_cfg["split_mode"]).strip().lower()
+    split_mode = str(args.split_mode if args.split_mode is not None else chi_cfg["split_mode"]).strip().lower()
     if split_mode not in {"polymer", "random"}:
         raise ValueError("chi_training.split_mode must be one of {'polymer','random'}")
     tune_cfg = bool(chi_cfg.get("tune", False))
@@ -3054,6 +3054,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 4: train Step4_1 regression + Step4_2 classification models")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Config path")
     parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
+    parser.add_argument(
+        "--split_mode",
+        type=str,
+        default=None,
+        choices=["polymer", "random"],
+        help="Optional split mode override (otherwise uses config chi_training.shared.split_mode).",
+    )
     parser.add_argument(
         "--stage",
         type=str,

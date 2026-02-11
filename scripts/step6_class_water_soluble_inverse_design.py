@@ -681,7 +681,7 @@ def main(args):
     config = load_config(args.config)
     chi_cfg = default_chi_config(config, step="step6")
 
-    split_mode = str(chi_cfg["split_mode"]).strip().lower()
+    split_mode = str(args.split_mode if args.split_mode is not None else chi_cfg["split_mode"]).strip().lower()
     if split_mode not in {"polymer", "random"}:
         raise ValueError("split_mode must be one of {'polymer','random'}")
 
@@ -1046,6 +1046,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 6: polymer-class + water-soluble inverse design")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Config path")
     parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
+    parser.add_argument(
+        "--split_mode",
+        type=str,
+        default=None,
+        choices=["polymer", "random"],
+        help="Optional split mode override (otherwise uses config chi_training.shared.split_mode).",
+    )
     parser.add_argument("--step4_dir", type=str, default=None, help="Optional base path containing Step4_1 and Step4_2 directories")
     parser.add_argument("--step4_reg_dir", type=str, default=None, help="Optional explicit Step4_1 regression directory")
     parser.add_argument("--step4_cls_dir", type=str, default=None, help="Optional explicit Step4_2 classification directory")
