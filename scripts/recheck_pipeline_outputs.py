@@ -79,7 +79,7 @@ def _count_artifacts(step_path: Path) -> Tuple[int, int, int]:
     return csv_count, fig_count, total
 
 
-def _make_figures(check_df: pd.DataFrame, fig_dir: Path, dpi: int = 300) -> None:
+def _make_figures(check_df: pd.DataFrame, fig_dir: Path, dpi: int = 600) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
     try:
         # Completion by step
@@ -203,7 +203,7 @@ def main(args):
         )
 
     if not args.skip_figures:
-        _make_figures(check_df, figures_dir, dpi=int(config.get("plotting", {}).get("dpi", 300)))
+        _make_figures(check_df, figures_dir, dpi=int(config.get("plotting", {}).get("dpi", 600)))
 
     print("=" * 70)
     print("Pipeline recheck complete")

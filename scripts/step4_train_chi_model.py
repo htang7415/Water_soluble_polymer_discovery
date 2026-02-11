@@ -2606,7 +2606,7 @@ def main(args):
 
     tokenizer_for_training = None
 
-    dpi = int(config.get("plotting", {}).get("dpi", 300))
+    dpi = int(config.get("plotting", {}).get("dpi", 600))
     font_size = int(config.get("plotting", {}).get("font_size", 12))
 
     reg_checkpoint_path = reg_checkpoint_dir / "chi_regression_best.pt"

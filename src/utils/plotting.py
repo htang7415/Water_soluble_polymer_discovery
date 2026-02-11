@@ -16,7 +16,7 @@ class PlotUtils:
         self,
         figure_size: Tuple[float, float] = (4.5, 4.5),
         font_size: int = 12,
-        dpi: int = 150
+        dpi: int = 600
     ):
         """Initialize plotting utilities.
 

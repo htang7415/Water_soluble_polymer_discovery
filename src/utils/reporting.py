@@ -52,7 +52,12 @@ def write_initial_log(
     return out_path
 
 
-def save_artifact_manifest(step_dir: Path, metrics_dir: Path, figures_dir: Path | None = None) -> Dict[str, Path]:
+def save_artifact_manifest(
+    step_dir: Path,
+    metrics_dir: Path,
+    figures_dir: Path | None = None,
+    dpi: int = 600,
+) -> Dict[str, Path]:
     """Save artifact manifest and simple artifact-count overview files.
 
     Outputs:
@@ -135,7 +140,7 @@ def save_artifact_manifest(step_dir: Path, metrics_dir: Path, figures_dir: Path 
             ax.set_ylabel("File count")
             ax.set_title("Artifact counts by category")
             fig.tight_layout()
-            fig.savefig(fig_path, dpi=300)
+            fig.savefig(fig_path, dpi=int(dpi))
             plt.close(fig)
             outputs["artifact_counts_figure"] = fig_path
         except Exception as exc:
