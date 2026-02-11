@@ -1,0 +1,107 @@
+paths:
+  # Base directory for all isolated traditional Step 4 outputs.
+  results_root: "traditional_step4"
+  # Existing DiT config path used by step4_4 comparison to locate DiT outputs.
+  dit_config_path: "configs/config.yaml"
+
+data:
+  random_seed: 42
+
+traditional_step4:
+  shared:
+    regression_dataset_path: "Data/chi/_50_polymers_T_phi.csv"
+    classification_dataset_path: "Data/water_solvent/water_solvent_polymers.csv"
+    split_mode: "polymer"  # polymer | random
+    split:
+      # If omitted, defaults to 1 / tuning_cv_folds.
+      holdout_test_ratio: 0.16
+    fingerprint:
+      radius: 3
+      n_bits: 1024
+      use_chirality: false
+      use_features: false
+
+  step4_3_1_regression:
+    tune: true
+    n_trials: 120
+    tuning_cv_folds: 6
+    tuning_objective: "val_r2"
+    models:
+      - "ridge"
+      - "random_forest"
+      - "xgboost"
+      - "mlp"
+      - "gpr"
+    # Optional per-model knobs; script fills robust defaults when keys are omitted.
+    optuna_search_space:
+      ridge_alpha: [1.0e-5, 1.0e3]
+      random_forest_n_estimators: [200, 1200]
+      random_forest_max_depth: [3, 30]
+      random_forest_min_samples_split: [2, 20]
+      random_forest_min_samples_leaf: [1, 10]
+      xgboost_n_estimators: [200, 1500]
+      xgboost_learning_rate: [1.0e-3, 0.2]
+      xgboost_max_depth: [3, 12]
+      xgboost_min_child_weight: [1, 12]
+      xgboost_subsample: [0.5, 1.0]
+      xgboost_colsample_bytree: [0.5, 1.0]
+      xgboost_reg_alpha: [1.0e-8, 10.0]
+      xgboost_reg_lambda: [1.0e-8, 30.0]
+      mlp_hidden_layers:
+        - [256]
+        - [512]
+        - [512, 256]
+        - [1024, 512]
+      mlp_alpha: [1.0e-7, 1.0e-2]
+      mlp_learning_rate_init: [1.0e-5, 5.0e-3]
+      gpr_alpha: [1.0e-10, 1.0e-1]
+      gpr_kernel:
+        - "rbf"
+        - "matern15"
+        - "matern25"
+      gpr_length_scale: [1.0e-2, 1.0e2]
+      gpr_max_iters: [80, 400]
+
+  step4_3_2_classification:
+    tune: true
+    n_trials: 120
+    tuning_cv_folds: 6
+    tuning_objective: "val_balanced_accuracy"
+    models:
+      - "logistic"
+      - "random_forest"
+      - "xgboost"
+      - "mlp"
+      - "gpc"
+    optuna_search_space:
+      logistic_c: [1.0e-5, 1.0e3]
+      random_forest_n_estimators: [200, 1200]
+      random_forest_max_depth: [3, 30]
+      random_forest_min_samples_split: [2, 20]
+      random_forest_min_samples_leaf: [1, 10]
+      xgboost_n_estimators: [200, 1500]
+      xgboost_learning_rate: [1.0e-3, 0.2]
+      xgboost_max_depth: [3, 12]
+      xgboost_min_child_weight: [1, 12]
+      xgboost_subsample: [0.5, 1.0]
+      xgboost_colsample_bytree: [0.5, 1.0]
+      xgboost_reg_alpha: [1.0e-8, 10.0]
+      xgboost_reg_lambda: [1.0e-8, 30.0]
+      mlp_hidden_layers:
+        - [256]
+        - [512]
+        - [512, 256]
+        - [1024, 512]
+      mlp_alpha: [1.0e-7, 1.0e-2]
+      mlp_learning_rate_init: [1.0e-5, 5.0e-3]
+      gpc_kernel:
+        - "rbf"
+        - "matern15"
+        - "matern25"
+      gpc_length_scale: [1.0e-2, 1.0e2]
+
+  step4_4_comparation:
+    model_sizes: ["small", "medium", "large", "xl"]
+    # Output folders under traditional_step4/:
+    # - results_4_4_comparation_polymer
+    # - results_4_4_comparation_random
