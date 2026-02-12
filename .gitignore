@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 results/
 results_1
+traditional_step4/results*/
 Bi_Diffusion_SMILES
 Data/
 *Data
