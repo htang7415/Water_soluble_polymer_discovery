@@ -1049,6 +1049,8 @@ def _save_cv_parity_by_fold_figure(
     ax.plot([lo_plot, hi_plot], [lo_plot, hi_plot], "k--", linewidth=1.1)
     ax.set_xlim(lo_plot, hi_plot)
     ax.set_ylim(lo_plot, hi_plot)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
     ax.set_xlabel("True χ")
     ax.set_ylabel("Predicted χ")
 
@@ -1472,6 +1474,8 @@ def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> 
     ax.plot([lo_plot, hi_plot], [lo_plot, hi_plot], "k--", linewidth=1.1)
     ax.set_xlim(lo_plot, hi_plot)
     ax.set_ylim(lo_plot, hi_plot)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
     ax.set_xlabel("True χ")
     ax.set_ylabel("Predicted χ")
 

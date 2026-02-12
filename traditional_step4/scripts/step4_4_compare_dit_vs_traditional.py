@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -67,14 +68,6 @@ def _safe_get(row: pd.Series, key: str) -> float:
         return np.nan
 
 
-def _prefer_existing_path(primary: Path, legacy: Path) -> Path:
-    if primary.exists():
-        return primary
-    if legacy.exists():
-        return legacy
-    return primary
-
-
 def _resolve_model_sizes(args_sizes: List[str], cfg_sizes: List[str]) -> List[str]:
     if args_sizes:
         sizes = [str(s).strip().lower() for s in args_sizes]
@@ -95,10 +88,18 @@ def _barplot_two_models(
     title: str,
     out_png: Path,
     dpi: int,
+    font_size: int,
+    model_size_order: List[str] | None = None,
 ) -> None:
     if df.empty:
         return
     plot_df = df[["model_size", f"dit_{metric}", f"traditional_{metric}"]].copy()
+    if model_size_order:
+        present = set(plot_df["model_size"].astype(str).tolist())
+        ordered = [str(s) for s in model_size_order if str(s) in present]
+        if ordered:
+            plot_df["model_size"] = pd.Categorical(plot_df["model_size"], categories=ordered, ordered=True)
+            plot_df = plot_df.sort_values("model_size").reset_index(drop=True)
     plot_df = plot_df.rename(
         columns={
             f"dit_{metric}": "DiT",
@@ -107,12 +108,21 @@ def _barplot_two_models(
     )
     melted = plot_df.melt(id_vars="model_size", var_name="pipeline", value_name="value")
     sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    plt.rcParams.update(
+        {
+            "font.size": font_size,
+            "axes.titlesize": font_size,
+            "axes.labelsize": font_size,
+            "legend.fontsize": font_size,
+        }
+    )
+    fig, ax = plt.subplots(figsize=(6, 5))
     sns.barplot(data=melted, x="model_size", y="value", hue="pipeline", ax=ax)
     ax.set_xlabel("Model size")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
-    fig.tight_layout()
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    fig.tight_layout(rect=(0, 0, 0.82, 1))
     fig.savefig(out_png, dpi=dpi)
     plt.close(fig)
 
@@ -174,7 +184,25 @@ def main() -> None:
         d.mkdir(parents=True, exist_ok=True)
 
     seed_info = _seed_everything_simple(seed)
-    save_config(config, output_dir / "config_used.yaml")
+    effective_config = copy.deepcopy(config)
+    effective_data_cfg = effective_config.setdefault("data", {})
+    if isinstance(effective_data_cfg, dict):
+        effective_data_cfg["random_seed"] = int(seed)
+    effective_paths_cfg = effective_config.setdefault("paths", {})
+    if isinstance(effective_paths_cfg, dict):
+        effective_paths_cfg["dit_config_path"] = str(dit_config_path)
+    effective_trad_cfg = effective_config.setdefault("traditional_step4", {})
+    if not isinstance(effective_trad_cfg, dict):
+        effective_trad_cfg = {}
+        effective_config["traditional_step4"] = effective_trad_cfg
+    effective_shared_cfg = effective_trad_cfg.setdefault("shared", {})
+    if isinstance(effective_shared_cfg, dict):
+        effective_shared_cfg["split_mode"] = str(split_mode)
+    effective_compare_cfg = effective_trad_cfg.setdefault("step4_4_comparation", {})
+    if isinstance(effective_compare_cfg, dict):
+        effective_compare_cfg["model_sizes"] = list(model_sizes)
+
+    save_config(effective_config, output_dir / "config_used.yaml")
     _save_run_metadata_simple(output_dir, args.config, seed_info)
     write_initial_log(
         step_dir=output_dir,
@@ -195,13 +223,10 @@ def main() -> None:
     for model_size in model_sizes:
         dit_results_dir = Path(get_results_dir(model_size=model_size, base_dir=dit_results_base, split_mode=split_mode))
         trad_results_dir = get_traditional_results_dir(results_root=results_root, split_mode=split_mode)
-        trad_results_dir_legacy = get_traditional_results_dir(
-            results_root=results_root, split_mode=split_mode, model_size=model_size
-        )
 
         dit_reg_csv = dit_results_dir / "step4_chi_training" / split_mode / "step4_1_regression" / "metrics" / "chi_metrics_overall.csv"
         dit_cls_csv = dit_results_dir / "step4_chi_training" / split_mode / "step4_2_classification" / "metrics" / "class_metrics_overall.csv"
-        trad_reg_csv_primary = (
+        trad_reg_csv = (
             trad_results_dir
             / "step4_3_traditional"
             / split_mode
@@ -209,7 +234,7 @@ def main() -> None:
             / "metrics"
             / "chi_metrics_overall.csv"
         )
-        trad_cls_csv_primary = (
+        trad_cls_csv = (
             trad_results_dir
             / "step4_3_traditional"
             / split_mode
@@ -217,24 +242,6 @@ def main() -> None:
             / "metrics"
             / "class_metrics_overall.csv"
         )
-        trad_reg_csv_legacy = (
-            trad_results_dir_legacy
-            / "step4_3_traditional"
-            / split_mode
-            / "step4_3_1_regression"
-            / "metrics"
-            / "chi_metrics_overall.csv"
-        )
-        trad_cls_csv_legacy = (
-            trad_results_dir_legacy
-            / "step4_3_traditional"
-            / split_mode
-            / "step4_3_2_classification"
-            / "metrics"
-            / "class_metrics_overall.csv"
-        )
-        trad_reg_csv = _prefer_existing_path(trad_reg_csv_primary, trad_reg_csv_legacy)
-        trad_cls_csv = _prefer_existing_path(trad_cls_csv_primary, trad_cls_csv_legacy)
 
         reg_ready = True
         try:
@@ -294,6 +301,7 @@ def main() -> None:
             row["delta_f1_traditional_minus_dit"] = _safe_get(pd.Series(row), "traditional_f1") - _safe_get(pd.Series(row), "dit_f1")
             row["winner_balanced_accuracy"] = "traditional" if row["delta_balanced_accuracy_traditional_minus_dit"] > 0 else "dit"
             row["winner_auroc"] = "traditional" if row["delta_auroc_traditional_minus_dit"] > 0 else "dit"
+            row["winner_f1"] = "traditional" if row["delta_f1_traditional_minus_dit"] > 0 else "dit"
             cls_rows.append(row)
 
     missing_df = pd.DataFrame(missing_rows)
@@ -326,13 +334,19 @@ def main() -> None:
         "delta_f1_traditional_minus_dit",
         "winner_balanced_accuracy",
         "winner_auroc",
+        "winner_f1",
     ]
+    size_rank = {str(s): i for i, s in enumerate(model_sizes)}
     if reg_rows:
-        reg_df = pd.DataFrame(reg_rows).sort_values("model_size").reset_index(drop=True)
+        reg_df = pd.DataFrame(reg_rows)
+        reg_df["__size_rank"] = reg_df["model_size"].astype(str).map(lambda s: size_rank.get(s, len(size_rank)))
+        reg_df = reg_df.sort_values("__size_rank").drop(columns=["__size_rank"]).reset_index(drop=True)
     else:
         reg_df = pd.DataFrame(columns=reg_columns)
     if cls_rows:
-        cls_df = pd.DataFrame(cls_rows).sort_values("model_size").reset_index(drop=True)
+        cls_df = pd.DataFrame(cls_rows)
+        cls_df["__size_rank"] = cls_df["model_size"].astype(str).map(lambda s: size_rank.get(s, len(size_rank)))
+        cls_df = cls_df.sort_values("__size_rank").drop(columns=["__size_rank"]).reset_index(drop=True)
     else:
         cls_df = pd.DataFrame(columns=cls_columns)
     reg_df.to_csv(metrics_dir / "regression_model_size_comparison.csv", index=False)
@@ -365,8 +379,10 @@ def main() -> None:
                         cls_df["delta_balanced_accuracy_traditional_minus_dit"].mean()
                     ),
                     "mean_delta_auroc_traditional_minus_dit": float(cls_df["delta_auroc_traditional_minus_dit"].mean()),
+                    "mean_delta_f1_traditional_minus_dit": float(cls_df["delta_f1_traditional_minus_dit"].mean()),
                     "traditional_wins_balanced_accuracy_count": int((cls_df["winner_balanced_accuracy"] == "traditional").sum()),
                     "traditional_wins_auroc_count": int((cls_df["winner_auroc"] == "traditional").sum()),
+                    "traditional_wins_f1_count": int((cls_df["winner_f1"] == "traditional").sum()),
                 }
             ]
         )
@@ -375,6 +391,7 @@ def main() -> None:
         pd.DataFrame().to_csv(metrics_dir / "classification_comparation_summary.csv", index=False)
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
+    font_size = int(config.get("plotting", {}).get("font_size", 12))
     if not reg_df.empty:
         _barplot_two_models(
             df=reg_df,
@@ -383,6 +400,8 @@ def main() -> None:
             title=f"Step4_1 vs Step4_3_1 (split={split_mode})",
             out_png=figures_dir / "regression_test_r2_by_model_size.png",
             dpi=dpi,
+            font_size=font_size,
+            model_size_order=model_sizes,
         )
         _barplot_two_models(
             df=reg_df,
@@ -391,6 +410,8 @@ def main() -> None:
             title=f"Step4_1 vs Step4_3_1 (split={split_mode})",
             out_png=figures_dir / "regression_test_rmse_by_model_size.png",
             dpi=dpi,
+            font_size=font_size,
+            model_size_order=model_sizes,
         )
 
     if not cls_df.empty:
@@ -401,6 +422,8 @@ def main() -> None:
             title=f"Step4_2 vs Step4_3_2 (split={split_mode})",
             out_png=figures_dir / "classification_test_balanced_accuracy_by_model_size.png",
             dpi=dpi,
+            font_size=font_size,
+            model_size_order=model_sizes,
         )
         _barplot_two_models(
             df=cls_df,
@@ -409,6 +432,18 @@ def main() -> None:
             title=f"Step4_2 vs Step4_3_2 (split={split_mode})",
             out_png=figures_dir / "classification_test_auroc_by_model_size.png",
             dpi=dpi,
+            font_size=font_size,
+            model_size_order=model_sizes,
+        )
+        _barplot_two_models(
+            df=cls_df,
+            metric="f1",
+            ylabel="Test F1",
+            title=f"Step4_2 vs Step4_3_2 (split={split_mode})",
+            out_png=figures_dir / "classification_test_f1_by_model_size.png",
+            dpi=dpi,
+            font_size=font_size,
+            model_size_order=model_sizes,
         )
 
     payload = {

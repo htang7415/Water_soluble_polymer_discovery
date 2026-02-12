@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import random
@@ -62,6 +63,7 @@ class StageConfig:
     tune: bool
     n_trials: int
     tuning_cv_folds: int
+    tuning_objective: str
     models: List[str]
     optuna_search_space: Dict[str, object]
 
@@ -189,6 +191,35 @@ def _resolve_bool_like(value, default: bool) -> bool:
         if text in {"0", "false", "no", "n", "off"}:
             return False
     return bool(default)
+
+
+def _normalize_tuning_objective(value: object, default_tuning_objective: str) -> str:
+    raw = str(value).strip().lower()
+    default_norm = str(default_tuning_objective).strip().lower()
+
+    if default_norm == "val_r2":
+        if raw in {"val_r2", "r2", "maximize_val_r2"}:
+            return "val_r2"
+        raise ValueError("step4_3_1_regression.tuning_objective must be one of {'val_r2', 'r2', 'maximize_val_r2'}")
+
+    if default_norm == "val_balanced_accuracy":
+        if raw in {"val_balanced_accuracy", "balanced_accuracy", "maximize_val_balanced_accuracy"}:
+            return "val_balanced_accuracy"
+        raise ValueError(
+            "step4_3_2_classification.tuning_objective must be one of "
+            "{'val_balanced_accuracy', 'balanced_accuracy', 'maximize_val_balanced_accuracy'}"
+        )
+
+    raise ValueError(f"Unsupported default tuning objective: {default_tuning_objective}")
+
+
+def _objective_summary_name(tuning_objective: str) -> str:
+    name = str(tuning_objective).strip().lower()
+    if name == "val_r2":
+        return "maximize_val_r2"
+    if name == "val_balanced_accuracy":
+        return "maximize_val_balanced_accuracy"
+    return name
 
 
 def _suggest_int(trial, name: str, search_space: Dict[str, object], default_lo: int, default_hi: int) -> int:
@@ -914,16 +945,18 @@ def _save_cv_parity_by_fold_figure(cv_val_df: pd.DataFrame, out_png: Path, dpi: 
     plot_df["fold"] = plot_df["fold"].astype(str)
     n_folds = int(plot_df["fold"].nunique())
     palette = sns.color_palette("tab10", n_colors=max(n_folds, 3))
-    sns.scatterplot(data=plot_df, x="chi_true", y="chi_pred", hue="fold", palette=palette, alpha=0.8, s=20, ax=ax)
+    sns.scatterplot(data=plot_df, x="chi_true", y="chi_pred", hue="fold", palette=palette, alpha=0.75, s=18, ax=ax)
     lo = float(min(plot_df["chi_true"].min(), plot_df["chi_pred"].min()))
     hi = float(max(plot_df["chi_true"].max(), plot_df["chi_pred"].max()))
     span = max(hi - lo, 1.0e-8)
     pad = 0.04 * span
     lo_plot = lo - pad
     hi_plot = hi + pad
-    ax.plot([lo_plot, hi_plot], [lo_plot, hi_plot], "k--", linewidth=1.0)
+    ax.plot([lo_plot, hi_plot], [lo_plot, hi_plot], "k--", linewidth=1.1)
     ax.set_xlim(lo_plot, hi_plot)
     ax.set_ylim(lo_plot, hi_plot)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
     ax.set_xlabel("True chi")
     ax.set_ylabel("Predicted chi")
     reg = regression_metrics(plot_df["chi_true"], plot_df["chi_pred"])
@@ -936,7 +969,7 @@ def _save_cv_parity_by_fold_figure(cv_val_df: pd.DataFrame, out_png: Path, dpi: 
         ha="left",
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
     )
-    ax.set_title(f"CV parity by fold (n={len(plot_df)})")
+    ax.set_title(f"CV parity by fold (val folds, n={len(plot_df)})")
     ax.legend(title="CV fold", loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     fig.tight_layout(rect=(0, 0, 0.82, 1))
     fig.savefig(out_png, dpi=dpi)
@@ -985,7 +1018,7 @@ def _tune_regression(
     )
     summarize_cv_folds(cv_folds).to_csv(tuning_dir / "optuna_tuning_cv_folds.csv", index=False)
 
-    objective_name = "val_r2"
+    objective_name = str(stage_cfg.tuning_objective).strip().lower()
     trial_rows: List[Dict[str, object]] = []
 
     def objective(trial: optuna.Trial) -> float:
@@ -999,7 +1032,10 @@ def _tune_regression(
                 model_params=params,
                 seed=stage_cfg.seed,
             )
-            score = float(cv_eval["cv_val_r2"])
+            if objective_name == "val_r2":
+                score = float(cv_eval["cv_val_r2"])
+            else:
+                raise ValueError(f"Unsupported regression tuning objective: {objective_name}")
             rmse = float(cv_eval["cv_val_rmse"])
             invalid = int((not np.isfinite(score)) or (not np.isfinite(rmse)))
         except Exception as exc:
@@ -1009,6 +1045,7 @@ def _tune_regression(
             trial.set_user_attr("error", str(exc))
 
         trial.set_user_attr("model_name", model_name)
+        trial.set_user_attr("model_params", _to_serializable(params))
         trial.set_user_attr("cv_val_r2", score)
         trial.set_user_attr("cv_val_rmse", rmse)
         trial.set_user_attr("cv_n_folds", int(len(cv_folds)))
@@ -1036,7 +1073,23 @@ def _tune_regression(
         }
         row.update(t.params)
         trial_rows.append(row)
-    trial_df = pd.DataFrame(trial_rows).sort_values("trial").reset_index(drop=True)
+    if trial_rows:
+        trial_df = pd.DataFrame(trial_rows).sort_values("trial").reset_index(drop=True)
+    else:
+        trial_df = pd.DataFrame(
+            columns=[
+                "trial",
+                "state",
+                "objective_name",
+                "objective_direction",
+                "objective_value",
+                "model_name",
+                "val_r2",
+                "val_rmse",
+                "invalid_metrics",
+                "cv_n_folds",
+            ]
+        )
     trial_df.to_csv(tuning_dir / "optuna_trials.csv", index=False)
     trial_df["best_objective_so_far"] = pd.to_numeric(trial_df["objective_value"], errors="coerce").cummax()
     trial_df.to_csv(tuning_dir / "optuna_optimization_objective.csv", index=False)
@@ -1049,16 +1102,49 @@ def _tune_regression(
         maximize=True,
     )
 
-    best_model_name = str(study.best_params["model_name"])
-    best_params = {k: v for k, v in study.best_params.items() if k != "model_name"}
-    best_cv = _evaluate_regression_cv(
-        cv_folds=cv_folds,
-        fingerprint_table=fingerprint_table,
-        model_name=best_model_name,
-        model_params=best_params,
-        seed=stage_cfg.seed,
-        collect_val_predictions=True,
-    )
+    valid_trials = []
+    for t in study.trials:
+        invalid = int(t.user_attrs.get("invalid_metrics", 0))
+        try:
+            value = float(t.value)
+        except Exception:
+            continue
+        if invalid == 0 and np.isfinite(value):
+            valid_trials.append(t)
+
+    best_trial = max(valid_trials, key=lambda t: float(t.value)) if valid_trials else None
+    fallback_reason = ""
+    if best_trial is None:
+        best_model_name = str(stage_cfg.models[0])
+        best_params = _default_regression_params(best_model_name)
+        objective_at_best = np.nan
+        fallback_reason = "no_valid_optuna_trial_using_default_model"
+    else:
+        best_model_name = str(best_trial.user_attrs.get("model_name", best_trial.params.get("model_name", stage_cfg.models[0]))).strip().lower()
+        params_attr = best_trial.user_attrs.get("model_params")
+        if isinstance(params_attr, dict) and len(params_attr) > 0:
+            best_params = dict(params_attr)
+        else:
+            best_params = {k: v for k, v in best_trial.params.items() if k != "model_name"}
+        if len(best_params) == 0:
+            best_params = _default_regression_params(best_model_name)
+        objective_at_best = float(best_trial.value)
+
+    best_params_by_model = _collect_best_params_by_model(study=study, model_names=stage_cfg.models)
+    best_cv_error = ""
+    try:
+        best_cv = _evaluate_regression_cv(
+            cv_folds=cv_folds,
+            fingerprint_table=fingerprint_table,
+            model_name=best_model_name,
+            model_params=best_params,
+            seed=stage_cfg.seed,
+            collect_val_predictions=True,
+        )
+    except Exception as exc:
+        best_cv = {"fold_metrics": pd.DataFrame(), "cv_val_predictions": pd.DataFrame()}
+        best_cv_error = str(exc)
+
     best_cv["fold_metrics"].to_csv(tuning_dir / "best_trial_cv_fold_metrics.csv", index=False)
     best_cv_val = best_cv.get("cv_val_predictions", pd.DataFrame())
     if isinstance(best_cv_val, pd.DataFrame) and not best_cv_val.empty:
@@ -1073,24 +1159,32 @@ def _tune_regression(
     with open(tuning_dir / "optuna_best.json", "w") as f:
         json.dump(
             {
-                "best_trial": int(study.best_trial.number),
-                "objective": "maximize_val_r2",
+                "best_trial": int(best_trial.number) if best_trial is not None else None,
+                "objective": _objective_summary_name(objective_name),
                 "objective_name": objective_name,
                 "objective_direction": "maximize",
-                "objective_value_at_best_trial": float(study.best_value),
+                "objective_value_at_best_trial": _safe_float(objective_at_best),
                 "best_model_name": best_model_name,
                 "best_params": best_params,
-                "best_value_r2": _safe_float(study.best_trial.user_attrs.get("cv_val_r2", np.nan)),
-                "best_value_rmse": _safe_float(study.best_trial.user_attrs.get("cv_val_rmse", np.nan)),
+                "best_value_r2": _safe_float(best_trial.user_attrs.get("cv_val_r2", np.nan)) if best_trial is not None else np.nan,
+                "best_value_rmse": _safe_float(best_trial.user_attrs.get("cv_val_rmse", np.nan)) if best_trial is not None else np.nan,
                 "tuning_cv_folds_requested": int(stage_cfg.tuning_cv_folds),
                 "tuning_cv_folds_resolved": int(cv_info.get("resolved_folds", len(cv_folds))),
                 "tuning_cv_strategy": str(cv_info.get("strategy", "unknown")),
                 "invalid_trial_count": int(trial_df["invalid_metrics"].sum()) if "invalid_metrics" in trial_df.columns else 0,
+                "best_trial_number": int(best_trial.number) if best_trial is not None else None,
+                "fallback_reason": fallback_reason,
+                "best_cv_eval_error": best_cv_error,
             },
             f,
             indent=2,
         )
-    return {"best_model_name": best_model_name, "best_params": best_params, "cv_info": cv_info}
+    return {
+        "best_model_name": best_model_name,
+        "best_params": best_params,
+        "best_params_by_model": best_params_by_model,
+        "cv_info": cv_info,
+    }
 
 
 def _tune_classification(
@@ -1112,7 +1206,7 @@ def _tune_classification(
     )
     summarize_cv_folds(cv_folds).to_csv(tuning_dir / "optuna_tuning_cv_folds.csv", index=False)
 
-    objective_name = "val_balanced_accuracy"
+    objective_name = str(stage_cfg.tuning_objective).strip().lower()
     trial_rows: List[Dict[str, object]] = []
 
     def objective(trial: optuna.Trial) -> float:
@@ -1126,7 +1220,10 @@ def _tune_classification(
                 model_params=params,
                 seed=stage_cfg.seed,
             )
-            score = float(cv_eval["cv_val_balanced_accuracy"])
+            if objective_name == "val_balanced_accuracy":
+                score = float(cv_eval["cv_val_balanced_accuracy"])
+            else:
+                raise ValueError(f"Unsupported classification tuning objective: {objective_name}")
             auroc = float(cv_eval["cv_val_auroc"])
             invalid = int((not np.isfinite(score)) or (not np.isfinite(auroc)))
         except Exception as exc:
@@ -1136,6 +1233,7 @@ def _tune_classification(
             trial.set_user_attr("error", str(exc))
 
         trial.set_user_attr("model_name", model_name)
+        trial.set_user_attr("model_params", _to_serializable(params))
         trial.set_user_attr("cv_val_balanced_accuracy", score)
         trial.set_user_attr("cv_val_auroc", auroc)
         trial.set_user_attr("cv_n_folds", int(len(cv_folds)))
@@ -1163,7 +1261,23 @@ def _tune_classification(
         }
         row.update(t.params)
         trial_rows.append(row)
-    trial_df = pd.DataFrame(trial_rows).sort_values("trial").reset_index(drop=True)
+    if trial_rows:
+        trial_df = pd.DataFrame(trial_rows).sort_values("trial").reset_index(drop=True)
+    else:
+        trial_df = pd.DataFrame(
+            columns=[
+                "trial",
+                "state",
+                "objective_name",
+                "objective_direction",
+                "objective_value",
+                "model_name",
+                "val_balanced_accuracy",
+                "val_auroc",
+                "invalid_metrics",
+                "cv_n_folds",
+            ]
+        )
     trial_df.to_csv(tuning_dir / "optuna_trials.csv", index=False)
     trial_df["best_objective_so_far"] = pd.to_numeric(trial_df["objective_value"], errors="coerce").cummax()
     trial_df.to_csv(tuning_dir / "optuna_optimization_objective.csv", index=False)
@@ -1176,38 +1290,81 @@ def _tune_classification(
         maximize=True,
     )
 
-    best_model_name = str(study.best_params["model_name"])
-    best_params = {k: v for k, v in study.best_params.items() if k != "model_name"}
-    best_cv = _evaluate_classification_cv(
-        cv_folds=cv_folds,
-        fingerprint_table=fingerprint_table,
-        model_name=best_model_name,
-        model_params=best_params,
-        seed=stage_cfg.seed,
-    )
+    valid_trials = []
+    for t in study.trials:
+        invalid = int(t.user_attrs.get("invalid_metrics", 0))
+        try:
+            value = float(t.value)
+        except Exception:
+            continue
+        if invalid == 0 and np.isfinite(value):
+            valid_trials.append(t)
+
+    best_trial = max(valid_trials, key=lambda t: float(t.value)) if valid_trials else None
+    fallback_reason = ""
+    if best_trial is None:
+        best_model_name = str(stage_cfg.models[0])
+        best_params = _default_classification_params(best_model_name)
+        objective_at_best = np.nan
+        fallback_reason = "no_valid_optuna_trial_using_default_model"
+    else:
+        best_model_name = str(best_trial.user_attrs.get("model_name", best_trial.params.get("model_name", stage_cfg.models[0]))).strip().lower()
+        params_attr = best_trial.user_attrs.get("model_params")
+        if isinstance(params_attr, dict) and len(params_attr) > 0:
+            best_params = dict(params_attr)
+        else:
+            best_params = {k: v for k, v in best_trial.params.items() if k != "model_name"}
+        if len(best_params) == 0:
+            best_params = _default_classification_params(best_model_name)
+        objective_at_best = float(best_trial.value)
+
+    best_params_by_model = _collect_best_params_by_model(study=study, model_names=stage_cfg.models)
+    best_cv_error = ""
+    try:
+        best_cv = _evaluate_classification_cv(
+            cv_folds=cv_folds,
+            fingerprint_table=fingerprint_table,
+            model_name=best_model_name,
+            model_params=best_params,
+            seed=stage_cfg.seed,
+        )
+    except Exception as exc:
+        best_cv = {"fold_metrics": pd.DataFrame()}
+        best_cv_error = str(exc)
+
     best_cv["fold_metrics"].to_csv(tuning_dir / "best_trial_cv_fold_metrics.csv", index=False)
 
     with open(tuning_dir / "optuna_best.json", "w") as f:
         json.dump(
             {
-                "best_trial": int(study.best_trial.number),
-                "objective": "maximize_val_balanced_accuracy",
+                "best_trial": int(best_trial.number) if best_trial is not None else None,
+                "objective": _objective_summary_name(objective_name),
                 "objective_name": objective_name,
                 "objective_direction": "maximize",
-                "objective_value_at_best_trial": float(study.best_value),
+                "objective_value_at_best_trial": _safe_float(objective_at_best),
                 "best_model_name": best_model_name,
                 "best_params": best_params,
-                "best_value_balanced_accuracy": _safe_float(study.best_trial.user_attrs.get("cv_val_balanced_accuracy", np.nan)),
-                "best_value_auroc": _safe_float(study.best_trial.user_attrs.get("cv_val_auroc", np.nan)),
+                "best_value_balanced_accuracy": _safe_float(best_trial.user_attrs.get("cv_val_balanced_accuracy", np.nan))
+                if best_trial is not None
+                else np.nan,
+                "best_value_auroc": _safe_float(best_trial.user_attrs.get("cv_val_auroc", np.nan)) if best_trial is not None else np.nan,
                 "tuning_cv_folds_requested": int(stage_cfg.tuning_cv_folds),
                 "tuning_cv_folds_resolved": int(cv_info.get("resolved_folds", len(cv_folds))),
                 "tuning_cv_strategy": str(cv_info.get("strategy", "unknown")),
                 "invalid_trial_count": int(trial_df["invalid_metrics"].sum()) if "invalid_metrics" in trial_df.columns else 0,
+                "best_trial_number": int(best_trial.number) if best_trial is not None else None,
+                "fallback_reason": fallback_reason,
+                "best_cv_eval_error": best_cv_error,
             },
             f,
             indent=2,
         )
-    return {"best_model_name": best_model_name, "best_params": best_params, "cv_info": cv_info}
+    return {
+        "best_model_name": best_model_name,
+        "best_params": best_params,
+        "best_params_by_model": best_params_by_model,
+        "cv_info": cv_info,
+    }
 
 
 def _fit_regression_on_final_split(
@@ -1299,35 +1456,76 @@ def _collect_regression_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
 def _make_regression_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int, font_size: int) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style="whitegrid")
-    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size})
+    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
 
     test_df = pred_df[pred_df["split"] == "test"].copy().reset_index(drop=True)
     if test_df.empty:
         return
 
-    fig, ax = plt.subplots(figsize=(5, 5))
-    sns.scatterplot(data=test_df, x="chi", y="chi_pred", s=24, alpha=0.8, ax=ax)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.scatterplot(
+        data=test_df,
+        x="chi",
+        y="chi_pred",
+        hue="water_soluble",
+        palette={1: "#1f77b4", 0: "#d62728"},
+        alpha=0.75,
+        s=18,
+        ax=ax,
+        legend=True,
+    )
     lo = float(min(test_df["chi"].min(), test_df["chi_pred"].min()))
     hi = float(max(test_df["chi"].max(), test_df["chi_pred"].max()))
     span = max(hi - lo, 1.0e-8)
     pad = 0.04 * span
     lo_plot = lo - pad
     hi_plot = hi + pad
-    ax.plot([lo_plot, hi_plot], [lo_plot, hi_plot], "k--", linewidth=1.0)
+    ax.plot([lo_plot, hi_plot], [lo_plot, hi_plot], "k--", linewidth=1.1)
     ax.set_xlim(lo_plot, hi_plot)
     ax.set_ylim(lo_plot, hi_plot)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
     ax.set_xlabel("True chi")
     ax.set_ylabel("Predicted chi")
     ax.set_title("chi parity (test)")
-    fig.tight_layout()
+    reg = regression_metrics(test_df["chi"], test_df["chi_pred"])
+    metrics_text = f"MAE={reg['mae']:.3f}\nRMSE={reg['rmse']:.3f}\nR2={reg['r2']:.3f}"
+    ax.text(
+        0.03,
+        0.97,
+        metrics_text,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
+    )
+    legend = ax.get_legend()
+    if legend is not None:
+        handles = getattr(legend, "legend_handles", None)
+        if handles is None:
+            handles = legend.legendHandles
+        labels = [t.get_text() for t in legend.get_texts()]
+        legend.remove()
+        ax.legend(
+            handles=handles,
+            labels=labels,
+            title="water_soluble",
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
+        )
+    fig.tight_layout(rect=(0, 0, 0.82, 1))
     fig.savefig(fig_dir / "chi_parity_test.png", dpi=dpi)
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    sns.histplot(test_df["chi_error"], kde=True, bins=30, ax=ax, color="#1f77b4")
-    ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0)
-    ax.set_xlabel("Prediction error (chi_pred - chi_true)")
-    ax.set_title("chi residual distribution (test)")
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for split, color in [("train", "#4c78a8"), ("val", "#f58518"), ("test", "#54a24b")]:
+        sub = pred_df[pred_df["split"] == split]
+        sns.kdeplot(sub["chi_error"], ax=ax, label=split, color=color, linewidth=2)
+    ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
+    ax.set_xlabel("chi prediction error")
+    ax.set_title("Residual distribution by split")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_residual_distribution.png", dpi=dpi)
     plt.close(fig)
@@ -1370,17 +1568,40 @@ def _make_classification_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int,
 
     fig_dir.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style="whitegrid")
-    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size})
+    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
 
     test_df = pred_df[pred_df["split"] == "test"].copy().reset_index(drop=True)
     if test_df.empty:
         return
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    sns.histplot(data=test_df, x="class_prob", hue="water_soluble", bins=30, stat="density", common_norm=False, ax=ax)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.kdeplot(
+        data=test_df,
+        x="class_prob",
+        hue="water_soluble",
+        common_norm=False,
+        fill=True,
+        alpha=0.3,
+        ax=ax,
+    )
     ax.set_xlabel("Predicted soluble probability")
-    ax.set_title("Probability distribution (test)")
-    fig.tight_layout()
+    ax.set_title("Class probability distribution (test)")
+    legend = ax.get_legend()
+    if legend is not None:
+        handles = getattr(legend, "legend_handles", None)
+        if handles is None:
+            handles = legend.legendHandles
+        labels = [t.get_text() for t in legend.get_texts()]
+        legend.remove()
+        ax.legend(
+            handles=handles,
+            labels=labels,
+            title="water_soluble",
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
+        )
+    fig.tight_layout(rect=(0, 0, 0.82, 1))
     fig.savefig(fig_dir / "class_prob_distribution_test.png", dpi=dpi)
     plt.close(fig)
 
@@ -1388,22 +1609,22 @@ def _make_classification_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int,
     y_prob = test_df["class_prob"].to_numpy(dtype=float)
     if len(np.unique(y_true)) > 1:
         fpr, tpr, _ = roc_curve(y_true, y_prob)
-        fig, ax = plt.subplots(figsize=(5, 5))
+        fig, ax = plt.subplots(figsize=(6, 5))
         ax.plot(fpr, tpr, color="#1f77b4", linewidth=2)
         ax.plot([0, 1], [0, 1], "k--", linewidth=1)
-        ax.set_xlabel("False Positive Rate")
-        ax.set_ylabel("True Positive Rate")
-        ax.set_title("ROC curve (test)")
+        ax.set_xlabel("FPR")
+        ax.set_ylabel("TPR")
+        ax.set_title("Classifier ROC (test)")
         fig.tight_layout()
         fig.savefig(fig_dir / "classifier_roc_test.png", dpi=dpi)
         plt.close(fig)
 
         precision, recall, _ = precision_recall_curve(y_true, y_prob)
-        fig, ax = plt.subplots(figsize=(5, 5))
-        ax.plot(recall, precision, color="#ff7f0e", linewidth=2)
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.plot(recall, precision, color="#d62728", linewidth=2)
         ax.set_xlabel("Recall")
         ax.set_ylabel("Precision")
-        ax.set_title("PR curve (test)")
+        ax.set_title("Classifier PR (test)")
         fig.tight_layout()
         fig.savefig(fig_dir / "classifier_pr_test.png", dpi=dpi)
         plt.close(fig)
@@ -1414,6 +1635,7 @@ def _resolve_stage_config(
     shared_split_mode: str,
     shared_holdout: Optional[float],
     seed: int,
+    default_tuning_objective: str,
     validate_dependencies: bool = True,
     tune_override: Optional[bool] = None,
     n_trials_override: Optional[int] = None,
@@ -1434,6 +1656,8 @@ def _resolve_stage_config(
     tune_default = bool(stage_section.get("tune", True))
     tune = bool(tune_default if tune_override is None else tune_override)
     n_trials = int(n_trials_override if n_trials_override is not None else stage_section.get("n_trials", 100))
+    objective_raw = stage_section.get("tuning_objective", default_tuning_objective)
+    tuning_objective = _normalize_tuning_objective(objective_raw, default_tuning_objective=default_tuning_objective)
 
     models = stage_section.get("models", [])
     if not isinstance(models, list) or len(models) == 0:
@@ -1454,6 +1678,7 @@ def _resolve_stage_config(
         tune=bool(tune),
         n_trials=int(n_trials),
         tuning_cv_folds=int(tuning_cv_folds),
+        tuning_objective=str(tuning_objective),
         models=models,
         optuna_search_space=dict(optuna_search_space),
     )
@@ -1471,6 +1696,164 @@ def _to_serializable(obj):
     return obj
 
 
+def _collect_best_params_by_model(study, model_names: List[str]) -> Dict[str, Dict[str, object]]:
+    out: Dict[str, Dict[str, object]] = {}
+    normalized = [str(m).strip().lower() for m in model_names]
+    for model_name in normalized:
+        best_trial = None
+        best_value = -np.inf
+        for t in study.trials:
+            trial_model = str(t.user_attrs.get("model_name", "")).strip().lower()
+            if trial_model != model_name:
+                continue
+            invalid = int(t.user_attrs.get("invalid_metrics", 0))
+            if invalid != 0:
+                continue
+            value = t.value
+            if value is None:
+                continue
+            try:
+                score = float(value)
+            except Exception:
+                continue
+            if not np.isfinite(score):
+                continue
+            if (best_trial is None) or (score > best_value):
+                best_trial = t
+                best_value = score
+        if best_trial is None:
+            continue
+        params = best_trial.user_attrs.get("model_params")
+        if not isinstance(params, dict):
+            params = {k: v for k, v in best_trial.params.items() if k != "model_name"}
+        out[model_name] = dict(params)
+    return out
+
+
+def _run_single_regression_model(
+    *,
+    split_df: pd.DataFrame,
+    split_assign: pd.DataFrame,
+    fingerprint_table: np.ndarray,
+    model_name: str,
+    model_params: Dict[str, object],
+    seed: int,
+    out_dir: Path,
+    checkpoint_basename: str,
+    dpi: int,
+    font_size: int,
+) -> Dict[str, object]:
+    metrics_dir = out_dir / "metrics"
+    figures_dir = out_dir / "figures"
+    checkpoint_dir = out_dir / "checkpoints"
+    for d in [metrics_dir, figures_dir, checkpoint_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    split_assign.to_csv(metrics_dir / "split_assignments.csv", index=False)
+    split_df.to_csv(metrics_dir / "chi_dataset_with_split.csv", index=False)
+
+    final_fit_df = build_final_fit_split_df(split_df)
+    model = _fit_regression_on_final_split(
+        final_fit_df=final_fit_df,
+        fingerprint_table=fingerprint_table,
+        model_name=model_name,
+        model_params=model_params,
+        seed=seed,
+    )
+    checkpoint_path = checkpoint_dir / checkpoint_basename
+    joblib.dump(model, checkpoint_path)
+    with open(checkpoint_dir / f"{Path(checkpoint_basename).stem}.meta.json", "w") as f:
+        json.dump({"model_name": model_name, "params": _to_serializable(model_params)}, f, indent=2)
+
+    pred_df = _save_regression_predictions(
+        split_df=final_fit_df,
+        fingerprint_table=fingerprint_table,
+        model=model,
+        out_dir=metrics_dir,
+    )
+    _collect_regression_metrics(pred_df, out_dir=metrics_dir)
+    _make_regression_figures(pred_df, fig_dir=figures_dir, dpi=dpi, font_size=font_size)
+    save_artifact_manifest(step_dir=out_dir, metrics_dir=metrics_dir, figures_dir=figures_dir, dpi=dpi)
+
+    overall_df = pd.read_csv(metrics_dir / "chi_metrics_overall.csv")
+    test_row = overall_df[overall_df["split"] == "test"]
+    test_r2 = float(test_row["r2"].iloc[0]) if not test_row.empty and "r2" in test_row.columns else np.nan
+    test_rmse = float(test_row["rmse"].iloc[0]) if not test_row.empty and "rmse" in test_row.columns else np.nan
+    test_mae = float(test_row["mae"].iloc[0]) if not test_row.empty and "mae" in test_row.columns else np.nan
+    return {
+        "metrics_dir": str(metrics_dir),
+        "figures_dir": str(figures_dir),
+        "checkpoint": str(checkpoint_path),
+        "test_r2": _safe_float(test_r2),
+        "test_rmse": _safe_float(test_rmse),
+        "test_mae": _safe_float(test_mae),
+    }
+
+
+def _run_single_classification_model(
+    *,
+    split_df: pd.DataFrame,
+    split_assign: pd.DataFrame,
+    fingerprint_table: np.ndarray,
+    model_name: str,
+    model_params: Dict[str, object],
+    seed: int,
+    out_dir: Path,
+    checkpoint_basename: str,
+    dpi: int,
+    font_size: int,
+) -> Dict[str, object]:
+    metrics_dir = out_dir / "metrics"
+    figures_dir = out_dir / "figures"
+    checkpoint_dir = out_dir / "checkpoints"
+    for d in [metrics_dir, figures_dir, checkpoint_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    split_assign.to_csv(metrics_dir / "split_assignments.csv", index=False)
+    split_df.to_csv(metrics_dir / "chi_dataset_with_split.csv", index=False)
+
+    final_fit_df = build_final_fit_split_df(split_df)
+    model = _fit_classification_on_final_split(
+        final_fit_df=final_fit_df,
+        fingerprint_table=fingerprint_table,
+        model_name=model_name,
+        model_params=model_params,
+        seed=seed,
+    )
+    checkpoint_path = checkpoint_dir / checkpoint_basename
+    joblib.dump(model, checkpoint_path)
+    with open(checkpoint_dir / f"{Path(checkpoint_basename).stem}.meta.json", "w") as f:
+        json.dump({"model_name": model_name, "params": _to_serializable(model_params)}, f, indent=2)
+
+    pred_df = _save_classification_predictions(
+        split_df=final_fit_df,
+        fingerprint_table=fingerprint_table,
+        model=model,
+        out_dir=metrics_dir,
+    )
+    _collect_classification_metrics(pred_df, out_dir=metrics_dir)
+    _make_classification_figures(pred_df, fig_dir=figures_dir, dpi=dpi, font_size=font_size)
+    save_artifact_manifest(step_dir=out_dir, metrics_dir=metrics_dir, figures_dir=figures_dir, dpi=dpi)
+
+    overall_df = pd.read_csv(metrics_dir / "class_metrics_overall.csv")
+    test_row = overall_df[overall_df["split"] == "test"]
+    test_bal = (
+        float(test_row["balanced_accuracy"].iloc[0])
+        if not test_row.empty and "balanced_accuracy" in test_row.columns
+        else np.nan
+    )
+    test_auroc = float(test_row["auroc"].iloc[0]) if not test_row.empty and "auroc" in test_row.columns else np.nan
+    test_f1 = float(test_row["f1"].iloc[0]) if not test_row.empty and "f1" in test_row.columns else np.nan
+    return {
+        "metrics_dir": str(metrics_dir),
+        "figures_dir": str(figures_dir),
+        "checkpoint": str(checkpoint_path),
+        "test_balanced_accuracy": _safe_float(test_bal),
+        "test_auroc": _safe_float(test_auroc),
+        "test_f1": _safe_float(test_f1),
+    }
+
+
 def _run_regression_stage(
     *,
     split_df: pd.DataFrame,
@@ -1485,7 +1868,8 @@ def _run_regression_stage(
     figures_dir = reg_dir / "figures"
     tuning_dir = reg_dir / "tuning"
     checkpoint_dir = reg_dir / "checkpoints"
-    for d in [metrics_dir, figures_dir, tuning_dir, checkpoint_dir]:
+    models_dir = reg_dir / "models"
+    for d in [metrics_dir, figures_dir, tuning_dir, checkpoint_dir, models_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     split_assign.to_csv(metrics_dir / "split_assignments.csv", index=False)
@@ -1502,9 +1886,11 @@ def _run_regression_stage(
         )
         best_model_name = str(tuned["best_model_name"])
         best_params = dict(tuned["best_params"])
+        best_params_by_model = dict(tuned.get("best_params_by_model", {}))
         hyper_summary = {
             "selection_mode": "optuna",
-            "objective": "maximize_val_r2",
+            "objective": _objective_summary_name(stage_cfg.tuning_objective),
+            "objective_name": stage_cfg.tuning_objective,
             "best_model_name": best_model_name,
             "best_params": _to_serializable(best_params),
             "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
@@ -1512,8 +1898,10 @@ def _run_regression_stage(
     else:
         best_model_name = str(stage_cfg.models[0])
         best_params = _default_regression_params(best_model_name)
+        best_params_by_model = {str(m): _default_regression_params(str(m)) for m in stage_cfg.models}
         hyper_summary = {
             "selection_mode": "default_no_tuning",
+            "objective_name": stage_cfg.tuning_objective,
             "best_model_name": best_model_name,
             "best_params": _to_serializable(best_params),
             "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
@@ -1524,40 +1912,81 @@ def _run_regression_stage(
     with open(metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
         json.dump(hyper_summary, f, indent=2)
 
-    final_fit_df = build_final_fit_split_df(split_df)
-    model = _fit_regression_on_final_split(
-        final_fit_df=final_fit_df,
+    model_outputs: List[Dict[str, object]] = []
+    for model_name in stage_cfg.models:
+        params = best_params_by_model.get(str(model_name), None)
+        if not isinstance(params, dict):
+            params = _default_regression_params(str(model_name))
+            param_source = "default_fallback"
+        else:
+            param_source = "optuna_best_per_model" if stage_cfg.tune else "default_no_tuning"
+        params = dict(params)
+        model_dir = models_dir / str(model_name)
+        out = _run_single_regression_model(
+            split_df=split_df,
+            split_assign=split_assign,
+            fingerprint_table=fingerprint_table,
+            model_name=str(model_name),
+            model_params=params,
+            seed=stage_cfg.seed,
+            out_dir=model_dir,
+            checkpoint_basename=f"chi_regression_traditional_{model_name}.joblib",
+            dpi=dpi,
+            font_size=font_size,
+        )
+        model_outputs.append(
+            {
+                "model_name": str(model_name),
+                "param_source": param_source,
+                "params": _to_serializable(params),
+                "metrics_dir": out["metrics_dir"],
+                "figures_dir": out["figures_dir"],
+                "checkpoint": out["checkpoint"],
+                "test_r2": out["test_r2"],
+                "test_rmse": out["test_rmse"],
+                "test_mae": out["test_mae"],
+            }
+        )
+
+    best_out = _run_single_regression_model(
+        split_df=split_df,
+        split_assign=split_assign,
         fingerprint_table=fingerprint_table,
         model_name=best_model_name,
         model_params=best_params,
         seed=stage_cfg.seed,
+        out_dir=reg_dir,
+        checkpoint_basename="chi_regression_traditional_best.joblib",
+        dpi=dpi,
+        font_size=font_size,
     )
-    checkpoint_path = checkpoint_dir / "chi_regression_traditional_best.joblib"
-    joblib.dump(model, checkpoint_path)
-    with open(checkpoint_dir / "chi_regression_traditional_best.meta.json", "w") as f:
-        json.dump({"model_name": best_model_name, "params": _to_serializable(best_params)}, f, indent=2)
 
-    pred_df = _save_regression_predictions(
-        split_df=final_fit_df,
-        fingerprint_table=fingerprint_table,
-        model=model,
-        out_dir=metrics_dir,
-    )
-    _collect_regression_metrics(pred_df, out_dir=metrics_dir)
-    _make_regression_figures(pred_df, fig_dir=figures_dir, dpi=dpi, font_size=font_size)
-    save_artifact_manifest(step_dir=reg_dir, metrics_dir=metrics_dir, figures_dir=figures_dir, dpi=dpi)
+    with open(metrics_dir / "model_hyperparameters_by_model.json", "w") as f:
+        json.dump({x["model_name"]: x["params"] for x in model_outputs}, f, indent=2)
+    pd.DataFrame(
+        [
+            {
+                "model_name": x["model_name"],
+                "param_source": x["param_source"],
+                "metrics_dir": x["metrics_dir"],
+                "figures_dir": x["figures_dir"],
+                "checkpoint": x["checkpoint"],
+                "test_r2": x["test_r2"],
+                "test_rmse": x["test_rmse"],
+                "test_mae": x["test_mae"],
+            }
+            for x in model_outputs
+        ]
+    ).to_csv(metrics_dir / "model_metrics_summary.csv", index=False)
 
-    overall_df = pd.read_csv(metrics_dir / "chi_metrics_overall.csv")
-    test_row = overall_df[overall_df["split"] == "test"]
-    test_r2 = float(test_row["r2"].iloc[0]) if not test_row.empty and "r2" in test_row.columns else np.nan
-    test_rmse = float(test_row["rmse"].iloc[0]) if not test_row.empty and "rmse" in test_row.columns else np.nan
     return {
-        "metrics_dir": str(metrics_dir),
-        "figures_dir": str(figures_dir),
-        "checkpoint": str(checkpoint_path),
+        "metrics_dir": best_out["metrics_dir"],
+        "figures_dir": best_out["figures_dir"],
+        "checkpoint": best_out["checkpoint"],
+        "models_dir": str(models_dir),
         "best_model_name": best_model_name,
-        "test_r2": _safe_float(test_r2),
-        "test_rmse": _safe_float(test_rmse),
+        "test_r2": _safe_float(best_out["test_r2"]),
+        "test_rmse": _safe_float(best_out["test_rmse"]),
     }
 
 
@@ -1575,7 +2004,8 @@ def _run_classification_stage(
     figures_dir = cls_dir / "figures"
     tuning_dir = cls_dir / "tuning"
     checkpoint_dir = cls_dir / "checkpoints"
-    for d in [metrics_dir, figures_dir, tuning_dir, checkpoint_dir]:
+    models_dir = cls_dir / "models"
+    for d in [metrics_dir, figures_dir, tuning_dir, checkpoint_dir, models_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     split_assign.to_csv(metrics_dir / "split_assignments.csv", index=False)
@@ -1592,9 +2022,11 @@ def _run_classification_stage(
         )
         best_model_name = str(tuned["best_model_name"])
         best_params = dict(tuned["best_params"])
+        best_params_by_model = dict(tuned.get("best_params_by_model", {}))
         hyper_summary = {
             "selection_mode": "optuna",
-            "objective": "maximize_val_balanced_accuracy",
+            "objective": _objective_summary_name(stage_cfg.tuning_objective),
+            "objective_name": stage_cfg.tuning_objective,
             "best_model_name": best_model_name,
             "best_params": _to_serializable(best_params),
             "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
@@ -1602,8 +2034,10 @@ def _run_classification_stage(
     else:
         best_model_name = str(stage_cfg.models[0])
         best_params = _default_classification_params(best_model_name)
+        best_params_by_model = {str(m): _default_classification_params(str(m)) for m in stage_cfg.models}
         hyper_summary = {
             "selection_mode": "default_no_tuning",
+            "objective_name": stage_cfg.tuning_objective,
             "best_model_name": best_model_name,
             "best_params": _to_serializable(best_params),
             "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
@@ -1614,44 +2048,81 @@ def _run_classification_stage(
     with open(metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
         json.dump(hyper_summary, f, indent=2)
 
-    final_fit_df = build_final_fit_split_df(split_df)
-    model = _fit_classification_on_final_split(
-        final_fit_df=final_fit_df,
+    model_outputs: List[Dict[str, object]] = []
+    for model_name in stage_cfg.models:
+        params = best_params_by_model.get(str(model_name), None)
+        if not isinstance(params, dict):
+            params = _default_classification_params(str(model_name))
+            param_source = "default_fallback"
+        else:
+            param_source = "optuna_best_per_model" if stage_cfg.tune else "default_no_tuning"
+        params = dict(params)
+        model_dir = models_dir / str(model_name)
+        out = _run_single_classification_model(
+            split_df=split_df,
+            split_assign=split_assign,
+            fingerprint_table=fingerprint_table,
+            model_name=str(model_name),
+            model_params=params,
+            seed=stage_cfg.seed,
+            out_dir=model_dir,
+            checkpoint_basename=f"chi_classifier_traditional_{model_name}.joblib",
+            dpi=dpi,
+            font_size=font_size,
+        )
+        model_outputs.append(
+            {
+                "model_name": str(model_name),
+                "param_source": param_source,
+                "params": _to_serializable(params),
+                "metrics_dir": out["metrics_dir"],
+                "figures_dir": out["figures_dir"],
+                "checkpoint": out["checkpoint"],
+                "test_balanced_accuracy": out["test_balanced_accuracy"],
+                "test_auroc": out["test_auroc"],
+                "test_f1": out["test_f1"],
+            }
+        )
+
+    best_out = _run_single_classification_model(
+        split_df=split_df,
+        split_assign=split_assign,
         fingerprint_table=fingerprint_table,
         model_name=best_model_name,
         model_params=best_params,
         seed=stage_cfg.seed,
+        out_dir=cls_dir,
+        checkpoint_basename="chi_classifier_traditional_best.joblib",
+        dpi=dpi,
+        font_size=font_size,
     )
-    checkpoint_path = checkpoint_dir / "chi_classifier_traditional_best.joblib"
-    joblib.dump(model, checkpoint_path)
-    with open(checkpoint_dir / "chi_classifier_traditional_best.meta.json", "w") as f:
-        json.dump({"model_name": best_model_name, "params": _to_serializable(best_params)}, f, indent=2)
 
-    pred_df = _save_classification_predictions(
-        split_df=final_fit_df,
-        fingerprint_table=fingerprint_table,
-        model=model,
-        out_dir=metrics_dir,
-    )
-    _collect_classification_metrics(pred_df, out_dir=metrics_dir)
-    _make_classification_figures(pred_df, fig_dir=figures_dir, dpi=dpi, font_size=font_size)
-    save_artifact_manifest(step_dir=cls_dir, metrics_dir=metrics_dir, figures_dir=figures_dir, dpi=dpi)
+    with open(metrics_dir / "model_hyperparameters_by_model.json", "w") as f:
+        json.dump({x["model_name"]: x["params"] for x in model_outputs}, f, indent=2)
+    pd.DataFrame(
+        [
+            {
+                "model_name": x["model_name"],
+                "param_source": x["param_source"],
+                "metrics_dir": x["metrics_dir"],
+                "figures_dir": x["figures_dir"],
+                "checkpoint": x["checkpoint"],
+                "test_balanced_accuracy": x["test_balanced_accuracy"],
+                "test_auroc": x["test_auroc"],
+                "test_f1": x["test_f1"],
+            }
+            for x in model_outputs
+        ]
+    ).to_csv(metrics_dir / "model_metrics_summary.csv", index=False)
 
-    overall_df = pd.read_csv(metrics_dir / "class_metrics_overall.csv")
-    test_row = overall_df[overall_df["split"] == "test"]
-    test_bal = (
-        float(test_row["balanced_accuracy"].iloc[0])
-        if not test_row.empty and "balanced_accuracy" in test_row.columns
-        else np.nan
-    )
-    test_auroc = float(test_row["auroc"].iloc[0]) if not test_row.empty and "auroc" in test_row.columns else np.nan
     return {
-        "metrics_dir": str(metrics_dir),
-        "figures_dir": str(figures_dir),
-        "checkpoint": str(checkpoint_path),
+        "metrics_dir": best_out["metrics_dir"],
+        "figures_dir": best_out["figures_dir"],
+        "checkpoint": best_out["checkpoint"],
+        "models_dir": str(models_dir),
         "best_model_name": best_model_name,
-        "test_balanced_accuracy": _safe_float(test_bal),
-        "test_auroc": _safe_float(test_auroc),
+        "test_balanced_accuracy": _safe_float(best_out["test_balanced_accuracy"]),
+        "test_auroc": _safe_float(best_out["test_auroc"]),
     }
 
 
@@ -1724,29 +2195,38 @@ def main() -> None:
     if not isinstance(reg_cfg_section, dict) or not isinstance(cls_cfg_section, dict):
         raise ValueError("step4_3_1_regression and step4_3_2_classification must be mapping objects.")
 
-    reg_cfg = _resolve_stage_config(
-        stage_section=reg_cfg_section,
-        shared_split_mode=split_mode,
-        shared_holdout=holdout_test_ratio,
-        seed=seed,
-        validate_dependencies=run_reg,
-        tune_override=tune_override,
-        n_trials_override=args.n_trials,
-        tuning_cv_folds_override=args.tuning_cv_folds,
-    )
-    cls_cfg = _resolve_stage_config(
-        stage_section=cls_cfg_section,
-        shared_split_mode=split_mode,
-        shared_holdout=holdout_test_ratio,
-        seed=seed,
-        validate_dependencies=run_cls,
-        tune_override=tune_override,
-        n_trials_override=args.n_trials,
-        tuning_cv_folds_override=args.tuning_cv_folds,
-    )
+    reg_cfg: Optional[StageConfig] = None
+    cls_cfg: Optional[StageConfig] = None
+    reg_split_ratios: Optional[Dict[str, float]] = None
+    cls_split_ratios: Optional[Dict[str, float]] = None
 
-    reg_split_ratios = resolve_split_ratios(reg_cfg.holdout_test_ratio, reg_cfg.tuning_cv_folds)
-    cls_split_ratios = resolve_split_ratios(cls_cfg.holdout_test_ratio, cls_cfg.tuning_cv_folds)
+    if run_reg:
+        reg_cfg = _resolve_stage_config(
+            stage_section=reg_cfg_section,
+            shared_split_mode=split_mode,
+            shared_holdout=holdout_test_ratio,
+            seed=seed,
+            default_tuning_objective="val_r2",
+            validate_dependencies=True,
+            tune_override=tune_override,
+            n_trials_override=args.n_trials,
+            tuning_cv_folds_override=args.tuning_cv_folds,
+        )
+        reg_split_ratios = resolve_split_ratios(reg_cfg.holdout_test_ratio, reg_cfg.tuning_cv_folds)
+
+    if run_cls:
+        cls_cfg = _resolve_stage_config(
+            stage_section=cls_cfg_section,
+            shared_split_mode=split_mode,
+            shared_holdout=holdout_test_ratio,
+            seed=seed,
+            default_tuning_objective="val_balanced_accuracy",
+            validate_dependencies=True,
+            tune_override=tune_override,
+            n_trials_override=args.n_trials,
+            tuning_cv_folds_override=args.tuning_cv_folds,
+        )
+        cls_split_ratios = resolve_split_ratios(cls_cfg.holdout_test_ratio, cls_cfg.tuning_cv_folds)
 
     reg_dataset = args.regression_dataset_path or shared_cfg.get("regression_dataset_path", "Data/chi/_50_polymers_T_phi.csv")
     cls_dataset = args.classification_dataset_path or shared_cfg.get(
@@ -1763,27 +2243,96 @@ def main() -> None:
     for d in [results_dir, step_dir, shared_dir, reg_dir, cls_dir, pipeline_metrics_dir, pipeline_metrics_run_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
+    effective_config = copy.deepcopy(config)
+    effective_data_cfg = effective_config.setdefault("data", {})
+    if isinstance(effective_data_cfg, dict):
+        effective_data_cfg["random_seed"] = int(seed)
+    effective_trad_cfg = effective_config.setdefault("traditional_step4", {})
+    if not isinstance(effective_trad_cfg, dict):
+        effective_trad_cfg = {}
+        effective_config["traditional_step4"] = effective_trad_cfg
+    effective_shared_cfg = effective_trad_cfg.setdefault("shared", {})
+    if not isinstance(effective_shared_cfg, dict):
+        effective_shared_cfg = {}
+        effective_trad_cfg["shared"] = effective_shared_cfg
+    effective_shared_cfg["split_mode"] = str(split_mode)
+    effective_shared_cfg["regression_dataset_path"] = str(reg_dataset)
+    effective_shared_cfg["classification_dataset_path"] = str(cls_dataset)
+    effective_shared_split_cfg = effective_shared_cfg.setdefault("split", {})
+    if not isinstance(effective_shared_split_cfg, dict):
+        effective_shared_split_cfg = {}
+        effective_shared_cfg["split"] = effective_shared_split_cfg
+    if reg_cfg is not None:
+        effective_shared_split_cfg["holdout_test_ratio"] = float(reg_cfg.holdout_test_ratio)
+    elif cls_cfg is not None:
+        effective_shared_split_cfg["holdout_test_ratio"] = float(cls_cfg.holdout_test_ratio)
+    effective_fp_cfg = effective_shared_cfg.setdefault("fingerprint", {})
+    if not isinstance(effective_fp_cfg, dict):
+        effective_fp_cfg = {}
+        effective_shared_cfg["fingerprint"] = effective_fp_cfg
+    effective_fp_cfg.update(
+        {
+            "radius": int(fp_cfg.radius),
+            "n_bits": int(fp_cfg.n_bits),
+            "use_chirality": bool(fp_cfg.use_chirality),
+            "use_features": bool(fp_cfg.use_features),
+        }
+    )
+    if reg_cfg is not None:
+        effective_reg_cfg = effective_trad_cfg.setdefault("step4_3_1_regression", {})
+        if isinstance(effective_reg_cfg, dict):
+            effective_reg_cfg["tune"] = bool(reg_cfg.tune)
+            effective_reg_cfg["n_trials"] = int(reg_cfg.n_trials)
+            effective_reg_cfg["tuning_cv_folds"] = int(reg_cfg.tuning_cv_folds)
+            effective_reg_cfg["tuning_objective"] = str(reg_cfg.tuning_objective)
+            effective_reg_cfg["models"] = list(reg_cfg.models)
+    if cls_cfg is not None:
+        effective_cls_cfg = effective_trad_cfg.setdefault("step4_3_2_classification", {})
+        if isinstance(effective_cls_cfg, dict):
+            effective_cls_cfg["tune"] = bool(cls_cfg.tune)
+            effective_cls_cfg["n_trials"] = int(cls_cfg.n_trials)
+            effective_cls_cfg["tuning_cv_folds"] = int(cls_cfg.tuning_cv_folds)
+            effective_cls_cfg["tuning_objective"] = str(cls_cfg.tuning_objective)
+            effective_cls_cfg["models"] = list(cls_cfg.models)
+
     seed_info = _seed_everything_simple(seed)
-    save_config(config, step_dir / "config_used.yaml")
+    save_config(effective_config, step_dir / "config_used.yaml")
     _save_run_metadata_simple(step_dir, args.config, seed_info)
+    log_context = {
+        "config_path": args.config,
+        "stage": args.stage,
+        "results_dir": str(results_dir),
+        "split_mode": split_mode,
+        "regression_dataset_path": str(reg_dataset),
+        "classification_dataset_path": str(cls_dataset),
+        "fingerprint_radius": int(fp_cfg.radius),
+        "fingerprint_n_bits": int(fp_cfg.n_bits),
+        "random_seed": int(seed),
+    }
+    if reg_cfg is not None:
+        log_context.update(
+            {
+                "regression_holdout_test_ratio": float(reg_cfg.holdout_test_ratio),
+                "regression_tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
+                "regression_tuning_objective": str(reg_cfg.tuning_objective),
+                "regression_tune": bool(reg_cfg.tune),
+                "regression_n_trials": int(reg_cfg.n_trials),
+            }
+        )
+    if cls_cfg is not None:
+        log_context.update(
+            {
+                "classification_holdout_test_ratio": float(cls_cfg.holdout_test_ratio),
+                "classification_tuning_cv_folds": int(cls_cfg.tuning_cv_folds),
+                "classification_tuning_objective": str(cls_cfg.tuning_objective),
+                "classification_tune": bool(cls_cfg.tune),
+                "classification_n_trials": int(cls_cfg.n_trials),
+            }
+        )
     write_initial_log(
         step_dir=step_dir,
         step_name="step4_3_traditional",
-        context={
-            "config_path": args.config,
-            "stage": args.stage,
-            "results_dir": str(results_dir),
-            "split_mode": split_mode,
-            "regression_dataset_path": str(reg_dataset),
-            "classification_dataset_path": str(cls_dataset),
-            "regression_holdout_test_ratio": float(reg_cfg.holdout_test_ratio),
-            "classification_holdout_test_ratio": float(cls_cfg.holdout_test_ratio),
-            "regression_tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
-            "classification_tuning_cv_folds": int(cls_cfg.tuning_cv_folds),
-            "fingerprint_radius": int(fp_cfg.radius),
-            "fingerprint_n_bits": int(fp_cfg.n_bits),
-            "random_seed": int(seed),
-        },
+        context=log_context,
     )
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
@@ -1809,15 +2358,31 @@ def main() -> None:
         "fingerprint_radius": int(fp_cfg.radius),
         "fingerprint_n_bits": int(fp_cfg.n_bits),
         "random_seed": int(seed),
-        "regression_tune": bool(reg_cfg.tune),
-        "classification_tune": bool(cls_cfg.tune),
-        "regression_n_trials": int(reg_cfg.n_trials),
-        "classification_n_trials": int(cls_cfg.n_trials),
-        "regression_tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
-        "classification_tuning_cv_folds": int(cls_cfg.tuning_cv_folds),
+        "regression_enabled": bool(run_reg),
+        "classification_enabled": bool(run_cls),
     }
+    if reg_cfg is not None:
+        summary.update(
+            {
+                "regression_tune": bool(reg_cfg.tune),
+                "regression_n_trials": int(reg_cfg.n_trials),
+                "regression_tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
+                "regression_tuning_objective": str(reg_cfg.tuning_objective),
+            }
+        )
+    if cls_cfg is not None:
+        summary.update(
+            {
+                "classification_tune": bool(cls_cfg.tune),
+                "classification_n_trials": int(cls_cfg.n_trials),
+                "classification_tuning_cv_folds": int(cls_cfg.tuning_cv_folds),
+                "classification_tuning_objective": str(cls_cfg.tuning_objective),
+            }
+        )
 
     if run_reg:
+        if reg_cfg is None or reg_split_ratios is None:
+            raise RuntimeError("Regression stage requested but regression configuration is not initialized.")
         reg_split_df, reg_split_assign = load_split_dataset(
             dataset_path=reg_dataset,
             split_mode=split_mode,
@@ -1849,6 +2414,7 @@ def main() -> None:
             {
                 "step4_3_1_metrics_dir": reg_out["metrics_dir"],
                 "step4_3_1_checkpoint": reg_out["checkpoint"],
+                "step4_3_1_models_dir": reg_out.get("models_dir", ""),
                 "step4_3_1_best_model_name": reg_out["best_model_name"],
                 "step4_3_1_test_r2": reg_out["test_r2"],
                 "step4_3_1_test_rmse": reg_out["test_rmse"],
@@ -1858,6 +2424,8 @@ def main() -> None:
         print("Skipping Step4_3_1 regression stage by request.")
 
     if run_cls:
+        if cls_cfg is None or cls_split_ratios is None:
+            raise RuntimeError("Classification stage requested but classification configuration is not initialized.")
         cls_split_df, cls_split_assign = load_split_dataset(
             dataset_path=cls_dataset,
             split_mode=split_mode,
@@ -1889,6 +2457,7 @@ def main() -> None:
             {
                 "step4_3_2_metrics_dir": cls_out["metrics_dir"],
                 "step4_3_2_checkpoint": cls_out["checkpoint"],
+                "step4_3_2_models_dir": cls_out.get("models_dir", ""),
                 "step4_3_2_best_model_name": cls_out["best_model_name"],
                 "step4_3_2_test_balanced_accuracy": cls_out["test_balanced_accuracy"],
                 "step4_3_2_test_auroc": cls_out["test_auroc"],

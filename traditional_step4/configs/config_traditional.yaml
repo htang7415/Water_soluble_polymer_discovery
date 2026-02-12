@@ -7,6 +7,10 @@ paths:
 data:
   random_seed: 42
 
+plotting:
+  font_size: 12
+  dpi: 600
+
 traditional_step4:
   shared:
     regression_dataset_path: "Data/chi/_50_polymers_T_phi.csv"

@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,9 +30,9 @@ def load_traditional_config(config_path: str) -> Dict:
     return cfg
 
 
-def get_traditional_results_dir(results_root: str, split_mode: str, model_size: Optional[str] = None) -> Path:
+def get_traditional_results_dir(results_root: str, split_mode: str) -> Path:
     base = str(Path(results_root) / "results_traditional")
-    return Path(get_results_dir(model_size=model_size, base_dir=base, split_mode=split_mode))
+    return Path(get_results_dir(model_size=None, base_dir=base, split_mode=split_mode))
 
 
 def normalize_split_mode(split_mode: str) -> str:
