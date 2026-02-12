@@ -54,9 +54,6 @@ from sklearn.preprocessing import StandardScaler
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
-VALID_MODEL_SIZES = {"small", "medium", "large", "xl"}
-
-
 @dataclass
 class StageConfig:
     split_mode: str
@@ -134,6 +131,66 @@ def _as_int_options(value, default: List[int]) -> List[int]:
     return out if out else [int(x) for x in default]
 
 
+def _as_choice_options(value, default: List[object]) -> List[object]:
+    if not isinstance(value, list) or len(value) == 0:
+        return list(default)
+    return list(value)
+
+
+def _resolve_max_features(value, default):
+    if value is None:
+        return default
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"none", "null", ""}:
+            return None
+        if text in {"sqrt", "log2"}:
+            return text
+        try:
+            return float(text)
+        except Exception:
+            return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    return default
+
+
+def _resolve_class_weight(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"none", "null", ""}:
+            return None
+        if text in {"balanced", "balanced_subsample"}:
+            return text
+        return None
+    return None
+
+
+def _resolve_mlp_batch_size(value):
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    try:
+        return int(value)
+    except Exception:
+        return "auto"
+
+
+def _resolve_bool_like(value, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(default)
+
+
 def _suggest_int(trial, name: str, search_space: Dict[str, object], default_lo: int, default_hi: int) -> int:
     lo, hi = _as_int_pair(search_space.get(name), default_lo, default_hi)
     if lo == hi:
@@ -187,9 +244,11 @@ def _sample_mlp_hidden_layers(trial, search_space: Dict[str, object]) -> Tuple[i
     return tuple(hidden)
 
 
-def _sklearn_kernel_from_name(name: str, length_scale: float):
+def _sklearn_kernel_from_name(name: str, length_scale: float, constant_value: float = 1.0, noise_level: float = 1.0e-5):
     name = str(name).strip().lower()
     ls = float(max(length_scale, 1.0e-6))
+    cv = float(max(constant_value, 1.0e-8))
+    nl = float(max(noise_level, 1.0e-10))
     if name == "rbf":
         base = RBF(length_scale=ls)
     elif name == "matern15":
@@ -198,7 +257,7 @@ def _sklearn_kernel_from_name(name: str, length_scale: float):
         base = Matern(length_scale=ls, nu=2.5)
     else:
         base = RBF(length_scale=ls)
-    return ConstantKernel(1.0, constant_value_bounds="fixed") * base + WhiteKernel(noise_level=1.0e-5)
+    return ConstantKernel(cv, constant_value_bounds="fixed") * base + WhiteKernel(noise_level=nl)
 
 
 def _check_xgboost_required(model_names: List[str]) -> None:
@@ -248,11 +307,13 @@ class GPyRegressor(BaseEstimator, RegressorMixin):
         self,
         kernel: str = "rbf",
         length_scale: float = 1.0,
+        kernel_variance: float = 1.0,
         alpha: float = 1.0e-5,
         max_iters: int = 200,
     ):
         self.kernel = kernel
         self.length_scale = length_scale
+        self.kernel_variance = kernel_variance
         self.alpha = alpha
         self.max_iters = max_iters
 
@@ -260,13 +321,14 @@ class GPyRegressor(BaseEstimator, RegressorMixin):
         GPy = _load_gpy_module()
         kname = str(self.kernel).strip().lower()
         ls = float(max(self.length_scale, 1.0e-6))
+        kv = float(max(self.kernel_variance, 1.0e-8))
         if kname == "rbf":
-            return GPy.kern.RBF(input_dim=input_dim, variance=1.0, lengthscale=ls, ARD=False)
+            return GPy.kern.RBF(input_dim=input_dim, variance=kv, lengthscale=ls, ARD=False)
         if kname == "matern15":
-            return GPy.kern.Matern32(input_dim=input_dim, variance=1.0, lengthscale=ls, ARD=False)
+            return GPy.kern.Matern32(input_dim=input_dim, variance=kv, lengthscale=ls, ARD=False)
         if kname == "matern25":
-            return GPy.kern.Matern52(input_dim=input_dim, variance=1.0, lengthscale=ls, ARD=False)
-        return GPy.kern.RBF(input_dim=input_dim, variance=1.0, lengthscale=ls, ARD=False)
+            return GPy.kern.Matern52(input_dim=input_dim, variance=kv, lengthscale=ls, ARD=False)
+        return GPy.kern.RBF(input_dim=input_dim, variance=kv, lengthscale=ls, ARD=False)
 
     def fit(self, X, y):
         GPy = _load_gpy_module()
@@ -306,18 +368,22 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
     model_name = str(model_name).strip().lower()
     if model_name == "ridge":
         alpha = float(params.get("alpha", 1.0))
+        fit_intercept = _resolve_bool_like(params.get("fit_intercept", True), default=True)
         return Pipeline(
             [
                 ("scaler", StandardScaler()),
-                ("model", Ridge(alpha=alpha)),
+                ("model", Ridge(alpha=alpha, fit_intercept=fit_intercept)),
             ]
         )
     if model_name == "random_forest":
+        max_features = _resolve_max_features(params.get("max_features", 1.0), default=1.0)
         return RandomForestRegressor(
             n_estimators=int(params.get("n_estimators", 600)),
             max_depth=None if params.get("max_depth", None) in {None, 0} else int(params["max_depth"]),
             min_samples_split=int(params.get("min_samples_split", 2)),
             min_samples_leaf=int(params.get("min_samples_leaf", 1)),
+            bootstrap=_resolve_bool_like(params.get("bootstrap", True), default=True),
+            max_features=max_features,
             n_jobs=-1,
             random_state=int(seed),
         )
@@ -332,8 +398,10 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
             min_child_weight=float(params.get("min_child_weight", 1.0)),
             subsample=float(params.get("subsample", 0.9)),
             colsample_bytree=float(params.get("colsample_bytree", 0.9)),
+            gamma=float(params.get("gamma", 0.0)),
             reg_alpha=float(params.get("reg_alpha", 0.0)),
             reg_lambda=float(params.get("reg_lambda", 1.0)),
+            max_bin=int(params.get("max_bin", 256)),
             random_state=int(seed),
             n_jobs=-1,
             tree_method="hist",
@@ -342,6 +410,8 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
         hidden_layers = tuple(int(x) for x in params.get("hidden_layers", (512, 256)))
         alpha = float(params.get("alpha", 1.0e-4))
         lr = float(params.get("learning_rate_init", 1.0e-3))
+        activation = str(params.get("activation", "relu"))
+        batch_size = _resolve_mlp_batch_size(params.get("batch_size", "auto"))
         return Pipeline(
             [
                 ("scaler", StandardScaler()),
@@ -349,6 +419,8 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
                     "model",
                     MLPRegressor(
                         hidden_layer_sizes=hidden_layers,
+                        activation=activation,
+                        batch_size=batch_size,
                         alpha=alpha,
                         learning_rate_init=lr,
                         max_iter=1000,
@@ -363,6 +435,7 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
         alpha = float(params.get("alpha", 1.0e-5))
         kernel_name = str(params.get("kernel", "rbf"))
         length_scale = float(params.get("length_scale", 1.0))
+        kernel_variance = float(params.get("kernel_variance", 1.0))
         max_iters = int(params.get("max_iters", 200))
         return Pipeline(
             [
@@ -372,6 +445,7 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
                     GPyRegressor(
                         kernel=kernel_name,
                         length_scale=length_scale,
+                        kernel_variance=kernel_variance,
                         alpha=alpha,
                         max_iters=max_iters,
                     ),
@@ -385,6 +459,12 @@ def _build_classification_estimator(model_name: str, params: Dict[str, object], 
     model_name = str(model_name).strip().lower()
     if model_name == "logistic":
         c_val = float(params.get("C", 1.0))
+        penalty = str(params.get("penalty", "l2")).strip().lower()
+        if penalty not in {"l1", "l2"}:
+            penalty = "l2"
+        class_weight = _resolve_class_weight(params.get("class_weight", None))
+        if class_weight not in {None, "balanced"}:
+            class_weight = None
         return Pipeline(
             [
                 ("scaler", StandardScaler()),
@@ -392,6 +472,8 @@ def _build_classification_estimator(model_name: str, params: Dict[str, object], 
                     "model",
                     LogisticRegression(
                         C=c_val,
+                        penalty=penalty,
+                        class_weight=class_weight,
                         solver="liblinear",
                         max_iter=5000,
                         random_state=int(seed),
@@ -400,11 +482,16 @@ def _build_classification_estimator(model_name: str, params: Dict[str, object], 
             ]
         )
     if model_name == "random_forest":
+        max_features = _resolve_max_features(params.get("max_features", "sqrt"), default="sqrt")
+        class_weight = _resolve_class_weight(params.get("class_weight", None))
         return RandomForestClassifier(
             n_estimators=int(params.get("n_estimators", 600)),
             max_depth=None if params.get("max_depth", None) in {None, 0} else int(params["max_depth"]),
             min_samples_split=int(params.get("min_samples_split", 2)),
             min_samples_leaf=int(params.get("min_samples_leaf", 1)),
+            bootstrap=_resolve_bool_like(params.get("bootstrap", True), default=True),
+            max_features=max_features,
+            class_weight=class_weight,
             n_jobs=-1,
             random_state=int(seed),
         )
@@ -419,8 +506,11 @@ def _build_classification_estimator(model_name: str, params: Dict[str, object], 
             min_child_weight=float(params.get("min_child_weight", 1.0)),
             subsample=float(params.get("subsample", 0.9)),
             colsample_bytree=float(params.get("colsample_bytree", 0.9)),
+            gamma=float(params.get("gamma", 0.0)),
             reg_alpha=float(params.get("reg_alpha", 0.0)),
             reg_lambda=float(params.get("reg_lambda", 1.0)),
+            scale_pos_weight=float(params.get("scale_pos_weight", 1.0)),
+            max_bin=int(params.get("max_bin", 256)),
             random_state=int(seed),
             n_jobs=-1,
             tree_method="hist",
@@ -429,6 +519,8 @@ def _build_classification_estimator(model_name: str, params: Dict[str, object], 
         hidden_layers = tuple(int(x) for x in params.get("hidden_layers", (512, 256)))
         alpha = float(params.get("alpha", 1.0e-4))
         lr = float(params.get("learning_rate_init", 1.0e-3))
+        activation = str(params.get("activation", "relu"))
+        batch_size = _resolve_mlp_batch_size(params.get("batch_size", "auto"))
         return Pipeline(
             [
                 ("scaler", StandardScaler()),
@@ -436,6 +528,8 @@ def _build_classification_estimator(model_name: str, params: Dict[str, object], 
                     "model",
                     MLPClassifier(
                         hidden_layer_sizes=hidden_layers,
+                        activation=activation,
+                        batch_size=batch_size,
                         alpha=alpha,
                         learning_rate_init=lr,
                         max_iter=1000,
@@ -449,7 +543,11 @@ def _build_classification_estimator(model_name: str, params: Dict[str, object], 
     if model_name == "gpc":
         kernel_name = str(params.get("kernel", "rbf"))
         length_scale = float(params.get("length_scale", 1.0))
-        kernel = _sklearn_kernel_from_name(kernel_name, length_scale)
+        constant_value = float(params.get("kernel_constant", 1.0))
+        noise_level = float(params.get("noise_level", 1.0e-5))
+        n_restarts_optimizer = int(params.get("n_restarts_optimizer", 0))
+        max_iter_predict = int(params.get("max_iter_predict", 100))
+        kernel = _sklearn_kernel_from_name(kernel_name, length_scale, constant_value=constant_value, noise_level=noise_level)
         return Pipeline(
             [
                 ("scaler", StandardScaler()),
@@ -458,8 +556,8 @@ def _build_classification_estimator(model_name: str, params: Dict[str, object], 
                     GaussianProcessClassifier(
                         kernel=kernel,
                         random_state=int(seed),
-                        n_restarts_optimizer=0,
-                        max_iter_predict=100,
+                        n_restarts_optimizer=n_restarts_optimizer,
+                        max_iter_predict=max_iter_predict,
                     ),
                 ),
             ]
@@ -469,9 +567,16 @@ def _build_classification_estimator(model_name: str, params: Dict[str, object], 
 
 def _default_regression_params(model_name: str) -> Dict[str, object]:
     if model_name == "ridge":
-        return {"alpha": 1.0}
+        return {"alpha": 1.0, "fit_intercept": True}
     if model_name == "random_forest":
-        return {"n_estimators": 600, "max_depth": 18, "min_samples_split": 2, "min_samples_leaf": 1}
+        return {
+            "n_estimators": 600,
+            "max_depth": 18,
+            "min_samples_split": 2,
+            "min_samples_leaf": 1,
+            "max_features": 1.0,
+            "bootstrap": True,
+        }
     if model_name == "xgboost":
         return {
             "n_estimators": 800,
@@ -480,21 +585,43 @@ def _default_regression_params(model_name: str) -> Dict[str, object]:
             "min_child_weight": 1.0,
             "subsample": 0.9,
             "colsample_bytree": 0.9,
+            "gamma": 0.0,
             "reg_alpha": 0.0,
             "reg_lambda": 1.0,
+            "max_bin": 256,
         }
     if model_name == "mlp":
-        return {"hidden_layers": (512, 256), "alpha": 1.0e-4, "learning_rate_init": 1.0e-3}
+        return {
+            "hidden_layers": (512, 256),
+            "activation": "relu",
+            "batch_size": 128,
+            "alpha": 1.0e-4,
+            "learning_rate_init": 1.0e-3,
+        }
     if model_name == "gpr":
-        return {"alpha": 1.0e-5, "kernel": "rbf", "length_scale": 1.0, "max_iters": 200}
+        return {
+            "alpha": 1.0e-5,
+            "kernel": "rbf",
+            "length_scale": 1.0,
+            "kernel_variance": 1.0,
+            "max_iters": 200,
+        }
     raise ValueError(f"Unsupported regression model: {model_name}")
 
 
 def _default_classification_params(model_name: str) -> Dict[str, object]:
     if model_name == "logistic":
-        return {"C": 1.0}
+        return {"C": 1.0, "penalty": "l2", "class_weight": None}
     if model_name == "random_forest":
-        return {"n_estimators": 600, "max_depth": 18, "min_samples_split": 2, "min_samples_leaf": 1}
+        return {
+            "n_estimators": 600,
+            "max_depth": 18,
+            "min_samples_split": 2,
+            "min_samples_leaf": 1,
+            "max_features": "sqrt",
+            "bootstrap": True,
+            "class_weight": None,
+        }
     if model_name == "xgboost":
         return {
             "n_estimators": 800,
@@ -503,27 +630,58 @@ def _default_classification_params(model_name: str) -> Dict[str, object]:
             "min_child_weight": 1.0,
             "subsample": 0.9,
             "colsample_bytree": 0.9,
+            "gamma": 0.0,
             "reg_alpha": 0.0,
             "reg_lambda": 1.0,
+            "scale_pos_weight": 1.0,
+            "max_bin": 256,
         }
     if model_name == "mlp":
-        return {"hidden_layers": (512, 256), "alpha": 1.0e-4, "learning_rate_init": 1.0e-3}
+        return {
+            "hidden_layers": (512, 256),
+            "activation": "relu",
+            "batch_size": 128,
+            "alpha": 1.0e-4,
+            "learning_rate_init": 1.0e-3,
+        }
     if model_name == "gpc":
-        return {"kernel": "rbf", "length_scale": 1.0}
+        return {
+            "kernel": "rbf",
+            "length_scale": 1.0,
+            "kernel_constant": 1.0,
+            "noise_level": 1.0e-5,
+            "n_restarts_optimizer": 0,
+            "max_iter_predict": 100,
+        }
     raise ValueError(f"Unsupported classification model: {model_name}")
 
 
 def _sample_regression_params(trial, model_name: str, search_space: Dict[str, object]) -> Dict[str, object]:
     if model_name == "ridge":
+        fit_intercept_options = _as_choice_options(search_space.get("ridge_fit_intercept"), default=[True, False])
         return {
             "alpha": _suggest_float(trial, "ridge_alpha", search_space, 1.0e-5, 1.0e3, log=True),
+            "fit_intercept": _resolve_bool_like(
+                trial.suggest_categorical("ridge_fit_intercept", fit_intercept_options),
+                default=True,
+            ),
         }
     if model_name == "random_forest":
+        max_features_options = _as_choice_options(
+            search_space.get("random_forest_max_features"),
+            default=["sqrt", "log2", 0.5, 0.75, 1.0],
+        )
+        bootstrap_options = _as_choice_options(search_space.get("random_forest_bootstrap"), default=[True, False])
         return {
             "n_estimators": _suggest_int(trial, "random_forest_n_estimators", search_space, 200, 1200),
             "max_depth": _suggest_int(trial, "random_forest_max_depth", search_space, 3, 30),
             "min_samples_split": _suggest_int(trial, "random_forest_min_samples_split", search_space, 2, 20),
             "min_samples_leaf": _suggest_int(trial, "random_forest_min_samples_leaf", search_space, 1, 10),
+            "max_features": trial.suggest_categorical("random_forest_max_features", max_features_options),
+            "bootstrap": _resolve_bool_like(
+                trial.suggest_categorical("random_forest_bootstrap", bootstrap_options),
+                default=True,
+            ),
         }
     if model_name == "xgboost":
         return {
@@ -533,12 +691,18 @@ def _sample_regression_params(trial, model_name: str, search_space: Dict[str, ob
             "min_child_weight": _suggest_float(trial, "xgboost_min_child_weight", search_space, 1.0, 12.0, log=False),
             "subsample": _suggest_float(trial, "xgboost_subsample", search_space, 0.5, 1.0, log=False),
             "colsample_bytree": _suggest_float(trial, "xgboost_colsample_bytree", search_space, 0.5, 1.0, log=False),
+            "gamma": _suggest_float(trial, "xgboost_gamma", search_space, 0.0, 8.0, log=False),
             "reg_alpha": _suggest_float(trial, "xgboost_reg_alpha", search_space, 1.0e-8, 10.0, log=True),
             "reg_lambda": _suggest_float(trial, "xgboost_reg_lambda", search_space, 1.0e-8, 30.0, log=True),
+            "max_bin": _suggest_int(trial, "xgboost_max_bin", search_space, 128, 512),
         }
     if model_name == "mlp":
+        activation_options = _as_choice_options(search_space.get("mlp_activation"), default=["relu", "tanh"])
+        batch_size_options = _as_choice_options(search_space.get("mlp_batch_size"), default=[32, 64, 128, 256])
         return {
             "hidden_layers": _sample_mlp_hidden_layers(trial, search_space=search_space),
+            "activation": str(trial.suggest_categorical("mlp_activation", activation_options)),
+            "batch_size": trial.suggest_categorical("mlp_batch_size", batch_size_options),
             "alpha": _suggest_float(trial, "mlp_alpha", search_space, 1.0e-7, 1.0e-2, log=True),
             "learning_rate_init": _suggest_float(trial, "mlp_learning_rate_init", search_space, 1.0e-5, 5.0e-3, log=True),
         }
@@ -550,6 +714,7 @@ def _sample_regression_params(trial, model_name: str, search_space: Dict[str, ob
             "alpha": _suggest_float(trial, "gpr_alpha", search_space, 1.0e-10, 1.0e-1, log=True),
             "kernel": trial.suggest_categorical("gpr_kernel", [str(x) for x in kernel_options]),
             "length_scale": _suggest_float(trial, "gpr_length_scale", search_space, 1.0e-2, 1.0e2, log=True),
+            "kernel_variance": _suggest_float(trial, "gpr_kernel_variance", search_space, 1.0e-2, 10.0, log=True),
             "max_iters": _suggest_int(trial, "gpr_max_iters", search_space, 80, 400),
         }
     raise ValueError(f"Unsupported regression model: {model_name}")
@@ -557,15 +722,34 @@ def _sample_regression_params(trial, model_name: str, search_space: Dict[str, ob
 
 def _sample_classification_params(trial, model_name: str, search_space: Dict[str, object]) -> Dict[str, object]:
     if model_name == "logistic":
+        penalty_options = _as_choice_options(search_space.get("logistic_penalty"), default=["l2", "l1"])
+        class_weight_options = _as_choice_options(search_space.get("logistic_class_weight"), default=["none", "balanced"])
         return {
             "C": _suggest_float(trial, "logistic_c", search_space, 1.0e-5, 1.0e3, log=True),
+            "penalty": str(trial.suggest_categorical("logistic_penalty", penalty_options)),
+            "class_weight": trial.suggest_categorical("logistic_class_weight", class_weight_options),
         }
     if model_name == "random_forest":
+        max_features_options = _as_choice_options(
+            search_space.get("random_forest_max_features"),
+            default=["sqrt", "log2", 0.5, 0.75, 1.0],
+        )
+        bootstrap_options = _as_choice_options(search_space.get("random_forest_bootstrap"), default=[True, False])
+        class_weight_options = _as_choice_options(
+            search_space.get("random_forest_class_weight"),
+            default=["none", "balanced", "balanced_subsample"],
+        )
         return {
             "n_estimators": _suggest_int(trial, "random_forest_n_estimators", search_space, 200, 1200),
             "max_depth": _suggest_int(trial, "random_forest_max_depth", search_space, 3, 30),
             "min_samples_split": _suggest_int(trial, "random_forest_min_samples_split", search_space, 2, 20),
             "min_samples_leaf": _suggest_int(trial, "random_forest_min_samples_leaf", search_space, 1, 10),
+            "max_features": trial.suggest_categorical("random_forest_max_features", max_features_options),
+            "bootstrap": _resolve_bool_like(
+                trial.suggest_categorical("random_forest_bootstrap", bootstrap_options),
+                default=True,
+            ),
+            "class_weight": trial.suggest_categorical("random_forest_class_weight", class_weight_options),
         }
     if model_name == "xgboost":
         return {
@@ -575,12 +759,19 @@ def _sample_classification_params(trial, model_name: str, search_space: Dict[str
             "min_child_weight": _suggest_float(trial, "xgboost_min_child_weight", search_space, 1.0, 12.0, log=False),
             "subsample": _suggest_float(trial, "xgboost_subsample", search_space, 0.5, 1.0, log=False),
             "colsample_bytree": _suggest_float(trial, "xgboost_colsample_bytree", search_space, 0.5, 1.0, log=False),
+            "gamma": _suggest_float(trial, "xgboost_gamma", search_space, 0.0, 8.0, log=False),
             "reg_alpha": _suggest_float(trial, "xgboost_reg_alpha", search_space, 1.0e-8, 10.0, log=True),
             "reg_lambda": _suggest_float(trial, "xgboost_reg_lambda", search_space, 1.0e-8, 30.0, log=True),
+            "scale_pos_weight": _suggest_float(trial, "xgboost_scale_pos_weight", search_space, 0.25, 5.0, log=True),
+            "max_bin": _suggest_int(trial, "xgboost_max_bin", search_space, 128, 512),
         }
     if model_name == "mlp":
+        activation_options = _as_choice_options(search_space.get("mlp_activation"), default=["relu", "tanh"])
+        batch_size_options = _as_choice_options(search_space.get("mlp_batch_size"), default=[32, 64, 128, 256])
         return {
             "hidden_layers": _sample_mlp_hidden_layers(trial, search_space=search_space),
+            "activation": str(trial.suggest_categorical("mlp_activation", activation_options)),
+            "batch_size": trial.suggest_categorical("mlp_batch_size", batch_size_options),
             "alpha": _suggest_float(trial, "mlp_alpha", search_space, 1.0e-7, 1.0e-2, log=True),
             "learning_rate_init": _suggest_float(trial, "mlp_learning_rate_init", search_space, 1.0e-5, 5.0e-3, log=True),
         }
@@ -591,6 +782,10 @@ def _sample_classification_params(trial, model_name: str, search_space: Dict[str
         return {
             "kernel": trial.suggest_categorical("gpc_kernel", [str(x) for x in kernel_options]),
             "length_scale": _suggest_float(trial, "gpc_length_scale", search_space, 1.0e-2, 1.0e2, log=True),
+            "kernel_constant": _suggest_float(trial, "gpc_kernel_constant", search_space, 1.0e-2, 10.0, log=True),
+            "noise_level": _suggest_float(trial, "gpc_noise_level", search_space, 1.0e-8, 1.0e-2, log=True),
+            "n_restarts_optimizer": _suggest_int(trial, "gpc_n_restarts_optimizer", search_space, 0, 5),
+            "max_iter_predict": _suggest_int(trial, "gpc_max_iter_predict", search_space, 80, 300),
         }
     raise ValueError(f"Unsupported classification model: {model_name}")
 
@@ -1470,7 +1665,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["both", "step4_3_1", "step4_3_2"],
         help="Run both substeps or only one.",
     )
-    parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large", "xl"])
     parser.add_argument(
         "--split_mode",
         type=str,
@@ -1493,8 +1687,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_arg_parser().parse_args()
 
-    if args.model_size not in VALID_MODEL_SIZES:
-        raise ValueError(f"Invalid model_size: {args.model_size}")
     if args.tune and args.no_tune:
         raise ValueError("Cannot set both --tune and --no_tune.")
     run_reg = args.stage in {"both", "step4_3_1"}
@@ -1561,7 +1753,7 @@ def main() -> None:
         "classification_dataset_path", "Data/water_solvent/water_solvent_polymers.csv"
     )
 
-    results_dir = get_traditional_results_dir(results_root=results_root, model_size=args.model_size, split_mode=split_mode)
+    results_dir = get_traditional_results_dir(results_root=results_root, split_mode=split_mode)
     step_dir = results_dir / "step4_3_traditional" / split_mode
     shared_dir = step_dir / "shared"
     reg_dir = step_dir / "step4_3_1_regression"
@@ -1579,7 +1771,6 @@ def main() -> None:
         step_name="step4_3_traditional",
         context={
             "config_path": args.config,
-            "model_size": args.model_size,
             "stage": args.stage,
             "results_dir": str(results_dir),
             "split_mode": split_mode,
@@ -1601,7 +1792,6 @@ def main() -> None:
     print("=" * 80)
     print("Step 4_3 traditional pipeline")
     print(f"Stage: {args.stage}")
-    print(f"Model size namespace: {args.model_size}")
     print(f"Split mode: {split_mode}")
     print(f"Regression dataset: {reg_dataset}")
     print(f"Classification dataset: {cls_dataset}")
@@ -1611,7 +1801,6 @@ def main() -> None:
     summary = {
         "step": "step4_3_traditional",
         "stage": args.stage,
-        "model_size": args.model_size,
         "split_mode": split_mode,
         "results_dir": str(results_dir),
         "step_dir": str(step_dir),

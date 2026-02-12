@@ -67,6 +67,14 @@ def _safe_get(row: pd.Series, key: str) -> float:
         return np.nan
 
 
+def _prefer_existing_path(primary: Path, legacy: Path) -> Path:
+    if primary.exists():
+        return primary
+    if legacy.exists():
+        return legacy
+    return primary
+
+
 def _resolve_model_sizes(args_sizes: List[str], cfg_sizes: List[str]) -> List[str]:
     if args_sizes:
         sizes = [str(s).strip().lower() for s in args_sizes]
@@ -132,7 +140,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to DiT config (fallback: config_traditional.paths.dit_config_path or configs/config.yaml).",
     )
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None, help="Optional seed override (default: config data.random_seed or 42).")
     return parser
 
 
@@ -154,6 +162,8 @@ def main() -> None:
     dit_config_path = args.dit_config or default_dit_config
     dit_config = load_config(dit_config_path)
     dit_results_base = str(dit_config.get("paths", {}).get("results_dir", "results"))
+    data_cfg = config.get("data", {}) if isinstance(config.get("data", {}), dict) else {}
+    seed = int(args.seed if args.seed is not None else data_cfg.get("random_seed", 42))
 
     model_sizes = _resolve_model_sizes(args.model_sizes or [], compare_cfg.get("model_sizes", []))
 
@@ -163,7 +173,7 @@ def main() -> None:
     for d in [output_dir, metrics_dir, figures_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    seed_info = _seed_everything_simple(int(args.seed))
+    seed_info = _seed_everything_simple(seed)
     save_config(config, output_dir / "config_used.yaml")
     _save_run_metadata_simple(output_dir, args.config, seed_info)
     write_initial_log(
@@ -184,11 +194,14 @@ def main() -> None:
 
     for model_size in model_sizes:
         dit_results_dir = Path(get_results_dir(model_size=model_size, base_dir=dit_results_base, split_mode=split_mode))
-        trad_results_dir = get_traditional_results_dir(results_root=results_root, model_size=model_size, split_mode=split_mode)
+        trad_results_dir = get_traditional_results_dir(results_root=results_root, split_mode=split_mode)
+        trad_results_dir_legacy = get_traditional_results_dir(
+            results_root=results_root, split_mode=split_mode, model_size=model_size
+        )
 
         dit_reg_csv = dit_results_dir / "step4_chi_training" / split_mode / "step4_1_regression" / "metrics" / "chi_metrics_overall.csv"
         dit_cls_csv = dit_results_dir / "step4_chi_training" / split_mode / "step4_2_classification" / "metrics" / "class_metrics_overall.csv"
-        trad_reg_csv = (
+        trad_reg_csv_primary = (
             trad_results_dir
             / "step4_3_traditional"
             / split_mode
@@ -196,7 +209,7 @@ def main() -> None:
             / "metrics"
             / "chi_metrics_overall.csv"
         )
-        trad_cls_csv = (
+        trad_cls_csv_primary = (
             trad_results_dir
             / "step4_3_traditional"
             / split_mode
@@ -204,6 +217,24 @@ def main() -> None:
             / "metrics"
             / "class_metrics_overall.csv"
         )
+        trad_reg_csv_legacy = (
+            trad_results_dir_legacy
+            / "step4_3_traditional"
+            / split_mode
+            / "step4_3_1_regression"
+            / "metrics"
+            / "chi_metrics_overall.csv"
+        )
+        trad_cls_csv_legacy = (
+            trad_results_dir_legacy
+            / "step4_3_traditional"
+            / split_mode
+            / "step4_3_2_classification"
+            / "metrics"
+            / "class_metrics_overall.csv"
+        )
+        trad_reg_csv = _prefer_existing_path(trad_reg_csv_primary, trad_reg_csv_legacy)
+        trad_cls_csv = _prefer_existing_path(trad_cls_csv_primary, trad_cls_csv_legacy)
 
         reg_ready = True
         try:

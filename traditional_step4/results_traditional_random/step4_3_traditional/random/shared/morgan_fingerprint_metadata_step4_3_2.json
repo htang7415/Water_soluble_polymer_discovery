@@ -1,0 +1,10 @@
+{
+  "n_polymers": 362,
+  "n_bits": 1024,
+  "radius": 3,
+  "use_chirality": false,
+  "use_features": false,
+  "n_invalid_smiles": 0,
+  "invalid_smiles_rows": [],
+  "cache_key": "942eab5a8e3546c55fba2b61ea09d392d74b362677f856ebadafa1800838778e"
+}

@@ -1,0 +1,9 @@
+{
+  "selection_mode": "default_no_tuning",
+  "best_model_name": "ridge",
+  "best_params": {
+    "alpha": 1.0,
+    "fit_intercept": true
+  },
+  "tuning_cv_folds": 3
+}
