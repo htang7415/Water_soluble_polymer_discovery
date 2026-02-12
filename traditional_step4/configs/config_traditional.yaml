@@ -47,11 +47,12 @@ traditional_step4:
       xgboost_colsample_bytree: [0.5, 1.0]
       xgboost_reg_alpha: [1.0e-8, 10.0]
       xgboost_reg_lambda: [1.0e-8, 30.0]
-      mlp_hidden_layers:
-        - [256]
-        - [512]
-        - [512, 256]
-        - [1024, 512]
+      # Dynamic MLP architecture search:
+      # - sample number of hidden layers from mlp_num_layers (inclusive range)
+      # - sample units for each layer independently from mlp_hidden_units
+      # Legacy fallback (still supported): mlp_hidden_layers as explicit list.
+      mlp_num_layers: [1, 4]
+      mlp_hidden_units: [64, 128, 256, 512, 1024]
       mlp_alpha: [1.0e-7, 1.0e-2]
       mlp_learning_rate_init: [1.0e-5, 5.0e-3]
       gpr_alpha: [1.0e-10, 1.0e-1]
@@ -87,11 +88,12 @@ traditional_step4:
       xgboost_colsample_bytree: [0.5, 1.0]
       xgboost_reg_alpha: [1.0e-8, 10.0]
       xgboost_reg_lambda: [1.0e-8, 30.0]
-      mlp_hidden_layers:
-        - [256]
-        - [512]
-        - [512, 256]
-        - [1024, 512]
+      # Dynamic MLP architecture search:
+      # - sample number of hidden layers from mlp_num_layers (inclusive range)
+      # - sample units for each layer independently from mlp_hidden_units
+      # Legacy fallback (still supported): mlp_hidden_layers as explicit list.
+      mlp_num_layers: [1, 4]
+      mlp_hidden_units: [64, 128, 256, 512, 1024]
       mlp_alpha: [1.0e-7, 1.0e-2]
       mlp_learning_rate_init: [1.0e-5, 5.0e-3]
       gpc_kernel:

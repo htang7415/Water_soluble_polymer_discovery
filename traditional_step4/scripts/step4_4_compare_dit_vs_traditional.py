@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -22,10 +24,26 @@ from common import get_traditional_results_dir, load_traditional_config, normali
 from src.utils.config import load_config, save_config  # noqa: E402
 from src.utils.model_scales import get_results_dir  # noqa: E402
 from src.utils.reporting import save_artifact_manifest, save_step_summary, write_initial_log  # noqa: E402
-from src.utils.reproducibility import save_run_metadata, seed_everything  # noqa: E402
 
 
 VALID_MODEL_SIZES = {"small", "medium", "large", "xl"}
+
+
+def _seed_everything_simple(seed: int) -> Dict[str, object]:
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    return {"seed": int(seed), "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def _save_run_metadata_simple(output_dir: Path, config_path: str, seed_info: Dict[str, object]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "config_path": str(config_path),
+        "seed": int(seed_info.get("seed", 0)),
+        "timestamp_utc": str(seed_info.get("timestamp_utc", "")),
+    }
+    with open(output_dir / "run_metadata.json", "w") as f:
+        json.dump(payload, f, indent=2)
 
 
 def _load_test_row(csv_path: Path) -> pd.Series:
@@ -145,9 +163,9 @@ def main() -> None:
     for d in [output_dir, metrics_dir, figures_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    seed_info = seed_everything(int(args.seed))
+    seed_info = _seed_everything_simple(int(args.seed))
     save_config(config, output_dir / "config_used.yaml")
-    save_run_metadata(output_dir, args.config, seed_info)
+    _save_run_metadata_simple(output_dir, args.config, seed_info)
     write_initial_log(
         step_dir=output_dir,
         step_name="step4_4_comparation",
@@ -250,8 +268,42 @@ def main() -> None:
     missing_df = pd.DataFrame(missing_rows)
     missing_df.to_csv(metrics_dir / "missing_or_invalid_inputs.csv", index=False)
 
-    reg_df = pd.DataFrame(reg_rows).sort_values("model_size").reset_index(drop=True)
-    cls_df = pd.DataFrame(cls_rows).sort_values("model_size").reset_index(drop=True)
+    reg_columns = [
+        "model_size",
+        "dit_r2",
+        "dit_rmse",
+        "dit_mae",
+        "traditional_r2",
+        "traditional_rmse",
+        "traditional_mae",
+        "delta_r2_traditional_minus_dit",
+        "delta_rmse_traditional_minus_dit",
+        "delta_mae_traditional_minus_dit",
+        "winner_r2",
+        "winner_rmse",
+    ]
+    cls_columns = [
+        "model_size",
+        "dit_balanced_accuracy",
+        "dit_auroc",
+        "dit_f1",
+        "traditional_balanced_accuracy",
+        "traditional_auroc",
+        "traditional_f1",
+        "delta_balanced_accuracy_traditional_minus_dit",
+        "delta_auroc_traditional_minus_dit",
+        "delta_f1_traditional_minus_dit",
+        "winner_balanced_accuracy",
+        "winner_auroc",
+    ]
+    if reg_rows:
+        reg_df = pd.DataFrame(reg_rows).sort_values("model_size").reset_index(drop=True)
+    else:
+        reg_df = pd.DataFrame(columns=reg_columns)
+    if cls_rows:
+        cls_df = pd.DataFrame(cls_rows).sort_values("model_size").reset_index(drop=True)
+    else:
+        cls_df = pd.DataFrame(columns=cls_columns)
     reg_df.to_csv(metrics_dir / "regression_model_size_comparison.csv", index=False)
     cls_df.to_csv(metrics_dir / "classification_model_size_comparison.csv", index=False)
 
@@ -338,7 +390,9 @@ def main() -> None:
     with open(metrics_dir / "comparation_run_summary.json", "w") as f:
         json.dump(payload, f, indent=2)
 
-    save_artifact_manifest(step_dir=output_dir, metrics_dir=metrics_dir, figures_dir=figures_dir, dpi=dpi)
+    # Keep artifact-manifest generation robust in constrained environments:
+    # skip the extra artifact-count PNG generated inside save_artifact_manifest.
+    save_artifact_manifest(step_dir=output_dir, metrics_dir=metrics_dir, figures_dir=None, dpi=dpi)
     save_step_summary(
         {
             "step": "step4_4_comparation",

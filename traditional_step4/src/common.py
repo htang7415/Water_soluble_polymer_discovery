@@ -10,9 +10,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold
 
-from src.chi.data import SplitConfig, add_split_column, load_chi_dataset, make_split_assignments
 from src.utils.config import load_config
 from src.utils.model_scales import get_results_dir
 
@@ -118,6 +116,8 @@ def load_split_dataset(
     seed: int,
     is_classification_dataset: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    from src.chi.data import SplitConfig, add_split_column, load_chi_dataset, make_split_assignments
+
     if is_classification_dataset:
         df = load_classification_dataset(dataset_path)
     else:
@@ -144,6 +144,8 @@ def build_final_fit_split_df(split_df: pd.DataFrame) -> pd.DataFrame:
 
 def build_tuning_cv_folds(split_df: pd.DataFrame, split_mode: str, tuning_cv_folds: int, seed: int) -> Tuple[List[pd.DataFrame], Dict[str, object]]:
     """Build CV folds from non-test rows using Step4-style stratification."""
+    from sklearn.model_selection import StratifiedKFold
+
     dev_df = split_df[split_df["split"].isin(["train", "val"])].copy().reset_index(drop=True)
     if dev_df.empty:
         raise ValueError("No train/val rows available for CV tuning.")

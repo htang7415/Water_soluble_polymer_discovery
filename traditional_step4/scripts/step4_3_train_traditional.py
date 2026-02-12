@@ -6,11 +6,35 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import random
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from src.chi.metrics import classification_metrics, hit_metrics, metrics_by_group, regression_metrics  # noqa: E402
+from common import (  # noqa: E402
+    FingerprintConfig,
+    build_final_fit_split_df,
+    build_or_load_fingerprint_cache,
+    build_tuning_cv_folds,
+    features_from_table,
+    get_traditional_results_dir,
+    load_split_dataset,
+    load_traditional_config,
+    normalize_split_mode,
+    resolve_split_ratios,
+    summarize_cv_folds,
+)
+from src.utils.config import save_config  # noqa: E402
+from src.utils.numerics import stable_sigmoid  # noqa: E402
+from src.utils.reporting import save_artifact_manifest, save_step_summary, write_initial_log  # noqa: E402
 
 import joblib
 import matplotlib.pyplot as plt
@@ -26,30 +50,6 @@ from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from common import (  # noqa: E402
-    FingerprintConfig,
-    build_final_fit_split_df,
-    build_or_load_fingerprint_cache,
-    build_tuning_cv_folds,
-    features_from_table,
-    get_traditional_results_dir,
-    load_split_dataset,
-    load_traditional_config,
-    normalize_split_mode,
-    resolve_split_ratios,
-    summarize_cv_folds,
-)
-from src.chi.metrics import classification_metrics, hit_metrics, metrics_by_group, regression_metrics  # noqa: E402
-from src.utils.config import save_config  # noqa: E402
-from src.utils.numerics import stable_sigmoid  # noqa: E402
-from src.utils.reporting import save_artifact_manifest, save_step_summary, write_initial_log  # noqa: E402
-from src.utils.reproducibility import save_run_metadata, seed_everything  # noqa: E402
-
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -67,6 +67,23 @@ class StageConfig:
     tuning_cv_folds: int
     models: List[str]
     optuna_search_space: Dict[str, object]
+
+
+def _seed_everything_simple(seed: int) -> Dict[str, object]:
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    return {"seed": int(seed), "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def _save_run_metadata_simple(output_dir: Path, config_path: str, seed_info: Dict[str, object]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "config_path": str(config_path),
+        "seed": int(seed_info.get("seed", 0)),
+        "timestamp_utc": str(seed_info.get("timestamp_utc", "")),
+    }
+    with open(output_dir / "run_metadata.json", "w") as f:
+        json.dump(payload, f, indent=2)
 
 
 def _safe_float(v, default=np.nan) -> float:
@@ -104,6 +121,19 @@ def _as_hidden_options(value, default: List[Tuple[int, ...]]) -> List[Tuple[int,
     return out if out else default
 
 
+def _as_int_options(value, default: List[int]) -> List[int]:
+    if not isinstance(value, list) or len(value) == 0:
+        return [int(x) for x in default]
+    out = []
+    for item in value:
+        try:
+            out.append(int(item))
+        except Exception:
+            continue
+    out = sorted(set(out))
+    return out if out else [int(x) for x in default]
+
+
 def _suggest_int(trial, name: str, search_space: Dict[str, object], default_lo: int, default_hi: int) -> int:
     lo, hi = _as_int_pair(search_space.get(name), default_lo, default_hi)
     if lo == hi:
@@ -123,6 +153,38 @@ def _suggest_float(
     if np.isclose(lo, hi):
         return float(lo)
     return float(trial.suggest_float(name, lo, hi, log=bool(log)))
+
+
+def _sample_mlp_hidden_layers(trial, search_space: Dict[str, object]) -> Tuple[int, ...]:
+    """Sample MLP hidden-layer layout.
+
+    Priority:
+    1) Legacy explicit architecture list via `mlp_hidden_layers`.
+    2) Dynamic depth/width search via `mlp_num_layers` + `mlp_hidden_units`.
+    """
+    legacy_options = _as_hidden_options(search_space.get("mlp_hidden_layers"), default=[])
+    if legacy_options:
+        return tuple(int(x) for x in trial.suggest_categorical("mlp_hidden_layers", legacy_options))
+
+    num_layers_raw = search_space.get("mlp_num_layers", [1, 2, 3])
+    if isinstance(num_layers_raw, list) and len(num_layers_raw) == 2:
+        n_lo = int(min(num_layers_raw))
+        n_hi = int(max(num_layers_raw))
+        n_layers = int(trial.suggest_int("mlp_num_layers", n_lo, n_hi))
+    else:
+        n_opts = _as_int_options(num_layers_raw, default=[1, 2, 3])
+        n_layers = int(trial.suggest_categorical("mlp_num_layers", n_opts))
+
+    n_layers = int(max(1, n_layers))
+    unit_options = _as_int_options(
+        search_space.get("mlp_hidden_units", [64, 128, 256, 512, 1024]),
+        default=[64, 128, 256, 512, 1024],
+    )
+    hidden: List[int] = []
+    for i in range(n_layers):
+        hidden_i = int(trial.suggest_categorical(f"mlp_hidden_{i}", unit_options))
+        hidden.append(hidden_i)
+    return tuple(hidden)
 
 
 def _sklearn_kernel_from_name(name: str, length_scale: float):
@@ -475,12 +537,8 @@ def _sample_regression_params(trial, model_name: str, search_space: Dict[str, ob
             "reg_lambda": _suggest_float(trial, "xgboost_reg_lambda", search_space, 1.0e-8, 30.0, log=True),
         }
     if model_name == "mlp":
-        hidden_options = _as_hidden_options(
-            search_space.get("mlp_hidden_layers"),
-            default=[(256,), (512,), (512, 256), (1024, 512)],
-        )
         return {
-            "hidden_layers": trial.suggest_categorical("mlp_hidden_layers", hidden_options),
+            "hidden_layers": _sample_mlp_hidden_layers(trial, search_space=search_space),
             "alpha": _suggest_float(trial, "mlp_alpha", search_space, 1.0e-7, 1.0e-2, log=True),
             "learning_rate_init": _suggest_float(trial, "mlp_learning_rate_init", search_space, 1.0e-5, 5.0e-3, log=True),
         }
@@ -521,12 +579,8 @@ def _sample_classification_params(trial, model_name: str, search_space: Dict[str
             "reg_lambda": _suggest_float(trial, "xgboost_reg_lambda", search_space, 1.0e-8, 30.0, log=True),
         }
     if model_name == "mlp":
-        hidden_options = _as_hidden_options(
-            search_space.get("mlp_hidden_layers"),
-            default=[(256,), (512,), (512, 256), (1024, 512)],
-        )
         return {
-            "hidden_layers": trial.suggest_categorical("mlp_hidden_layers", hidden_options),
+            "hidden_layers": _sample_mlp_hidden_layers(trial, search_space=search_space),
             "alpha": _suggest_float(trial, "mlp_alpha", search_space, 1.0e-7, 1.0e-2, log=True),
             "learning_rate_init": _suggest_float(trial, "mlp_learning_rate_init", search_space, 1.0e-5, 5.0e-3, log=True),
         }
@@ -1165,6 +1219,7 @@ def _resolve_stage_config(
     shared_split_mode: str,
     shared_holdout: Optional[float],
     seed: int,
+    validate_dependencies: bool = True,
     tune_override: Optional[bool] = None,
     n_trials_override: Optional[int] = None,
     tuning_cv_folds_override: Optional[int] = None,
@@ -1189,8 +1244,9 @@ def _resolve_stage_config(
     if not isinstance(models, list) or len(models) == 0:
         raise ValueError("Stage config requires a non-empty 'models' list.")
     models = [str(x).strip().lower() for x in models]
-    _check_xgboost_required(models)
-    _check_gpy_required(models)
+    if validate_dependencies:
+        _check_xgboost_required(models)
+        _check_gpy_required(models)
 
     optuna_search_space = stage_section.get("optuna_search_space", {})
     if not isinstance(optuna_search_space, dict):
@@ -1441,6 +1497,8 @@ def main() -> None:
         raise ValueError(f"Invalid model_size: {args.model_size}")
     if args.tune and args.no_tune:
         raise ValueError("Cannot set both --tune and --no_tune.")
+    run_reg = args.stage in {"both", "step4_3_1"}
+    run_cls = args.stage in {"both", "step4_3_2"}
 
     config = load_traditional_config(args.config)
     trad_cfg = config.get("traditional_step4", {})
@@ -1479,6 +1537,7 @@ def main() -> None:
         shared_split_mode=split_mode,
         shared_holdout=holdout_test_ratio,
         seed=seed,
+        validate_dependencies=run_reg,
         tune_override=tune_override,
         n_trials_override=args.n_trials,
         tuning_cv_folds_override=args.tuning_cv_folds,
@@ -1488,6 +1547,7 @@ def main() -> None:
         shared_split_mode=split_mode,
         shared_holdout=holdout_test_ratio,
         seed=seed,
+        validate_dependencies=run_cls,
         tune_override=tune_override,
         n_trials_override=args.n_trials,
         tuning_cv_folds_override=args.tuning_cv_folds,
@@ -1511,9 +1571,9 @@ def main() -> None:
     for d in [results_dir, step_dir, shared_dir, reg_dir, cls_dir, pipeline_metrics_dir, pipeline_metrics_run_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    seed_info = seed_everything(seed)
+    seed_info = _seed_everything_simple(seed)
     save_config(config, step_dir / "config_used.yaml")
-    save_run_metadata(step_dir, args.config, seed_info)
+    _save_run_metadata_simple(step_dir, args.config, seed_info)
     write_initial_log(
         step_dir=step_dir,
         step_name="step4_3_traditional",
@@ -1547,9 +1607,6 @@ def main() -> None:
     print(f"Classification dataset: {cls_dataset}")
     print(f"Morgan fingerprint: radius={fp_cfg.radius}, nBits={fp_cfg.n_bits}")
     print("=" * 80)
-
-    run_reg = args.stage in {"both", "step4_3_1"}
-    run_cls = args.stage in {"both", "step4_3_2"}
 
     summary = {
         "step": "step4_3_traditional",
