@@ -1,8 +1,0 @@
-{
-  "model_name": "logistic",
-  "params": {
-    "C": 1.0,
-    "penalty": "l2",
-    "class_weight": null
-  }
-}

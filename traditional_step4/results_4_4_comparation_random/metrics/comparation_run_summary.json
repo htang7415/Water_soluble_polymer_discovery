@@ -1,9 +1,0 @@
-{
-  "split_mode": "random",
-  "model_sizes": [
-    "small"
-  ],
-  "n_regression_rows": 0,
-  "n_classification_rows": 0,
-  "n_missing_or_invalid": 2
-}
