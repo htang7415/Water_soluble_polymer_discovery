@@ -1374,6 +1374,44 @@ def _save_history(history: Dict[str, List[float]], out_csv: Path) -> None:
     pd.DataFrame(history).to_csv(out_csv, index=False)
 
 
+def _coerce_coeff_matrix(coefficients: np.ndarray, expected_rows: int, split: str) -> np.ndarray:
+    """Normalize coefficient outputs to a 2D [rows, coeff_dims] matrix."""
+    coeff = np.asarray(coefficients)
+
+    if coeff.size == 0:
+        return np.empty((expected_rows, 0), dtype=np.float32)
+
+    if coeff.ndim == 0:
+        coeff = coeff.reshape(1, 1)
+    elif coeff.ndim == 1:
+        if expected_rows <= 0:
+            raise ValueError(
+                f"Coefficient shape mismatch on split={split}: expected {expected_rows} rows, got 1D array of size {coeff.size}"
+            )
+        if coeff.size == len(COEFF_NAMES) and expected_rows == 1:
+            coeff = coeff.reshape(1, len(COEFF_NAMES))
+        elif coeff.size % expected_rows == 0:
+            coeff = coeff.reshape(expected_rows, coeff.size // expected_rows)
+        else:
+            raise ValueError(
+                f"Coefficient shape mismatch on split={split}: expected {expected_rows} rows, got 1D array of size {coeff.size}"
+            )
+    elif coeff.ndim != 2:
+        raise ValueError(
+            f"Coefficient shape mismatch on split={split}: expected 1D/2D array, got shape {coeff.shape}"
+        )
+
+    if coeff.shape[0] != expected_rows:
+        if coeff.shape[1] == expected_rows:
+            coeff = coeff.T
+        else:
+            raise ValueError(
+                f"Coefficient row mismatch on split={split}: expected {expected_rows} rows, got shape {coeff.shape}"
+            )
+
+    return coeff
+
+
 
 def _save_prediction_csvs(
     split_df: pd.DataFrame,
@@ -1392,9 +1430,9 @@ def _save_prediction_csvs(
         sub["class_prob"] = pred["prob"]
         sub["class_pred"] = (sub["class_prob"] >= 0.5).astype(int)
 
-        coeff = pred["coefficients"]
+        coeff = _coerce_coeff_matrix(pred["coefficients"], expected_rows=len(sub), split=split)
         for i, name in enumerate(COEFF_NAMES):
-            sub[name] = coeff[:, i]
+            sub[name] = coeff[:, i] if i < coeff.shape[1] else np.nan
 
         sub.to_csv(out_dir / f"chi_predictions_{split}.csv", index=False)
         frames.append(sub)
@@ -2168,9 +2206,9 @@ def _save_regression_prediction_csvs(
         pred = predictions[split]
         sub["chi_pred"] = pred["chi_pred"]
         sub["chi_error"] = sub["chi_pred"] - sub["chi"]
-        coeff = pred["coefficients"]
+        coeff = _coerce_coeff_matrix(pred["coefficients"], expected_rows=len(sub), split=split)
         for i, name in enumerate(COEFF_NAMES):
-            sub[name] = coeff[:, i]
+            sub[name] = coeff[:, i] if i < coeff.shape[1] else np.nan
         sub.to_csv(out_dir / f"chi_predictions_{split}.csv", index=False)
         frames.append(sub)
     all_df = pd.concat(frames, axis=0, ignore_index=True)
