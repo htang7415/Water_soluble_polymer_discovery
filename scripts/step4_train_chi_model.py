@@ -1412,6 +1412,22 @@ def _coerce_coeff_matrix(coefficients: np.ndarray, expected_rows: int, split: st
     return coeff
 
 
+def _concat_non_empty_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate frames while avoiding pandas all-NA/empty concat deprecation warnings."""
+    non_empty = [frame for frame in frames if not frame.empty]
+    if non_empty:
+        return pd.concat(non_empty, axis=0, ignore_index=True)
+    if frames:
+        return frames[0].iloc[0:0].copy()
+    return pd.DataFrame()
+
+
+def _clean_numeric_array(values: pd.Series | np.ndarray) -> np.ndarray:
+    """Convert series/array to finite 1D float array."""
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    return arr[np.isfinite(arr)]
+
+
 
 def _save_prediction_csvs(
     split_df: pd.DataFrame,
@@ -1437,7 +1453,7 @@ def _save_prediction_csvs(
         sub.to_csv(out_dir / f"chi_predictions_{split}.csv", index=False)
         frames.append(sub)
 
-    all_df = pd.concat(frames, axis=0, ignore_index=True)
+    all_df = _concat_non_empty_frames(frames)
     all_df.to_csv(out_dir / "chi_predictions_all.csv", index=False)
     return all_df
 
@@ -1583,13 +1599,21 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
 
     # Residual histogram by split
     fig, ax = plt.subplots(figsize=(6, 5))
+    plotted_any = False
     for split, color in [("train", "#4c78a8"), ("val", "#f58518"), ("test", "#54a24b")]:
         sub = pred_df[pred_df["split"] == split]
-        sns.kdeplot(sub["chi_error"], ax=ax, label=split, color=color, linewidth=2)
+        residual = _clean_numeric_array(sub["chi_error"])
+        if residual.size < 2 or np.isclose(np.std(residual), 0.0):
+            continue
+        sns.kdeplot(x=residual, ax=ax, label=split, color=color, linewidth=2)
+        plotted_any = True
     ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
     ax.set_xlabel("χ prediction error")
     ax.set_title("Residual distribution by split")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    if plotted_any:
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    else:
+        ax.text(0.5, 0.5, "Insufficient residual variance for KDE", ha="center", va="center", transform=ax.transAxes)
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_residual_distribution.png", dpi=dpi)
     plt.close(fig)
@@ -2178,7 +2202,7 @@ def _save_classifier_prediction_csvs(
         sub["class_pred"] = (sub["class_prob"] >= 0.5).astype(int)
         sub.to_csv(out_dir / f"class_predictions_{split}.csv", index=False)
         frames.append(sub)
-    all_df = pd.concat(frames, axis=0, ignore_index=True)
+    all_df = _concat_non_empty_frames(frames)
     all_df.to_csv(out_dir / "class_predictions_all.csv", index=False)
     return all_df
 
@@ -2211,7 +2235,7 @@ def _save_regression_prediction_csvs(
             sub[name] = coeff[:, i] if i < coeff.shape[1] else np.nan
         sub.to_csv(out_dir / f"chi_predictions_{split}.csv", index=False)
         frames.append(sub)
-    all_df = pd.concat(frames, axis=0, ignore_index=True)
+    all_df = _concat_non_empty_frames(frames)
     all_df.to_csv(out_dir / "chi_predictions_all.csv", index=False)
     return all_df
 
@@ -2289,13 +2313,21 @@ def _make_regression_figures(
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(6, 5))
+    plotted_any = False
     for split, color in [("train", "#4c78a8"), ("val", "#f58518"), ("test", "#54a24b")]:
         sub = pred_df[pred_df["split"] == split]
-        sns.kdeplot(sub["chi_error"], ax=ax, label=split, color=color, linewidth=2)
+        residual = _clean_numeric_array(sub["chi_error"])
+        if residual.size < 2 or np.isclose(np.std(residual), 0.0):
+            continue
+        sns.kdeplot(x=residual, ax=ax, label=split, color=color, linewidth=2)
+        plotted_any = True
     ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
     ax.set_xlabel("chi prediction error")
     ax.set_title("Residual distribution by split")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    if plotted_any:
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    else:
+        ax.text(0.5, 0.5, "Insufficient residual variance for KDE", ha="center", va="center", transform=ax.transAxes)
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_residual_distribution.png", dpi=dpi)
     plt.close(fig)
