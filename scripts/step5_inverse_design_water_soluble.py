@@ -487,7 +487,13 @@ def _save_figures(
     curve_df = pd.DataFrame(curve_rows)
 
     fig, ax = plt.subplots(figsize=(6, 5))
-    sns.lineplot(data=curve_df, x="k", y="success_rate", marker="o", linewidth=2, ax=ax)
+    ax.plot(
+        curve_df["k"].to_numpy(),
+        curve_df["success_rate"].to_numpy(dtype=float),
+        marker="o",
+        linewidth=2,
+        color="#4c78a8",
+    )
     ax.set_xlabel("Top-k")
     ax.set_ylabel("Target success rate")
     ax.set_title("Step 5 top-k target success")
@@ -564,12 +570,24 @@ def _save_figures(
     # Novelty and quality vs top-k
     if not topk_novelty.empty:
         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        sns.lineplot(data=topk_novelty, x="k", y="mean_novel_rate", marker="o", linewidth=2, ax=axes[0], color="#54a24b")
+        axes[0].plot(
+            topk_novelty["k"].to_numpy(),
+            topk_novelty["mean_novel_rate"].to_numpy(dtype=float),
+            marker="o",
+            linewidth=2,
+            color="#54a24b",
+        )
         axes[0].set_xlabel("k")
         axes[0].set_ylabel("Mean novelty rate")
         axes[0].set_title("Novelty among top-k")
 
-        sns.lineplot(data=topk_novelty, x="k", y="mean_property_error", marker="o", linewidth=2, ax=axes[1], color="#e45756")
+        axes[1].plot(
+            topk_novelty["k"].to_numpy(),
+            topk_novelty["mean_property_error"].to_numpy(dtype=float),
+            marker="o",
+            linewidth=2,
+            color="#e45756",
+        )
         axes[1].set_xlabel("k")
         axes[1].set_ylabel("Mean property error")
         axes[1].set_title("Property error among top-k")
