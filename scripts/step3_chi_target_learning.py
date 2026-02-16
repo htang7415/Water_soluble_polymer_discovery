@@ -74,6 +74,45 @@ def _set_plot_style(font_size: int) -> None:
     )
 
 
+def _plot_kde_safe_by_class(
+    ax,
+    df: pd.DataFrame,
+    *,
+    class_value: int,
+    label: str,
+    color: str,
+) -> bool:
+    values = df.loc[df["water_soluble"] == int(class_value), "chi"].to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size < 2 or np.isclose(np.std(values), 0.0):
+        return False
+    try:
+        sns.kdeplot(
+            x=np.asarray(values, dtype=float),
+            fill=True,
+            alpha=0.4,
+            label=label,
+            color=color,
+            ax=ax,
+        )
+    except Exception as exc:
+        if "Multi-dimensional indexing" not in str(exc):
+            raise
+        bins = int(np.clip(np.sqrt(values.size), 10, 60))
+        sns.histplot(
+            x=np.asarray(values, dtype=float),
+            bins=bins,
+            stat="density",
+            element="step",
+            fill=True,
+            alpha=0.2,
+            label=label,
+            color=color,
+            ax=ax,
+        )
+    return True
+
+
 def _confusion_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     y = y_true.astype(int)
     p = y_pred.astype(int)
@@ -266,29 +305,29 @@ def _make_figures(
     # χ distribution with global threshold
     gthr = float(global_best["chi_target"].iloc[0])
     fig, ax = plt.subplots(figsize=(6, 5))
-    sns.kdeplot(
-        data=df[df["water_soluble"] == 1],
-        x="chi",
-        fill=True,
-        alpha=0.4,
+    plotted_any = False
+    plotted_any = _plot_kde_safe_by_class(
+        ax=ax,
+        df=df,
+        class_value=1,
         label="Water-soluble",
         color="#1f77b4",
+    ) or plotted_any
+    plotted_any = _plot_kde_safe_by_class(
         ax=ax,
-    )
-    sns.kdeplot(
-        data=df[df["water_soluble"] == 0],
-        x="chi",
-        fill=True,
-        alpha=0.4,
+        df=df,
+        class_value=0,
         label="Water-insoluble",
         color="#d62728",
-        ax=ax,
-    )
+    ) or plotted_any
     ax.axvline(gthr, color="black", linestyle="--", linewidth=2, label=f"Global χ_target={gthr:.3f}")
     ax.set_xlabel("χ")
     ax.set_ylabel("Density")
     ax.set_title("Global χ threshold from labels")
-    ax.legend()
+    if plotted_any:
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, "Insufficient class variance for density plot", ha="center", va="center", transform=ax.transAxes)
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_distribution_global_threshold.png", dpi=dpi)
     plt.close(fig)

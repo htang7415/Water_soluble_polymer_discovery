@@ -1111,18 +1111,45 @@ def tune_hyperparameters(
             return values
         return default
 
-    num_layers_space = _as_list("num_layers", [1, 2, 3])
-    hidden_units_space = [int(v) for v in _as_list("hidden_units", [64, 128, 256, 512])]
-    dropout_space = [float(v) for v in _as_list("dropout", [0.0, 0.1, 0.2, 0.3])]
-    lr_space = [float(v) for v in _as_list("learning_rate", [1e-4, 5e-3])]
-    wd_space = [float(v) for v in _as_list("weight_decay", [1e-7, 1e-3])]
-    batch_size_space = [int(v) for v in _as_list("batch_size", [16, 32, 64, 128, 256])]
+    def _as_int_list(key: str, default: List[int]) -> List[int]:
+        raw = _as_list(key, [int(v) for v in default])
+        parsed = []
+        for item in raw:
+            try:
+                parsed.append(int(float(item)))
+            except Exception:
+                continue
+        return parsed if parsed else [int(v) for v in default]
+
+    def _as_float_list(key: str, default: List[float]) -> List[float]:
+        raw = _as_list(key, [float(v) for v in default])
+        parsed = []
+        for item in raw:
+            try:
+                parsed.append(float(item))
+            except Exception:
+                continue
+        return parsed if parsed else [float(v) for v in default]
+
+    num_layers_space = _as_int_list("num_layers", [1, 2, 3])
+    hidden_units_space = _as_int_list("hidden_units", [64, 128, 256, 512])
+    dropout_space = _as_float_list("dropout", [0.0, 0.1, 0.2, 0.3])
+    lr_space = _as_float_list("learning_rate", [1e-4, 5e-3])
+    wd_space = _as_float_list("weight_decay", [1e-7, 1e-3])
+    batch_size_space = _as_int_list("batch_size", [16, 32, 64, 128, 256])
     lr_log = bool(search_space.get("learning_rate_log", True))
     wd_log = bool(search_space.get("weight_decay_log", True))
     finetune_raw = search_space.get("finetune_last_layers", [0, int(backbone_num_layers)])
     if isinstance(finetune_raw, list) and len(finetune_raw) > 0:
-        finetune_space = [int(v) for v in finetune_raw]
+        finetune_space = []
+        for item in finetune_raw:
+            try:
+                finetune_space.append(int(float(item)))
+            except Exception:
+                continue
     else:
+        finetune_space = [0, int(backbone_num_layers)]
+    if len(finetune_space) == 0:
         finetune_space = [0, int(backbone_num_layers)]
     if len(finetune_space) == 2:
         finetune_lo = max(0, min(finetune_space))
@@ -1428,6 +1455,78 @@ def _clean_numeric_array(values: pd.Series | np.ndarray) -> np.ndarray:
     return arr[np.isfinite(arr)]
 
 
+def _plot_kde_safe_1d(
+    ax,
+    values: pd.Series | np.ndarray,
+    *,
+    label: str,
+    color: str,
+    linewidth: float = 2.0,
+    fill: bool = False,
+    alpha: float = 0.3,
+) -> bool:
+    arr = _clean_numeric_array(values)
+    if arr.size < 2 or np.isclose(np.std(arr), 0.0):
+        return False
+    try:
+        kde_kwargs = {
+            "x": np.asarray(arr, dtype=float),
+            "ax": ax,
+            "label": label,
+            "color": color,
+            "linewidth": linewidth,
+            "fill": fill,
+        }
+        if fill:
+            kde_kwargs["alpha"] = alpha
+        sns.kdeplot(**kde_kwargs)
+    except Exception as exc:
+        if "Multi-dimensional indexing" not in str(exc):
+            raise
+        bins = int(np.clip(np.sqrt(arr.size), 10, 60))
+        sns.histplot(
+            x=np.asarray(arr, dtype=float),
+            bins=bins,
+            stat="density",
+            element="step",
+            fill=False,
+            color=color,
+            linewidth=linewidth,
+            label=label,
+            ax=ax,
+        )
+    return True
+
+
+def _plot_class_prob_density_safe(ax, test_df: pd.DataFrame) -> None:
+    try:
+        sns.kdeplot(
+            data=test_df,
+            x="class_prob",
+            hue="water_soluble",
+            common_norm=False,
+            fill=True,
+            alpha=0.3,
+            ax=ax,
+        )
+        return
+    except Exception as exc:
+        if "Multi-dimensional indexing" not in str(exc):
+            raise
+
+    for class_value, color in [(1, "#1f77b4"), (0, "#d62728")]:
+        sub = test_df.loc[test_df["water_soluble"] == class_value, "class_prob"]
+        _plot_kde_safe_1d(
+            ax=ax,
+            values=sub,
+            label=str(class_value),
+            color=color,
+            linewidth=2.0,
+            fill=False,
+            alpha=0.3,
+        )
+
+
 
 def _save_prediction_csvs(
     split_df: pd.DataFrame,
@@ -1602,11 +1701,15 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     plotted_any = False
     for split, color in [("train", "#4c78a8"), ("val", "#f58518"), ("test", "#54a24b")]:
         sub = pred_df[pred_df["split"] == split]
-        residual = _clean_numeric_array(sub["chi_error"])
-        if residual.size < 2 or np.isclose(np.std(residual), 0.0):
-            continue
-        sns.kdeplot(x=residual, ax=ax, label=split, color=color, linewidth=2)
-        plotted_any = True
+        plotted_any = _plot_kde_safe_1d(
+            ax=ax,
+            values=sub["chi_error"],
+            label=split,
+            color=color,
+            linewidth=2.0,
+            fill=False,
+            alpha=0.3,
+        ) or plotted_any
     ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
     ax.set_xlabel("χ prediction error")
     ax.set_title("Residual distribution by split")
@@ -2009,18 +2112,45 @@ def tune_classifier_hyperparameters(
             return values
         return default
 
-    num_layers_space = _as_list("num_layers", [1, 2, 3])
-    hidden_units_space = [int(v) for v in _as_list("hidden_units", [64, 128, 256, 512])]
-    dropout_space = [float(v) for v in _as_list("dropout", [0.0, 0.1, 0.2, 0.3])]
-    lr_space = [float(v) for v in _as_list("learning_rate", [1e-4, 5e-3])]
-    wd_space = [float(v) for v in _as_list("weight_decay", [1e-7, 1e-3])]
-    batch_size_space = [int(v) for v in _as_list("batch_size", [16, 32, 64, 128, 256])]
+    def _as_int_list(key: str, default: List[int]) -> List[int]:
+        raw = _as_list(key, [int(v) for v in default])
+        parsed = []
+        for item in raw:
+            try:
+                parsed.append(int(float(item)))
+            except Exception:
+                continue
+        return parsed if parsed else [int(v) for v in default]
+
+    def _as_float_list(key: str, default: List[float]) -> List[float]:
+        raw = _as_list(key, [float(v) for v in default])
+        parsed = []
+        for item in raw:
+            try:
+                parsed.append(float(item))
+            except Exception:
+                continue
+        return parsed if parsed else [float(v) for v in default]
+
+    num_layers_space = _as_int_list("num_layers", [1, 2, 3])
+    hidden_units_space = _as_int_list("hidden_units", [64, 128, 256, 512])
+    dropout_space = _as_float_list("dropout", [0.0, 0.1, 0.2, 0.3])
+    lr_space = _as_float_list("learning_rate", [1e-4, 5e-3])
+    wd_space = _as_float_list("weight_decay", [1e-7, 1e-3])
+    batch_size_space = _as_int_list("batch_size", [16, 32, 64, 128, 256])
     lr_log = bool(search_space.get("learning_rate_log", True))
     wd_log = bool(search_space.get("weight_decay_log", True))
     finetune_raw = search_space.get("finetune_last_layers", [0, int(backbone_num_layers)])
     if isinstance(finetune_raw, list) and len(finetune_raw) > 0:
-        finetune_space = [int(v) for v in finetune_raw]
+        finetune_space = []
+        for item in finetune_raw:
+            try:
+                finetune_space.append(int(float(item)))
+            except Exception:
+                continue
     else:
+        finetune_space = [0, int(backbone_num_layers)]
+    if len(finetune_space) == 0:
         finetune_space = [0, int(backbone_num_layers)]
     if len(finetune_space) == 2:
         finetune_lo = max(0, min(finetune_space))
@@ -2316,11 +2446,15 @@ def _make_regression_figures(
     plotted_any = False
     for split, color in [("train", "#4c78a8"), ("val", "#f58518"), ("test", "#54a24b")]:
         sub = pred_df[pred_df["split"] == split]
-        residual = _clean_numeric_array(sub["chi_error"])
-        if residual.size < 2 or np.isclose(np.std(residual), 0.0):
-            continue
-        sns.kdeplot(x=residual, ax=ax, label=split, color=color, linewidth=2)
-        plotted_any = True
+        plotted_any = _plot_kde_safe_1d(
+            ax=ax,
+            values=sub["chi_error"],
+            label=split,
+            color=color,
+            linewidth=2.0,
+            fill=False,
+            alpha=0.3,
+        ) or plotted_any
     ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
     ax.set_xlabel("chi prediction error")
     ax.set_title("Residual distribution by split")
@@ -2363,15 +2497,7 @@ def _make_classifier_figures(
     test = pred_df[pred_df["split"] == "test"].copy()
     if not test.empty:
         fig, ax = plt.subplots(figsize=(6, 5))
-        sns.kdeplot(
-            data=test,
-            x="class_prob",
-            hue="water_soluble",
-            common_norm=False,
-            fill=True,
-            alpha=0.3,
-            ax=ax,
-        )
+        _plot_class_prob_density_safe(ax=ax, test_df=test)
         ax.set_xlabel("Predicted soluble probability")
         ax.set_title("Class probability distribution (test)")
         legend = ax.get_legend()

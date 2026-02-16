@@ -276,6 +276,7 @@ sampling:
   variable_length_samples_per_length: 16  # number of samples drawn per length bucket
   valid_only_max_rounds: 25  # maximum valid-only resampling rounds
   valid_only_min_samples_per_round: 256  # minimum raw requests per valid-only round
+  valid_only_fail_on_shortfall: false  # if true, Step 2 exits when rounds cannot hit target count
   use_constraints: true  # enable constrained sampler checks (syntax/ring/star constraints)
 
 # SMARTS-like family tags used in Step 6.

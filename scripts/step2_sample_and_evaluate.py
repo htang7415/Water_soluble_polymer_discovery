@@ -351,6 +351,8 @@ def main(args):
         raise ValueError("Use only one of --valid_only or --no_valid_only")
     if args.valid_only_require_target_stars and args.valid_only_allow_non_target_stars:
         raise ValueError("Use only one of --valid_only_require_target_stars or --valid_only_allow_non_target_stars")
+    if args.valid_only_fail_on_shortfall and args.valid_only_continue_on_shortfall:
+        raise ValueError("Use only one of --valid_only_fail_on_shortfall or --valid_only_continue_on_shortfall")
     valid_only = bool(sampling_cfg.get('valid_only', False))
     if args.valid_only:
         valid_only = True
@@ -380,6 +382,11 @@ def main(args):
         raise ValueError(
             f"valid_only_min_samples_per_round must be >= 1, got {valid_only_min_samples_per_round}"
         )
+    valid_only_fail_on_shortfall = bool(sampling_cfg.get('valid_only_fail_on_shortfall', False))
+    if args.valid_only_fail_on_shortfall:
+        valid_only_fail_on_shortfall = True
+    elif args.valid_only_continue_on_shortfall:
+        valid_only_fail_on_shortfall = False
     target_polymer_count = int(sampling_cfg.get("target_polymer_count", 100))
     target_sa_max = float(sampling_cfg.get("target_sa_max", 4.0))
     if target_polymer_count < 1:
@@ -428,6 +435,7 @@ def main(args):
             "valid_only_require_target_stars": valid_only_require_target_stars,
             "valid_only_max_rounds": valid_only_max_rounds,
             "valid_only_min_samples_per_round": valid_only_min_samples_per_round,
+            "valid_only_fail_on_shortfall": valid_only_fail_on_shortfall,
             "random_seed": config['data']['random_seed'],
         },
     )
@@ -567,6 +575,8 @@ def main(args):
         "valid_only_raw_generated": 0,
         "valid_only_acceptance_rate": None,
         "valid_only_rejected_count": 0,
+        "valid_only_target_met": False,
+        "valid_only_shortfall_count": int(generation_goal),
     }
     sa_cache: dict[str, float | None] = {}
     training_canonical = {canonicalize_smiles(s) or s for s in training_smiles}
@@ -627,12 +637,16 @@ def main(args):
                 f"cumulative={len(generated_smiles)}/{generation_goal}"
             )
 
-        if len(generated_smiles) < generation_goal:
-            raise RuntimeError(
+        shortfall_count = int(max(generation_goal - len(generated_smiles), 0))
+        if shortfall_count > 0:
+            shortfall_msg = (
                 "Valid-only sampling did not reach requested samples. "
-                f"accepted={len(generated_smiles)}, requested={generation_goal}. "
-                "Increase valid_only_max_rounds."
+                f"accepted={len(generated_smiles)}, requested={generation_goal}, "
+                f"shortfall={shortfall_count}, max_rounds={valid_only_max_rounds}."
             )
+            if valid_only_fail_on_shortfall:
+                raise RuntimeError(f"{shortfall_msg} Increase valid_only_max_rounds or loosen filters.")
+            print(f"WARNING: {shortfall_msg} Continuing with accepted subset.")
 
         generated_smiles = generated_smiles[:generation_goal]
         rounds_df = pd.DataFrame(round_rows)
@@ -646,6 +660,8 @@ def main(args):
                 "valid_only_raw_generated": int(total_raw_generated),
                 "valid_only_acceptance_rate": float(acceptance_rate),
                 "valid_only_rejected_count": int(max(total_raw_generated - len(generated_smiles), 0)),
+                "valid_only_target_met": bool(len(generated_smiles) >= generation_goal),
+                "valid_only_shortfall_count": int(max(generation_goal - len(generated_smiles), 0)),
             }
         )
         total_sampling_points = int(total_raw_generated)
@@ -663,6 +679,8 @@ def main(args):
                 "valid_only_raw_generated": int(len(raw_smiles)),
                 "valid_only_acceptance_rate": float(len(generated_smiles) / len(raw_smiles)) if raw_smiles else 0.0,
                 "valid_only_rejected_count": int(max(len(raw_smiles) - len(generated_smiles), 0)),
+                "valid_only_target_met": bool(len(generated_smiles) >= generation_goal),
+                "valid_only_shortfall_count": int(max(generation_goal - len(generated_smiles), 0)),
             }
         )
         total_sampling_points = int(len(raw_smiles))
@@ -837,6 +855,8 @@ def main(args):
         "valid_only_raw_generated": int(valid_only_stats["valid_only_raw_generated"]),
         "valid_only_acceptance_rate": float(valid_only_stats["valid_only_acceptance_rate"]),
         "valid_only_rejected_count": int(valid_only_stats["valid_only_rejected_count"]),
+        "valid_only_target_met": bool(valid_only_stats["valid_only_target_met"]),
+        "valid_only_shortfall_count": int(valid_only_stats["valid_only_shortfall_count"]),
         "sampling_time_sec": float(sampling_time_sec),
         "samples_per_sec": float(metrics.get("samples_per_sec", 0.0)),
         "validity": float(metrics.get("validity", 0.0)),
@@ -917,6 +937,10 @@ if __name__ == '__main__':
                         help='Maximum rounds in valid-only mode (default: sampling.valid_only_max_rounds)')
     parser.add_argument('--valid_only_min_samples_per_round', type=int, default=None,
                         help='Minimum requested samples per valid-only round (default: sampling.valid_only_min_samples_per_round)')
+    parser.add_argument('--valid_only_fail_on_shortfall', action='store_true',
+                        help='Raise an error if valid-only rounds do not reach target count')
+    parser.add_argument('--valid_only_continue_on_shortfall', action='store_true',
+                        help='Continue with accepted subset if valid-only rounds do not reach target count')
     parser.add_argument('--variable_length', action='store_true',
                         help='Enable variable length sampling (or set sampling.variable_length=true in config)')
     parser.add_argument('--min_length', type=int, default=None,

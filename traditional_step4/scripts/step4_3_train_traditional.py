@@ -93,19 +93,41 @@ def _safe_float(v, default=np.nan) -> float:
 
 
 def _as_float_pair(value, default_lo: float, default_hi: float) -> Tuple[float, float]:
-    if isinstance(value, list) and len(value) == 2:
-        lo = float(min(value))
-        hi = float(max(value))
-        return lo, hi
-    return float(default_lo), float(default_hi)
+    lo_default = float(default_lo)
+    hi_default = float(default_hi)
+    if lo_default > hi_default:
+        lo_default, hi_default = hi_default, lo_default
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        parsed: List[float] = []
+        for item in value:
+            try:
+                parsed.append(float(item))
+            except Exception:
+                continue
+        if len(parsed) == 2 and np.isfinite(parsed).all():
+            lo = float(min(parsed))
+            hi = float(max(parsed))
+            return lo, hi
+    return lo_default, hi_default
 
 
 def _as_int_pair(value, default_lo: int, default_hi: int) -> Tuple[int, int]:
-    if isinstance(value, list) and len(value) == 2:
-        lo = int(min(value))
-        hi = int(max(value))
-        return lo, hi
-    return int(default_lo), int(default_hi)
+    lo_default = int(default_lo)
+    hi_default = int(default_hi)
+    if lo_default > hi_default:
+        lo_default, hi_default = hi_default, lo_default
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        parsed: List[int] = []
+        for item in value:
+            try:
+                parsed.append(int(float(item)))
+            except Exception:
+                continue
+        if len(parsed) == 2:
+            lo = int(min(parsed))
+            hi = int(max(parsed))
+            return lo, hi
+    return lo_default, hi_default
 
 
 def _as_hidden_options(value, default: List[Tuple[int, ...]]) -> List[Tuple[int, ...]]:
@@ -193,6 +215,83 @@ def _resolve_bool_like(value, default: bool) -> bool:
     return bool(default)
 
 
+def _clean_numeric_array(values) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    return arr[np.isfinite(arr)]
+
+
+def _plot_kde_safe_1d(
+    ax,
+    values,
+    *,
+    label: str,
+    color: str,
+    linewidth: float = 2.0,
+    fill: bool = False,
+    alpha: float = 0.3,
+) -> bool:
+    arr = _clean_numeric_array(values)
+    if arr.size < 2 or np.isclose(np.std(arr), 0.0):
+        return False
+    try:
+        kde_kwargs = {
+            "x": np.asarray(arr, dtype=float),
+            "ax": ax,
+            "label": label,
+            "color": color,
+            "linewidth": linewidth,
+            "fill": fill,
+        }
+        if fill:
+            kde_kwargs["alpha"] = alpha
+        sns.kdeplot(**kde_kwargs)
+    except Exception as exc:
+        if "Multi-dimensional indexing" not in str(exc):
+            raise
+        bins = int(np.clip(np.sqrt(arr.size), 10, 60))
+        sns.histplot(
+            x=np.asarray(arr, dtype=float),
+            bins=bins,
+            stat="density",
+            element="step",
+            fill=False,
+            color=color,
+            linewidth=linewidth,
+            label=label,
+            ax=ax,
+        )
+    return True
+
+
+def _plot_class_prob_density_safe(ax, test_df: pd.DataFrame) -> None:
+    try:
+        sns.kdeplot(
+            data=test_df,
+            x="class_prob",
+            hue="water_soluble",
+            common_norm=False,
+            fill=True,
+            alpha=0.3,
+            ax=ax,
+        )
+        return
+    except Exception as exc:
+        if "Multi-dimensional indexing" not in str(exc):
+            raise
+
+    for class_value, color in [(1, "#1f77b4"), (0, "#d62728")]:
+        sub = test_df.loc[test_df["water_soluble"] == class_value, "class_prob"]
+        _plot_kde_safe_1d(
+            ax=ax,
+            values=sub,
+            label=str(class_value),
+            color=color,
+            linewidth=2.0,
+            fill=False,
+            alpha=0.3,
+        )
+
+
 def _normalize_tuning_objective(value: object, default_tuning_objective: str) -> str:
     raw = str(value).strip().lower()
     default_norm = str(default_tuning_objective).strip().lower()
@@ -238,6 +337,9 @@ def _suggest_float(
     log: bool = False,
 ) -> float:
     lo, hi = _as_float_pair(search_space.get(name), default_lo, default_hi)
+    if bool(log):
+        lo = float(max(lo, 1.0e-12))
+        hi = float(max(hi, lo))
     if np.isclose(lo, hi):
         return float(lo)
     return float(trial.suggest_float(name, lo, hi, log=bool(log)))
@@ -1519,13 +1621,25 @@ def _make_regression_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int, fon
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(6, 5))
+    plotted_any = False
     for split, color in [("train", "#4c78a8"), ("val", "#f58518"), ("test", "#54a24b")]:
         sub = pred_df[pred_df["split"] == split]
-        sns.kdeplot(sub["chi_error"], ax=ax, label=split, color=color, linewidth=2)
+        plotted_any = _plot_kde_safe_1d(
+            ax=ax,
+            values=sub["chi_error"],
+            label=split,
+            color=color,
+            linewidth=2.0,
+            fill=False,
+            alpha=0.3,
+        ) or plotted_any
     ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
     ax.set_xlabel("chi prediction error")
     ax.set_title("Residual distribution by split")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    if plotted_any:
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    else:
+        ax.text(0.5, 0.5, "Insufficient residual variance for KDE", ha="center", va="center", transform=ax.transAxes)
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_residual_distribution.png", dpi=dpi)
     plt.close(fig)
@@ -1575,15 +1689,7 @@ def _make_classification_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int,
         return
 
     fig, ax = plt.subplots(figsize=(6, 5))
-    sns.kdeplot(
-        data=test_df,
-        x="class_prob",
-        hue="water_soluble",
-        common_norm=False,
-        fill=True,
-        alpha=0.3,
-        ax=ax,
-    )
+    _plot_class_prob_density_safe(ax=ax, test_df=test_df)
     ax.set_xlabel("Predicted soluble probability")
     ax.set_title("Class probability distribution (test)")
     legend = ax.get_legend()
