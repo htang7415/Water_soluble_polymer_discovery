@@ -1455,6 +1455,14 @@ def _clean_numeric_array(values: pd.Series | np.ndarray) -> np.ndarray:
     return arr[np.isfinite(arr)]
 
 
+def _get_legend_handles(legend) -> List[object]:
+    """Matplotlib compatibility: prefer new legend_handles, fallback to legacy legendHandles."""
+    handles = getattr(legend, "legend_handles", None)
+    if handles is None:
+        handles = getattr(legend, "legendHandles", [])
+    return list(handles)
+
+
 def _plot_kde_safe_1d(
     ax,
     values: pd.Series | np.ndarray,
@@ -1651,7 +1659,7 @@ def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> 
     legend = ax.get_legend()
     if legend is not None:
         if show_legend:
-            handles = legend.legendHandles
+            handles = _get_legend_handles(legend)
             labels = [t.get_text() for t in legend.get_texts()]
             legend.remove()
             ax.legend(
@@ -2502,7 +2510,7 @@ def _make_classifier_figures(
         ax.set_title("Class probability distribution (test)")
         legend = ax.get_legend()
         if legend is not None:
-            handles = legend.legendHandles
+            handles = _get_legend_handles(legend)
             labels = [t.get_text() for t in legend.get_texts()]
             legend.remove()
             ax.legend(
