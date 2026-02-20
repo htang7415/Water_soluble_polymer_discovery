@@ -1455,6 +1455,14 @@ def _clean_numeric_array(values: pd.Series | np.ndarray) -> np.ndarray:
     return arr[np.isfinite(arr)]
 
 
+def _has_finite_history_values(history: Dict[str, List[float]], key: str) -> bool:
+    values = history.get(key, [])
+    if len(values) == 0:
+        return False
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+    return bool(np.isfinite(arr).any())
+
+
 def _get_legend_handles(legend) -> List[object]:
     """Matplotlib compatibility: prefer new legend_handles, fallback to legacy legendHandles."""
     handles = getattr(legend, "legend_handles", None)
@@ -1674,6 +1682,73 @@ def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> 
             legend.remove()
 
 
+def _plot_classifier_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> None:
+    if sub.empty:
+        ax.set_axis_off()
+        ax.set_title(f"{split.upper()} (empty)")
+        return
+
+    plot_df = sub.copy()
+    rng = np.random.default_rng(0)
+    jitter = rng.normal(loc=0.0, scale=0.03, size=len(plot_df))
+    plot_df["water_soluble_jitter"] = np.clip(plot_df["water_soluble"].to_numpy(dtype=float) + jitter, -0.08, 1.08)
+
+    sns.scatterplot(
+        data=plot_df,
+        x="water_soluble_jitter",
+        y="class_prob",
+        hue="water_soluble",
+        palette={1: "#1f77b4", 0: "#d62728"},
+        alpha=0.75,
+        s=18,
+        ax=ax,
+        legend=show_legend,
+    )
+    ax.plot([0.0, 1.0], [0.0, 1.0], "k--", linewidth=1.1)
+    ax.set_xlim(-0.1, 1.1)
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.set_xticks([0.0, 1.0])
+    ax.set_xticklabels(["0", "1"])
+    ax.set_xlabel("True water_soluble")
+    ax.set_ylabel("Predicted soluble probability")
+
+    cls = classification_metrics(sub["water_soluble"], sub["class_prob"])
+    metrics_text = (
+        f"BalAcc={cls['balanced_accuracy']:.3f}\n"
+        f"AUROC={cls['auroc']:.3f}\n"
+        f"AUPRC={cls['auprc']:.3f}\n"
+        f"Brier={cls['brier']:.3f}"
+    )
+    ax.text(
+        0.03,
+        0.97,
+        metrics_text,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
+    )
+    ax.set_title(f"{split.upper()} classifier parity (n={len(sub)})")
+
+    legend = ax.get_legend()
+    if legend is not None:
+        if show_legend:
+            handles = _get_legend_handles(legend)
+            labels = [t.get_text() for t in legend.get_texts()]
+            legend.remove()
+            ax.legend(
+                handles=handles,
+                labels=labels,
+                title="water_soluble",
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0),
+                borderaxespad=0.0,
+            )
+        else:
+            legend.remove()
+
+
 def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_dir: Path, dpi: int, font_size: int) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style="whitegrid")
@@ -1685,18 +1760,37 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     })
 
     # Loss curve
+    has_val_curve = _has_finite_history_values(history, "val_loss")
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.plot(history["epoch"], history["train_loss"], label="Train loss")
-    ax.plot(history["epoch"], history["val_loss"], label="Val loss")
+    if has_val_curve:
+        ax.plot(history["epoch"], history["val_loss"], label="Val loss")
+        ax.set_title("Step4 chi training loss")
+    else:
+        ax.set_title("Step4 chi training loss (final fit: train+val)")
+        ax.text(
+            0.03,
+            0.97,
+            "No validation split in final fit",
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
+        )
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
-    ax.set_title("Step4 chi training loss")
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_loss_curve.png", dpi=dpi)
     plt.close(fig)
 
-    # Test-only parity (water_soluble legend is only shown on test plot).
+    train = pred_df[pred_df["split"] == "train"].copy()
+    fig, ax = plt.subplots(figsize=(6, 5))
+    _plot_parity_panel(ax, sub=train, split="train", show_legend=True)
+    fig.tight_layout(rect=(0, 0, 0.82, 1))
+    fig.savefig(fig_dir / "chi_parity_train.png", dpi=dpi)
+    plt.close(fig)
+
     test = pred_df[pred_df["split"] == "test"].copy()
     fig, ax = plt.subplots(figsize=(6, 5))
     _plot_parity_panel(ax, sub=test, split="test", show_legend=True)
@@ -2431,18 +2525,37 @@ def _make_regression_figures(
         "legend.fontsize": font_size,
     })
 
+    has_val_curve = _has_finite_history_values(history, "val_loss")
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.plot(history["epoch"], history["train_loss"], label="Train loss")
-    ax.plot(history["epoch"], history["val_loss"], label="Val loss")
+    if has_val_curve:
+        ax.plot(history["epoch"], history["val_loss"], label="Val loss")
+        ax.set_title("Step4_1 regression loss")
+    else:
+        ax.set_title("Step4_1 regression loss (final fit: train+val)")
+        ax.text(
+            0.03,
+            0.97,
+            "No validation split in final fit",
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
+        )
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
-    ax.set_title("Step4_1 regression loss")
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_loss_curve.png", dpi=dpi)
     plt.close(fig)
 
-    # Test-only parity (water_soluble legend is only shown on test plot).
+    train = pred_df[pred_df["split"] == "train"].copy()
+    fig, ax = plt.subplots(figsize=(6, 5))
+    _plot_parity_panel(ax, sub=train, split="train", show_legend=True)
+    fig.tight_layout(rect=(0, 0, 0.82, 1))
+    fig.savefig(fig_dir / "chi_parity_train.png", dpi=dpi)
+    plt.close(fig)
+
     test = pred_df[pred_df["split"] == "test"].copy()
     fig, ax = plt.subplots(figsize=(6, 5))
     _plot_parity_panel(ax, sub=test, split="test", show_legend=True)
@@ -2491,19 +2604,46 @@ def _make_classifier_figures(
         "legend.fontsize": font_size,
     })
 
+    has_val_curve = _has_finite_history_values(history, "val_loss")
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.plot(history["epoch"], history["train_loss"], label="Train BCE")
-    ax.plot(history["epoch"], history["val_loss"], label="Val BCE")
+    if has_val_curve:
+        ax.plot(history["epoch"], history["val_loss"], label="Val BCE")
+        ax.set_title("Step4_2 classification loss")
+    else:
+        ax.set_title("Step4_2 classification loss (final fit: train+val)")
+        ax.text(
+            0.03,
+            0.97,
+            "No validation split in final fit",
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
+        )
     ax.set_xlabel("Epoch")
     ax.set_ylabel("BCE loss")
-    ax.set_title("Step4_2 classification loss")
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     fig.tight_layout()
     fig.savefig(fig_dir / "class_loss_curve.png", dpi=dpi)
     plt.close(fig)
 
+    train = pred_df[pred_df["split"] == "train"].copy()
+    if not train.empty:
+        fig, ax = plt.subplots(figsize=(6, 5))
+        _plot_classifier_parity_panel(ax=ax, sub=train, split="train", show_legend=True)
+        fig.tight_layout(rect=(0, 0, 0.82, 1))
+        fig.savefig(fig_dir / "class_parity_train.png", dpi=dpi)
+        plt.close(fig)
+
     test = pred_df[pred_df["split"] == "test"].copy()
     if not test.empty:
+        fig, ax = plt.subplots(figsize=(6, 5))
+        _plot_classifier_parity_panel(ax=ax, sub=test, split="test", show_legend=True)
+        fig.tight_layout(rect=(0, 0, 0.82, 1))
+        fig.savefig(fig_dir / "class_parity_test.png", dpi=dpi)
+        plt.close(fig)
+
         fig, ax = plt.subplots(figsize=(6, 5))
         _plot_class_prob_density_safe(ax=ax, test_df=test)
         ax.set_xlabel("Predicted soluble probability")
