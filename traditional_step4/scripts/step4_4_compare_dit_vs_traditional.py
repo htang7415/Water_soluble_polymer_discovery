@@ -59,6 +59,50 @@ def _load_test_row(csv_path: Path) -> pd.Series:
     return test_df.iloc[0]
 
 
+def _load_best_model_row_from_summary(
+    summary_csv: Path,
+    *,
+    primary_metric: str,
+    primary_higher_is_better: bool,
+    tiebreak_metrics: List[tuple[str, bool]] | None = None,
+) -> pd.Series:
+    if not summary_csv.exists():
+        raise FileNotFoundError(f"model summary file not found: {summary_csv}")
+    df = pd.read_csv(summary_csv)
+    if df.empty:
+        raise ValueError(f"model summary is empty: {summary_csv}")
+    if "model_name" not in df.columns:
+        raise ValueError(f"Expected 'model_name' column in {summary_csv}")
+    if primary_metric not in df.columns:
+        raise ValueError(f"Expected '{primary_metric}' column in {summary_csv}")
+
+    score = pd.to_numeric(df[primary_metric], errors="coerce")
+    valid = df[score.notna()].copy()
+    if valid.empty:
+        raise ValueError(f"No valid '{primary_metric}' values in {summary_csv}")
+
+    sort_cols: List[str] = []
+    ascending: List[bool] = []
+
+    valid["__primary"] = pd.to_numeric(valid[primary_metric], errors="coerce")
+    sort_cols.append("__primary")
+    ascending.append(not bool(primary_higher_is_better))
+
+    for metric_name, metric_higher_is_better in (tiebreak_metrics or []):
+        if metric_name not in valid.columns:
+            continue
+        numeric_col = f"__tb_{metric_name}"
+        valid[numeric_col] = pd.to_numeric(valid[metric_name], errors="coerce")
+        fill_value = -np.inf if metric_higher_is_better else np.inf
+        valid[numeric_col] = valid[numeric_col].fillna(fill_value)
+        sort_cols.append(numeric_col)
+        ascending.append(not bool(metric_higher_is_better))
+
+    valid = valid.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+    best = valid.iloc[0].copy()
+    return best
+
+
 def _safe_get(row: pd.Series, key: str) -> float:
     if key not in row.index:
         return np.nan
@@ -66,6 +110,13 @@ def _safe_get(row: pd.Series, key: str) -> float:
         return float(row[key])
     except Exception:
         return np.nan
+
+
+def _first_existing_path(candidates: List[Path]) -> Path:
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
 
 
 def _resolve_model_sizes(args_sizes: List[str], cfg_sizes: List[str]) -> List[str]:
@@ -221,26 +272,61 @@ def main() -> None:
     cls_rows: List[Dict[str, object]] = []
 
     for model_size in model_sizes:
-        dit_results_dir = Path(get_results_dir(model_size=model_size, base_dir=dit_results_base, split_mode=split_mode))
-        trad_results_dir = get_traditional_results_dir(results_root=results_root, split_mode=split_mode)
+        dit_results_dir_split = Path(get_results_dir(model_size=model_size, base_dir=dit_results_base, split_mode=split_mode))
+        dit_results_dir_root = Path(get_results_dir(model_size=model_size, base_dir=dit_results_base, split_mode=None))
+        trad_results_dir = get_traditional_results_dir(results_root=results_root)
+        trad_results_dir_legacy = get_traditional_results_dir(results_root=results_root, split_mode=split_mode)
 
-        dit_reg_csv = dit_results_dir / "step4_chi_training" / split_mode / "step4_1_regression" / "metrics" / "chi_metrics_overall.csv"
-        dit_cls_csv = dit_results_dir / "step4_chi_training" / split_mode / "step4_2_classification" / "metrics" / "class_metrics_overall.csv"
-        trad_reg_csv = (
-            trad_results_dir
-            / "step4_3_traditional"
-            / split_mode
-            / "step4_3_1_regression"
-            / "metrics"
-            / "chi_metrics_overall.csv"
+        dit_reg_csv = _first_existing_path(
+            [
+                dit_results_dir_root / "step4_chi_training" / "step4_1_regression" / split_mode / "metrics" / "chi_metrics_overall.csv",
+                dit_results_dir_split / "step4_chi_training" / split_mode / "step4_1_regression" / "metrics" / "chi_metrics_overall.csv",
+            ]
         )
-        trad_cls_csv = (
-            trad_results_dir
-            / "step4_3_traditional"
-            / split_mode
-            / "step4_3_2_classification"
-            / "metrics"
-            / "class_metrics_overall.csv"
+        dit_cls_csv = _first_existing_path(
+            [
+                dit_results_dir_root / "step4_chi_training" / "step4_2_classification" / "metrics" / "class_metrics_overall.csv",
+                dit_results_dir_split / "step4_chi_training" / split_mode / "step4_2_classification" / "metrics" / "class_metrics_overall.csv",
+            ]
+        )
+        trad_reg_summary_csv = _first_existing_path(
+            [
+                (
+                    trad_results_dir
+                    / "step4_3_traditional"
+                    / "step4_3_1_regression"
+                    / split_mode
+                    / "metrics"
+                    / "model_metrics_summary.csv"
+                ),
+                (
+                    trad_results_dir_legacy
+                    / "step4_3_traditional"
+                    / split_mode
+                    / "step4_3_1_regression"
+                    / "metrics"
+                    / "model_metrics_summary.csv"
+                ),
+            ]
+        )
+        trad_cls_summary_csv = _first_existing_path(
+            [
+                (
+                    trad_results_dir
+                    / "step4_3_traditional"
+                    / "step4_3_2_classification"
+                    / "metrics"
+                    / "model_metrics_summary.csv"
+                ),
+                (
+                    trad_results_dir_legacy
+                    / "step4_3_traditional"
+                    / split_mode
+                    / "step4_3_2_classification"
+                    / "metrics"
+                    / "model_metrics_summary.csv"
+                ),
+            ]
         )
 
         reg_ready = True
@@ -250,10 +336,22 @@ def main() -> None:
             reg_ready = False
             missing_rows.append({"model_size": model_size, "stage": "step4_1_regression", "path": str(dit_reg_csv), "error": str(exc)})
         try:
-            trad_reg = _load_test_row(trad_reg_csv)
+            trad_reg = _load_best_model_row_from_summary(
+                trad_reg_summary_csv,
+                primary_metric="test_r2",
+                primary_higher_is_better=True,
+                tiebreak_metrics=[("test_rmse", False), ("test_mae", False)],
+            )
         except Exception as exc:
             reg_ready = False
-            missing_rows.append({"model_size": model_size, "stage": "step4_3_1_regression", "path": str(trad_reg_csv), "error": str(exc)})
+            missing_rows.append(
+                {
+                    "model_size": model_size,
+                    "stage": "step4_3_1_regression_best_model_selection",
+                    "path": str(trad_reg_summary_csv),
+                    "error": str(exc),
+                }
+            )
 
         if reg_ready:
             row = {
@@ -261,9 +359,10 @@ def main() -> None:
                 "dit_r2": _safe_get(dit_reg, "r2"),
                 "dit_rmse": _safe_get(dit_reg, "rmse"),
                 "dit_mae": _safe_get(dit_reg, "mae"),
-                "traditional_r2": _safe_get(trad_reg, "r2"),
-                "traditional_rmse": _safe_get(trad_reg, "rmse"),
-                "traditional_mae": _safe_get(trad_reg, "mae"),
+                "traditional_best_model_name": str(trad_reg.get("model_name", "")),
+                "traditional_r2": _safe_get(trad_reg, "test_r2"),
+                "traditional_rmse": _safe_get(trad_reg, "test_rmse"),
+                "traditional_mae": _safe_get(trad_reg, "test_mae"),
             }
             row["delta_r2_traditional_minus_dit"] = _safe_get(pd.Series(row), "traditional_r2") - _safe_get(pd.Series(row), "dit_r2")
             row["delta_rmse_traditional_minus_dit"] = _safe_get(pd.Series(row), "traditional_rmse") - _safe_get(pd.Series(row), "dit_rmse")
@@ -279,10 +378,22 @@ def main() -> None:
             cls_ready = False
             missing_rows.append({"model_size": model_size, "stage": "step4_2_classification", "path": str(dit_cls_csv), "error": str(exc)})
         try:
-            trad_cls = _load_test_row(trad_cls_csv)
+            trad_cls = _load_best_model_row_from_summary(
+                trad_cls_summary_csv,
+                primary_metric="test_balanced_accuracy",
+                primary_higher_is_better=True,
+                tiebreak_metrics=[("test_auroc", True), ("test_f1", True)],
+            )
         except Exception as exc:
             cls_ready = False
-            missing_rows.append({"model_size": model_size, "stage": "step4_3_2_classification", "path": str(trad_cls_csv), "error": str(exc)})
+            missing_rows.append(
+                {
+                    "model_size": model_size,
+                    "stage": "step4_3_2_classification_best_model_selection",
+                    "path": str(trad_cls_summary_csv),
+                    "error": str(exc),
+                }
+            )
 
         if cls_ready:
             row = {
@@ -290,9 +401,10 @@ def main() -> None:
                 "dit_balanced_accuracy": _safe_get(dit_cls, "balanced_accuracy"),
                 "dit_auroc": _safe_get(dit_cls, "auroc"),
                 "dit_f1": _safe_get(dit_cls, "f1"),
-                "traditional_balanced_accuracy": _safe_get(trad_cls, "balanced_accuracy"),
-                "traditional_auroc": _safe_get(trad_cls, "auroc"),
-                "traditional_f1": _safe_get(trad_cls, "f1"),
+                "traditional_best_model_name": str(trad_cls.get("model_name", "")),
+                "traditional_balanced_accuracy": _safe_get(trad_cls, "test_balanced_accuracy"),
+                "traditional_auroc": _safe_get(trad_cls, "test_auroc"),
+                "traditional_f1": _safe_get(trad_cls, "test_f1"),
             }
             row["delta_balanced_accuracy_traditional_minus_dit"] = _safe_get(pd.Series(row), "traditional_balanced_accuracy") - _safe_get(
                 pd.Series(row), "dit_balanced_accuracy"

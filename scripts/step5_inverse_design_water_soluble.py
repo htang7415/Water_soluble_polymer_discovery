@@ -681,10 +681,48 @@ def main(args):
         )
 
     results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], split_mode))
+    results_dir_nosplit = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], split_mode=None))
     base_results_dir = Path(config["paths"]["results_dir"])
-    step4_base_dir = Path(args.step4_dir) if args.step4_dir else results_dir / "step4_chi_training" / split_mode
-    step4_reg_dir = Path(args.step4_reg_dir) if args.step4_reg_dir else step4_base_dir / "step4_1_regression"
-    step4_cls_dir = Path(args.step4_cls_dir) if args.step4_cls_dir else step4_base_dir / "step4_2_classification"
+
+    def _first_existing(paths: List[Path]) -> Path:
+        for p in paths:
+            if p.exists():
+                return p
+        return paths[0]
+
+    if args.step4_reg_dir is not None:
+        step4_reg_dir = Path(args.step4_reg_dir)
+    else:
+        if args.step4_dir is not None:
+            step4_root = Path(args.step4_dir)
+            reg_candidates = [
+                step4_root / "step4_1_regression" / split_mode,
+                step4_root / split_mode / "step4_1_regression",
+                step4_root / "step4_1_regression",
+            ]
+        else:
+            reg_candidates = [
+                results_dir_nosplit / "step4_chi_training" / "step4_1_regression" / split_mode,
+                results_dir / "step4_chi_training" / split_mode / "step4_1_regression",
+            ]
+        step4_reg_dir = _first_existing(reg_candidates)
+
+    if args.step4_cls_dir is not None:
+        step4_cls_dir = Path(args.step4_cls_dir)
+    else:
+        if args.step4_dir is not None:
+            step4_root = Path(args.step4_dir)
+            cls_candidates = [
+                step4_root / "step4_2_classification",
+                step4_root / split_mode / "step4_2_classification",
+            ]
+        else:
+            cls_candidates = [
+                results_dir_nosplit / "step4_chi_training" / "step4_2_classification",
+                results_dir / "step4_chi_training" / split_mode / "step4_2_classification",
+            ]
+        step4_cls_dir = _first_existing(cls_candidates)
+
     step4_reg_metrics_dir = step4_reg_dir / "metrics"
     step4_cls_metrics_dir = step4_cls_dir / "metrics"
 

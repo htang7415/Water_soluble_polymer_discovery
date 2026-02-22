@@ -30,9 +30,19 @@ def load_traditional_config(config_path: str) -> Dict:
     return cfg
 
 
-def get_traditional_results_dir(results_root: str, split_mode: str) -> Path:
+def get_traditional_results_dir(results_root: str, split_mode: str | None = None) -> Path:
+    """Resolve traditional Step4 base results directory.
+
+    New layout defaults to a split-independent root:
+      <results_root>/results_traditional
+
+    When split_mode is provided, keep backward-compatible split-suffixed
+    resolution:
+      <results_root>/results_traditional_<split_mode>
+    """
     base = str(Path(results_root) / "results_traditional")
-    return Path(get_results_dir(model_size=None, base_dir=base, split_mode=split_mode))
+    resolved_split = normalize_split_mode(split_mode) if split_mode is not None else None
+    return Path(get_results_dir(model_size=None, base_dir=base, split_mode=resolved_split))
 
 
 def normalize_split_mode(split_mode: str) -> str:

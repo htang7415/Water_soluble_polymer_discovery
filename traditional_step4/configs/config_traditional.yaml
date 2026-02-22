@@ -16,6 +16,7 @@ traditional_step4:
     regression_dataset_path: "Data/chi/_50_polymers_T_phi.csv"
     classification_dataset_path: "Data/water_solvent/water_solvent_polymers.csv"
     split_mode: "polymer"  # polymer | random
+    classification_split_mode: "random"  # split mode used by step4_3_2 only (independent of regression split_mode)
     split:
       # If omitted, defaults to 1 / tuning_cv_folds.
       holdout_test_ratio: 0.16

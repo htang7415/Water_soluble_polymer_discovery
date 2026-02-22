@@ -17,7 +17,8 @@ import pandas as pd
 import seaborn as sns
 import torch
 import torch.nn as nn
-from sklearn.metrics import precision_recall_curve, roc_curve
+from matplotlib.lines import Line2D
+from sklearn.metrics import confusion_matrix, precision_recall_curve, roc_curve
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset
 
@@ -36,6 +37,9 @@ from src.utils.model_scales import get_model_config, get_results_dir
 from src.utils.numerics import stable_sigmoid
 from src.utils.reproducibility import save_run_metadata, seed_everything
 from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
+
+
+WATER_SOLUBLE_PALETTE = {0: "#d62728", 1: "#1f77b4"}
 
 
 @dataclass
@@ -350,6 +354,7 @@ def _default_chi_config(config: Dict) -> Dict:
         "dataset_path": "Data/chi/_50_polymers_T_phi.csv",
         "step4_2_dataset_path": "Data/water_solvent/water_solvent_polymers.csv",
         "split_mode": "polymer",
+        "classification_split_mode": "random",
         "holdout_test_ratio": None,
         "batch_size": 128,
         "num_epochs": 500,
@@ -382,6 +387,12 @@ def _default_chi_config(config: Dict) -> Dict:
     )
     out["step4_2_dataset_path"] = str(step42_cfg.get("dataset_path", step42_dataset_fallback))
     out["split_mode"] = str(shared.get("split_mode", chi_cfg.get("split_mode", defaults["split_mode"])))
+    out["classification_split_mode"] = str(
+        shared.get(
+            "classification_split_mode",
+            chi_cfg.get("classification_split_mode", defaults["classification_split_mode"]),
+        )
+    )
     legacy_test_ratio = split_cfg.get("test_ratio", chi_cfg.get("test_ratio", None))
     out["holdout_test_ratio"] = split_cfg.get(
         "holdout_test_ratio",
@@ -1543,6 +1554,45 @@ def _plot_class_prob_density_safe(ax, test_df: pd.DataFrame) -> None:
         )
 
 
+def _save_binary_confusion_matrix_figure(
+    sub: pd.DataFrame,
+    out_png: Path,
+    title: str,
+    dpi: int,
+) -> None:
+    if sub.empty or "water_soluble" not in sub.columns:
+        return
+    y_true = pd.to_numeric(sub["water_soluble"], errors="coerce").fillna(0).to_numpy(dtype=int)
+    if "class_pred" in sub.columns:
+        y_pred = pd.to_numeric(sub["class_pred"], errors="coerce").fillna(0).to_numpy(dtype=int)
+    elif "class_prob" in sub.columns:
+        y_pred = (pd.to_numeric(sub["class_prob"], errors="coerce").fillna(0.0).to_numpy(dtype=float) >= 0.5).astype(int)
+    else:
+        return
+    if len(y_true) == 0:
+        return
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    fig, ax = plt.subplots(figsize=(5.2, 4.6))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cbar=False,
+        cmap="Blues",
+        square=True,
+        xticklabels=["0", "1"],
+        yticklabels=["0", "1"],
+        ax=ax,
+    )
+    ax.set_xlabel("Predicted water_soluble")
+    ax.set_ylabel("True water_soluble")
+    ax.set_title(f"{title} (n={len(y_true)})")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
 
 def _save_prediction_csvs(
     split_df: pd.DataFrame,
@@ -1628,7 +1678,7 @@ def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> 
         x="chi",
         y="chi_pred",
         hue="water_soluble",
-        palette={1: "#1f77b4", 0: "#d62728"},
+        palette=WATER_SOLUBLE_PALETTE,
         alpha=0.75,
         s=18,
         ax=ax,
@@ -1667,12 +1717,14 @@ def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> 
     legend = ax.get_legend()
     if legend is not None:
         if show_legend:
-            handles = _get_legend_handles(legend)
-            labels = [t.get_text() for t in legend.get_texts()]
             legend.remove()
+            handles = [
+                Line2D([], [], marker="o", linestyle="None", color=WATER_SOLUBLE_PALETTE[0], markersize=6),
+                Line2D([], [], marker="o", linestyle="None", color=WATER_SOLUBLE_PALETTE[1], markersize=6),
+            ]
             ax.legend(
                 handles=handles,
-                labels=labels,
+                labels=["0 (red)", "1 (blue)"],
                 title="water_soluble",
                 loc="upper left",
                 bbox_to_anchor=(1.02, 1.0),
@@ -1790,6 +1842,12 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     fig.tight_layout(rect=(0, 0, 0.82, 1))
     fig.savefig(fig_dir / "chi_parity_train.png", dpi=dpi)
     plt.close(fig)
+    _save_binary_confusion_matrix_figure(
+        sub=train,
+        out_png=fig_dir / "chi_classifier_confusion_matrix_train.png",
+        title="Classifier confusion matrix (train)",
+        dpi=dpi,
+    )
 
     test = pred_df[pred_df["split"] == "test"].copy()
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -1797,6 +1855,12 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     fig.tight_layout(rect=(0, 0, 0.82, 1))
     fig.savefig(fig_dir / "chi_parity_test.png", dpi=dpi)
     plt.close(fig)
+    _save_binary_confusion_matrix_figure(
+        sub=test,
+        out_png=fig_dir / "chi_classifier_confusion_matrix_test.png",
+        title="Classifier confusion matrix (test)",
+        dpi=dpi,
+    )
 
     # Residual histogram by split
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -2635,6 +2699,12 @@ def _make_classifier_figures(
         fig.tight_layout(rect=(0, 0, 0.82, 1))
         fig.savefig(fig_dir / "class_parity_train.png", dpi=dpi)
         plt.close(fig)
+    _save_binary_confusion_matrix_figure(
+        sub=train,
+        out_png=fig_dir / "class_confusion_matrix_train.png",
+        title="Step4_2 confusion matrix (train)",
+        dpi=dpi,
+    )
 
     test = pred_df[pred_df["split"] == "test"].copy()
     if not test.empty:
@@ -2643,7 +2713,14 @@ def _make_classifier_figures(
         fig.tight_layout(rect=(0, 0, 0.82, 1))
         fig.savefig(fig_dir / "class_parity_test.png", dpi=dpi)
         plt.close(fig)
+    _save_binary_confusion_matrix_figure(
+        sub=test,
+        out_png=fig_dir / "class_confusion_matrix_test.png",
+        title="Step4_2 confusion matrix (test)",
+        dpi=dpi,
+    )
 
+    if not test.empty:
         fig, ax = plt.subplots(figsize=(6, 5))
         _plot_class_prob_density_safe(ax=ax, test_df=test)
         ax.set_xlabel("Predicted soluble probability")
@@ -2769,6 +2846,11 @@ def _save_combined_polymer_coefficients(
 def main(args):
     config = load_config(args.config)
     train_cfg = build_train_config(args, config)
+    chi_cfg = _default_chi_config(config)
+    reg_split_mode = str(train_cfg.split_mode).strip().lower()
+    cls_split_mode = str(chi_cfg.get("classification_split_mode", "random")).strip().lower()
+    if cls_split_mode not in {"polymer", "random"}:
+        raise ValueError("chi_training.shared.classification_split_mode must be one of {'polymer','random'}")
     if args.finetune_last_layers is not None:
         train_cfg.finetune_last_layers = int(args.finetune_last_layers)
     run_step41 = args.stage in {"both", "step4_1"}
@@ -2782,12 +2864,20 @@ def main(args):
             f"for model_size={args.model_size}, got {train_cfg.finetune_last_layers}"
         )
 
-    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], train_cfg.split_mode))
-    step_dir = results_dir / "step4_chi_training" / train_cfg.split_mode
+    # New Step 4 layout keeps one model-size root:
+    #   results_<model_size>/step4_chi_training/
+    # Regression is split-scoped; classification is shared.
+    results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], split_mode=None))
+    step_dir = results_dir / "step4_chi_training"
     shared_dir = step_dir / "shared"
     pipeline_metrics_dir = step_dir / "pipeline_metrics"
-    pipeline_metrics_run_dir = pipeline_metrics_dir if args.stage == "both" else (pipeline_metrics_dir / args.stage)
-    reg_dir = step_dir / "step4_1_regression"
+    if args.stage == "step4_1":
+        pipeline_metrics_run_dir = pipeline_metrics_dir / "step4_1_regression" / reg_split_mode
+    elif args.stage == "step4_2":
+        pipeline_metrics_run_dir = pipeline_metrics_dir / "step4_2_classification"
+    else:
+        pipeline_metrics_run_dir = pipeline_metrics_dir / f"both_{reg_split_mode}"
+    reg_dir = step_dir / "step4_1_regression" / reg_split_mode
     cls_dir = step_dir / "step4_2_classification"
     reg_metrics_dir = reg_dir / "metrics"
     reg_figures_dir = reg_dir / "figures"
@@ -2815,7 +2905,6 @@ def main(args):
     ]:
         d.mkdir(parents=True, exist_ok=True)
 
-    chi_cfg = _default_chi_config(config)
     split_ratios = _resolve_split_ratios(train_cfg)
     reg_csv = args.regression_dataset_path or args.dataset_path or chi_cfg["step4_1_dataset_path"]
     cls_csv = args.classification_dataset_path or chi_cfg["step4_2_dataset_path"]
@@ -2831,7 +2920,9 @@ def main(args):
             "model_size": args.model_size,
             "stage": args.stage,
             "results_dir": str(results_dir),
-            "split_mode": train_cfg.split_mode,
+            "split_mode": reg_split_mode,
+            "regression_split_mode": reg_split_mode,
+            "classification_split_mode": cls_split_mode,
             "holdout_test_ratio": float(train_cfg.holdout_test_ratio),
             "resolved_train_ratio": float(split_ratios["train_ratio"]),
             "resolved_val_ratio": float(split_ratios["val_ratio"]),
@@ -2849,8 +2940,8 @@ def main(args):
             "scheduler_min_lr": train_cfg.scheduler_min_lr,
             "backbone_num_layers": backbone_num_layers,
             "finetune_last_layers": train_cfg.finetune_last_layers,
-            "stage4_1_dir": str(reg_dir),
-            "stage4_2_dir": str(cls_dir),
+            "step4_1_dir": str(reg_dir),
+            "step4_2_dir": str(cls_dir),
             "random_seed": train_cfg.seed,
         },
     )
@@ -2862,7 +2953,8 @@ def main(args):
     print("  Step4_1: chi regression")
     print("  Step4_2: water-soluble classification")
     print(f"Stage: {args.stage}")
-    print(f"Split mode: {train_cfg.split_mode}")
+    print(f"Regression split mode: {reg_split_mode}")
+    print(f"Classification split mode: {cls_split_mode}")
     print(
         "Resolved split ratios: "
         f"train={split_ratios['train_ratio']:.4f}, "
@@ -2879,7 +2971,7 @@ def main(args):
     reg_split_assign = make_split_assignments(
         reg_df,
         SplitConfig(
-            split_mode=train_cfg.split_mode,
+            split_mode=reg_split_mode,
             train_ratio=split_ratios["train_ratio"],
             val_ratio=split_ratios["val_ratio"],
             test_ratio=split_ratios["test_ratio"],
@@ -2892,7 +2984,7 @@ def main(args):
     cls_split_assign = make_split_assignments(
         cls_df,
         SplitConfig(
-            split_mode=train_cfg.split_mode,
+            split_mode=cls_split_mode,
             train_ratio=split_ratios["train_ratio"],
             val_ratio=split_ratios["val_ratio"],
             test_ratio=split_ratios["test_ratio"],
@@ -2901,11 +2993,11 @@ def main(args):
     )
     cls_split_df = add_split_column(cls_df, cls_split_assign)
 
-    # Shared outputs: keep legacy regression filenames plus explicit per-stage split files.
+    # Shared outputs: keep legacy regression filenames plus explicit split-tagged files.
     reg_split_assign.to_csv(shared_dir / "split_assignments.csv", index=False)
     reg_split_df.to_csv(shared_dir / "chi_dataset_with_split.csv", index=False)
-    reg_split_assign.to_csv(shared_dir / "split_assignments_step4_1.csv", index=False)
-    reg_split_df.to_csv(shared_dir / "chi_dataset_with_split_step4_1.csv", index=False)
+    reg_split_assign.to_csv(shared_dir / f"split_assignments_step4_1_{reg_split_mode}.csv", index=False)
+    reg_split_df.to_csv(shared_dir / f"chi_dataset_with_split_step4_1_{reg_split_mode}.csv", index=False)
     cls_split_assign.to_csv(shared_dir / "split_assignments_step4_2.csv", index=False)
     cls_split_df.to_csv(shared_dir / "chi_dataset_with_split_step4_2.csv", index=False)
 
@@ -2920,9 +3012,9 @@ def main(args):
         reg_emb_cache = build_or_load_embedding_cache(
             polymer_df=reg_polymer_df,
             config=config,
-            cache_npz=shared_dir / "polymer_embeddings.npz",
+            cache_npz=shared_dir / f"polymer_embeddings_step4_1_{reg_split_mode}.npz",
             model_size=args.model_size,
-            split_mode=train_cfg.split_mode,
+            split_mode=reg_split_mode,
             checkpoint_path=args.backbone_checkpoint,
             device=device,
             timestep=train_cfg.timestep_for_embedding,
@@ -2939,9 +3031,9 @@ def main(args):
         cls_emb_cache = build_or_load_embedding_cache(
             polymer_df=cls_polymer_df,
             config=config,
-            cache_npz=shared_dir / "polymer_embeddings_step4_2_classification.npz",
+            cache_npz=shared_dir / f"polymer_embeddings_step4_2_classification_{cls_split_mode}.npz",
             model_size=args.model_size,
-            split_mode=train_cfg.split_mode,
+            split_mode=cls_split_mode,
             checkpoint_path=args.backbone_checkpoint,
             device=device,
             timestep=train_cfg.timestep_for_embedding,
@@ -2998,7 +3090,7 @@ def main(args):
             tokenizer_for_training, _, _ = load_backbone_from_step1(
                 config=config,
                 model_size=args.model_size,
-                split_mode=train_cfg.split_mode,
+                split_mode=reg_split_mode,
                 checkpoint_path=args.backbone_checkpoint,
                 device="cpu",
             )
@@ -3142,6 +3234,7 @@ def main(args):
         if cls_embedding_table is None:
             raise RuntimeError("Classification embedding table was not prepared.")
         cls_cfg = copy.deepcopy(train_cfg)
+        cls_cfg.split_mode = cls_split_mode
         cls_section = chi_cfg.get("step4_2", {}) if isinstance(chi_cfg.get("step4_2", {}), dict) else {}
         cls_cfg.finetune_last_layers = int(cls_section.get("finetune_last_layers", cls_cfg.finetune_last_layers))
         cls_cfg.batch_size = int(cls_section.get("batch_size", cls_cfg.batch_size))
@@ -3180,7 +3273,7 @@ def main(args):
             tokenizer_for_training, _, _ = load_backbone_from_step1(
                 config=config,
                 model_size=args.model_size,
-                split_mode=train_cfg.split_mode,
+                split_mode=cls_split_mode,
                 checkpoint_path=args.backbone_checkpoint,
                 device="cpu",
             )
@@ -3349,7 +3442,9 @@ def main(args):
         "step": "step4_chi_training",
         "stage": args.stage,
         "model_size": args.model_size or "small",
-        "split_mode": train_cfg.split_mode,
+        "split_mode": reg_split_mode,
+        "regression_split_mode": reg_split_mode,
+        "classification_split_mode": cls_split_mode,
         "holdout_test_ratio": float(train_cfg.holdout_test_ratio),
         "resolved_train_ratio": float(split_ratios["train_ratio"]),
         "resolved_val_ratio": float(split_ratios["val_ratio"]),
@@ -3406,10 +3501,10 @@ def main(args):
         save_artifact_manifest(step_dir=cls_dir, metrics_dir=cls_metrics_dir, figures_dir=cls_figures_dir)
 
     print("Training complete.")
-    print(f"Pipeline outputs: {step_dir}")
+    print(f"Step4 outputs root: {step_dir}")
     print(f"Pipeline metrics for this run: {pipeline_metrics_run_dir}")
     if run_step41:
-        print(f"Step4_1 outputs: {reg_dir}")
+        print(f"Step4_1 outputs ({reg_split_mode}): {reg_dir}")
         print(f"Step4_1 checkpoint: {reg_checkpoint_path}")
     if run_step42:
         print(f"Step4_2 outputs: {cls_dir}")
@@ -3425,7 +3520,11 @@ if __name__ == "__main__":
         type=str,
         default=None,
         choices=["polymer", "random"],
-        help="Optional split mode override (otherwise uses config chi_training.shared.split_mode).",
+        help=(
+            "Optional regression split-mode override "
+            "(otherwise uses config chi_training.shared.split_mode). "
+            "Step4_2 classification uses chi_training.shared.classification_split_mode."
+        ),
     )
     parser.add_argument(
         "--stage",

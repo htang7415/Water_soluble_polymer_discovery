@@ -46,12 +46,12 @@ def _expected_files(split_mode: str) -> Dict[str, List[str]]:
             "metrics/chi_target_summary.json",
             "figures/chi_target_heatmap.png",
         ],
-        f"step4_chi_training/{split_mode}": [
-            "pipeline_metrics/step_summary.csv",
-            "step4_1_regression/metrics/chi_metrics_overall.csv",
-            "step4_1_regression/metrics/polymer_coefficients_regression_only.csv",
+        "step4_chi_training": [
+            f"pipeline_metrics/both_{split_mode}/step_summary.csv",
+            f"step4_1_regression/{split_mode}/metrics/chi_metrics_overall.csv",
+            f"step4_1_regression/{split_mode}/metrics/polymer_coefficients_regression_only.csv",
             "step4_2_classification/metrics/class_metrics_overall.csv",
-            "step4_1_regression/figures/chi_loss_curve.png",
+            f"step4_1_regression/{split_mode}/figures/chi_loss_curve.png",
         ],
         f"step5_water_soluble_inverse_design/{split_mode}": [
             "metrics/step_summary.csv",
@@ -119,6 +119,7 @@ def main(args):
     base_results_dir = Path(config["paths"]["results_dir"])
     split_mode = args.split_mode
     results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], split_mode))
+    results_dir_nosplit = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], None))
 
     out_dir = results_dir / "pipeline_recheck" / split_mode
     metrics_dir = out_dir / "metrics"
@@ -134,7 +135,12 @@ def main(args):
 
     for step_rel, reqs in expected.items():
         step_name = step_rel.split("/")[0]
-        step_root = base_results_dir if step_name in {"step0_data_prep", "step3_chi_target_learning"} else results_dir
+        if step_name in {"step0_data_prep", "step3_chi_target_learning"}:
+            step_root = base_results_dir
+        elif step_name == "step4_chi_training":
+            step_root = results_dir_nosplit
+        else:
+            step_root = results_dir
         step_path = step_root / step_rel
         exists = step_path.exists()
 

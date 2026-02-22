@@ -19,7 +19,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from src.chi.constants import COEFF_NAMES  # noqa: E402
 from src.chi.metrics import classification_metrics, hit_metrics, metrics_by_group, regression_metrics  # noqa: E402
+from src.chi.model import predict_chi_from_coefficients  # noqa: E402
 from common import (  # noqa: E402
     FingerprintConfig,
     build_final_fit_split_df,
@@ -42,18 +44,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from matplotlib.lines import Line2D
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessClassifier
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, RBF, WhiteKernel
 from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.multioutput import MultiOutputRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
+WATER_SOLUBLE_PALETTE = {0: "#d62728", 1: "#1f77b4"}
+
 
 @dataclass
 class StageConfig:
@@ -292,6 +299,50 @@ def _plot_class_prob_density_safe(ax, test_df: pd.DataFrame) -> None:
         )
 
 
+def _save_binary_confusion_matrix_figure(
+    sub: pd.DataFrame,
+    out_png: Path,
+    title: str,
+    dpi: int,
+) -> None:
+    if sub.empty or "water_soluble" not in sub.columns:
+        return
+    y_true = pd.to_numeric(sub["water_soluble"], errors="coerce").fillna(0).to_numpy(dtype=int)
+    if "class_pred" in sub.columns:
+        y_pred = pd.to_numeric(sub["class_pred"], errors="coerce").fillna(0).to_numpy(dtype=int)
+    elif "class_prob" in sub.columns:
+        y_pred = (pd.to_numeric(sub["class_prob"], errors="coerce").fillna(0.0).to_numpy(dtype=float) >= 0.5).astype(int)
+    else:
+        return
+    if len(y_true) == 0:
+        return
+
+    cm = np.zeros((2, 2), dtype=int)
+    for yt, yp in zip(y_true, y_pred):
+        yt_bin = int(np.clip(int(yt), 0, 1))
+        yp_bin = int(np.clip(int(yp), 0, 1))
+        cm[yt_bin, yp_bin] += 1
+
+    fig, ax = plt.subplots(figsize=(5.2, 4.6))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cbar=False,
+        cmap="Blues",
+        square=True,
+        xticklabels=["0", "1"],
+        yticklabels=["0", "1"],
+        ax=ax,
+    )
+    ax.set_xlabel("Predicted water_soluble")
+    ax.set_ylabel("True water_soluble")
+    ax.set_title(f"{title} (n={len(y_true)})")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
 def _normalize_tuning_objective(value: object, default_tuning_objective: str) -> str:
     raw = str(value).strip().lower()
     default_norm = str(default_tuning_objective).strip().lower()
@@ -499,18 +550,19 @@ class GPyRegressor(BaseEstimator, RegressorMixin):
 
 def _build_regression_estimator(model_name: str, params: Dict[str, object], seed: int):
     model_name = str(model_name).strip().lower()
+    base_estimator = None
     if model_name == "ridge":
         alpha = float(params.get("alpha", 1.0))
         fit_intercept = _resolve_bool_like(params.get("fit_intercept", True), default=True)
-        return Pipeline(
+        base_estimator = Pipeline(
             [
                 ("scaler", StandardScaler()),
                 ("model", Ridge(alpha=alpha, fit_intercept=fit_intercept)),
             ]
         )
-    if model_name == "random_forest":
+    elif model_name == "random_forest":
         max_features = _resolve_max_features(params.get("max_features", 1.0), default=1.0)
-        return RandomForestRegressor(
+        base_estimator = RandomForestRegressor(
             n_estimators=int(params.get("n_estimators", 600)),
             max_depth=None if params.get("max_depth", None) in {None, 0} else int(params["max_depth"]),
             min_samples_split=int(params.get("min_samples_split", 2)),
@@ -520,9 +572,9 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
             n_jobs=-1,
             random_state=int(seed),
         )
-    if model_name == "xgboost":
+    elif model_name == "xgboost":
         _, XGBRegressor = _load_xgboost_classes()
-        return XGBRegressor(
+        base_estimator = XGBRegressor(
             objective="reg:squarederror",
             eval_metric="rmse",
             n_estimators=int(params.get("n_estimators", 800)),
@@ -539,13 +591,13 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
             n_jobs=-1,
             tree_method="hist",
         )
-    if model_name == "mlp":
+    elif model_name == "mlp":
         hidden_layers = tuple(int(x) for x in params.get("hidden_layers", (512, 256)))
         alpha = float(params.get("alpha", 1.0e-4))
         lr = float(params.get("learning_rate_init", 1.0e-3))
         activation = str(params.get("activation", "relu"))
         batch_size = _resolve_mlp_batch_size(params.get("batch_size", "auto"))
-        return Pipeline(
+        base_estimator = Pipeline(
             [
                 ("scaler", StandardScaler()),
                 (
@@ -564,13 +616,13 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
                 ),
             ]
         )
-    if model_name == "gpr":
+    elif model_name == "gpr":
         alpha = float(params.get("alpha", 1.0e-5))
         kernel_name = str(params.get("kernel", "rbf"))
         length_scale = float(params.get("length_scale", 1.0))
         kernel_variance = float(params.get("kernel_variance", 1.0))
         max_iters = int(params.get("max_iters", 200))
-        return Pipeline(
+        base_estimator = Pipeline(
             [
                 ("scaler", StandardScaler()),
                 (
@@ -585,7 +637,14 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
                 ),
             ]
         )
-    raise ValueError(f"Unsupported regression model: {model_name}")
+    else:
+        raise ValueError(f"Unsupported regression model: {model_name}")
+
+    # Step4_3_1 regression predicts 6 physics coefficients (a0,a1,a2,a3,b1,b2).
+    # Some estimators require explicit multi-output wrapping.
+    if model_name in {"xgboost", "gpr"}:
+        return MultiOutputRegressor(base_estimator)
+    return base_estimator
 
 
 def _build_classification_estimator(model_name: str, params: Dict[str, object], seed: int):
@@ -938,6 +997,124 @@ def _predict_class_probability(model, X: np.ndarray) -> np.ndarray:
     return np.clip(pred, 0.0, 1.0)
 
 
+def _coerce_coeff_matrix(coefficients: np.ndarray, expected_rows: int, context: str) -> np.ndarray:
+    coeff = np.asarray(coefficients, dtype=float)
+    n_coeff = int(len(COEFF_NAMES))
+
+    if coeff.size == 0:
+        if expected_rows == 0:
+            return np.zeros((0, n_coeff), dtype=float)
+        raise ValueError(f"{context}: empty coefficient predictions for expected_rows={expected_rows}")
+
+    if coeff.ndim == 0:
+        coeff = coeff.reshape(1, 1)
+    elif coeff.ndim == 1:
+        if expected_rows <= 0:
+            raise ValueError(f"{context}: invalid expected_rows={expected_rows} for 1D coefficients")
+        if coeff.size == n_coeff and expected_rows == 1:
+            coeff = coeff.reshape(1, n_coeff)
+        elif coeff.size % expected_rows == 0:
+            coeff = coeff.reshape(expected_rows, coeff.size // expected_rows)
+        else:
+            raise ValueError(
+                f"{context}: coefficient size mismatch (size={coeff.size}, expected_rows={expected_rows})"
+            )
+    elif coeff.ndim != 2:
+        raise ValueError(f"{context}: expected 1D/2D coefficients, got shape={coeff.shape}")
+
+    if coeff.shape[0] != expected_rows:
+        if coeff.shape[1] == expected_rows:
+            coeff = coeff.T
+        else:
+            raise ValueError(
+                f"{context}: coefficient row mismatch (shape={coeff.shape}, expected_rows={expected_rows})"
+            )
+    if coeff.shape[1] != n_coeff:
+        raise ValueError(
+            f"{context}: coefficient dim mismatch (got={coeff.shape[1]}, expected={n_coeff})"
+        )
+    return coeff.astype(float, copy=False)
+
+
+def _fit_physics_coefficients_for_polymer(poly_df: pd.DataFrame, reg_lambda: float = 1.0e-4) -> np.ndarray:
+    sub = poly_df[["temperature", "phi", "chi"]].copy()
+    sub["temperature"] = pd.to_numeric(sub["temperature"], errors="coerce")
+    sub["phi"] = pd.to_numeric(sub["phi"], errors="coerce")
+    sub["chi"] = pd.to_numeric(sub["chi"], errors="coerce")
+    sub = sub.replace([np.inf, -np.inf], np.nan).dropna()
+    sub = sub[sub["temperature"] > 0.0]
+    sub = sub[(sub["phi"] >= -1.0e-8) & (sub["phi"] <= 1.0 + 1.0e-8)]
+
+    if sub.empty:
+        return np.zeros((len(COEFF_NAMES),), dtype=float)
+
+    temperature = sub["temperature"].to_numpy(dtype=float)
+    phi = np.clip(sub["phi"].to_numpy(dtype=float), 0.0, 1.0)
+    chi_true = sub["chi"].to_numpy(dtype=float)
+
+    y_mean = float(np.nanmean(chi_true)) if len(chi_true) > 0 else 0.0
+    x0 = np.array([y_mean, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=float)
+    prior = x0.copy()
+    if len(chi_true) < 2:
+        return x0
+
+    try:
+        from scipy.optimize import least_squares
+    except Exception:
+        return x0
+
+    def residual(coeff: np.ndarray) -> np.ndarray:
+        pred = np.asarray(predict_chi_from_coefficients(coeff, temperature, phi), dtype=float).reshape(-1)
+        data_res = pred - chi_true
+        if reg_lambda > 0.0:
+            reg_res = np.sqrt(float(reg_lambda)) * (coeff - prior)
+            return np.concatenate([data_res, reg_res], axis=0)
+        return data_res
+
+    try:
+        res = least_squares(
+            residual,
+            x0=x0,
+            method="trf",
+            max_nfev=2000,
+        )
+        coeff = np.asarray(res.x, dtype=float) if res is not None and hasattr(res, "x") else x0
+    except Exception:
+        coeff = x0
+
+    if not np.all(np.isfinite(coeff)):
+        coeff = x0
+    return np.clip(coeff, -1.0e6, 1.0e6).astype(float, copy=False)
+
+
+def _build_polymer_coefficient_targets(train_df: pd.DataFrame) -> Dict[int, np.ndarray]:
+    if train_df.empty:
+        raise ValueError("Cannot build coefficient targets from empty training split.")
+    coeff_by_polymer: Dict[int, np.ndarray] = {}
+    for polymer_id, sub in train_df.groupby("polymer_id"):
+        coeff_by_polymer[int(polymer_id)] = _fit_physics_coefficients_for_polymer(sub)
+    if len(coeff_by_polymer) == 0:
+        raise ValueError("No polymer coefficient targets were generated from training data.")
+    return coeff_by_polymer
+
+
+def _fit_coeff_regression_model_from_split(
+    train_df: pd.DataFrame,
+    fingerprint_table: np.ndarray,
+    model_name: str,
+    model_params: Dict[str, object],
+    seed: int,
+):
+    coeff_by_polymer = _build_polymer_coefficient_targets(train_df)
+    polymer_ids = np.array(sorted(coeff_by_polymer.keys()), dtype=np.int64)
+    X_train = fingerprint_table[polymer_ids].astype(np.float32, copy=False)
+    y_train_coeff = np.stack([coeff_by_polymer[int(pid)] for pid in polymer_ids], axis=0).astype(float, copy=False)
+
+    model = _build_regression_estimator(model_name=model_name, params=model_params, seed=seed)
+    model.fit(X_train, y_train_coeff)
+    return model
+
+
 def _evaluate_regression_cv(
     cv_folds: List[pd.DataFrame],
     fingerprint_table: np.ndarray,
@@ -954,14 +1131,28 @@ def _evaluate_regression_cv(
         if train_df.empty or val_df.empty:
             raise ValueError(f"Invalid CV fold={fold_id}: empty train or val.")
 
-        X_train = features_from_table(train_df, fingerprint_table)
-        y_train = train_df["chi"].to_numpy(dtype=float)
+        model = _fit_coeff_regression_model_from_split(
+            train_df=train_df,
+            fingerprint_table=fingerprint_table,
+            model_name=model_name,
+            model_params=model_params,
+            seed=seed,
+        )
         X_val = features_from_table(val_df, fingerprint_table)
+        coeff_pred = _coerce_coeff_matrix(
+            model.predict(X_val),
+            expected_rows=int(len(val_df)),
+            context=f"cv_fold={fold_id}, model={model_name}",
+        )
         y_val = val_df["chi"].to_numpy(dtype=float)
-
-        model = _build_regression_estimator(model_name=model_name, params=model_params, seed=seed)
-        model.fit(X_train, y_train)
-        y_pred = np.asarray(model.predict(X_val), dtype=float)
+        y_pred = np.asarray(
+            predict_chi_from_coefficients(
+                coeff_pred,
+                val_df["temperature"].to_numpy(dtype=float),
+                val_df["phi"].to_numpy(dtype=float),
+            ),
+            dtype=float,
+        ).reshape(-1)
 
         reg = regression_metrics(y_val, y_pred)
         fold_rows.append(
@@ -978,8 +1169,25 @@ def _evaluate_regression_cv(
             out = val_df.copy()
             out["chi_true"] = y_val
             out["chi_pred"] = y_pred
+            for idx, coeff_name in enumerate(COEFF_NAMES):
+                out[coeff_name] = coeff_pred[:, idx]
             out["fold"] = int(fold_id)
-            val_frames.append(out[["fold", "polymer_id", "Polymer", "SMILES", "water_soluble", "chi_true", "chi_pred"]].copy())
+            val_frames.append(
+                out[
+                    [
+                        "fold",
+                        "polymer_id",
+                        "Polymer",
+                        "SMILES",
+                        "water_soluble",
+                        "temperature",
+                        "phi",
+                        "chi_true",
+                        "chi_pred",
+                        *COEFF_NAMES,
+                    ]
+                ].copy()
+            )
 
     fold_metrics_df = pd.DataFrame(fold_rows)
     return {
@@ -1477,10 +1685,13 @@ def _fit_regression_on_final_split(
     seed: int,
 ):
     train_df = final_fit_df[final_fit_df["split"] == "train"].copy().reset_index(drop=True)
-    X_train = features_from_table(train_df, fingerprint_table)
-    y_train = train_df["chi"].to_numpy(dtype=float)
-    model = _build_regression_estimator(model_name=model_name, params=model_params, seed=seed)
-    model.fit(X_train, y_train)
+    model = _fit_coeff_regression_model_from_split(
+        train_df=train_df,
+        fingerprint_table=fingerprint_table,
+        model_name=model_name,
+        model_params=model_params,
+        seed=seed,
+    )
     return model
 
 
@@ -1508,11 +1719,26 @@ def _save_regression_predictions(split_df: pd.DataFrame, fingerprint_table: np.n
         sub = split_df[split_df["split"] == split].copy().reset_index(drop=True)
         if len(sub) > 0:
             X = features_from_table(sub, fingerprint_table)
-            y_pred = np.asarray(model.predict(X), dtype=float)
+            coeff_pred = _coerce_coeff_matrix(
+                model.predict(X),
+                expected_rows=int(len(sub)),
+                context=f"prediction_split={split}",
+            )
+            y_pred = np.asarray(
+                predict_chi_from_coefficients(
+                    coeff_pred,
+                    sub["temperature"].to_numpy(dtype=float),
+                    sub["phi"].to_numpy(dtype=float),
+                ),
+                dtype=float,
+            ).reshape(-1)
         else:
+            coeff_pred = np.zeros((0, len(COEFF_NAMES)), dtype=float)
             y_pred = np.zeros((0,), dtype=float)
         sub["chi_pred"] = y_pred
         sub["chi_error"] = sub["chi_pred"] - sub["chi"]
+        for idx, coeff_name in enumerate(COEFF_NAMES):
+            sub[coeff_name] = coeff_pred[:, idx]
         sub.to_csv(out_dir / f"chi_predictions_{split}.csv", index=False)
         frames.append(sub)
     all_df = pd.concat(frames, ignore_index=True)
@@ -1555,29 +1781,25 @@ def _collect_regression_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
     pd.DataFrame(polymer_rows).to_csv(out_dir / "chi_metrics_polymer_level.csv", index=False)
 
 
-def _make_regression_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int, font_size: int) -> None:
-    fig_dir.mkdir(parents=True, exist_ok=True)
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
-
-    test_df = pred_df[pred_df["split"] == "test"].copy().reset_index(drop=True)
-    if test_df.empty:
+def _plot_regression_parity_panel(ax, sub: pd.DataFrame, split: str) -> None:
+    if sub.empty:
+        ax.set_axis_off()
+        ax.set_title(f"chi parity ({split}) empty")
         return
 
-    fig, ax = plt.subplots(figsize=(6, 5))
     sns.scatterplot(
-        data=test_df,
+        data=sub,
         x="chi",
         y="chi_pred",
         hue="water_soluble",
-        palette={1: "#1f77b4", 0: "#d62728"},
+        palette=WATER_SOLUBLE_PALETTE,
         alpha=0.75,
         s=18,
         ax=ax,
         legend=True,
     )
-    lo = float(min(test_df["chi"].min(), test_df["chi_pred"].min()))
-    hi = float(max(test_df["chi"].max(), test_df["chi_pred"].max()))
+    lo = float(min(sub["chi"].min(), sub["chi_pred"].min()))
+    hi = float(max(sub["chi"].max(), sub["chi_pred"].max()))
     span = max(hi - lo, 1.0e-8)
     pad = 0.04 * span
     lo_plot = lo - pad
@@ -1589,8 +1811,8 @@ def _make_regression_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int, fon
     ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
     ax.set_xlabel("True chi")
     ax.set_ylabel("Predicted chi")
-    ax.set_title("chi parity (test)")
-    reg = regression_metrics(test_df["chi"], test_df["chi_pred"])
+    ax.set_title(f"chi parity ({split})")
+    reg = regression_metrics(sub["chi"], sub["chi_pred"])
     metrics_text = f"MAE={reg['mae']:.3f}\nRMSE={reg['rmse']:.3f}\nR2={reg['r2']:.3f}"
     ax.text(
         0.03,
@@ -1603,22 +1825,41 @@ def _make_regression_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int, fon
     )
     legend = ax.get_legend()
     if legend is not None:
-        handles = getattr(legend, "legend_handles", None)
-        if handles is None:
-            handles = legend.legendHandles
-        labels = [t.get_text() for t in legend.get_texts()]
         legend.remove()
-        ax.legend(
-            handles=handles,
-            labels=labels,
-            title="water_soluble",
-            loc="upper left",
-            bbox_to_anchor=(1.02, 1.0),
-            borderaxespad=0.0,
-        )
-    fig.tight_layout(rect=(0, 0, 0.82, 1))
-    fig.savefig(fig_dir / "chi_parity_test.png", dpi=dpi)
-    plt.close(fig)
+    handles = [
+        Line2D([], [], marker="o", linestyle="None", color=WATER_SOLUBLE_PALETTE[0], markersize=6),
+        Line2D([], [], marker="o", linestyle="None", color=WATER_SOLUBLE_PALETTE[1], markersize=6),
+    ]
+    ax.legend(
+        handles=handles,
+        labels=["0 (red)", "1 (blue)"],
+        title="water_soluble",
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+    )
+
+
+def _make_regression_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int, font_size: int) -> None:
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    sns.set_theme(style="whitegrid")
+    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
+
+    train_df = pred_df[pred_df["split"] == "train"].copy().reset_index(drop=True)
+    test_df = pred_df[pred_df["split"] == "test"].copy().reset_index(drop=True)
+    if not train_df.empty:
+        fig, ax = plt.subplots(figsize=(6, 5))
+        _plot_regression_parity_panel(ax=ax, sub=train_df, split="train")
+        fig.tight_layout(rect=(0, 0, 0.82, 1))
+        fig.savefig(fig_dir / "chi_parity_train.png", dpi=dpi)
+        plt.close(fig)
+
+    if not test_df.empty:
+        fig, ax = plt.subplots(figsize=(6, 5))
+        _plot_regression_parity_panel(ax=ax, sub=test_df, split="test")
+        fig.tight_layout(rect=(0, 0, 0.82, 1))
+        fig.savefig(fig_dir / "chi_parity_test.png", dpi=dpi)
+        plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(6, 5))
     plotted_any = False
@@ -1684,7 +1925,20 @@ def _make_classification_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int,
     sns.set_theme(style="whitegrid")
     plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
 
+    train_df = pred_df[pred_df["split"] == "train"].copy().reset_index(drop=True)
     test_df = pred_df[pred_df["split"] == "test"].copy().reset_index(drop=True)
+    _save_binary_confusion_matrix_figure(
+        sub=train_df,
+        out_png=fig_dir / "class_confusion_matrix_train.png",
+        title="Step4_3_2 confusion matrix (train)",
+        dpi=dpi,
+    )
+    _save_binary_confusion_matrix_figure(
+        sub=test_df,
+        out_png=fig_dir / "class_confusion_matrix_test.png",
+        title="Step4_3_2 confusion matrix (test)",
+        dpi=dpi,
+    )
     if test_df.empty:
         return
 
@@ -1971,68 +2225,56 @@ def _run_regression_stage(
     font_size: int,
 ) -> Dict[str, object]:
     metrics_dir = reg_dir / "metrics"
-    figures_dir = reg_dir / "figures"
-    tuning_dir = reg_dir / "tuning"
-    checkpoint_dir = reg_dir / "checkpoints"
     models_dir = reg_dir / "models"
-    for d in [metrics_dir, figures_dir, tuning_dir, checkpoint_dir, models_dir]:
+    for d in [metrics_dir, models_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     split_assign.to_csv(metrics_dir / "split_assignments.csv", index=False)
     split_df.to_csv(metrics_dir / "chi_dataset_with_split.csv", index=False)
 
-    if stage_cfg.tune:
-        tuned = _tune_regression(
-            split_df=split_df,
-            fingerprint_table=fingerprint_table,
-            stage_cfg=stage_cfg,
-            tuning_dir=tuning_dir,
-            dpi=dpi,
-            font_size=font_size,
-        )
-        best_model_name = str(tuned["best_model_name"])
-        best_params = dict(tuned["best_params"])
-        best_params_by_model = dict(tuned.get("best_params_by_model", {}))
-        hyper_summary = {
-            "selection_mode": "optuna",
-            "objective": _objective_summary_name(stage_cfg.tuning_objective),
-            "objective_name": stage_cfg.tuning_objective,
-            "best_model_name": best_model_name,
-            "best_params": _to_serializable(best_params),
-            "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
-        }
-    else:
-        best_model_name = str(stage_cfg.models[0])
-        best_params = _default_regression_params(best_model_name)
-        best_params_by_model = {str(m): _default_regression_params(str(m)) for m in stage_cfg.models}
-        hyper_summary = {
-            "selection_mode": "default_no_tuning",
-            "objective_name": stage_cfg.tuning_objective,
-            "best_model_name": best_model_name,
-            "best_params": _to_serializable(best_params),
-            "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
-        }
-
-    with open(metrics_dir / "chosen_hyperparameters.json", "w") as f:
-        json.dump({"model_name": best_model_name, "params": _to_serializable(best_params)}, f, indent=2)
-    with open(metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
-        json.dump(hyper_summary, f, indent=2)
-
     model_outputs: List[Dict[str, object]] = []
     for model_name in stage_cfg.models:
-        params = best_params_by_model.get(str(model_name), None)
-        if not isinstance(params, dict):
-            params = _default_regression_params(str(model_name))
-            param_source = "default_fallback"
+        model_name_str = str(model_name)
+        model_dir = models_dir / model_name_str
+        tuning_dir = model_dir / "tuning"
+        tuning_dir.mkdir(parents=True, exist_ok=True)
+
+        if stage_cfg.tune:
+            model_cfg = copy.deepcopy(stage_cfg)
+            model_cfg.models = [model_name_str]
+            tuned = _tune_regression(
+                split_df=split_df,
+                fingerprint_table=fingerprint_table,
+                stage_cfg=model_cfg,
+                tuning_dir=tuning_dir,
+                dpi=dpi,
+                font_size=font_size,
+            )
+            params = tuned.get("best_params", _default_regression_params(model_name_str))
+            param_source = "optuna_single_model"
         else:
-            param_source = "optuna_best_per_model" if stage_cfg.tune else "default_no_tuning"
+            params = _default_regression_params(model_name_str)
+            param_source = "default_no_tuning"
+            with open(tuning_dir / "tuning_skipped.json", "w") as f:
+                json.dump(
+                    {
+                        "tuning_enabled": False,
+                        "reason": "stage_cfg.tune is false",
+                        "model_name": model_name_str,
+                    },
+                    f,
+                    indent=2,
+                )
+
+        if not isinstance(params, dict):
+            params = _default_regression_params(model_name_str)
+            param_source = "default_fallback"
         params = dict(params)
-        model_dir = models_dir / str(model_name)
         out = _run_single_regression_model(
             split_df=split_df,
             split_assign=split_assign,
             fingerprint_table=fingerprint_table,
-            model_name=str(model_name),
+            model_name=model_name_str,
             model_params=params,
             seed=stage_cfg.seed,
             out_dir=model_dir,
@@ -2048,27 +2290,30 @@ def _run_regression_stage(
                 "metrics_dir": out["metrics_dir"],
                 "figures_dir": out["figures_dir"],
                 "checkpoint": out["checkpoint"],
+                "tuning_dir": str(tuning_dir),
                 "test_r2": out["test_r2"],
                 "test_rmse": out["test_rmse"],
                 "test_mae": out["test_mae"],
             }
         )
 
-    best_out = _run_single_regression_model(
-        split_df=split_df,
-        split_assign=split_assign,
-        fingerprint_table=fingerprint_table,
-        model_name=best_model_name,
-        model_params=best_params,
-        seed=stage_cfg.seed,
-        out_dir=reg_dir,
-        checkpoint_basename="chi_regression_traditional_best.joblib",
-        dpi=dpi,
-        font_size=font_size,
-    )
-
     with open(metrics_dir / "model_hyperparameters_by_model.json", "w") as f:
         json.dump({x["model_name"]: x["params"] for x in model_outputs}, f, indent=2)
+    with open(metrics_dir / "chosen_hyperparameters.json", "w") as f:
+        json.dump({x["model_name"]: x["params"] for x in model_outputs}, f, indent=2)
+    with open(metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
+        json.dump(
+            {
+                "selection_mode": "per_model_optuna" if stage_cfg.tune else "default_no_tuning",
+                "objective_name": stage_cfg.tuning_objective,
+                "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
+                "model_names": [str(m) for m in stage_cfg.models],
+                "cross_model_best_selected_in_step4_3": False,
+                "selection_note": "Step4_3 trains each model independently; cross-model selection is deferred to Step4_4.",
+            },
+            f,
+            indent=2,
+        )
     pd.DataFrame(
         [
             {
@@ -2077,6 +2322,7 @@ def _run_regression_stage(
                 "metrics_dir": x["metrics_dir"],
                 "figures_dir": x["figures_dir"],
                 "checkpoint": x["checkpoint"],
+                "tuning_dir": x["tuning_dir"],
                 "test_r2": x["test_r2"],
                 "test_rmse": x["test_rmse"],
                 "test_mae": x["test_mae"],
@@ -2086,13 +2332,10 @@ def _run_regression_stage(
     ).to_csv(metrics_dir / "model_metrics_summary.csv", index=False)
 
     return {
-        "metrics_dir": best_out["metrics_dir"],
-        "figures_dir": best_out["figures_dir"],
-        "checkpoint": best_out["checkpoint"],
+        "metrics_dir": str(metrics_dir),
         "models_dir": str(models_dir),
-        "best_model_name": best_model_name,
-        "test_r2": _safe_float(best_out["test_r2"]),
-        "test_rmse": _safe_float(best_out["test_rmse"]),
+        "n_models": int(len(model_outputs)),
+        "model_metrics_summary": str(metrics_dir / "model_metrics_summary.csv"),
     }
 
 
@@ -2107,68 +2350,56 @@ def _run_classification_stage(
     font_size: int,
 ) -> Dict[str, object]:
     metrics_dir = cls_dir / "metrics"
-    figures_dir = cls_dir / "figures"
-    tuning_dir = cls_dir / "tuning"
-    checkpoint_dir = cls_dir / "checkpoints"
     models_dir = cls_dir / "models"
-    for d in [metrics_dir, figures_dir, tuning_dir, checkpoint_dir, models_dir]:
+    for d in [metrics_dir, models_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     split_assign.to_csv(metrics_dir / "split_assignments.csv", index=False)
     split_df.to_csv(metrics_dir / "chi_dataset_with_split.csv", index=False)
 
-    if stage_cfg.tune:
-        tuned = _tune_classification(
-            split_df=split_df,
-            fingerprint_table=fingerprint_table,
-            stage_cfg=stage_cfg,
-            tuning_dir=tuning_dir,
-            dpi=dpi,
-            font_size=font_size,
-        )
-        best_model_name = str(tuned["best_model_name"])
-        best_params = dict(tuned["best_params"])
-        best_params_by_model = dict(tuned.get("best_params_by_model", {}))
-        hyper_summary = {
-            "selection_mode": "optuna",
-            "objective": _objective_summary_name(stage_cfg.tuning_objective),
-            "objective_name": stage_cfg.tuning_objective,
-            "best_model_name": best_model_name,
-            "best_params": _to_serializable(best_params),
-            "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
-        }
-    else:
-        best_model_name = str(stage_cfg.models[0])
-        best_params = _default_classification_params(best_model_name)
-        best_params_by_model = {str(m): _default_classification_params(str(m)) for m in stage_cfg.models}
-        hyper_summary = {
-            "selection_mode": "default_no_tuning",
-            "objective_name": stage_cfg.tuning_objective,
-            "best_model_name": best_model_name,
-            "best_params": _to_serializable(best_params),
-            "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
-        }
-
-    with open(metrics_dir / "chosen_hyperparameters.json", "w") as f:
-        json.dump({"model_name": best_model_name, "params": _to_serializable(best_params)}, f, indent=2)
-    with open(metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
-        json.dump(hyper_summary, f, indent=2)
-
     model_outputs: List[Dict[str, object]] = []
     for model_name in stage_cfg.models:
-        params = best_params_by_model.get(str(model_name), None)
-        if not isinstance(params, dict):
-            params = _default_classification_params(str(model_name))
-            param_source = "default_fallback"
+        model_name_str = str(model_name)
+        model_dir = models_dir / model_name_str
+        tuning_dir = model_dir / "tuning"
+        tuning_dir.mkdir(parents=True, exist_ok=True)
+
+        if stage_cfg.tune:
+            model_cfg = copy.deepcopy(stage_cfg)
+            model_cfg.models = [model_name_str]
+            tuned = _tune_classification(
+                split_df=split_df,
+                fingerprint_table=fingerprint_table,
+                stage_cfg=model_cfg,
+                tuning_dir=tuning_dir,
+                dpi=dpi,
+                font_size=font_size,
+            )
+            params = tuned.get("best_params", _default_classification_params(model_name_str))
+            param_source = "optuna_single_model"
         else:
-            param_source = "optuna_best_per_model" if stage_cfg.tune else "default_no_tuning"
+            params = _default_classification_params(model_name_str)
+            param_source = "default_no_tuning"
+            with open(tuning_dir / "tuning_skipped.json", "w") as f:
+                json.dump(
+                    {
+                        "tuning_enabled": False,
+                        "reason": "stage_cfg.tune is false",
+                        "model_name": model_name_str,
+                    },
+                    f,
+                    indent=2,
+                )
+
+        if not isinstance(params, dict):
+            params = _default_classification_params(model_name_str)
+            param_source = "default_fallback"
         params = dict(params)
-        model_dir = models_dir / str(model_name)
         out = _run_single_classification_model(
             split_df=split_df,
             split_assign=split_assign,
             fingerprint_table=fingerprint_table,
-            model_name=str(model_name),
+            model_name=model_name_str,
             model_params=params,
             seed=stage_cfg.seed,
             out_dir=model_dir,
@@ -2184,27 +2415,30 @@ def _run_classification_stage(
                 "metrics_dir": out["metrics_dir"],
                 "figures_dir": out["figures_dir"],
                 "checkpoint": out["checkpoint"],
+                "tuning_dir": str(tuning_dir),
                 "test_balanced_accuracy": out["test_balanced_accuracy"],
                 "test_auroc": out["test_auroc"],
                 "test_f1": out["test_f1"],
             }
         )
 
-    best_out = _run_single_classification_model(
-        split_df=split_df,
-        split_assign=split_assign,
-        fingerprint_table=fingerprint_table,
-        model_name=best_model_name,
-        model_params=best_params,
-        seed=stage_cfg.seed,
-        out_dir=cls_dir,
-        checkpoint_basename="chi_classifier_traditional_best.joblib",
-        dpi=dpi,
-        font_size=font_size,
-    )
-
     with open(metrics_dir / "model_hyperparameters_by_model.json", "w") as f:
         json.dump({x["model_name"]: x["params"] for x in model_outputs}, f, indent=2)
+    with open(metrics_dir / "chosen_hyperparameters.json", "w") as f:
+        json.dump({x["model_name"]: x["params"] for x in model_outputs}, f, indent=2)
+    with open(metrics_dir / "hyperparameter_selection_summary.json", "w") as f:
+        json.dump(
+            {
+                "selection_mode": "per_model_optuna" if stage_cfg.tune else "default_no_tuning",
+                "objective_name": stage_cfg.tuning_objective,
+                "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
+                "model_names": [str(m) for m in stage_cfg.models],
+                "cross_model_best_selected_in_step4_3": False,
+                "selection_note": "Step4_3 trains each model independently; cross-model selection is deferred to Step4_4.",
+            },
+            f,
+            indent=2,
+        )
     pd.DataFrame(
         [
             {
@@ -2213,6 +2447,7 @@ def _run_classification_stage(
                 "metrics_dir": x["metrics_dir"],
                 "figures_dir": x["figures_dir"],
                 "checkpoint": x["checkpoint"],
+                "tuning_dir": x["tuning_dir"],
                 "test_balanced_accuracy": x["test_balanced_accuracy"],
                 "test_auroc": x["test_auroc"],
                 "test_f1": x["test_f1"],
@@ -2222,13 +2457,10 @@ def _run_classification_stage(
     ).to_csv(metrics_dir / "model_metrics_summary.csv", index=False)
 
     return {
-        "metrics_dir": best_out["metrics_dir"],
-        "figures_dir": best_out["figures_dir"],
-        "checkpoint": best_out["checkpoint"],
+        "metrics_dir": str(metrics_dir),
         "models_dir": str(models_dir),
-        "best_model_name": best_model_name,
-        "test_balanced_accuracy": _safe_float(best_out["test_balanced_accuracy"]),
-        "test_auroc": _safe_float(best_out["test_auroc"]),
+        "n_models": int(len(model_outputs)),
+        "model_metrics_summary": str(metrics_dir / "model_metrics_summary.csv"),
     }
 
 
@@ -2247,7 +2479,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=["polymer", "random"],
-        help="Optional split mode override (otherwise uses config traditional_step4.shared.split_mode).",
+        help=(
+            "Optional regression split mode override "
+            "(otherwise uses config traditional_step4.shared.split_mode). "
+            "Step4_3_2 classification uses a fixed split mode and is not keyed by this flag."
+        ),
     )
     parser.add_argument("--regression_dataset_path", type=str, default=None)
     parser.add_argument("--classification_dataset_path", type=str, default=None)
@@ -2285,7 +2521,9 @@ def main() -> None:
     split_cfg = shared_cfg.get("split", {}) if isinstance(shared_cfg.get("split", {}), dict) else {}
     fp_cfg_raw = shared_cfg.get("fingerprint", {}) if isinstance(shared_cfg.get("fingerprint", {}), dict) else {}
 
-    split_mode = normalize_split_mode(args.split_mode or shared_cfg.get("split_mode", "polymer"))
+    reg_split_mode = normalize_split_mode(args.split_mode or shared_cfg.get("split_mode", "polymer"))
+    # Classification split is intentionally decoupled from regression split mode.
+    cls_split_mode = normalize_split_mode(shared_cfg.get("classification_split_mode", "random"))
     holdout_test_ratio = split_cfg.get("holdout_test_ratio", None)
     tune_override = True if args.tune else (False if args.no_tune else None)
 
@@ -2309,7 +2547,7 @@ def main() -> None:
     if run_reg:
         reg_cfg = _resolve_stage_config(
             stage_section=reg_cfg_section,
-            shared_split_mode=split_mode,
+            shared_split_mode=reg_split_mode,
             shared_holdout=holdout_test_ratio,
             seed=seed,
             default_tuning_objective="val_r2",
@@ -2323,7 +2561,7 @@ def main() -> None:
     if run_cls:
         cls_cfg = _resolve_stage_config(
             stage_section=cls_cfg_section,
-            shared_split_mode=split_mode,
+            shared_split_mode=cls_split_mode,
             shared_holdout=holdout_test_ratio,
             seed=seed,
             default_tuning_objective="val_balanced_accuracy",
@@ -2339,13 +2577,21 @@ def main() -> None:
         "classification_dataset_path", "Data/water_solvent/water_solvent_polymers.csv"
     )
 
-    results_dir = get_traditional_results_dir(results_root=results_root, split_mode=split_mode)
-    step_dir = results_dir / "step4_3_traditional" / split_mode
+    # New layout:
+    # - regression: .../step4_3_traditional/step4_3_1_regression/{polymer|random}
+    # - classification: .../step4_3_traditional/step4_3_2_classification
+    results_dir = get_traditional_results_dir(results_root=results_root)
+    step_dir = results_dir / "step4_3_traditional"
     shared_dir = step_dir / "shared"
-    reg_dir = step_dir / "step4_3_1_regression"
+    reg_dir = step_dir / "step4_3_1_regression" / reg_split_mode
     cls_dir = step_dir / "step4_3_2_classification"
     pipeline_metrics_dir = step_dir / "pipeline_metrics"
-    pipeline_metrics_run_dir = pipeline_metrics_dir if args.stage == "both" else (pipeline_metrics_dir / args.stage)
+    if args.stage == "step4_3_1":
+        pipeline_metrics_run_dir = pipeline_metrics_dir / "step4_3_1_regression" / reg_split_mode
+    elif args.stage == "step4_3_2":
+        pipeline_metrics_run_dir = pipeline_metrics_dir / "step4_3_2_classification"
+    else:
+        pipeline_metrics_run_dir = pipeline_metrics_dir / f"both_{reg_split_mode}"
     for d in [results_dir, step_dir, shared_dir, reg_dir, cls_dir, pipeline_metrics_dir, pipeline_metrics_run_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -2361,7 +2607,8 @@ def main() -> None:
     if not isinstance(effective_shared_cfg, dict):
         effective_shared_cfg = {}
         effective_trad_cfg["shared"] = effective_shared_cfg
-    effective_shared_cfg["split_mode"] = str(split_mode)
+    effective_shared_cfg["split_mode"] = str(reg_split_mode)
+    effective_shared_cfg["classification_split_mode"] = str(cls_split_mode)
     effective_shared_cfg["regression_dataset_path"] = str(reg_dataset)
     effective_shared_cfg["classification_dataset_path"] = str(cls_dataset)
     effective_shared_split_cfg = effective_shared_cfg.setdefault("split", {})
@@ -2408,7 +2655,8 @@ def main() -> None:
         "config_path": args.config,
         "stage": args.stage,
         "results_dir": str(results_dir),
-        "split_mode": split_mode,
+        "regression_split_mode": reg_split_mode,
+        "classification_split_mode": cls_split_mode,
         "regression_dataset_path": str(reg_dataset),
         "classification_dataset_path": str(cls_dataset),
         "fingerprint_radius": int(fp_cfg.radius),
@@ -2447,7 +2695,8 @@ def main() -> None:
     print("=" * 80)
     print("Step 4_3 traditional pipeline")
     print(f"Stage: {args.stage}")
-    print(f"Split mode: {split_mode}")
+    print(f"Regression split mode: {reg_split_mode}")
+    print(f"Classification split mode: {cls_split_mode}")
     print(f"Regression dataset: {reg_dataset}")
     print(f"Classification dataset: {cls_dataset}")
     print(f"Morgan fingerprint: radius={fp_cfg.radius}, nBits={fp_cfg.n_bits}")
@@ -2456,7 +2705,8 @@ def main() -> None:
     summary = {
         "step": "step4_3_traditional",
         "stage": args.stage,
-        "split_mode": split_mode,
+        "regression_split_mode": reg_split_mode,
+        "classification_split_mode": cls_split_mode,
         "results_dir": str(results_dir),
         "step_dir": str(step_dir),
         "regression_dataset_path": str(reg_dataset),
@@ -2491,20 +2741,20 @@ def main() -> None:
             raise RuntimeError("Regression stage requested but regression configuration is not initialized.")
         reg_split_df, reg_split_assign = load_split_dataset(
             dataset_path=reg_dataset,
-            split_mode=split_mode,
+            split_mode=reg_split_mode,
             split_ratios=reg_split_ratios,
             seed=seed,
             is_classification_dataset=False,
         )
-        reg_split_assign.to_csv(shared_dir / "split_assignments_step4_3_1.csv", index=False)
-        reg_split_df.to_csv(shared_dir / "chi_dataset_with_split_step4_3_1.csv", index=False)
+        reg_split_assign.to_csv(shared_dir / f"split_assignments_step4_3_1_{reg_split_mode}.csv", index=False)
+        reg_split_df.to_csv(shared_dir / f"chi_dataset_with_split_step4_3_1_{reg_split_mode}.csv", index=False)
 
         reg_table, reg_fp_meta = build_or_load_fingerprint_cache(
             df=reg_split_df,
             fp_cfg=fp_cfg,
-            cache_npz=shared_dir / "morgan_fingerprint_table_step4_3_1.npz",
+            cache_npz=shared_dir / f"morgan_fingerprint_table_step4_3_1_{reg_split_mode}.npz",
         )
-        with open(shared_dir / "morgan_fingerprint_metadata_step4_3_1.json", "w") as f:
+        with open(shared_dir / f"morgan_fingerprint_metadata_step4_3_1_{reg_split_mode}.json", "w") as f:
             json.dump(reg_fp_meta, f, indent=2)
 
         reg_out = _run_regression_stage(
@@ -2519,11 +2769,10 @@ def main() -> None:
         summary.update(
             {
                 "step4_3_1_metrics_dir": reg_out["metrics_dir"],
-                "step4_3_1_checkpoint": reg_out["checkpoint"],
                 "step4_3_1_models_dir": reg_out.get("models_dir", ""),
-                "step4_3_1_best_model_name": reg_out["best_model_name"],
-                "step4_3_1_test_r2": reg_out["test_r2"],
-                "step4_3_1_test_rmse": reg_out["test_rmse"],
+                "step4_3_1_model_metrics_summary": reg_out.get("model_metrics_summary", ""),
+                "step4_3_1_n_models": reg_out.get("n_models", 0),
+                "step4_3_1_cross_model_best_selected": False,
             }
         )
     else:
@@ -2534,7 +2783,7 @@ def main() -> None:
             raise RuntimeError("Classification stage requested but classification configuration is not initialized.")
         cls_split_df, cls_split_assign = load_split_dataset(
             dataset_path=cls_dataset,
-            split_mode=split_mode,
+            split_mode=cls_split_mode,
             split_ratios=cls_split_ratios,
             seed=seed,
             is_classification_dataset=True,
@@ -2562,18 +2811,21 @@ def main() -> None:
         summary.update(
             {
                 "step4_3_2_metrics_dir": cls_out["metrics_dir"],
-                "step4_3_2_checkpoint": cls_out["checkpoint"],
                 "step4_3_2_models_dir": cls_out.get("models_dir", ""),
-                "step4_3_2_best_model_name": cls_out["best_model_name"],
-                "step4_3_2_test_balanced_accuracy": cls_out["test_balanced_accuracy"],
-                "step4_3_2_test_auroc": cls_out["test_auroc"],
+                "step4_3_2_model_metrics_summary": cls_out.get("model_metrics_summary", ""),
+                "step4_3_2_n_models": cls_out.get("n_models", 0),
+                "step4_3_2_cross_model_best_selected": False,
             }
         )
     else:
         print("Skipping Step4_3_2 classification stage by request.")
 
     save_step_summary(summary, pipeline_metrics_run_dir)
-    print(f"Step4_3 outputs: {step_dir}")
+    print(f"Step4_3 outputs root: {step_dir}")
+    if run_reg:
+        print(f"Step4_3_1 regression ({reg_split_mode}) outputs: {reg_dir}")
+    if run_cls:
+        print(f"Step4_3_2 classification outputs: {cls_dir}")
 
 
 if __name__ == "__main__":
