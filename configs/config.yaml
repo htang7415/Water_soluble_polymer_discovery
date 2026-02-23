@@ -125,7 +125,7 @@ training_property:
 chi_training:
   shared:
     dataset_path: "Data/chi/_50_polymers_T_phi.csv"  # labeled chi(T,phi) dataset used in Step 3 and Step4_1
-    split_mode: "random"  # data split mode: polymer (hold out polymers) | random (row-wise random)
+    split_mode: "polymer"  # data split mode: polymer (hold out polymers) | random (row-wise random)
     classification_split_mode: "random"  # Step4_2 split mode (independent of split_mode used by Step4_1)
     split:
       # Step 4 split is CV-driven by default:
@@ -175,9 +175,11 @@ chi_training:
       weight_decay_log: true
       batch_size: [4, 8, 16, 32, 64, 128]
 
-  # Step4_2: water-soluble classification
+  # Step4_2: water-miscible classification
   step4_2_classification:
-    dataset_path: "Data/water_solvent/water_solvent_polymers.csv"
+    dataset_path:
+      - "Data/water_solvent/water_miscible_polymer.csv"
+      - "Data/water_solvent/water_immiscible_polymer.csv"
     batch_size: 128
     num_epochs: 500
     patience: 20

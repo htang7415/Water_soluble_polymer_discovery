@@ -22,7 +22,7 @@ import pandas as pd
 import seaborn as sns
 
 
-CLASS_NAME_MAP = {1: "Water-soluble", 0: "Water-insoluble"}
+CLASS_NAME_MAP = {1: "Water-miscible", 0: "Water-immiscible"}
 
 
 def _default_chi_config(config: Dict) -> Dict:
@@ -310,14 +310,14 @@ def _make_figures(
         ax=ax,
         df=df,
         class_value=1,
-        label="Water-soluble",
+        label=CLASS_NAME_MAP[1],
         color="#1f77b4",
     ) or plotted_any
     plotted_any = _plot_kde_safe_by_class(
         ax=ax,
         df=df,
         class_value=0,
-        label="Water-insoluble",
+        label=CLASS_NAME_MAP[0],
         color="#d62728",
     ) or plotted_any
     ax.axvline(gthr, color="black", linestyle="--", linewidth=2, label=f"Global χ_target={gthr:.3f}")
@@ -472,7 +472,7 @@ def main(args):
     )
 
     print("=" * 70)
-    print("Step 3: χ_target learning from data + water-soluble labels")
+    print("Step 3: χ_target learning from data + water-miscible labels")
     print(f"dataset={dataset_path}")
     print(f"objective={objective}")
     print(f"bootstrap_repeats={n_bootstrap}")

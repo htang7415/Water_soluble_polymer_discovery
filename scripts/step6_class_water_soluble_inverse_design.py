@@ -18,6 +18,8 @@ import seaborn as sns
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.chi.inverse_design_common import (
+    CLASS_LABEL_INTERNAL,
+    CLASS_LABEL_PUBLIC,
     build_candidate_pool,
     default_chi_config,
     load_soluble_targets,
@@ -123,7 +125,8 @@ def _compute_target_candidates(
     copy_cols = required_cols + [
         c
         for c in [
-            "water_soluble",
+            CLASS_LABEL_INTERNAL,
+            CLASS_LABEL_PUBLIC,
             "candidate_source",
             "canonical_smiles",
             "class_logit",

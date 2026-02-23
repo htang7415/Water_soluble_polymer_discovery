@@ -335,8 +335,8 @@ def _save_binary_confusion_matrix_figure(
         yticklabels=["0", "1"],
         ax=ax,
     )
-    ax.set_xlabel("Predicted water_soluble")
-    ax.set_ylabel("True water_soluble")
+    ax.set_xlabel("Predicted water_miscible")
+    ax.set_ylabel("True water_miscible")
     ax.set_title(f"{title} (n={len(y_true)})")
     fig.tight_layout()
     fig.savefig(out_png, dpi=dpi)
@@ -1833,7 +1833,7 @@ def _plot_regression_parity_panel(ax, sub: pd.DataFrame, split: str) -> None:
     ax.legend(
         handles=handles,
         labels=["0 (red)", "1 (blue)"],
-        title="water_soluble",
+        title="water_miscible",
         loc="upper left",
         bbox_to_anchor=(1.02, 1.0),
         borderaxespad=0.0,
@@ -1944,7 +1944,7 @@ def _make_classification_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int,
 
     fig, ax = plt.subplots(figsize=(6, 5))
     _plot_class_prob_density_safe(ax=ax, test_df=test_df)
-    ax.set_xlabel("Predicted soluble probability")
+    ax.set_xlabel("Predicted water_miscible probability")
     ax.set_title("Class probability distribution (test)")
     legend = ax.get_legend()
     if legend is not None:
@@ -1956,7 +1956,7 @@ def _make_classification_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int,
         ax.legend(
             handles=handles,
             labels=labels,
-            title="water_soluble",
+            title="water_miscible",
             loc="upper left",
             bbox_to_anchor=(1.02, 1.0),
             borderaxespad=0.0,
@@ -2486,7 +2486,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--regression_dataset_path", type=str, default=None)
-    parser.add_argument("--classification_dataset_path", type=str, default=None)
+    parser.add_argument(
+        "--classification_dataset_path",
+        type=str,
+        default=None,
+        help=(
+            "Path/list to classification CSV data "
+            "(supports Polymer/SMILES/water_miscible; accepts single CSV, CSV directory, or comma-separated CSVs)."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=None, help="Override random seed.")
     parser.add_argument("--tune", action="store_true", help="Force-enable Optuna tuning.")
     parser.add_argument("--no_tune", action="store_true", help="Disable Optuna tuning.")
@@ -2574,7 +2582,11 @@ def main() -> None:
 
     reg_dataset = args.regression_dataset_path or shared_cfg.get("regression_dataset_path", "Data/chi/_50_polymers_T_phi.csv")
     cls_dataset = args.classification_dataset_path or shared_cfg.get(
-        "classification_dataset_path", "Data/water_solvent/water_solvent_polymers.csv"
+        "classification_dataset_path",
+        [
+            "Data/water_solvent/water_miscible_polymer.csv",
+            "Data/water_solvent/water_immiscible_polymer.csv",
+        ],
     )
 
     # New layout:
@@ -2610,7 +2622,7 @@ def main() -> None:
     effective_shared_cfg["split_mode"] = str(reg_split_mode)
     effective_shared_cfg["classification_split_mode"] = str(cls_split_mode)
     effective_shared_cfg["regression_dataset_path"] = str(reg_dataset)
-    effective_shared_cfg["classification_dataset_path"] = str(cls_dataset)
+    effective_shared_cfg["classification_dataset_path"] = _to_serializable(cls_dataset)
     effective_shared_split_cfg = effective_shared_cfg.setdefault("split", {})
     if not isinstance(effective_shared_split_cfg, dict):
         effective_shared_split_cfg = {}
@@ -2658,7 +2670,7 @@ def main() -> None:
         "regression_split_mode": reg_split_mode,
         "classification_split_mode": cls_split_mode,
         "regression_dataset_path": str(reg_dataset),
-        "classification_dataset_path": str(cls_dataset),
+        "classification_dataset_path": _to_serializable(cls_dataset),
         "fingerprint_radius": int(fp_cfg.radius),
         "fingerprint_n_bits": int(fp_cfg.n_bits),
         "random_seed": int(seed),
@@ -2710,7 +2722,7 @@ def main() -> None:
         "results_dir": str(results_dir),
         "step_dir": str(step_dir),
         "regression_dataset_path": str(reg_dataset),
-        "classification_dataset_path": str(cls_dataset),
+        "classification_dataset_path": _to_serializable(cls_dataset),
         "fingerprint_radius": int(fp_cfg.radius),
         "fingerprint_n_bits": int(fp_cfg.n_bits),
         "random_seed": int(seed),

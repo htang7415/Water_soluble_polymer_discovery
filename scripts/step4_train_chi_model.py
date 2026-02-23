@@ -40,6 +40,8 @@ from src.utils.reporting import save_step_summary, save_artifact_manifest, write
 
 
 WATER_SOLUBLE_PALETTE = {0: "#d62728", 1: "#1f77b4"}
+CLASS_LABEL_INTERNAL = "water_soluble"
+CLASS_LABEL_PUBLIC = "water_miscible"
 
 
 @dataclass
@@ -276,36 +278,100 @@ def _describe_tuning_objective(train_cfg: TrainConfig) -> str:
 
 
 def _normalize_water_soluble_column(df: pd.DataFrame) -> pd.DataFrame:
-    rename_map = {}
-    for col in df.columns:
+    label_aliases = {
+        "water_soluble",
+        "water_solubel",
+        "water_solubility",
+        "water_miscible",
+        "water miscible",
+        "watermiscible",
+        "water_missible",
+    }
+    out = df.copy()
+
+    matched = []
+    for col in out.columns:
         key = str(col).strip().lower()
-        if key in {"water_soluble", "water_solubel", "water_solubility"}:
-            rename_map[col] = "water_soluble"
-    if rename_map:
-        df = df.rename(columns=rename_map)
-    return df
+        if key in label_aliases:
+            matched.append(col)
+
+    if not matched:
+        return out
+
+    if CLASS_LABEL_INTERNAL not in out.columns:
+        primary = matched[0]
+        if primary != CLASS_LABEL_INTERNAL:
+            out = out.rename(columns={primary: CLASS_LABEL_INTERNAL})
+        matched = [CLASS_LABEL_INTERNAL] + [c for c in matched if c != primary]
+
+    for col in matched:
+        if col == CLASS_LABEL_INTERNAL or col not in out.columns:
+            continue
+        out[CLASS_LABEL_INTERNAL] = out[CLASS_LABEL_INTERNAL].where(
+            out[CLASS_LABEL_INTERNAL].notna(),
+            out[col],
+        )
+
+    # Public-facing alias for updated label naming in downstream tables/plots.
+    out[CLASS_LABEL_PUBLIC] = out[CLASS_LABEL_INTERNAL]
+    return out
+
+
+def _resolve_classification_dataset_paths(csv_path: str | Path | List[str] | Tuple[str, ...]) -> List[Path]:
+    specs: List[str] = []
+    if isinstance(csv_path, (list, tuple)):
+        specs = [str(x).strip() for x in csv_path if str(x).strip()]
+    else:
+        raw = str(csv_path).strip()
+        if len(raw) == 0:
+            raise ValueError("Step4_2 classification dataset path is empty.")
+        if "," in raw:
+            specs = [x.strip() for x in raw.split(",") if x.strip()]
+        else:
+            specs = [raw]
+
+    paths: List[Path] = []
+    for spec in specs:
+        p = Path(spec)
+        if p.is_dir():
+            csvs = sorted(q for q in p.glob("*.csv") if q.is_file())
+            if len(csvs) == 0:
+                raise FileNotFoundError(f"No CSV files found under Step4_2 dataset directory: {p}")
+            paths.extend(csvs)
+        else:
+            if not p.exists():
+                raise FileNotFoundError(f"Step4_2 classification dataset not found: {p}")
+            paths.append(p)
+
+    if len(paths) == 0:
+        raise ValueError("No classification dataset CSV paths resolved for Step4_2.")
+    return paths
+
+
+def _serialize_path_spec(value: object) -> object:
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return str(value)
 
 
 def _load_step42_classification_dataset(
-    csv_path: str | Path,
+    csv_path: str | Path | List[str] | Tuple[str, ...],
     default_temperature: float = 293.15,
     default_phi: float = 0.2,
     default_chi: float = 0.0,
 ) -> pd.DataFrame:
     """Load Step4_2 classification dataset and normalize required columns.
 
-    Step4_2 now supports classification-only CSV files that may only include
-    Polymer/SMILES/water_soluble. Missing physics columns are filled with
+    Step4_2 now supports one or more classification-only CSV files that may only include
+    Polymer/SMILES/water_miscible. Missing physics columns are filled with
     deterministic defaults so existing dataloader interfaces remain unchanged.
     """
-    csv_path = Path(csv_path)
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Step4_2 classification dataset not found: {csv_path}")
-
-    df = pd.read_csv(csv_path)
+    csv_paths = _resolve_classification_dataset_paths(csv_path)
+    df = pd.concat([pd.read_csv(p) for p in csv_paths], ignore_index=True)
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
     df = _normalize_water_soluble_column(df)
 
-    required_base = {"Polymer", "SMILES", "water_soluble"}
+    required_base = {"Polymer", "SMILES", CLASS_LABEL_INTERNAL}
     missing_base = required_base - set(df.columns)
     if missing_base:
         raise ValueError(
@@ -323,7 +389,8 @@ def _load_step42_classification_dataset(
     out["temperature"] = out["temperature"].fillna(float(default_temperature)).astype(float)
     out["phi"] = out["phi"].fillna(float(default_phi)).astype(float)
     out["chi"] = out["chi"].fillna(float(default_chi)).astype(float)
-    out["water_soluble"] = out["water_soluble"].astype(int)
+    out[CLASS_LABEL_INTERNAL] = pd.to_numeric(out[CLASS_LABEL_INTERNAL], errors="coerce").fillna(0).astype(int)
+    out[CLASS_LABEL_PUBLIC] = out[CLASS_LABEL_INTERNAL]
 
     polymer_order = sorted(out["Polymer"].astype(str).unique())
     polymer_to_id = {p: i for i, p in enumerate(polymer_order)}
@@ -352,7 +419,10 @@ def _default_chi_config(config: Dict) -> Dict:
 
     defaults = {
         "dataset_path": "Data/chi/_50_polymers_T_phi.csv",
-        "step4_2_dataset_path": "Data/water_solvent/water_solvent_polymers.csv",
+        "step4_2_dataset_path": [
+            "Data/water_solvent/water_miscible_polymer.csv",
+            "Data/water_solvent/water_immiscible_polymer.csv",
+        ],
         "split_mode": "polymer",
         "classification_split_mode": "random",
         "holdout_test_ratio": None,
@@ -385,7 +455,7 @@ def _default_chi_config(config: Dict) -> Dict:
         "step4_2_dataset_path",
         chi_cfg.get("classification_dataset_path", defaults["step4_2_dataset_path"]),
     )
-    out["step4_2_dataset_path"] = str(step42_cfg.get("dataset_path", step42_dataset_fallback))
+    out["step4_2_dataset_path"] = step42_cfg.get("dataset_path", step42_dataset_fallback)
     out["split_mode"] = str(shared.get("split_mode", chi_cfg.get("split_mode", defaults["split_mode"])))
     out["classification_split_mode"] = str(
         shared.get(
@@ -1536,6 +1606,9 @@ def _plot_class_prob_density_safe(ax, test_df: pd.DataFrame) -> None:
             alpha=0.3,
             ax=ax,
         )
+        legend = ax.get_legend()
+        if legend is not None:
+            legend.set_title(CLASS_LABEL_PUBLIC)
         return
     except Exception as exc:
         if "Multi-dimensional indexing" not in str(exc):
@@ -1585,8 +1658,8 @@ def _save_binary_confusion_matrix_figure(
         yticklabels=["0", "1"],
         ax=ax,
     )
-    ax.set_xlabel("Predicted water_soluble")
-    ax.set_ylabel("True water_soluble")
+    ax.set_xlabel(f"Predicted {CLASS_LABEL_PUBLIC}")
+    ax.set_ylabel(f"True {CLASS_LABEL_PUBLIC}")
     ax.set_title(f"{title} (n={len(y_true)})")
     fig.tight_layout()
     fig.savefig(out_png, dpi=dpi)
@@ -1725,7 +1798,7 @@ def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> 
             ax.legend(
                 handles=handles,
                 labels=["0 (red)", "1 (blue)"],
-                title="water_soluble",
+                title=CLASS_LABEL_PUBLIC,
                 loc="upper left",
                 bbox_to_anchor=(1.02, 1.0),
                 borderaxespad=0.0,
@@ -1762,8 +1835,8 @@ def _plot_classifier_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend
     ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
     ax.set_xticks([0.0, 1.0])
     ax.set_xticklabels(["0", "1"])
-    ax.set_xlabel("True water_soluble")
-    ax.set_ylabel("Predicted soluble probability")
+    ax.set_xlabel(f"True {CLASS_LABEL_PUBLIC}")
+    ax.set_ylabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
 
     cls = classification_metrics(sub["water_soluble"], sub["class_prob"])
     metrics_text = (
@@ -1792,7 +1865,7 @@ def _plot_classifier_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend
             ax.legend(
                 handles=handles,
                 labels=labels,
-                title="water_soluble",
+                title=CLASS_LABEL_PUBLIC,
                 loc="upper left",
                 bbox_to_anchor=(1.02, 1.0),
                 borderaxespad=0.0,
@@ -2723,7 +2796,7 @@ def _make_classifier_figures(
     if not test.empty:
         fig, ax = plt.subplots(figsize=(6, 5))
         _plot_class_prob_density_safe(ax=ax, test_df=test)
-        ax.set_xlabel("Predicted soluble probability")
+        ax.set_xlabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
         ax.set_title("Class probability distribution (test)")
         legend = ax.get_legend()
         if legend is not None:
@@ -2733,7 +2806,7 @@ def _make_classifier_figures(
             ax.legend(
                 handles=handles,
                 labels=labels,
-                title="water_soluble",
+                title=CLASS_LABEL_PUBLIC,
                 loc="upper left",
                 bbox_to_anchor=(1.02, 1.0),
                 borderaxespad=0.0,
@@ -2930,7 +3003,7 @@ def main(args):
             "final_fit_uses_train_plus_val": True,
             "dataset_path": str(reg_csv),
             "step4_1_dataset_path": str(reg_csv),
-            "step4_2_dataset_path": str(cls_csv),
+            "step4_2_dataset_path": _serialize_path_spec(cls_csv),
             "tune": train_cfg.tune,
             "n_trials": train_cfg.n_trials,
             "tuning_objective": train_cfg.tuning_objective,
@@ -2951,7 +3024,7 @@ def main(args):
     print("=" * 70)
     print("Step 4 split pipeline:")
     print("  Step4_1: chi regression")
-    print("  Step4_2: water-soluble classification")
+    print("  Step4_2: water-miscible classification")
     print(f"Stage: {args.stage}")
     print(f"Regression split mode: {reg_split_mode}")
     print(f"Classification split mode: {cls_split_mode}")
@@ -3385,7 +3458,7 @@ def main(args):
             "backbone_num_layers": int(backbone_num_layers),
             "finetune_last_layers": int(cls_finetune_last_layers),
             "backbone_finetune_enabled": bool(cls_use_backbone_finetune),
-            "dataset_path": str(cls_csv),
+            "dataset_path": _serialize_path_spec(cls_csv),
             "config": config,
         }
         cls_legacy_path = legacy_checkpoint_dir / "chi_classifier_best.pt"
@@ -3451,7 +3524,7 @@ def main(args):
         "resolved_test_ratio": float(split_ratios["test_ratio"]),
         "final_fit_uses_train_plus_val": True,
         "step4_1_dataset_path": str(reg_csv),
-        "step4_2_dataset_path": str(cls_csv),
+        "step4_2_dataset_path": _serialize_path_spec(cls_csv),
         "n_data_rows_step4_1": int(len(reg_split_df)),
         "n_polymers_step4_1": int(reg_split_df["polymer_id"].nunique()),
         "n_data_rows_step4_2": int(len(cls_split_df)),
@@ -3549,7 +3622,10 @@ if __name__ == "__main__":
         "--classification_dataset_path",
         type=str,
         default=None,
-        help="Path to Step4_2 classification dataset CSV (supports Polymer/SMILES/water_soluble).",
+        help=(
+            "Path/list to Step4_2 classification CSV data "
+            "(supports Polymer/SMILES/water_miscible; accepts single CSV, CSV directory, or comma-separated CSVs)."
+        ),
     )
     parser.add_argument("--backbone_checkpoint", type=str, default=None, help="Optional backbone checkpoint override")
     parser.add_argument("--tune", action="store_true", help="Enable Optuna tuning")

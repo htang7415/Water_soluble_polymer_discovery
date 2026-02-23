@@ -13,13 +13,16 @@ from sklearn.model_selection import train_test_split
 
 from src.chi.constants import COEFF_NAMES
 
+CLASS_LABEL_INTERNAL = "water_soluble"
+CLASS_LABEL_PUBLIC = "water_miscible"
+
 REQUIRED_CHI_COLUMNS = [
     "Polymer",
     "SMILES",
     "temperature",
     "phi",
     "chi",
-    "water_soluble",
+    CLASS_LABEL_INTERNAL,
 ]
 
 
@@ -70,15 +73,44 @@ def _safe_train_test_split(*args, stratify, random_state: int, test_size: float)
 
 
 def _standardize_water_soluble_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize known typo variants of water_soluble column."""
-    rename_map = {}
-    for col in df.columns:
-        key = col.strip().lower()
-        if key in {"water_solubel", "water_solubility", "water_soluble"}:
-            rename_map[col] = "water_soluble"
-    if rename_map:
-        df = df.rename(columns=rename_map)
-    return df
+    """Normalize typo/alias variants of class label to water_soluble."""
+    out = df.copy()
+    out.columns = [str(c).strip().lstrip("\ufeff") for c in out.columns]
+
+    label_aliases = {
+        "water_solubel",
+        "water_solubility",
+        "water_soluble",
+        "water_miscible",
+        "water miscible",
+        "watermiscible",
+        "water_missible",
+    }
+    matched = []
+    for col in out.columns:
+        key = str(col).strip().lower()
+        if key in label_aliases:
+            matched.append(col)
+
+    if len(matched) == 0:
+        return out
+
+    if CLASS_LABEL_INTERNAL not in out.columns:
+        primary = matched[0]
+        if primary != CLASS_LABEL_INTERNAL:
+            out = out.rename(columns={primary: CLASS_LABEL_INTERNAL})
+        matched = [CLASS_LABEL_INTERNAL] + [c for c in matched if c != primary]
+
+    for col in matched:
+        if col == CLASS_LABEL_INTERNAL or col not in out.columns:
+            continue
+        out[CLASS_LABEL_INTERNAL] = out[CLASS_LABEL_INTERNAL].where(
+            out[CLASS_LABEL_INTERNAL].notna(),
+            out[col],
+        )
+
+    out[CLASS_LABEL_PUBLIC] = out[CLASS_LABEL_INTERNAL]
+    return out
 
 
 
@@ -102,7 +134,8 @@ def load_chi_dataset(csv_path: str | Path) -> pd.DataFrame:
     out["temperature"] = out["temperature"].astype(float)
     out["phi"] = out["phi"].astype(float)
     out["chi"] = out["chi"].astype(float)
-    out["water_soluble"] = out["water_soluble"].astype(int)
+    out[CLASS_LABEL_INTERNAL] = out[CLASS_LABEL_INTERNAL].astype(int)
+    out[CLASS_LABEL_PUBLIC] = out[CLASS_LABEL_INTERNAL]
 
     polymer_order = sorted(out["Polymer"].astype(str).unique())
     polymer_to_id = {p: i for i, p in enumerate(polymer_order)}

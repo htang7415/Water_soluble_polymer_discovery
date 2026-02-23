@@ -23,8 +23,19 @@ from src.chi.constants import COEFF_NAMES
 from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars
 from src.utils.numerics import stable_sigmoid
 
+CLASS_LABEL_INTERNAL = "water_soluble"
+CLASS_LABEL_PUBLIC = "water_miscible"
 
-CLASS_NAME_MAP = {1: "Water-soluble", 0: "Water-insoluble"}
+CLASS_NAME_MAP = {1: "Water-miscible", 0: "Water-immiscible"}
+
+
+def _ensure_internal_label(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if CLASS_LABEL_INTERNAL not in out.columns and CLASS_LABEL_PUBLIC in out.columns:
+        out[CLASS_LABEL_INTERNAL] = out[CLASS_LABEL_PUBLIC]
+    if CLASS_LABEL_INTERNAL in out.columns and CLASS_LABEL_PUBLIC not in out.columns:
+        out[CLASS_LABEL_PUBLIC] = out[CLASS_LABEL_INTERNAL]
+    return out
 
 
 def default_chi_config(config: Dict, step: str | None = None) -> Dict:
@@ -184,6 +195,8 @@ def _load_known_candidates_from_step4_metrics(
         cls_df = pd.concat([pd.read_csv(p) for p in available], ignore_index=True)
         cls_source = available[0]
 
+    cls_df = _ensure_internal_label(cls_df)
+
     required_cls = {"polymer_id", "class_prob"}
     missing_cls = sorted(required_cls - set(cls_df.columns))
     if missing_cls:
@@ -199,8 +212,8 @@ def _load_known_candidates_from_step4_metrics(
         cls_poly["class_logit_std"] = (
             by_poly["class_logit"].std(ddof=0)["class_logit"].fillna(0.0).astype(float)
         )
-    if "water_soluble" in cls_df.columns:
-        cls_poly["water_soluble"] = by_poly["water_soluble"].max()["water_soluble"]
+    if CLASS_LABEL_INTERNAL in cls_df.columns:
+        cls_poly[CLASS_LABEL_INTERNAL] = by_poly[CLASS_LABEL_INTERNAL].max()[CLASS_LABEL_INTERNAL]
 
     out = reg_df.merge(cls_poly, on="polymer_id", how="left")
     if out["class_prob"].isna().any():
@@ -215,8 +228,8 @@ def _load_known_candidates_from_step4_metrics(
     out["canonical_smiles"] = out["canonical_smiles"].where(out["canonical_smiles"].notna(), out["SMILES"].astype(str))
     out["candidate_source"] = "known_step4"
     out["is_novel_vs_train"] = (~out["canonical_smiles"].isin(training_canonical)).astype(int)
-    if "water_soluble" not in out.columns:
-        out["water_soluble"] = -1
+    if CLASS_LABEL_INTERNAL not in out.columns:
+        out[CLASS_LABEL_INTERNAL] = -1
     if "class_logit" not in out.columns:
         out["class_logit"] = np.nan
     if "class_prob_std" not in out.columns:
@@ -231,6 +244,8 @@ def _load_known_candidates_from_step4_metrics(
     out["class_logit_std"] = out["class_logit_std"].fillna(0.0).astype(float)
     for name in COEFF_NAMES:
         out[f"{name}_std"] = out[f"{name}_std"].fillna(0.0).astype(float)
+
+    out = _ensure_internal_label(out)
 
     summary = {
         "known_regression_coefficients_csv": str(reg_path),
@@ -357,7 +372,8 @@ def infer_coefficients_for_novel_candidates(
                 "Polymer",
                 "SMILES",
                 "canonical_smiles",
-                "water_soluble",
+                CLASS_LABEL_INTERNAL,
+                CLASS_LABEL_PUBLIC,
                 "class_logit",
                 "class_logit_std",
                 "class_prob",
@@ -596,7 +612,8 @@ def infer_coefficients_for_novel_candidates(
     prob_std = np.concatenate(prob_std_list, axis=0) if prob_std_list else np.zeros((0,), dtype=float)
 
     result = novel_df[["polymer_id", "Polymer", "SMILES", "canonical_smiles"]].copy()
-    result["water_soluble"] = -1
+    result[CLASS_LABEL_INTERNAL] = -1
+    result[CLASS_LABEL_PUBLIC] = result[CLASS_LABEL_INTERNAL]
     result["class_logit"] = logit_mean
     result["class_logit_std"] = logit_std
     result["class_prob"] = prob_mean
@@ -679,7 +696,7 @@ def load_soluble_targets(
 
     target_df = target_df.sort_values(["temperature", "phi"]).reset_index(drop=True)
     if target_df.empty:
-        raise ValueError("No water-soluble targets found in χ_target file (class=1).")
+        raise ValueError("No water-miscible targets found in χ_target file (class=1).")
     target_df["target_id"] = np.arange(1, len(target_df) + 1)
     return target_df, str(target_path)
 
@@ -797,7 +814,8 @@ def build_candidate_pool(
                 "Polymer",
                 "SMILES",
                 "canonical_smiles",
-                "water_soluble",
+                CLASS_LABEL_INTERNAL,
+                CLASS_LABEL_PUBLIC,
                 "class_logit",
                 "class_logit_std",
                 "class_prob",

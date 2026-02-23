@@ -17,6 +17,22 @@ from src.model.backbone import DiffusionBackbone
 from src.model.diffusion import DiscreteMaskingDiffusion
 from src.utils.model_scales import get_model_config, get_results_dir
 
+CLASS_LABEL_INTERNAL = "water_soluble"
+CLASS_LABEL_PUBLIC = "water_miscible"
+
+
+def _ensure_internal_label(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if CLASS_LABEL_INTERNAL not in out.columns:
+        if CLASS_LABEL_PUBLIC in out.columns:
+            out[CLASS_LABEL_INTERNAL] = out[CLASS_LABEL_PUBLIC]
+        else:
+            raise ValueError(
+                f"polymer dataframe must include '{CLASS_LABEL_INTERNAL}' or '{CLASS_LABEL_PUBLIC}'"
+            )
+    out[CLASS_LABEL_PUBLIC] = out[CLASS_LABEL_INTERNAL]
+    return out
+
 
 
 def _sha256(text: str) -> str:
@@ -38,7 +54,8 @@ def _make_cache_key(
     timestep: int,
     pooling: str,
 ) -> str:
-    records = polymer_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].sort_values("polymer_id")
+    polymer_df = _ensure_internal_label(polymer_df)
+    records = polymer_df[["polymer_id", "Polymer", "SMILES", CLASS_LABEL_INTERNAL]].sort_values("polymer_id")
     payload = {
         "checkpoint": str(checkpoint_path.resolve()),
         "model_size": model_size or "base",
@@ -138,7 +155,8 @@ def compute_polymer_embeddings(
     batch_size: int = 128,
 ) -> pd.DataFrame:
     """Compute pooled backbone embeddings for unique polymers."""
-    records = polymer_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].drop_duplicates("polymer_id")
+    polymer_df = _ensure_internal_label(polymer_df)
+    records = polymer_df[["polymer_id", "Polymer", "SMILES", CLASS_LABEL_INTERNAL]].drop_duplicates("polymer_id")
     records = records.sort_values("polymer_id").reset_index(drop=True)
 
     all_embeddings: List[np.ndarray] = []
@@ -168,15 +186,18 @@ def compute_polymer_embeddings(
 
 def save_embedding_cache(cache_npz: Path, embedding_df: pd.DataFrame, metadata: Dict) -> None:
     cache_npz.parent.mkdir(parents=True, exist_ok=True)
+    embedding_df = _ensure_internal_label(embedding_df)
     # Force fixed-width unicode arrays so np.load(..., allow_pickle=False) is always valid.
     polymer_arr = np.asarray(embedding_df["Polymer"].astype(str).to_list(), dtype=np.str_)
     smiles_arr = np.asarray(embedding_df["SMILES"].astype(str).to_list(), dtype=np.str_)
+    label_arr = embedding_df[CLASS_LABEL_INTERNAL].to_numpy(dtype=int)
     np.savez_compressed(
         cache_npz,
         polymer_id=embedding_df["polymer_id"].to_numpy(dtype=int),
         polymer=polymer_arr,
         smiles=smiles_arr,
-        water_soluble=embedding_df["water_soluble"].to_numpy(dtype=int),
+        water_soluble=label_arr,
+        water_miscible=label_arr,
         embedding=np.stack(embedding_df["embedding"].to_list(), axis=0).astype(np.float32, copy=False),
     )
     with open(cache_npz.with_suffix(".json"), "w") as f:
@@ -192,6 +213,11 @@ def load_embedding_cache(cache_npz: Path) -> Tuple[pd.DataFrame, Dict]:
                 "Polymer": np.asarray(arr["polymer"]).astype(str),
                 "SMILES": np.asarray(arr["smiles"]).astype(str),
                 "water_soluble": np.asarray(arr["water_soluble"]).astype(int),
+                "water_miscible": (
+                    np.asarray(arr["water_miscible"]).astype(int)
+                    if "water_miscible" in arr.files
+                    else np.asarray(arr["water_soluble"]).astype(int)
+                ),
                 "embedding": np.asarray(arr["embedding"], dtype=np.float32),
             }
 
@@ -216,6 +242,7 @@ def load_embedding_cache(cache_npz: Path) -> Tuple[pd.DataFrame, Dict]:
             "Polymer": arrays["Polymer"],
             "SMILES": arrays["SMILES"],
             "water_soluble": arrays["water_soluble"],
+            "water_miscible": arrays["water_miscible"],
             "embedding": list(arrays["embedding"]),
         }
     )

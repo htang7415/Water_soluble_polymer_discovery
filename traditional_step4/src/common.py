@@ -14,6 +14,9 @@ import pandas as pd
 from src.utils.config import load_config
 from src.utils.model_scales import get_results_dir
 
+CLASS_LABEL_INTERNAL = "water_soluble"
+CLASS_LABEL_PUBLIC = "water_miscible"
+
 
 @dataclass(frozen=True)
 class FingerprintConfig:
@@ -73,27 +76,75 @@ def resolve_split_ratios(holdout_test_ratio: float, tuning_cv_folds: int) -> Dic
     return out
 
 
+def _resolve_classification_dataset_paths(csv_path: str | Path | List[str] | Tuple[str, ...]) -> List[Path]:
+    specs: List[str] = []
+    if isinstance(csv_path, (list, tuple)):
+        specs = [str(x).strip() for x in csv_path if str(x).strip()]
+    else:
+        raw = str(csv_path).strip()
+        if len(raw) == 0:
+            raise ValueError("classification dataset path is empty")
+        if "," in raw:
+            specs = [x.strip() for x in raw.split(",") if x.strip()]
+        else:
+            specs = [raw]
+
+    paths: List[Path] = []
+    for spec in specs:
+        p = Path(spec)
+        if p.is_dir():
+            csvs = sorted(q for q in p.glob("*.csv") if q.is_file())
+            if len(csvs) == 0:
+                raise FileNotFoundError(f"No CSV files found under classification dataset directory: {p}")
+            paths.extend(csvs)
+        else:
+            if not p.exists():
+                raise FileNotFoundError(f"classification dataset not found: {p}")
+            paths.append(p)
+    if len(paths) == 0:
+        raise ValueError("No classification dataset CSV paths resolved.")
+    return paths
+
+
 def load_classification_dataset(
-    csv_path: str | Path,
+    csv_path: str | Path | List[str] | Tuple[str, ...],
     default_temperature: float = 293.15,
     default_phi: float = 0.2,
     default_chi: float = 0.0,
 ) -> pd.DataFrame:
     """Load Step4_3_2 classification dataset with compatibility normalization."""
-    csv_path = Path(csv_path)
-    if not csv_path.exists():
-        raise FileNotFoundError(f"classification dataset not found: {csv_path}")
+    paths = _resolve_classification_dataset_paths(csv_path)
+    df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
 
-    df = pd.read_csv(csv_path)
-    rename_map = {}
+    label_aliases = {
+        "water_soluble",
+        "water_solubel",
+        "water_solubility",
+        "water_miscible",
+        "water miscible",
+        "watermiscible",
+        "water_missible",
+    }
+    matched = []
     for col in df.columns:
         key = str(col).strip().lower()
-        if key in {"water_soluble", "water_solubel", "water_solubility"}:
-            rename_map[col] = "water_soluble"
-    if rename_map:
-        df = df.rename(columns=rename_map)
+        if key in label_aliases:
+            matched.append(col)
+    if CLASS_LABEL_INTERNAL not in df.columns and len(matched) > 0:
+        primary = matched[0]
+        if primary != CLASS_LABEL_INTERNAL:
+            df = df.rename(columns={primary: CLASS_LABEL_INTERNAL})
+        matched = [CLASS_LABEL_INTERNAL] + [c for c in matched if c != primary]
+    for col in matched:
+        if col == CLASS_LABEL_INTERNAL or col not in df.columns:
+            continue
+        df[CLASS_LABEL_INTERNAL] = df[CLASS_LABEL_INTERNAL].where(
+            df[CLASS_LABEL_INTERNAL].notna(),
+            df[col],
+        )
 
-    required_base = {"Polymer", "SMILES", "water_soluble"}
+    required_base = {"Polymer", "SMILES", CLASS_LABEL_INTERNAL}
     missing_base = sorted(required_base - set(df.columns))
     if missing_base:
         raise ValueError(f"classification dataset missing required columns: {missing_base}")
@@ -109,7 +160,8 @@ def load_classification_dataset(
     out["temperature"] = out["temperature"].fillna(float(default_temperature)).astype(float)
     out["phi"] = out["phi"].fillna(float(default_phi)).astype(float)
     out["chi"] = out["chi"].fillna(float(default_chi)).astype(float)
-    out["water_soluble"] = out["water_soluble"].astype(int)
+    out[CLASS_LABEL_INTERNAL] = pd.to_numeric(out[CLASS_LABEL_INTERNAL], errors="coerce").fillna(0).astype(int)
+    out[CLASS_LABEL_PUBLIC] = out[CLASS_LABEL_INTERNAL]
 
     polymer_order = sorted(out["Polymer"].astype(str).unique())
     polymer_to_id = {p: i for i, p in enumerate(polymer_order)}
@@ -120,7 +172,7 @@ def load_classification_dataset(
 
 
 def load_split_dataset(
-    dataset_path: str | Path,
+    dataset_path: str | Path | List[str] | Tuple[str, ...],
     split_mode: str,
     split_ratios: Dict[str, float],
     seed: int,
