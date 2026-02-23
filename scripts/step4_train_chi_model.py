@@ -1595,10 +1595,10 @@ def _plot_kde_safe_1d(
     return True
 
 
-def _plot_class_prob_density_safe(ax, test_df: pd.DataFrame) -> None:
+def _plot_class_prob_density_safe(ax, split_df: pd.DataFrame) -> None:
     try:
         sns.kdeplot(
-            data=test_df,
+            data=split_df,
             x="class_prob",
             hue="water_soluble",
             common_norm=False,
@@ -1615,7 +1615,7 @@ def _plot_class_prob_density_safe(ax, test_df: pd.DataFrame) -> None:
             raise
 
     for class_value, color in [(1, "#1f77b4"), (0, "#d62728")]:
-        sub = test_df.loc[test_df["water_soluble"] == class_value, "class_prob"]
+        sub = split_df.loc[split_df["water_soluble"] == class_value, "class_prob"]
         _plot_kde_safe_1d(
             ax=ax,
             values=sub,
@@ -1960,31 +1960,55 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     fig.savefig(fig_dir / "chi_residual_distribution.png", dpi=dpi)
     plt.close(fig)
 
-    # ROC and PR (test)
-    y_true = test["water_soluble"].to_numpy(dtype=int)
-    y_prob = test["class_prob"].to_numpy(dtype=float)
-    if len(np.unique(y_true)) > 1:
-        fpr, tpr, _ = roc_curve(y_true, y_prob)
-        precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    for split_name, split_df in [("train", train), ("test", test)]:
+        if split_df.empty:
+            continue
 
         fig, ax = plt.subplots(figsize=(6, 5))
-        ax.plot(fpr, tpr, color="#1f77b4", linewidth=2)
-        ax.plot([0, 1], [0, 1], "k--", linewidth=1)
-        ax.set_xlabel("FPR")
-        ax.set_ylabel("TPR")
-        ax.set_title("Classifier ROC (test)")
-        fig.tight_layout()
-        fig.savefig(fig_dir / "chi_classifier_roc_test.png", dpi=dpi)
+        _plot_class_prob_density_safe(ax=ax, split_df=split_df)
+        ax.set_xlabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
+        ax.set_title(f"Class probability distribution ({split_name})")
+        legend = ax.get_legend()
+        if legend is not None:
+            handles = _get_legend_handles(legend)
+            labels = [t.get_text() for t in legend.get_texts()]
+            legend.remove()
+            ax.legend(
+                handles=handles,
+                labels=labels,
+                title=CLASS_LABEL_PUBLIC,
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0),
+                borderaxespad=0.0,
+            )
+        fig.tight_layout(rect=(0, 0, 0.82, 1))
+        fig.savefig(fig_dir / f"chi_class_prob_distribution_{split_name}.png", dpi=dpi)
         plt.close(fig)
 
-        fig, ax = plt.subplots(figsize=(6, 5))
-        ax.plot(recall, precision, color="#d62728", linewidth=2)
-        ax.set_xlabel("Recall")
-        ax.set_ylabel("Precision")
-        ax.set_title("Classifier PR (test)")
-        fig.tight_layout()
-        fig.savefig(fig_dir / "chi_classifier_pr_test.png", dpi=dpi)
-        plt.close(fig)
+        y_true = split_df["water_soluble"].to_numpy(dtype=int)
+        y_prob = split_df["class_prob"].to_numpy(dtype=float)
+        if len(np.unique(y_true)) > 1:
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+            precision, recall, _ = precision_recall_curve(y_true, y_prob)
+
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ax.plot(fpr, tpr, color="#1f77b4", linewidth=2)
+            ax.plot([0, 1], [0, 1], "k--", linewidth=1)
+            ax.set_xlabel("FPR")
+            ax.set_ylabel("TPR")
+            ax.set_title(f"Classifier ROC ({split_name})")
+            fig.tight_layout()
+            fig.savefig(fig_dir / f"chi_classifier_roc_{split_name}.png", dpi=dpi)
+            plt.close(fig)
+
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ax.plot(recall, precision, color="#d62728", linewidth=2)
+            ax.set_xlabel("Recall")
+            ax.set_ylabel("Precision")
+            ax.set_title(f"Classifier PR ({split_name})")
+            fig.tight_layout()
+            fig.savefig(fig_dir / f"chi_classifier_pr_{split_name}.png", dpi=dpi)
+            plt.close(fig)
 
 
 
@@ -2793,11 +2817,14 @@ def _make_classifier_figures(
         dpi=dpi,
     )
 
-    if not test.empty:
+    for split_name, split_df in [("train", train), ("test", test)]:
+        if split_df.empty:
+            continue
+
         fig, ax = plt.subplots(figsize=(6, 5))
-        _plot_class_prob_density_safe(ax=ax, test_df=test)
+        _plot_class_prob_density_safe(ax=ax, split_df=split_df)
         ax.set_xlabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
-        ax.set_title("Class probability distribution (test)")
+        ax.set_title(f"Class probability distribution ({split_name})")
         legend = ax.get_legend()
         if legend is not None:
             handles = _get_legend_handles(legend)
@@ -2812,11 +2839,11 @@ def _make_classifier_figures(
                 borderaxespad=0.0,
             )
         fig.tight_layout(rect=(0, 0, 0.82, 1))
-        fig.savefig(fig_dir / "class_prob_distribution_test.png", dpi=dpi)
+        fig.savefig(fig_dir / f"class_prob_distribution_{split_name}.png", dpi=dpi)
         plt.close(fig)
 
-        y_true = test["water_soluble"].to_numpy(dtype=int)
-        y_prob = test["class_prob"].to_numpy(dtype=float)
+        y_true = split_df["water_soluble"].to_numpy(dtype=int)
+        y_prob = split_df["class_prob"].to_numpy(dtype=float)
         if len(np.unique(y_true)) > 1:
             fpr, tpr, _ = roc_curve(y_true, y_prob)
             precision, recall, _ = precision_recall_curve(y_true, y_prob)
@@ -2826,18 +2853,18 @@ def _make_classifier_figures(
             ax.plot([0, 1], [0, 1], "k--", linewidth=1)
             ax.set_xlabel("FPR")
             ax.set_ylabel("TPR")
-            ax.set_title("Classifier ROC (test)")
+            ax.set_title(f"Classifier ROC ({split_name})")
             fig.tight_layout()
-            fig.savefig(fig_dir / "classifier_roc_test.png", dpi=dpi)
+            fig.savefig(fig_dir / f"classifier_roc_{split_name}.png", dpi=dpi)
             plt.close(fig)
 
             fig, ax = plt.subplots(figsize=(6, 5))
             ax.plot(recall, precision, color="#d62728", linewidth=2)
             ax.set_xlabel("Recall")
             ax.set_ylabel("Precision")
-            ax.set_title("Classifier PR (test)")
+            ax.set_title(f"Classifier PR ({split_name})")
             fig.tight_layout()
-            fig.savefig(fig_dir / "classifier_pr_test.png", dpi=dpi)
+            fig.savefig(fig_dir / f"classifier_pr_{split_name}.png", dpi=dpi)
             plt.close(fig)
 
 

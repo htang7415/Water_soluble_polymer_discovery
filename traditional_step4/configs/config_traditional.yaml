@@ -20,7 +20,8 @@ traditional_step4:
     split_mode: "polymer"  # polymer | random
     classification_split_mode: "random"  # split mode used by step4_3_2 only (independent of regression split_mode)
     split:
-      # If omitted, defaults to 1 / tuning_cv_folds.
+      # Holdout ratio for the one-time test split.
+      # Train set is (1 - holdout_test_ratio), and CV is performed only inside train.
       holdout_test_ratio: 0.16
     fingerprint:
       radius: 3

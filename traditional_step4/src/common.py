@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import train_test_split
 
 from src.utils.config import load_config
 from src.utils.model_scales import get_results_dir
@@ -55,14 +57,46 @@ def normalize_split_mode(split_mode: str) -> str:
     return out
 
 
+def _safe_train_test_split(*args, stratify, random_state: int, test_size: float):
+    """Fallback to unstratified split if stratification is impossible."""
+    try:
+        return train_test_split(
+            *args,
+            test_size=test_size,
+            random_state=random_state,
+            stratify=stratify,
+        )
+    except ValueError as exc:
+        warnings.warn(
+            "Stratified split failed; falling back to unstratified split. "
+            f"reason={exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return train_test_split(
+            *args,
+            test_size=test_size,
+            random_state=random_state,
+            stratify=None,
+        )
+
+
 def resolve_split_ratios(holdout_test_ratio: float, tuning_cv_folds: int) -> Dict[str, float]:
+    """Resolve holdout split ratios for Step4_3.
+
+    Step4_3 follows the workflow:
+    1) one holdout split into train/test,
+    2) CV only inside train for hyperparameter tuning,
+    3) refit on all train and evaluate on test.
+
+    Therefore, we do not reserve a separate fixed validation split here.
+    """
     test_ratio = float(holdout_test_ratio)
     if not (0.0 < test_ratio < 1.0):
         raise ValueError("holdout_test_ratio must be in (0, 1)")
-    folds = int(max(2, tuning_cv_folds))
-    dev_ratio = 1.0 - test_ratio
-    val_ratio = dev_ratio / float(folds)
-    train_ratio = dev_ratio - val_ratio
+    _ = int(max(2, tuning_cv_folds))  # kept for API compatibility / validation context
+    train_ratio = 1.0 - test_ratio
+    val_ratio = 0.0
     out = {
         "train_ratio": float(train_ratio),
         "val_ratio": float(val_ratio),
@@ -71,8 +105,8 @@ def resolve_split_ratios(holdout_test_ratio: float, tuning_cv_folds: int) -> Dic
     total = sum(out.values())
     if not np.isclose(total, 1.0):
         raise ValueError(f"Resolved split ratios must sum to 1, got {out}")
-    if min(out.values()) <= 0.0:
-        raise ValueError(f"Resolved split ratios must all be > 0, got {out}")
+    if out["train_ratio"] <= 0.0 or out["test_ratio"] <= 0.0:
+        raise ValueError(f"Resolved train/test ratios must be > 0, got {out}")
     return out
 
 
@@ -184,16 +218,62 @@ def load_split_dataset(
         df = load_classification_dataset(dataset_path)
     else:
         df = load_chi_dataset(dataset_path)
-    split_assign = make_split_assignments(
-        df,
-        SplitConfig(
-            split_mode=split_mode,
-            train_ratio=float(split_ratios["train_ratio"]),
-            val_ratio=float(split_ratios["val_ratio"]),
-            test_ratio=float(split_ratios["test_ratio"]),
-            seed=int(seed),
-        ),
-    )
+
+    train_ratio = float(split_ratios["train_ratio"])
+    val_ratio = float(split_ratios["val_ratio"])
+    test_ratio = float(split_ratios["test_ratio"])
+
+    if val_ratio <= 0.0:
+        # Preferred Step4_3 mode: holdout split only (train/test), CV happens inside train.
+        assignments = pd.DataFrame({"row_id": df["row_id"].astype(int)})
+        assignments["split"] = ""
+        mode = normalize_split_mode(split_mode)
+
+        if mode == "polymer":
+            polymer_df = (
+                df[["polymer_id", "water_soluble"]]
+                .drop_duplicates(subset=["polymer_id"])
+                .sort_values("polymer_id")
+                .reset_index(drop=True)
+            )
+            train_poly, test_poly = _safe_train_test_split(
+                polymer_df,
+                stratify=polymer_df["water_soluble"],
+                random_state=int(seed),
+                test_size=float(test_ratio),
+            )
+            split_map: Dict[int, str] = {}
+            split_map.update({int(pid): "train" for pid in train_poly["polymer_id"].tolist()})
+            split_map.update({int(pid): "test" for pid in test_poly["polymer_id"].tolist()})
+            assignments["split"] = df["polymer_id"].map(split_map)
+        else:
+            row_df = df[["row_id", "water_soluble"]].copy()
+            train_rows, test_rows = _safe_train_test_split(
+                row_df,
+                stratify=row_df["water_soluble"],
+                random_state=int(seed),
+                test_size=float(test_ratio),
+            )
+            split_map = {}
+            split_map.update({int(rid): "train" for rid in train_rows["row_id"].tolist()})
+            split_map.update({int(rid): "test" for rid in test_rows["row_id"].tolist()})
+            assignments["split"] = assignments["row_id"].map(split_map)
+
+        if assignments["split"].isna().any() or (assignments["split"] == "").any():
+            raise RuntimeError("Failed to assign all rows to train/test")
+        split_assign = assignments
+    else:
+        # Backward-compatible path when caller explicitly requests a fixed val split.
+        split_assign = make_split_assignments(
+            df,
+            SplitConfig(
+                split_mode=split_mode,
+                train_ratio=train_ratio,
+                val_ratio=val_ratio,
+                test_ratio=test_ratio,
+                seed=int(seed),
+            ),
+        )
     split_df = add_split_column(df, split_assign)
     return split_df, split_assign
 
