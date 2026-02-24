@@ -2138,13 +2138,20 @@ def _run_single_regression_model(
 
     overall_df = pd.read_csv(metrics_dir / "chi_metrics_overall.csv")
     test_row = overall_df[overall_df["split"] == "test"]
+    train_row = overall_df[overall_df["split"] == "train"]
     test_r2 = float(test_row["r2"].iloc[0]) if not test_row.empty and "r2" in test_row.columns else np.nan
     test_rmse = float(test_row["rmse"].iloc[0]) if not test_row.empty and "rmse" in test_row.columns else np.nan
     test_mae = float(test_row["mae"].iloc[0]) if not test_row.empty and "mae" in test_row.columns else np.nan
+    train_r2 = float(train_row["r2"].iloc[0]) if not train_row.empty and "r2" in train_row.columns else np.nan
+    train_rmse = float(train_row["rmse"].iloc[0]) if not train_row.empty and "rmse" in train_row.columns else np.nan
+    train_mae = float(train_row["mae"].iloc[0]) if not train_row.empty and "mae" in train_row.columns else np.nan
     return {
         "metrics_dir": str(metrics_dir),
         "figures_dir": str(figures_dir),
         "checkpoint": str(checkpoint_path),
+        "train_r2": _safe_float(train_r2),
+        "train_rmse": _safe_float(train_rmse),
+        "train_mae": _safe_float(train_mae),
         "test_r2": _safe_float(test_r2),
         "test_rmse": _safe_float(test_rmse),
         "test_mae": _safe_float(test_mae),
@@ -2198,6 +2205,7 @@ def _run_single_classification_model(
 
     overall_df = pd.read_csv(metrics_dir / "class_metrics_overall.csv")
     test_row = overall_df[overall_df["split"] == "test"]
+    train_row = overall_df[overall_df["split"] == "train"]
     test_bal = (
         float(test_row["balanced_accuracy"].iloc[0])
         if not test_row.empty and "balanced_accuracy" in test_row.columns
@@ -2205,14 +2213,267 @@ def _run_single_classification_model(
     )
     test_auroc = float(test_row["auroc"].iloc[0]) if not test_row.empty and "auroc" in test_row.columns else np.nan
     test_f1 = float(test_row["f1"].iloc[0]) if not test_row.empty and "f1" in test_row.columns else np.nan
+    train_bal = (
+        float(train_row["balanced_accuracy"].iloc[0])
+        if not train_row.empty and "balanced_accuracy" in train_row.columns
+        else np.nan
+    )
+    train_auroc = float(train_row["auroc"].iloc[0]) if not train_row.empty and "auroc" in train_row.columns else np.nan
+    train_f1 = float(train_row["f1"].iloc[0]) if not train_row.empty and "f1" in train_row.columns else np.nan
     return {
         "metrics_dir": str(metrics_dir),
         "figures_dir": str(figures_dir),
         "checkpoint": str(checkpoint_path),
+        "train_balanced_accuracy": _safe_float(train_bal),
+        "train_auroc": _safe_float(train_auroc),
+        "train_f1": _safe_float(train_f1),
         "test_balanced_accuracy": _safe_float(test_bal),
         "test_auroc": _safe_float(test_auroc),
         "test_f1": _safe_float(test_f1),
     }
+
+
+def _save_split_diagnostics(split_df: pd.DataFrame, metrics_dir: Path, stage_name: str) -> Dict[str, object]:
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    train_df = split_df[split_df["split"] == "train"].copy()
+    test_df = split_df[split_df["split"] == "test"].copy()
+    val_df = split_df[split_df["split"] == "val"].copy()
+
+    diag: Dict[str, object] = {
+        "stage_name": str(stage_name),
+        "n_rows_train": int(len(train_df)),
+        "n_rows_val": int(len(val_df)),
+        "n_rows_test": int(len(test_df)),
+    }
+    if "water_soluble" in split_df.columns:
+        class_counts = split_df.groupby(["split", "water_soluble"], as_index=False).size().rename(columns={"size": "n_rows"})
+        class_counts.to_csv(metrics_dir / "split_class_counts.csv", index=False)
+    if "polymer_id" in split_df.columns:
+        train_ids = set(pd.to_numeric(train_df["polymer_id"], errors="coerce").dropna().astype(int).tolist())
+        test_ids = set(pd.to_numeric(test_df["polymer_id"], errors="coerce").dropna().astype(int).tolist())
+        overlap_ids = sorted(train_ids.intersection(test_ids))
+        diag.update(
+            {
+                "n_unique_polymers_train": int(len(train_ids)),
+                "n_unique_polymers_test": int(len(test_ids)),
+                "n_overlap_polymer_ids_train_test": int(len(overlap_ids)),
+                "overlap_polymer_ids_train_test": overlap_ids,
+            }
+        )
+        if len(overlap_ids) > 0:
+            overlap_df = (
+                split_df[split_df["polymer_id"].isin(overlap_ids)][["polymer_id", "Polymer", "SMILES", "split"]]
+                .drop_duplicates()
+                .sort_values(["polymer_id", "split"])
+                .reset_index(drop=True)
+            )
+            overlap_df.to_csv(metrics_dir / "overlap_polymer_ids_train_test.csv", index=False)
+    with open(metrics_dir / "split_diagnostics.json", "w") as f:
+        json.dump(diag, f, indent=2)
+    return diag
+
+
+def _save_regression_leaderboard_and_figures(
+    model_outputs: List[Dict[str, object]],
+    metrics_dir: Path,
+    dpi: int,
+    font_size: int,
+) -> pd.DataFrame:
+    summary_df = pd.DataFrame(
+        [
+            {
+                "model_name": x["model_name"],
+                "param_source": x["param_source"],
+                "metrics_dir": x["metrics_dir"],
+                "figures_dir": x["figures_dir"],
+                "checkpoint": x["checkpoint"],
+                "tuning_dir": x["tuning_dir"],
+                "train_r2": x.get("train_r2", np.nan),
+                "train_rmse": x.get("train_rmse", np.nan),
+                "train_mae": x.get("train_mae", np.nan),
+                "test_r2": x.get("test_r2", np.nan),
+                "test_rmse": x.get("test_rmse", np.nan),
+                "test_mae": x.get("test_mae", np.nan),
+            }
+            for x in model_outputs
+        ]
+    )
+    if summary_df.empty:
+        summary_df = pd.DataFrame(
+            columns=[
+                "rank",
+                "model_name",
+                "param_source",
+                "metrics_dir",
+                "figures_dir",
+                "checkpoint",
+                "tuning_dir",
+                "train_r2",
+                "train_rmse",
+                "train_mae",
+                "test_r2",
+                "test_rmse",
+                "test_mae",
+                "r2_gap_train_minus_test",
+                "quality_flag_negative_test_r2",
+                "quality_flag_r2_gap_gt_0_5",
+                "quality_status",
+            ]
+        )
+    else:
+        summary_df["r2_gap_train_minus_test"] = summary_df["train_r2"] - summary_df["test_r2"]
+        summary_df["quality_flag_negative_test_r2"] = summary_df["test_r2"] < 0.0
+        summary_df["quality_flag_r2_gap_gt_0_5"] = summary_df["r2_gap_train_minus_test"] > 0.5
+        summary_df["quality_status"] = np.where(
+            summary_df["quality_flag_negative_test_r2"] | summary_df["quality_flag_r2_gap_gt_0_5"],
+            "review",
+            "pass",
+        )
+        summary_df = summary_df.sort_values(["test_r2", "test_rmse"], ascending=[False, True]).reset_index(drop=True)
+        summary_df.insert(0, "rank", np.arange(1, len(summary_df) + 1, dtype=int))
+    summary_df.to_csv(metrics_dir / "model_metrics_summary.csv", index=False)
+    summary_df.to_csv(metrics_dir / "model_leaderboard.csv", index=False)
+
+    rec_payload: Dict[str, object] = {"selection_rule": "highest_test_r2_then_lowest_test_rmse"}
+    if not summary_df.empty:
+        non_negative = summary_df[summary_df["test_r2"] >= 0.0]
+        chosen_row = non_negative.iloc[0] if not non_negative.empty else summary_df.iloc[0]
+        rec_payload.update(
+            {
+                "recommended_model_name": str(chosen_row["model_name"]),
+                "recommended_rank": int(chosen_row["rank"]),
+                "recommended_test_r2": _safe_float(chosen_row["test_r2"]),
+                "recommended_test_rmse": _safe_float(chosen_row["test_rmse"]),
+                "recommended_test_mae": _safe_float(chosen_row["test_mae"]),
+                "non_negative_test_r2_available": bool(not non_negative.empty),
+            }
+        )
+    with open(metrics_dir / "model_recommendation.json", "w") as f:
+        json.dump(rec_payload, f, indent=2)
+
+    if summary_df.empty:
+        return summary_df
+    sns.set_theme(style="whitegrid")
+    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    sns.barplot(data=summary_df, x="model_name", y="test_r2", hue="quality_status", dodge=False, palette={"pass": "#2ca02c", "review": "#d62728"}, ax=axes[0])
+    axes[0].axhline(0.0, color="black", linestyle="--", linewidth=1)
+    axes[0].set_xlabel("Model")
+    axes[0].set_ylabel("Test R2")
+    axes[0].set_title("Regression leaderboard: test R2")
+    axes[0].tick_params(axis="x", rotation=25)
+    axes[0].legend(loc="best", title="quality_status")
+
+    sns.barplot(data=summary_df, x="model_name", y="test_rmse", color="#4c78a8", ax=axes[1])
+    axes[1].set_xlabel("Model")
+    axes[1].set_ylabel("Test RMSE")
+    axes[1].set_title("Regression comparison: test RMSE")
+    axes[1].tick_params(axis="x", rotation=25)
+    fig.tight_layout()
+    fig.savefig(metrics_dir / "model_comparison_test_metrics.png", dpi=dpi)
+    plt.close(fig)
+    return summary_df
+
+
+def _save_classification_leaderboard_and_figures(
+    model_outputs: List[Dict[str, object]],
+    metrics_dir: Path,
+    dpi: int,
+    font_size: int,
+) -> pd.DataFrame:
+    summary_df = pd.DataFrame(
+        [
+            {
+                "model_name": x["model_name"],
+                "param_source": x["param_source"],
+                "metrics_dir": x["metrics_dir"],
+                "figures_dir": x["figures_dir"],
+                "checkpoint": x["checkpoint"],
+                "tuning_dir": x["tuning_dir"],
+                "train_balanced_accuracy": x.get("train_balanced_accuracy", np.nan),
+                "train_auroc": x.get("train_auroc", np.nan),
+                "train_f1": x.get("train_f1", np.nan),
+                "test_balanced_accuracy": x.get("test_balanced_accuracy", np.nan),
+                "test_auroc": x.get("test_auroc", np.nan),
+                "test_f1": x.get("test_f1", np.nan),
+            }
+            for x in model_outputs
+        ]
+    )
+    if summary_df.empty:
+        summary_df = pd.DataFrame(
+            columns=[
+                "rank",
+                "model_name",
+                "param_source",
+                "metrics_dir",
+                "figures_dir",
+                "checkpoint",
+                "tuning_dir",
+                "train_balanced_accuracy",
+                "train_auroc",
+                "train_f1",
+                "test_balanced_accuracy",
+                "test_auroc",
+                "test_f1",
+                "balanced_accuracy_gap_train_minus_test",
+                "quality_flag_balanced_accuracy_gap_gt_0_1",
+                "quality_status",
+            ]
+        )
+    else:
+        summary_df["balanced_accuracy_gap_train_minus_test"] = summary_df["train_balanced_accuracy"] - summary_df["test_balanced_accuracy"]
+        summary_df["quality_flag_balanced_accuracy_gap_gt_0_1"] = summary_df["balanced_accuracy_gap_train_minus_test"] > 0.1
+        summary_df["quality_status"] = np.where(summary_df["quality_flag_balanced_accuracy_gap_gt_0_1"], "review", "pass")
+        summary_df = summary_df.sort_values(["test_balanced_accuracy", "test_auroc"], ascending=[False, False]).reset_index(drop=True)
+        summary_df.insert(0, "rank", np.arange(1, len(summary_df) + 1, dtype=int))
+    summary_df.to_csv(metrics_dir / "model_metrics_summary.csv", index=False)
+    summary_df.to_csv(metrics_dir / "model_leaderboard.csv", index=False)
+
+    rec_payload: Dict[str, object] = {"selection_rule": "highest_test_balanced_accuracy_then_test_auroc"}
+    if not summary_df.empty:
+        chosen_row = summary_df.iloc[0]
+        rec_payload.update(
+            {
+                "recommended_model_name": str(chosen_row["model_name"]),
+                "recommended_rank": int(chosen_row["rank"]),
+                "recommended_test_balanced_accuracy": _safe_float(chosen_row["test_balanced_accuracy"]),
+                "recommended_test_auroc": _safe_float(chosen_row["test_auroc"]),
+                "recommended_test_f1": _safe_float(chosen_row["test_f1"]),
+            }
+        )
+    with open(metrics_dir / "model_recommendation.json", "w") as f:
+        json.dump(rec_payload, f, indent=2)
+
+    if summary_df.empty:
+        return summary_df
+    sns.set_theme(style="whitegrid")
+    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    sns.barplot(
+        data=summary_df,
+        x="model_name",
+        y="test_balanced_accuracy",
+        hue="quality_status",
+        dodge=False,
+        palette={"pass": "#2ca02c", "review": "#d62728"},
+        ax=axes[0],
+    )
+    axes[0].set_xlabel("Model")
+    axes[0].set_ylabel("Test balanced accuracy")
+    axes[0].set_title("Classification leaderboard: balanced accuracy")
+    axes[0].tick_params(axis="x", rotation=25)
+    axes[0].legend(loc="best", title="quality_status")
+
+    sns.barplot(data=summary_df, x="model_name", y="test_auroc", color="#4c78a8", ax=axes[1])
+    axes[1].set_xlabel("Model")
+    axes[1].set_ylabel("Test AUROC")
+    axes[1].set_title("Classification comparison: test AUROC")
+    axes[1].tick_params(axis="x", rotation=25)
+    fig.tight_layout()
+    fig.savefig(metrics_dir / "model_comparison_test_metrics.png", dpi=dpi)
+    plt.close(fig)
+    return summary_df
 
 
 def _run_regression_stage(
@@ -2232,6 +2493,7 @@ def _run_regression_stage(
 
     split_assign.to_csv(metrics_dir / "split_assignments.csv", index=False)
     split_df.to_csv(metrics_dir / "chi_dataset_with_split.csv", index=False)
+    split_diag = _save_split_diagnostics(split_df=split_df, metrics_dir=metrics_dir, stage_name="step4_3_1_regression")
 
     model_outputs: List[Dict[str, object]] = []
     for model_name in stage_cfg.models:
@@ -2292,6 +2554,9 @@ def _run_regression_stage(
                 "figures_dir": out["figures_dir"],
                 "checkpoint": out["checkpoint"],
                 "tuning_dir": str(tuning_dir),
+                "train_r2": out["train_r2"],
+                "train_rmse": out["train_rmse"],
+                "train_mae": out["train_mae"],
                 "test_r2": out["test_r2"],
                 "test_rmse": out["test_rmse"],
                 "test_mae": out["test_mae"],
@@ -2311,31 +2576,29 @@ def _run_regression_stage(
                 "model_names": [str(m) for m in stage_cfg.models],
                 "cross_model_best_selected_in_step4_3": False,
                 "selection_note": "Step4_3 trains each model independently; cross-model selection is deferred to Step4_4.",
+                "split_diagnostics_path": str(metrics_dir / "split_diagnostics.json"),
+                "leaderboard_path": str(metrics_dir / "model_leaderboard.csv"),
+                "recommendation_path": str(metrics_dir / "model_recommendation.json"),
             },
             f,
             indent=2,
         )
-    pd.DataFrame(
-        [
-            {
-                "model_name": x["model_name"],
-                "param_source": x["param_source"],
-                "metrics_dir": x["metrics_dir"],
-                "figures_dir": x["figures_dir"],
-                "checkpoint": x["checkpoint"],
-                "tuning_dir": x["tuning_dir"],
-                "test_r2": x["test_r2"],
-                "test_rmse": x["test_rmse"],
-                "test_mae": x["test_mae"],
-            }
-            for x in model_outputs
-        ]
-    ).to_csv(metrics_dir / "model_metrics_summary.csv", index=False)
+    summary_df = _save_regression_leaderboard_and_figures(
+        model_outputs=model_outputs,
+        metrics_dir=metrics_dir,
+        dpi=dpi,
+        font_size=font_size,
+    )
+    if int(split_diag.get("n_overlap_polymer_ids_train_test", 0)) > 0:
+        print(
+            f"[warning] Regression split has train/test polymer overlap: "
+            f"{int(split_diag.get('n_overlap_polymer_ids_train_test', 0))}"
+        )
 
     return {
         "metrics_dir": str(metrics_dir),
         "models_dir": str(models_dir),
-        "n_models": int(len(model_outputs)),
+        "n_models": int(len(summary_df)),
         "model_metrics_summary": str(metrics_dir / "model_metrics_summary.csv"),
     }
 
@@ -2357,6 +2620,7 @@ def _run_classification_stage(
 
     split_assign.to_csv(metrics_dir / "split_assignments.csv", index=False)
     split_df.to_csv(metrics_dir / "chi_dataset_with_split.csv", index=False)
+    split_diag = _save_split_diagnostics(split_df=split_df, metrics_dir=metrics_dir, stage_name="step4_3_2_classification")
 
     model_outputs: List[Dict[str, object]] = []
     for model_name in stage_cfg.models:
@@ -2417,6 +2681,9 @@ def _run_classification_stage(
                 "figures_dir": out["figures_dir"],
                 "checkpoint": out["checkpoint"],
                 "tuning_dir": str(tuning_dir),
+                "train_balanced_accuracy": out["train_balanced_accuracy"],
+                "train_auroc": out["train_auroc"],
+                "train_f1": out["train_f1"],
                 "test_balanced_accuracy": out["test_balanced_accuracy"],
                 "test_auroc": out["test_auroc"],
                 "test_f1": out["test_f1"],
@@ -2436,31 +2703,29 @@ def _run_classification_stage(
                 "model_names": [str(m) for m in stage_cfg.models],
                 "cross_model_best_selected_in_step4_3": False,
                 "selection_note": "Step4_3 trains each model independently; cross-model selection is deferred to Step4_4.",
+                "split_diagnostics_path": str(metrics_dir / "split_diagnostics.json"),
+                "leaderboard_path": str(metrics_dir / "model_leaderboard.csv"),
+                "recommendation_path": str(metrics_dir / "model_recommendation.json"),
             },
             f,
             indent=2,
         )
-    pd.DataFrame(
-        [
-            {
-                "model_name": x["model_name"],
-                "param_source": x["param_source"],
-                "metrics_dir": x["metrics_dir"],
-                "figures_dir": x["figures_dir"],
-                "checkpoint": x["checkpoint"],
-                "tuning_dir": x["tuning_dir"],
-                "test_balanced_accuracy": x["test_balanced_accuracy"],
-                "test_auroc": x["test_auroc"],
-                "test_f1": x["test_f1"],
-            }
-            for x in model_outputs
-        ]
-    ).to_csv(metrics_dir / "model_metrics_summary.csv", index=False)
+    summary_df = _save_classification_leaderboard_and_figures(
+        model_outputs=model_outputs,
+        metrics_dir=metrics_dir,
+        dpi=dpi,
+        font_size=font_size,
+    )
+    if int(split_diag.get("n_overlap_polymer_ids_train_test", 0)) > 0:
+        print(
+            f"[warning] Classification split has train/test polymer overlap: "
+            f"{int(split_diag.get('n_overlap_polymer_ids_train_test', 0))}"
+        )
 
     return {
         "metrics_dir": str(metrics_dir),
         "models_dir": str(models_dir),
-        "n_models": int(len(model_outputs)),
+        "n_models": int(len(summary_df)),
         "model_metrics_summary": str(metrics_dir / "model_metrics_summary.csv"),
     }
 
@@ -2701,6 +2966,12 @@ def main() -> None:
         step_name="step4_3_traditional",
         context=log_context,
     )
+    write_initial_log(
+        step_dir=step_dir,
+        step_name="step4_3_traditional",
+        context=log_context,
+        filename=f"log_{args.stage}.txt",
+    )
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
     font_size = int(config.get("plotting", {}).get("font_size", 12))
@@ -2752,6 +3023,22 @@ def main() -> None:
     if run_reg:
         if reg_cfg is None or reg_split_ratios is None:
             raise RuntimeError("Regression stage requested but regression configuration is not initialized.")
+        write_initial_log(
+            step_dir=reg_dir,
+            step_name="step4_3_1_regression",
+            context={
+                "stage": "step4_3_1",
+                "split_mode": reg_split_mode,
+                "dataset_path": str(reg_dataset),
+                "holdout_test_ratio": float(reg_cfg.holdout_test_ratio),
+                "tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
+                "tuning_objective": str(reg_cfg.tuning_objective),
+                "tune": bool(reg_cfg.tune),
+                "n_trials": int(reg_cfg.n_trials),
+                "random_seed": int(seed),
+            },
+            filename="log.txt",
+        )
         reg_split_df, reg_split_assign = load_split_dataset(
             dataset_path=reg_dataset,
             split_mode=reg_split_mode,
@@ -2794,6 +3081,22 @@ def main() -> None:
     if run_cls:
         if cls_cfg is None or cls_split_ratios is None:
             raise RuntimeError("Classification stage requested but classification configuration is not initialized.")
+        write_initial_log(
+            step_dir=cls_dir,
+            step_name="step4_3_2_classification",
+            context={
+                "stage": "step4_3_2",
+                "split_mode": cls_split_mode,
+                "dataset_path": _to_serializable(cls_dataset),
+                "holdout_test_ratio": float(cls_cfg.holdout_test_ratio),
+                "tuning_cv_folds": int(cls_cfg.tuning_cv_folds),
+                "tuning_objective": str(cls_cfg.tuning_objective),
+                "tune": bool(cls_cfg.tune),
+                "n_trials": int(cls_cfg.n_trials),
+                "random_seed": int(seed),
+            },
+            filename="log.txt",
+        )
         cls_split_df, cls_split_assign = load_split_dataset(
             dataset_path=cls_dataset,
             split_mode=cls_split_mode,

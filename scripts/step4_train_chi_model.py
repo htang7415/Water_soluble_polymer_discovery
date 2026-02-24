@@ -1094,6 +1094,7 @@ def _save_cv_parity_by_fold_figure(
     out_png: Path,
     dpi: int,
     font_size: int,
+    split_label: str = "val",
 ) -> None:
     if cv_val_df.empty:
         return
@@ -1150,7 +1151,7 @@ def _save_cv_parity_by_fold_figure(
         ha="left",
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
     )
-    ax.set_title(f"CV parity by fold (val folds, n={len(plot_df)})")
+    ax.set_title(f"CV parity by fold ({split_label} folds, n={len(plot_df)})")
     ax.legend(
         title="CV fold",
         loc="upper left",
@@ -1160,6 +1161,441 @@ def _save_cv_parity_by_fold_figure(
     fig.tight_layout(rect=(0, 0, 0.82, 1))
     fig.savefig(out_png, dpi=dpi)
     plt.close(fig)
+
+
+def _summarize_cv_fold_metrics(
+    fold_metrics_df: pd.DataFrame,
+    metric_cols: List[str],
+) -> pd.DataFrame:
+    if fold_metrics_df.empty:
+        cols = ["cv_split", "n_folds"] + [f"{m}_{s}" for m in metric_cols for s in ["mean", "std"]]
+        return pd.DataFrame(columns=cols)
+
+    rows: List[Dict[str, object]] = []
+    for cv_split, sub in fold_metrics_df.groupby("cv_split", sort=True):
+        row: Dict[str, object] = {
+            "cv_split": str(cv_split),
+            "n_folds": int(sub["fold"].nunique()) if "fold" in sub.columns else int(len(sub)),
+        }
+        for metric in metric_cols:
+            vals = pd.to_numeric(sub.get(metric, pd.Series(dtype=float)), errors="coerce").to_numpy(dtype=float)
+            finite = vals[np.isfinite(vals)]
+            row[f"{metric}_mean"] = float(np.mean(finite)) if finite.size > 0 else np.nan
+            row[f"{metric}_std"] = float(np.std(finite)) if finite.size > 0 else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _cv_summary_table_to_dict(summary_df: pd.DataFrame) -> Dict[str, Dict[str, object]]:
+    out: Dict[str, Dict[str, object]] = {}
+    if summary_df.empty:
+        return out
+    for _, row in summary_df.iterrows():
+        split = str(row.get("cv_split", ""))
+        if len(split) == 0:
+            continue
+        payload: Dict[str, object] = {}
+        for col in summary_df.columns:
+            if col == "cv_split":
+                continue
+            val = row[col]
+            if pd.isna(val):
+                payload[col] = None
+            elif isinstance(val, (np.floating, float)):
+                payload[col] = float(val)
+            elif isinstance(val, (np.integer, int)):
+                payload[col] = int(val)
+            else:
+                payload[col] = val
+        out[split] = payload
+    return out
+
+
+def _save_classifier_cv_parity_by_fold_figure(
+    cv_pred_df: pd.DataFrame,
+    out_png: Path,
+    dpi: int,
+    font_size: int,
+    split_label: str,
+) -> None:
+    if cv_pred_df.empty:
+        return
+
+    plt.rcParams.update(
+        {
+            "font.size": font_size,
+            "axes.titlesize": font_size,
+            "axes.labelsize": font_size,
+            "legend.fontsize": font_size,
+        }
+    )
+    fig, ax = plt.subplots(figsize=(6, 5))
+    plot_df = cv_pred_df.copy()
+    plot_df["fold"] = plot_df["fold"].astype(str)
+    rng = np.random.default_rng(0)
+    jitter = rng.normal(loc=0.0, scale=0.03, size=len(plot_df))
+    plot_df["water_soluble_jitter"] = np.clip(
+        pd.to_numeric(plot_df["water_soluble"], errors="coerce").fillna(0.0).to_numpy(dtype=float) + jitter,
+        -0.08,
+        1.08,
+    )
+    n_folds = int(plot_df["fold"].nunique())
+    palette = sns.color_palette("tab10", n_colors=max(n_folds, 3))
+    sns.scatterplot(
+        data=plot_df,
+        x="water_soluble_jitter",
+        y="class_prob",
+        hue="fold",
+        palette=palette,
+        alpha=0.75,
+        s=18,
+        ax=ax,
+    )
+    ax.plot([0.0, 1.0], [0.0, 1.0], "k--", linewidth=1.1)
+    ax.set_xlim(-0.1, 1.1)
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.set_xticks([0.0, 1.0])
+    ax.set_xticklabels(["0", "1"])
+    ax.set_xlabel(f"True {CLASS_LABEL_PUBLIC}")
+    ax.set_ylabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
+
+    cls = classification_metrics(plot_df["water_soluble"], plot_df["class_prob"])
+    metrics_text = (
+        f"BalAcc={cls['balanced_accuracy']:.3f}\n"
+        f"AUROC={cls['auroc']:.3f}\n"
+        f"AUPRC={cls['auprc']:.3f}\n"
+        f"Brier={cls['brier']:.3f}"
+    )
+    ax.text(
+        0.03,
+        0.97,
+        metrics_text,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
+    )
+    ax.set_title(f"CV parity by fold ({split_label} folds, n={len(plot_df)})")
+    ax.legend(
+        title="CV fold",
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+    )
+    fig.tight_layout(rect=(0, 0, 0.82, 1))
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
+def run_regression_cv_with_best_hyperparameters(
+    split_df: pd.DataFrame,
+    embedding_table: Optional[np.ndarray],
+    train_cfg: TrainConfig,
+    config: Dict,
+    model_size: Optional[str],
+    backbone_checkpoint: Optional[str],
+    tokenizer,
+    device: str,
+    hidden_sizes: List[int],
+    dropout: float,
+    learning_rate: float,
+    weight_decay: float,
+    batch_size: int,
+    finetune_last_layers: int,
+    metrics_dir: Path,
+    figures_dir: Path,
+    dpi: int,
+    font_size: int,
+) -> Dict[str, object]:
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    cv_folds, cv_info = _build_tuning_cv_folds(split_df=split_df, train_cfg=train_cfg)
+    fold_layout_df = _summarize_tuning_cv_folds(cv_folds)
+    fold_layout_df.to_csv(metrics_dir / "cv_fold_layout.csv", index=False)
+
+    fold_metric_rows: List[Dict[str, object]] = []
+    fold_pred_frames: List[pd.DataFrame] = []
+    fold_history_frames: List[pd.DataFrame] = []
+
+    for fold_id, fold_df in enumerate(cv_folds, start=1):
+        _, history, preds = train_one_model(
+            split_df=fold_df,
+            embedding_table=embedding_table,
+            train_cfg=train_cfg,
+            device=device,
+            hidden_sizes=hidden_sizes,
+            dropout=dropout,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            batch_size=batch_size,
+            num_epochs=train_cfg.num_epochs,
+            patience=train_cfg.patience,
+            config=config,
+            model_size=model_size,
+            backbone_checkpoint=backbone_checkpoint,
+            tokenizer=tokenizer,
+            finetune_last_layers=finetune_last_layers,
+            timestep_for_embedding=train_cfg.timestep_for_embedding,
+        )
+
+        fold_hist = pd.DataFrame(history)
+        if not fold_hist.empty:
+            fold_hist.insert(0, "fold", int(fold_id))
+            fold_history_frames.append(fold_hist)
+
+        for raw_split, cv_split in [("train", "train"), ("val", "test")]:
+            sub = fold_df[fold_df["split"] == raw_split].copy().reset_index(drop=True)
+            pred = preds[raw_split]
+            if len(sub) != len(pred["chi_true"]):
+                raise ValueError(
+                    f"Step4_1 CV fold={fold_id} split={raw_split} length mismatch: "
+                    f"split_rows={len(sub)}, pred_rows={len(pred['chi_true'])}"
+                )
+
+            chi_true = np.asarray(pred["chi_true"], dtype=float)
+            chi_pred = np.asarray(pred["chi_pred"], dtype=float)
+            coeff = _coerce_coeff_matrix(pred["coefficients"], expected_rows=len(sub), split=f"cv_{raw_split}")
+            sub["chi_true"] = chi_true
+            sub["chi_pred"] = chi_pred
+            sub["chi_error"] = chi_pred - chi_true
+            sub["fold"] = int(fold_id)
+            sub["cv_split"] = cv_split
+            sub["raw_split"] = raw_split
+            for i, name in enumerate(COEFF_NAMES):
+                sub[name] = coeff[:, i] if i < coeff.shape[1] else np.nan
+
+            use_cols = [
+                "fold",
+                "cv_split",
+                "raw_split",
+                "row_id",
+                "polymer_id",
+                "Polymer",
+                "SMILES",
+                "water_soluble",
+                "chi_true",
+                "chi_pred",
+                "chi_error",
+            ] + COEFF_NAMES
+            fold_pred_frames.append(sub[[c for c in use_cols if c in sub.columns]].copy())
+
+            row: Dict[str, object] = {
+                "fold": int(fold_id),
+                "cv_split": cv_split,
+                "raw_split": raw_split,
+                "n_rows": int(len(sub)),
+            }
+            row.update(regression_metrics(chi_true, chi_pred))
+            row.update(hit_metrics(chi_pred - chi_true, epsilons=[0.02, 0.05, 0.1, 0.2]))
+            fold_metric_rows.append(row)
+
+    fold_metrics_df = pd.DataFrame(fold_metric_rows).sort_values(["cv_split", "fold"]).reset_index(drop=True)
+    fold_metrics_df.to_csv(metrics_dir / "cv_fold_metrics.csv", index=False)
+    cv_summary_df = _summarize_cv_fold_metrics(
+        fold_metrics_df=fold_metrics_df,
+        metric_cols=["mae", "rmse", "r2"],
+    )
+    cv_summary_df.to_csv(metrics_dir / "cv_metrics_summary.csv", index=False)
+
+    if fold_history_frames:
+        pd.concat(fold_history_frames, ignore_index=True).to_csv(metrics_dir / "cv_training_history.csv", index=False)
+    else:
+        pd.DataFrame().to_csv(metrics_dir / "cv_training_history.csv", index=False)
+
+    if fold_pred_frames:
+        cv_pred_df = pd.concat(fold_pred_frames, ignore_index=True)
+    else:
+        cv_pred_df = pd.DataFrame()
+    cv_pred_df.to_csv(metrics_dir / "cv_predictions_all.csv", index=False)
+    for split in ["train", "test"]:
+        if cv_pred_df.empty or "cv_split" not in cv_pred_df.columns:
+            split_df = pd.DataFrame()
+        else:
+            split_df = cv_pred_df[cv_pred_df["cv_split"] == split].copy()
+        split_df.to_csv(metrics_dir / f"cv_predictions_{split}.csv", index=False)
+        if not split_df.empty:
+            if split == "train":
+                _save_cv_parity_by_fold_figure(
+                    cv_val_df=split_df,
+                    out_png=figures_dir / "cv_parity_train_by_fold.png",
+                    dpi=dpi,
+                    font_size=font_size,
+                    split_label="train",
+                )
+            else:
+                _save_cv_parity_by_fold_figure(
+                    cv_val_df=split_df,
+                    out_png=figures_dir / "cv_parity_test_by_fold.png",
+                    dpi=dpi,
+                    font_size=font_size,
+                    split_label="test",
+                )
+
+    summary_by_split = _cv_summary_table_to_dict(cv_summary_df)
+    run_summary = {
+        "requested_folds": int(train_cfg.tuning_cv_folds),
+        "resolved_folds": int(cv_info.get("resolved_folds", len(cv_folds))),
+        "strategy": str(cv_info.get("strategy", "unknown")),
+        "dev_rows": int(cv_info.get("dev_rows", 0)),
+        "dev_units": int(cv_info.get("dev_units", 0)),
+        "num_epochs": int(train_cfg.num_epochs),
+        "patience": int(train_cfg.patience),
+        "summary_by_split": summary_by_split,
+    }
+    with open(metrics_dir / "cv_run_summary.json", "w") as f:
+        json.dump(run_summary, f, indent=2)
+    return run_summary
+
+
+def run_classifier_cv_with_best_hyperparameters(
+    split_df: pd.DataFrame,
+    embedding_table: Optional[np.ndarray],
+    train_cfg: TrainConfig,
+    config: Dict,
+    model_size: Optional[str],
+    backbone_checkpoint: Optional[str],
+    tokenizer,
+    device: str,
+    hidden_sizes: List[int],
+    dropout: float,
+    learning_rate: float,
+    weight_decay: float,
+    batch_size: int,
+    finetune_last_layers: int,
+    metrics_dir: Path,
+    figures_dir: Path,
+    dpi: int,
+    font_size: int,
+) -> Dict[str, object]:
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    cv_folds, cv_info = _build_tuning_cv_folds(split_df=split_df, train_cfg=train_cfg)
+    fold_layout_df = _summarize_tuning_cv_folds(cv_folds)
+    fold_layout_df.to_csv(metrics_dir / "cv_fold_layout.csv", index=False)
+
+    fold_metric_rows: List[Dict[str, object]] = []
+    fold_pred_frames: List[pd.DataFrame] = []
+    fold_history_frames: List[pd.DataFrame] = []
+
+    for fold_id, fold_df in enumerate(cv_folds, start=1):
+        _, history, preds = train_one_classifier_model(
+            split_df=fold_df,
+            embedding_table=embedding_table,
+            train_cfg=train_cfg,
+            device=device,
+            hidden_sizes=hidden_sizes,
+            dropout=dropout,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            batch_size=batch_size,
+            num_epochs=train_cfg.num_epochs,
+            patience=train_cfg.patience,
+            config=config,
+            model_size=model_size,
+            backbone_checkpoint=backbone_checkpoint,
+            tokenizer=tokenizer,
+            finetune_last_layers=finetune_last_layers,
+            timestep_for_embedding=train_cfg.timestep_for_embedding,
+        )
+
+        fold_hist = pd.DataFrame(history)
+        if not fold_hist.empty:
+            fold_hist.insert(0, "fold", int(fold_id))
+            fold_history_frames.append(fold_hist)
+
+        for raw_split, cv_split in [("train", "train"), ("val", "test")]:
+            sub = fold_df[fold_df["split"] == raw_split].copy().reset_index(drop=True)
+            pred = preds[raw_split]
+            if len(sub) != len(pred["prob"]):
+                raise ValueError(
+                    f"Step4_2 CV fold={fold_id} split={raw_split} length mismatch: "
+                    f"split_rows={len(sub)}, pred_rows={len(pred['prob'])}"
+                )
+
+            class_logit = np.asarray(pred["logit"], dtype=float)
+            class_prob = np.asarray(pred["prob"], dtype=float)
+            class_true = pd.to_numeric(sub["water_soluble"], errors="coerce").fillna(0).to_numpy(dtype=int)
+            sub["class_logit"] = class_logit
+            sub["class_prob"] = class_prob
+            sub["class_pred"] = (class_prob >= 0.5).astype(int)
+            sub["fold"] = int(fold_id)
+            sub["cv_split"] = cv_split
+            sub["raw_split"] = raw_split
+
+            use_cols = [
+                "fold",
+                "cv_split",
+                "raw_split",
+                "row_id",
+                "polymer_id",
+                "Polymer",
+                "SMILES",
+                "water_soluble",
+                "class_logit",
+                "class_prob",
+                "class_pred",
+            ]
+            fold_pred_frames.append(sub[[c for c in use_cols if c in sub.columns]].copy())
+
+            row: Dict[str, object] = {
+                "fold": int(fold_id),
+                "cv_split": cv_split,
+                "raw_split": raw_split,
+                "n_rows": int(len(sub)),
+            }
+            row.update(classification_metrics(class_true, class_prob))
+            fold_metric_rows.append(row)
+
+    fold_metrics_df = pd.DataFrame(fold_metric_rows).sort_values(["cv_split", "fold"]).reset_index(drop=True)
+    fold_metrics_df.to_csv(metrics_dir / "cv_fold_metrics.csv", index=False)
+    cv_summary_df = _summarize_cv_fold_metrics(
+        fold_metrics_df=fold_metrics_df,
+        metric_cols=["balanced_accuracy", "auroc", "auprc", "brier"],
+    )
+    cv_summary_df.to_csv(metrics_dir / "cv_metrics_summary.csv", index=False)
+
+    if fold_history_frames:
+        pd.concat(fold_history_frames, ignore_index=True).to_csv(metrics_dir / "cv_training_history.csv", index=False)
+    else:
+        pd.DataFrame().to_csv(metrics_dir / "cv_training_history.csv", index=False)
+
+    if fold_pred_frames:
+        cv_pred_df = pd.concat(fold_pred_frames, ignore_index=True)
+    else:
+        cv_pred_df = pd.DataFrame()
+    cv_pred_df.to_csv(metrics_dir / "cv_predictions_all.csv", index=False)
+    for split in ["train", "test"]:
+        if cv_pred_df.empty or "cv_split" not in cv_pred_df.columns:
+            split_df = pd.DataFrame()
+        else:
+            split_df = cv_pred_df[cv_pred_df["cv_split"] == split].copy()
+        split_df.to_csv(metrics_dir / f"cv_predictions_{split}.csv", index=False)
+        if not split_df.empty:
+            _save_classifier_cv_parity_by_fold_figure(
+                cv_pred_df=split_df,
+                out_png=figures_dir / f"cv_parity_{split}_by_fold.png",
+                dpi=dpi,
+                font_size=font_size,
+                split_label=split,
+            )
+
+    summary_by_split = _cv_summary_table_to_dict(cv_summary_df)
+    run_summary = {
+        "requested_folds": int(train_cfg.tuning_cv_folds),
+        "resolved_folds": int(cv_info.get("resolved_folds", len(cv_folds))),
+        "strategy": str(cv_info.get("strategy", "unknown")),
+        "dev_rows": int(cv_info.get("dev_rows", 0)),
+        "dev_units": int(cv_info.get("dev_units", 0)),
+        "num_epochs": int(train_cfg.num_epochs),
+        "patience": int(train_cfg.patience),
+        "summary_by_split": summary_by_split,
+    }
+    with open(metrics_dir / "cv_run_summary.json", "w") as f:
+        json.dump(run_summary, f, indent=2)
+    return run_summary
 
 
 def tune_hyperparameters(
@@ -2951,6 +3387,7 @@ def main(args):
     cls_split_mode = str(chi_cfg.get("classification_split_mode", "random")).strip().lower()
     if cls_split_mode not in {"polymer", "random"}:
         raise ValueError("chi_training.shared.classification_split_mode must be one of {'polymer','random'}")
+    backbone_split_mode = reg_split_mode
     if args.finetune_last_layers is not None:
         train_cfg.finetune_last_layers = int(args.finetune_last_layers)
     run_step41 = args.stage in {"both", "step4_1"}
@@ -2964,21 +3401,27 @@ def main(args):
             f"for model_size={args.model_size}, got {train_cfg.finetune_last_layers}"
         )
 
-    # New Step 4 layout keeps one model-size root:
-    #   results_<model_size>/step4_chi_training/
-    # Regression is split-scoped; classification is shared.
+    # Stage-separated Step 4 layout:
+    #   results_<model_size>/step4_1_regression/<split_mode>/
+    #   results_<model_size>/step4_2_classification/
+    # This avoids write contention when Step4_1 and Step4_2 run as separate jobs.
     results_dir = Path(get_results_dir(args.model_size, config["paths"]["results_dir"], split_mode=None))
-    step_dir = results_dir / "step4_chi_training"
-    shared_dir = step_dir / "shared"
-    pipeline_metrics_dir = step_dir / "pipeline_metrics"
+    reg_dir = results_dir / "step4_1_regression" / reg_split_mode
+    cls_dir = results_dir / "step4_2_classification"
+    reg_shared_dir = reg_dir / "shared"
+    cls_shared_dir = cls_dir / "shared"
     if args.stage == "step4_1":
-        pipeline_metrics_run_dir = pipeline_metrics_dir / "step4_1_regression" / reg_split_mode
+        stage_dir = reg_dir
+        stage_step_name = "step4_1_regression"
+        pipeline_metrics_run_dir = reg_dir / "pipeline_metrics"
     elif args.stage == "step4_2":
-        pipeline_metrics_run_dir = pipeline_metrics_dir / "step4_2_classification"
+        stage_dir = cls_dir
+        stage_step_name = "step4_2_classification"
+        pipeline_metrics_run_dir = cls_dir / "pipeline_metrics"
     else:
-        pipeline_metrics_run_dir = pipeline_metrics_dir / f"both_{reg_split_mode}"
-    reg_dir = step_dir / "step4_1_regression" / reg_split_mode
-    cls_dir = step_dir / "step4_2_classification"
+        stage_dir = results_dir / f"step4_split_pipeline_{reg_split_mode}"
+        stage_step_name = "step4_split_pipeline"
+        pipeline_metrics_run_dir = stage_dir / "pipeline_metrics"
     reg_metrics_dir = reg_dir / "metrics"
     reg_figures_dir = reg_dir / "figures"
     reg_tuning_dir = reg_dir / "tuning"
@@ -2989,20 +3432,30 @@ def main(args):
     cls_checkpoint_dir = cls_dir / "checkpoints"
     legacy_checkpoint_dir = results_dir / "checkpoints"
 
-    for d in [
-        shared_dir,
-        pipeline_metrics_dir,
-        pipeline_metrics_run_dir,
-        reg_metrics_dir,
-        reg_figures_dir,
-        reg_tuning_dir,
-        reg_checkpoint_dir,
-        cls_metrics_dir,
-        cls_figures_dir,
-        cls_tuning_dir,
-        cls_checkpoint_dir,
-        legacy_checkpoint_dir,
-    ]:
+    dir_candidates = [stage_dir, pipeline_metrics_run_dir, legacy_checkpoint_dir]
+    if run_step41:
+        dir_candidates.extend(
+            [
+                reg_dir,
+                reg_shared_dir,
+                reg_metrics_dir,
+                reg_figures_dir,
+                reg_tuning_dir,
+                reg_checkpoint_dir,
+            ]
+        )
+    if run_step42:
+        dir_candidates.extend(
+            [
+                cls_dir,
+                cls_shared_dir,
+                cls_metrics_dir,
+                cls_figures_dir,
+                cls_tuning_dir,
+                cls_checkpoint_dir,
+            ]
+        )
+    for d in dir_candidates:
         d.mkdir(parents=True, exist_ok=True)
 
     split_ratios = _resolve_split_ratios(train_cfg)
@@ -3010,19 +3463,21 @@ def main(args):
     cls_csv = args.classification_dataset_path or chi_cfg["step4_2_dataset_path"]
 
     seed_info = seed_everything(train_cfg.seed)
-    save_config(config, step_dir / "config_used.yaml")
-    save_run_metadata(step_dir, args.config, seed_info)
+    save_config(config, stage_dir / "config_used.yaml")
+    save_run_metadata(stage_dir, args.config, seed_info)
     write_initial_log(
-        step_dir=step_dir,
-        step_name="step4_chi_training",
+        step_dir=stage_dir,
+        step_name=stage_step_name,
         context={
             "config_path": args.config,
             "model_size": args.model_size,
             "stage": args.stage,
             "results_dir": str(results_dir),
+            "stage_output_dir": str(stage_dir),
             "split_mode": reg_split_mode,
             "regression_split_mode": reg_split_mode,
             "classification_split_mode": cls_split_mode,
+            "backbone_artifact_split_mode": backbone_split_mode,
             "holdout_test_ratio": float(train_cfg.holdout_test_ratio),
             "resolved_train_ratio": float(split_ratios["train_ratio"]),
             "resolved_val_ratio": float(split_ratios["val_ratio"]),
@@ -3055,6 +3510,7 @@ def main(args):
     print(f"Stage: {args.stage}")
     print(f"Regression split mode: {reg_split_mode}")
     print(f"Classification split mode: {cls_split_mode}")
+    print(f"Backbone artifact split mode: {backbone_split_mode}")
     print(
         "Resolved split ratios: "
         f"train={split_ratios['train_ratio']:.4f}, "
@@ -3093,18 +3549,20 @@ def main(args):
     )
     cls_split_df = add_split_column(cls_df, cls_split_assign)
 
-    # Shared outputs: keep legacy regression filenames plus explicit split-tagged files.
-    reg_split_assign.to_csv(shared_dir / "split_assignments.csv", index=False)
-    reg_split_df.to_csv(shared_dir / "chi_dataset_with_split.csv", index=False)
-    reg_split_assign.to_csv(shared_dir / f"split_assignments_step4_1_{reg_split_mode}.csv", index=False)
-    reg_split_df.to_csv(shared_dir / f"chi_dataset_with_split_step4_1_{reg_split_mode}.csv", index=False)
-    cls_split_assign.to_csv(shared_dir / "split_assignments_step4_2.csv", index=False)
-    cls_split_df.to_csv(shared_dir / "chi_dataset_with_split_step4_2.csv", index=False)
-
-    reg_split_assign.to_csv(reg_metrics_dir / "split_assignments.csv", index=False)
-    reg_split_df.to_csv(reg_metrics_dir / "chi_dataset_with_split.csv", index=False)
-    cls_split_assign.to_csv(cls_metrics_dir / "split_assignments.csv", index=False)
-    cls_split_df.to_csv(cls_metrics_dir / "chi_dataset_with_split.csv", index=False)
+    if run_step41:
+        reg_split_assign.to_csv(reg_shared_dir / "split_assignments.csv", index=False)
+        reg_split_df.to_csv(reg_shared_dir / "chi_dataset_with_split.csv", index=False)
+        reg_split_assign.to_csv(reg_shared_dir / f"split_assignments_step4_1_{reg_split_mode}.csv", index=False)
+        reg_split_df.to_csv(reg_shared_dir / f"chi_dataset_with_split_step4_1_{reg_split_mode}.csv", index=False)
+        reg_split_assign.to_csv(reg_metrics_dir / "split_assignments.csv", index=False)
+        reg_split_df.to_csv(reg_metrics_dir / "chi_dataset_with_split.csv", index=False)
+    if run_step42:
+        cls_split_assign.to_csv(cls_shared_dir / "split_assignments.csv", index=False)
+        cls_split_df.to_csv(cls_shared_dir / "chi_dataset_with_split.csv", index=False)
+        cls_split_assign.to_csv(cls_shared_dir / f"split_assignments_step4_2_{cls_split_mode}.csv", index=False)
+        cls_split_df.to_csv(cls_shared_dir / f"chi_dataset_with_split_step4_2_{cls_split_mode}.csv", index=False)
+        cls_split_assign.to_csv(cls_metrics_dir / "split_assignments.csv", index=False)
+        cls_split_df.to_csv(cls_metrics_dir / "chi_dataset_with_split.csv", index=False)
 
     reg_embedding_table: Optional[np.ndarray] = None
     if run_step41:
@@ -3112,7 +3570,7 @@ def main(args):
         reg_emb_cache = build_or_load_embedding_cache(
             polymer_df=reg_polymer_df,
             config=config,
-            cache_npz=shared_dir / f"polymer_embeddings_step4_1_{reg_split_mode}.npz",
+            cache_npz=reg_shared_dir / f"polymer_embeddings_step4_1_{reg_split_mode}.npz",
             model_size=args.model_size,
             split_mode=reg_split_mode,
             checkpoint_path=args.backbone_checkpoint,
@@ -3131,9 +3589,9 @@ def main(args):
         cls_emb_cache = build_or_load_embedding_cache(
             polymer_df=cls_polymer_df,
             config=config,
-            cache_npz=shared_dir / f"polymer_embeddings_step4_2_classification_{cls_split_mode}.npz",
+            cache_npz=cls_shared_dir / f"polymer_embeddings_step4_2_classification_{cls_split_mode}.npz",
             model_size=args.model_size,
-            split_mode=cls_split_mode,
+            split_mode=backbone_split_mode,
             checkpoint_path=args.backbone_checkpoint,
             device=device,
             timestep=train_cfg.timestep_for_embedding,
@@ -3159,6 +3617,7 @@ def main(args):
     reg_final_train_rows: Optional[int] = None
     reg_final_test_rows: Optional[int] = None
     reg_history: Dict[str, List[float]] = {"epoch": []}
+    reg_post_optuna_cv_summary: Optional[Dict[str, object]] = None
 
     cls_best_params = None
     cls_chosen = None
@@ -3167,6 +3626,7 @@ def main(args):
     cls_final_train_rows: Optional[int] = None
     cls_final_test_rows: Optional[int] = None
     cls_history: Dict[str, List[float]] = {"epoch": []}
+    cls_post_optuna_cv_summary: Optional[Dict[str, object]] = None
 
     # -------------------------
     # Step 4_1: Regression
@@ -3190,7 +3650,7 @@ def main(args):
             tokenizer_for_training, _, _ = load_backbone_from_step1(
                 config=config,
                 model_size=args.model_size,
-                split_mode=reg_split_mode,
+                split_mode=backbone_split_mode,
                 checkpoint_path=args.backbone_checkpoint,
                 device="cpu",
             )
@@ -3240,6 +3700,28 @@ def main(args):
                 f"chosen regression finetune_last_layers must be in [0, {backbone_num_layers}], got {reg_finetune_last_layers}"
             )
         reg_use_backbone_finetune = bool(reg_finetune_last_layers > 0)
+        if reg_cfg.tune:
+            print("Running Step4_1 CV retraining with selected hyperparameters...")
+            reg_post_optuna_cv_summary = run_regression_cv_with_best_hyperparameters(
+                split_df=reg_split_df,
+                embedding_table=reg_embedding_table,
+                train_cfg=reg_cfg,
+                config=config,
+                model_size=args.model_size,
+                backbone_checkpoint=args.backbone_checkpoint,
+                tokenizer=tokenizer_for_training,
+                device=device,
+                hidden_sizes=reg_chosen["hidden_sizes"],
+                dropout=reg_chosen["dropout"],
+                learning_rate=reg_chosen["learning_rate"],
+                weight_decay=reg_chosen["weight_decay"],
+                batch_size=reg_chosen["batch_size"],
+                finetune_last_layers=reg_finetune_last_layers,
+                metrics_dir=reg_metrics_dir / "cv_best_params",
+                figures_dir=reg_figures_dir / "cv_best_params",
+                dpi=dpi,
+                font_size=font_size,
+            )
         reg_final_fit_df = _build_final_fit_split_df(reg_split_df)
         reg_final_train_rows = int((reg_final_fit_df["split"] == "train").sum())
         reg_final_test_rows = int((reg_final_fit_df["split"] == "test").sum())
@@ -3263,6 +3745,7 @@ def main(args):
                     "final_fit_uses_train_plus_val": True,
                     "final_fit_train_rows": reg_final_train_rows,
                     "final_fit_test_rows": reg_final_test_rows,
+                    "post_optuna_cv_retrain": reg_post_optuna_cv_summary,
                 },
                 f,
                 indent=2,
@@ -3373,7 +3856,7 @@ def main(args):
             tokenizer_for_training, _, _ = load_backbone_from_step1(
                 config=config,
                 model_size=args.model_size,
-                split_mode=cls_split_mode,
+                split_mode=backbone_split_mode,
                 checkpoint_path=args.backbone_checkpoint,
                 device="cpu",
             )
@@ -3423,6 +3906,28 @@ def main(args):
                 f"chosen classification finetune_last_layers must be in [0, {backbone_num_layers}], got {cls_finetune_last_layers}"
             )
         cls_use_backbone_finetune = bool(cls_finetune_last_layers > 0)
+        if cls_cfg.tune:
+            print("Running Step4_2 CV retraining with selected hyperparameters...")
+            cls_post_optuna_cv_summary = run_classifier_cv_with_best_hyperparameters(
+                split_df=cls_split_df,
+                embedding_table=cls_embedding_table,
+                train_cfg=cls_cfg,
+                config=config,
+                model_size=args.model_size,
+                backbone_checkpoint=args.backbone_checkpoint,
+                tokenizer=tokenizer_for_training,
+                device=device,
+                hidden_sizes=cls_chosen["hidden_sizes"],
+                dropout=cls_chosen["dropout"],
+                learning_rate=cls_chosen["learning_rate"],
+                weight_decay=cls_chosen["weight_decay"],
+                batch_size=cls_chosen["batch_size"],
+                finetune_last_layers=cls_finetune_last_layers,
+                metrics_dir=cls_metrics_dir / "cv_best_params",
+                figures_dir=cls_figures_dir / "cv_best_params",
+                dpi=dpi,
+                font_size=font_size,
+            )
         cls_final_fit_df = _build_final_fit_split_df(cls_split_df)
         cls_final_train_rows = int((cls_final_fit_df["split"] == "train").sum())
         cls_final_test_rows = int((cls_final_fit_df["split"] == "test").sum())
@@ -3445,6 +3950,7 @@ def main(args):
                     "final_fit_uses_train_plus_val": True,
                     "final_fit_train_rows": cls_final_train_rows,
                     "final_fit_test_rows": cls_final_test_rows,
+                    "post_optuna_cv_retrain": cls_post_optuna_cv_summary,
                 },
                 f,
                 indent=2,
@@ -3528,18 +4034,20 @@ def main(args):
             "objective": "maximize_val_r2",
             "optuna_best_params": reg_best_params,
             "final_training_hyperparameters": reg_chosen,
+            "post_optuna_cv_retrain": reg_post_optuna_cv_summary,
         }
     if cls_chosen is not None:
         hp_summary["step4_2_classification"] = {
             "objective": "maximize_val_balanced_accuracy",
             "optuna_best_params": cls_best_params,
             "final_training_hyperparameters": cls_chosen,
+            "post_optuna_cv_retrain": cls_post_optuna_cv_summary,
         }
     with open(pipeline_metrics_run_dir / "hyperparameter_selection_summary.json", "w") as f:
         json.dump(hp_summary, f, indent=2)
 
     summary = {
-        "step": "step4_chi_training",
+        "step": stage_step_name,
         "stage": args.stage,
         "model_size": args.model_size or "small",
         "split_mode": reg_split_mode,
@@ -3565,6 +4073,13 @@ def main(args):
         reg_overall_df = pd.read_csv(reg_metrics_dir / "chi_metrics_overall.csv")
         test_rows = reg_overall_df[reg_overall_df["split"] == "test"]
         test_row = test_rows.iloc[0] if len(test_rows) > 0 else reg_overall_df.iloc[-1]
+        reg_cv_train = {}
+        reg_cv_test = {}
+        if isinstance(reg_post_optuna_cv_summary, dict):
+            reg_cv_by_split = reg_post_optuna_cv_summary.get("summary_by_split", {})
+            if isinstance(reg_cv_by_split, dict):
+                reg_cv_train = reg_cv_by_split.get("train", {}) if isinstance(reg_cv_by_split.get("train", {}), dict) else {}
+                reg_cv_test = reg_cv_by_split.get("test", {}) if isinstance(reg_cv_by_split.get("test", {}), dict) else {}
         summary.update(
             {
                 "step4_1_backbone_num_layers": int(backbone_num_layers),
@@ -3576,12 +4091,26 @@ def main(args):
                 "step4_1_test_mae": float(test_row["mae"]) if "mae" in test_row else np.nan,
                 "step4_1_test_rmse": float(test_row["rmse"]) if "rmse" in test_row else np.nan,
                 "step4_1_test_r2": float(test_row["r2"]) if "r2" in test_row else np.nan,
+                "step4_1_post_optuna_cv_folds": (
+                    int(reg_post_optuna_cv_summary["resolved_folds"])
+                    if isinstance(reg_post_optuna_cv_summary, dict) and "resolved_folds" in reg_post_optuna_cv_summary
+                    else np.nan
+                ),
+                "step4_1_post_optuna_cv_train_r2_mean": float(reg_cv_train["r2_mean"]) if "r2_mean" in reg_cv_train else np.nan,
+                "step4_1_post_optuna_cv_test_r2_mean": float(reg_cv_test["r2_mean"]) if "r2_mean" in reg_cv_test else np.nan,
             }
         )
     if run_step42:
         cls_overall_df = pd.read_csv(cls_metrics_dir / "class_metrics_overall.csv")
         cls_test_rows = cls_overall_df[cls_overall_df["split"] == "test"]
         cls_test_row = cls_test_rows.iloc[0] if len(cls_test_rows) > 0 else cls_overall_df.iloc[-1]
+        cls_cv_train = {}
+        cls_cv_test = {}
+        if isinstance(cls_post_optuna_cv_summary, dict):
+            cls_cv_by_split = cls_post_optuna_cv_summary.get("summary_by_split", {})
+            if isinstance(cls_cv_by_split, dict):
+                cls_cv_train = cls_cv_by_split.get("train", {}) if isinstance(cls_cv_by_split.get("train", {}), dict) else {}
+                cls_cv_test = cls_cv_by_split.get("test", {}) if isinstance(cls_cv_by_split.get("test", {}), dict) else {}
         summary.update(
             {
                 "step4_2_backbone_num_layers": int(backbone_num_layers),
@@ -3592,6 +4121,17 @@ def main(args):
                 "step4_2_n_epochs": int(len(cls_history["epoch"])),
                 "step4_2_test_balanced_accuracy": float(cls_test_row["balanced_accuracy"]) if "balanced_accuracy" in cls_test_row else np.nan,
                 "step4_2_test_auroc": float(cls_test_row["auroc"]) if "auroc" in cls_test_row else np.nan,
+                "step4_2_post_optuna_cv_folds": (
+                    int(cls_post_optuna_cv_summary["resolved_folds"])
+                    if isinstance(cls_post_optuna_cv_summary, dict) and "resolved_folds" in cls_post_optuna_cv_summary
+                    else np.nan
+                ),
+                "step4_2_post_optuna_cv_train_balanced_accuracy_mean": (
+                    float(cls_cv_train["balanced_accuracy_mean"]) if "balanced_accuracy_mean" in cls_cv_train else np.nan
+                ),
+                "step4_2_post_optuna_cv_test_balanced_accuracy_mean": (
+                    float(cls_cv_test["balanced_accuracy_mean"]) if "balanced_accuracy_mean" in cls_cv_test else np.nan
+                ),
             }
         )
     save_step_summary(summary, pipeline_metrics_run_dir)
@@ -3601,7 +4141,7 @@ def main(args):
         save_artifact_manifest(step_dir=cls_dir, metrics_dir=cls_metrics_dir, figures_dir=cls_figures_dir)
 
     print("Training complete.")
-    print(f"Step4 outputs root: {step_dir}")
+    print(f"Step4 outputs dir for this run: {stage_dir}")
     print(f"Pipeline metrics for this run: {pipeline_metrics_run_dir}")
     if run_step41:
         print(f"Step4_1 outputs ({reg_split_mode}): {reg_dir}")

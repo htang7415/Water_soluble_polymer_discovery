@@ -73,23 +73,63 @@ def resolve_step1_artifacts(
     checkpoint_path: Optional[str] = None,
 ) -> Tuple[Path, Path]:
     """Resolve tokenizer and Step1 checkpoint paths without loading model weights."""
-    base_results_dir = Path(config["paths"]["results_dir"])
-    results_dir = Path(get_results_dir(model_size, config["paths"]["results_dir"], split_mode))
+    base_dir_name = str(config["paths"]["results_dir"])
+    base_results_dir = Path(base_dir_name)
+    requested_split = str(split_mode).strip().lower() if split_mode is not None else ""
 
-    tokenizer_path = results_dir / "tokenizer.json"
-    if not tokenizer_path.exists():
-        tokenizer_path = base_results_dir / "tokenizer.json"
-    if not tokenizer_path.exists():
-        raise FileNotFoundError(f"Tokenizer not found at {tokenizer_path}")
+    chi_cfg = config.get("chi_training", {})
+    shared_cfg = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared", {}), dict) else {}
+    configured_split = str(shared_cfg.get("split_mode", "")).strip().lower()
+
+    candidate_dirs: List[Path] = []
+    seen_dirs = set()
+
+    def _add_candidate_dir(path: Path) -> None:
+        key = str(path)
+        if key in seen_dirs:
+            return
+        seen_dirs.add(key)
+        candidate_dirs.append(path)
+
+    _add_candidate_dir(Path(get_results_dir(model_size, base_dir_name, requested_split or None)))
+    if configured_split:
+        _add_candidate_dir(Path(get_results_dir(model_size, base_dir_name, configured_split)))
+    _add_candidate_dir(Path(get_results_dir(model_size, base_dir_name, None)))
+
+    # Backward compatibility for legacy layout that always appended split suffixes
+    # (for example: results_small_polymer).
+    if model_size is not None:
+        legacy_suffixes: List[str] = []
+        for suffix in [requested_split, configured_split, "polymer", "random"]:
+            if suffix and suffix not in legacy_suffixes:
+                legacy_suffixes.append(suffix)
+        for suffix in legacy_suffixes:
+            _add_candidate_dir(Path(f"{base_dir_name}_{model_size}_{suffix}"))
+
+    _add_candidate_dir(base_results_dir)
+
+    tokenizer_candidates = [d / "tokenizer.json" for d in candidate_dirs]
+    tokenizer_path = next((p for p in tokenizer_candidates if p.exists()), None)
+    if tokenizer_path is None:
+        searched = "\n".join(str(p) for p in tokenizer_candidates)
+        raise FileNotFoundError(f"Tokenizer not found. Searched:\n{searched}")
 
     if checkpoint_path is not None:
         ckpt_path = Path(checkpoint_path)
     else:
-        ckpt_path = results_dir / "step1_backbone" / "checkpoints" / "backbone_best.pt"
-        if not ckpt_path.exists():
-            ckpt_path = base_results_dir / "step1_backbone" / "checkpoints" / "backbone_best.pt"
+        checkpoint_candidates = [
+            d / "step1_backbone" / "checkpoints" / "backbone_best.pt"
+            for d in candidate_dirs
+        ]
+        ckpt_path = next((p for p in checkpoint_candidates if p.exists()), checkpoint_candidates[0])
     if not ckpt_path.exists():
-        raise FileNotFoundError(f"Backbone checkpoint not found: {ckpt_path}")
+        if checkpoint_path is not None:
+            raise FileNotFoundError(f"Backbone checkpoint not found: {ckpt_path}")
+        searched = "\n".join(
+            str(d / "step1_backbone" / "checkpoints" / "backbone_best.pt")
+            for d in candidate_dirs
+        )
+        raise FileNotFoundError(f"Backbone checkpoint not found. Searched:\n{searched}")
 
     return tokenizer_path, ckpt_path
 

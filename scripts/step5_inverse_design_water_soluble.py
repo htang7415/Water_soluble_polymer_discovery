@@ -705,6 +705,8 @@ def main(args):
             ]
         else:
             reg_candidates = [
+                results_dir_nosplit / "step4_1_regression" / split_mode,
+                results_dir / "step4_1_regression" / split_mode,
                 results_dir_nosplit / "step4_chi_training" / "step4_1_regression" / split_mode,
                 results_dir / "step4_chi_training" / split_mode / "step4_1_regression",
             ]
@@ -721,6 +723,8 @@ def main(args):
             ]
         else:
             cls_candidates = [
+                results_dir_nosplit / "step4_2_classification",
+                results_dir / "step4_2_classification",
                 results_dir_nosplit / "step4_chi_training" / "step4_2_classification",
                 results_dir / "step4_chi_training" / split_mode / "step4_2_classification",
             ]

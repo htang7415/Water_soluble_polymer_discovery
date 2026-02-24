@@ -274,12 +274,16 @@ def get_results_dir(
         base_dir: Base results directory name.
         split_mode: Optional split namespace (e.g., 'polymer' or 'random').
             When omitted, falls back to env `CHI_SPLIT_MODE` if set.
+            The default "polymer" split is treated as canonical and does not
+            add an extra suffix to the directory name.
 
     Returns:
         Results directory path string.
     """
     resolved_split = split_mode if split_mode is not None else os.environ.get("CHI_SPLIT_MODE")
     resolved_split = (str(resolved_split).strip().lower() if resolved_split is not None else "")
+    if resolved_split == "polymer":
+        resolved_split = ""
 
     parts = [str(base_dir)]
     if model_size is not None:
