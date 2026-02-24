@@ -8,6 +8,7 @@ from typing import Dict, Iterable
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from src.utils.figure_style import apply_publication_figure_style
 
 
 def _to_scalar(value):
@@ -131,6 +132,7 @@ def save_artifact_manifest(
         figures_dir.mkdir(parents=True, exist_ok=True)
         fig_path = figures_dir / "artifact_counts_by_category.png"
         try:
+            apply_publication_figure_style(font_size=10, dpi=int(dpi), remove_titles=True)
             fig, ax = plt.subplots(figsize=(5, 4))
             if not by_cat.empty:
                 ax.bar(by_cat["category"], by_cat["n_files"], color="#4c78a8")

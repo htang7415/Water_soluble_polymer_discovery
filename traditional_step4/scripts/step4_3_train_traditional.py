@@ -36,6 +36,7 @@ from common import (  # noqa: E402
     summarize_cv_folds,
 )
 from src.utils.config import save_config  # noqa: E402
+from src.utils.figure_style import apply_publication_figure_style  # noqa: E402
 from src.utils.numerics import stable_sigmoid  # noqa: E402
 from src.utils.reporting import save_artifact_manifest, save_step_summary, write_initial_log  # noqa: E402
 
@@ -1248,8 +1249,7 @@ def _evaluate_classification_cv(
 def _save_cv_parity_by_fold_figure(cv_val_df: pd.DataFrame, out_png: Path, dpi: int, font_size: int) -> None:
     if cv_val_df.empty:
         return
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
     fig, ax = plt.subplots(figsize=(6, 5))
     plot_df = cv_val_df.copy()
     plot_df["fold"] = plot_df["fold"].astype(str)
@@ -1289,8 +1289,7 @@ def _save_cv_parity_by_fold_figure(cv_val_df: pd.DataFrame, out_png: Path, dpi: 
 def _plot_optuna_objective(trial_df: pd.DataFrame, out_png: Path, objective_name: str, dpi: int, font_size: int, maximize: bool) -> None:
     if trial_df.empty:
         return
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
     fig, ax = plt.subplots(figsize=(6, 5))
     x = trial_df["trial"].to_numpy()
     y = pd.to_numeric(trial_df["objective_value"], errors="coerce").to_numpy()
@@ -1842,8 +1841,7 @@ def _plot_regression_parity_panel(ax, sub: pd.DataFrame, split: str) -> None:
 
 def _make_regression_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int, font_size: int) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
 
     train_df = pred_df[pred_df["split"] == "train"].copy().reset_index(drop=True)
     test_df = pred_df[pred_df["split"] == "test"].copy().reset_index(drop=True)
@@ -1922,8 +1920,7 @@ def _make_classification_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int,
     from sklearn.metrics import precision_recall_curve, roc_curve
 
     fig_dir.mkdir(parents=True, exist_ok=True)
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
 
     train_df = pred_df[pred_df["split"] == "train"].copy().reset_index(drop=True)
     test_df = pred_df[pred_df["split"] == "test"].copy().reset_index(drop=True)
@@ -2353,8 +2350,7 @@ def _save_regression_leaderboard_and_figures(
 
     if summary_df.empty:
         return summary_df
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
     sns.barplot(data=summary_df, x="model_name", y="test_r2", hue="quality_status", dodge=False, palette={"pass": "#2ca02c", "review": "#d62728"}, ax=axes[0])
     axes[0].axhline(0.0, color="black", linestyle="--", linewidth=1)
@@ -2447,8 +2443,7 @@ def _save_classification_leaderboard_and_figures(
 
     if summary_df.empty:
         return summary_df
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update({"font.size": font_size, "axes.titlesize": font_size, "axes.labelsize": font_size, "legend.fontsize": font_size})
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
     sns.barplot(
         data=summary_df,

@@ -9,8 +9,6 @@ import warnings
 import torch
 import numpy as np
 import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
 
 from src.chi.embeddings import load_backbone_from_step1
 from src.chi.model import (
@@ -21,6 +19,7 @@ from src.chi.model import (
 )
 from src.chi.constants import COEFF_NAMES
 from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars
+from src.utils.figure_style import apply_publication_figure_style
 from src.utils.numerics import stable_sigmoid
 
 CLASS_LABEL_INTERNAL = "water_soluble"
@@ -121,17 +120,7 @@ def default_chi_config(config: Dict, step: str | None = None) -> Dict:
 
 
 def set_plot_style(font_size: int) -> None:
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update(
-        {
-            "font.size": font_size,
-            "axes.titlesize": font_size,
-            "axes.labelsize": font_size,
-            "legend.fontsize": font_size,
-            "xtick.labelsize": font_size,
-            "ytick.labelsize": font_size,
-        }
-    )
+    apply_publication_figure_style(font_size=font_size, remove_titles=True)
 
 
 def parse_candidate_source(value: str) -> str:

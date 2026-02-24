@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.chi.data import SplitConfig, add_split_column, load_chi_dataset, make_split_assignments
 from src.utils.config import load_config, save_config
+from src.utils.figure_style import apply_publication_figure_style
 from src.utils.reproducibility import save_run_metadata, seed_everything
 from src.utils.reporting import save_step_summary, save_artifact_manifest, write_initial_log
 
@@ -61,17 +62,7 @@ def _default_chi_config(config: Dict) -> Dict:
 
 
 def _set_plot_style(font_size: int) -> None:
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update(
-        {
-            "font.size": font_size,
-            "axes.titlesize": font_size,
-            "axes.labelsize": font_size,
-            "legend.fontsize": font_size,
-            "xtick.labelsize": font_size,
-            "ytick.labelsize": font_size,
-        }
-    )
+    apply_publication_figure_style(font_size=font_size, remove_titles=True)
 
 
 def _plot_kde_safe_by_class(

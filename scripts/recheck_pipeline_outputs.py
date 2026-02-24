@@ -16,6 +16,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.utils.config import load_config
+from src.utils.figure_style import apply_publication_figure_style
 from src.utils.model_scales import get_results_dir
 
 
@@ -582,6 +583,7 @@ def _make_figures(
     max_gallery_panels: int = 9,
 ) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
+    apply_publication_figure_style(font_size=10, dpi=int(dpi), remove_titles=True)
     try:
         # Completion by step
         fig, ax = plt.subplots(figsize=(7.5, 4.5))

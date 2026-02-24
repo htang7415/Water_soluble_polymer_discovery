@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from common import get_traditional_results_dir, load_traditional_config, normalize_split_mode  # noqa: E402
 from src.utils.config import load_config, save_config  # noqa: E402
+from src.utils.figure_style import apply_publication_figure_style  # noqa: E402
 from src.utils.model_scales import get_results_dir  # noqa: E402
 from src.utils.reporting import save_artifact_manifest, save_step_summary, write_initial_log  # noqa: E402
 
@@ -158,15 +159,7 @@ def _barplot_two_models(
         }
     )
     melted = plot_df.melt(id_vars="model_size", var_name="pipeline", value_name="value")
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update(
-        {
-            "font.size": font_size,
-            "axes.titlesize": font_size,
-            "axes.labelsize": font_size,
-            "legend.fontsize": font_size,
-        }
-    )
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
     fig, ax = plt.subplots(figsize=(6, 5))
     sns.barplot(data=melted, x="model_size", y="value", hue="pipeline", ax=ax)
     ax.set_xlabel("Model size")

@@ -33,6 +33,7 @@ from src.chi.embeddings import (
 from src.chi.metrics import classification_metrics, hit_metrics, metrics_by_group, regression_metrics
 from src.chi.model import PhysicsGuidedChiModel, SolubilityClassifier
 from src.utils.config import load_config, save_config
+from src.utils.figure_style import apply_publication_figure_style
 from src.utils.model_scales import get_model_config, get_results_dir
 from src.utils.numerics import stable_sigmoid
 from src.utils.reproducibility import save_run_metadata, seed_everything
@@ -1099,14 +1100,7 @@ def _save_cv_parity_by_fold_figure(
     if cv_val_df.empty:
         return
 
-    plt.rcParams.update(
-        {
-            "font.size": font_size,
-            "axes.titlesize": font_size,
-            "axes.labelsize": font_size,
-            "legend.fontsize": font_size,
-        }
-    )
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
     fig, ax = plt.subplots(figsize=(6, 5))
     plot_df = cv_val_df.copy()
     plot_df["fold"] = plot_df["fold"].astype(str)
@@ -1221,14 +1215,7 @@ def _save_classifier_cv_parity_by_fold_figure(
     if cv_pred_df.empty:
         return
 
-    plt.rcParams.update(
-        {
-            "font.size": font_size,
-            "axes.titlesize": font_size,
-            "axes.labelsize": font_size,
-            "legend.fontsize": font_size,
-        }
-    )
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
     fig, ax = plt.subplots(figsize=(6, 5))
     plot_df = cv_pred_df.copy()
     plot_df["fold"] = plot_df["fold"].astype(str)
@@ -1834,14 +1821,7 @@ def tune_hyperparameters(
         )
 
     # Figure: trial-by-trial chi R2 and running best chi R2.
-    plt.rcParams.update(
-        {
-            "font.size": font_size,
-            "axes.titlesize": font_size,
-            "axes.labelsize": font_size,
-            "legend.fontsize": font_size,
-        }
-    )
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
     # Convert Series to NumPy arrays for matplotlib/pandas compatibility.
     trial_numbers = trial_df["trial"].to_numpy()
     chi_val_r2_values = pd.to_numeric(trial_df["chi_val_r2"], errors="coerce").to_numpy()
@@ -2312,13 +2292,7 @@ def _plot_classifier_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend
 
 def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_dir: Path, dpi: int, font_size: int) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update({
-        "font.size": font_size,
-        "axes.titlesize": font_size,
-        "axes.labelsize": font_size,
-        "legend.fontsize": font_size,
-    })
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
 
     # Loss curve
     has_val_curve = _has_finite_history_values(history, "val_loss")
@@ -2957,14 +2931,7 @@ def tune_classifier_hyperparameters(
     trial_df["best_objective_so_far"] = objective_numeric.cummax()
     trial_df.to_csv(tuning_dir / "optuna_optimization_objective.csv", index=False)
 
-    plt.rcParams.update(
-        {
-            "font.size": font_size,
-            "axes.titlesize": font_size,
-            "axes.labelsize": font_size,
-            "legend.fontsize": font_size,
-        }
-    )
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
     # Convert Series to NumPy arrays for matplotlib/pandas compatibility.
     trial_numbers = trial_df["trial"].to_numpy()
     objective_values = pd.to_numeric(trial_df["objective_value"], errors="coerce").to_numpy()
@@ -3114,13 +3081,7 @@ def _make_regression_figures(
     font_size: int,
 ) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update({
-        "font.size": font_size,
-        "axes.titlesize": font_size,
-        "axes.labelsize": font_size,
-        "legend.fontsize": font_size,
-    })
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
 
     has_val_curve = _has_finite_history_values(history, "val_loss")
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -3193,13 +3154,7 @@ def _make_classifier_figures(
     font_size: int,
 ) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
-    sns.set_theme(style="whitegrid")
-    plt.rcParams.update({
-        "font.size": font_size,
-        "axes.titlesize": font_size,
-        "axes.labelsize": font_size,
-        "legend.fontsize": font_size,
-    })
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
 
     has_val_curve = _has_finite_history_values(history, "val_loss")
     fig, ax = plt.subplots(figsize=(6, 5))

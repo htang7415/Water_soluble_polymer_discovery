@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple, Dict, Any
 
 from collections import Counter
 from matplotlib.ticker import MaxNLocator
+from src.utils.figure_style import apply_publication_figure_style
 
 
 class PlotUtils:
@@ -29,17 +30,8 @@ class PlotUtils:
         self.font_size = font_size
         self.dpi = dpi
 
-        # Set global matplotlib parameters
-        plt.rcParams.update({
-            'font.size': font_size,
-            'axes.labelsize': font_size,
-            'axes.titlesize': font_size,
-            'xtick.labelsize': font_size - 2,
-            'ytick.labelsize': font_size - 2,
-            'legend.fontsize': font_size - 2,
-            'figure.figsize': figure_size,
-            'figure.dpi': dpi,
-        })
+        apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
+        plt.rcParams.update({"figure.figsize": figure_size})
 
     def histogram(
         self,
