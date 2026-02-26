@@ -37,7 +37,7 @@ def _default_chi_config(config: Dict) -> Dict:
     )
 
     defaults = {
-        "dataset_path": "Data/chi/_50_polymers_T_phi.csv",
+        "dataset_path": "Data/chi/_250_polymers_T_phi.csv",
         "split_mode": "polymer",
         "train_ratio": 0.70,
         "val_ratio": 0.14,
@@ -73,7 +73,7 @@ def _plot_kde_safe_by_class(
     label: str,
     color: str,
 ) -> bool:
-    values = df.loc[df["water_soluble"] == int(class_value), "chi"].to_numpy(dtype=float)
+    values = df.loc[df["water_miscible"] == int(class_value), "chi"].to_numpy(dtype=float)
     values = values[np.isfinite(values)]
     if values.size < 2 or np.isclose(np.std(values), 0.0):
         return False
@@ -379,8 +379,8 @@ def _condition_stability_report(
                 "temperature": t,
                 "phi": phi,
                 "n_samples": int(len(sub)),
-                "n_soluble": int((sub["water_soluble"] == 1).sum()),
-                "n_insoluble": int((sub["water_soluble"] == 0).sum()),
+                "n_soluble": int((sub["water_miscible"] == 1).sum()),
+                "n_insoluble": int((sub["water_miscible"] == 0).sum()),
                 "chosen_chi_target": chosen,
                 "chosen_balanced_accuracy": float(best_sub["balanced_accuracy"].iloc[0]),
                 "objective_max": max_obj,
@@ -498,7 +498,7 @@ def main(args):
     )
 
     x_all = dev_df["chi"].to_numpy(dtype=float)
-    y_all = dev_df["water_soluble"].to_numpy(dtype=int)
+    y_all = dev_df["water_miscible"].to_numpy(dtype=int)
 
     # global scan
     global_scan = _scan_thresholds(x_all, y_all, positive_when_low=positive_when_low)
@@ -522,7 +522,7 @@ def main(args):
     best_rows = []
     for idx, ((t, phi), sub) in enumerate(dev_df.groupby(["temperature", "phi"])):
         x = sub["chi"].to_numpy(dtype=float)
-        y = sub["water_soluble"].to_numpy(dtype=int)
+        y = sub["water_miscible"].to_numpy(dtype=int)
         scan = _scan_thresholds(x, y, positive_when_low=positive_when_low)
         if scan.empty:
             continue
@@ -553,7 +553,7 @@ def main(args):
 
     # Hold-out test evaluation (thresholds learned on train+val dev split only).
     global_thr = float(global_best["chi_target"].iloc[0])
-    y_test = test_df["water_soluble"].to_numpy(dtype=int)
+    y_test = test_df["water_miscible"].to_numpy(dtype=int)
     x_test = test_df["chi"].to_numpy(dtype=float)
     pred_test_global = (x_test <= global_thr).astype(int)
     test_global = _confusion_metrics(y_test, pred_test_global)
@@ -565,7 +565,7 @@ def main(args):
     )
     matched_mask = test_cond_df["chi_target"].notna().to_numpy(dtype=bool)
     if np.any(matched_mask):
-        y_test_cond = test_cond_df.loc[matched_mask, "water_soluble"].to_numpy(dtype=int)
+        y_test_cond = test_cond_df.loc[matched_mask, "water_miscible"].to_numpy(dtype=int)
         x_test_cond = test_cond_df.loc[matched_mask, "chi"].to_numpy(dtype=float)
         thr_test_cond = test_cond_df.loc[matched_mask, "chi_target"].to_numpy(dtype=float)
         pred_test_cond = (x_test_cond <= thr_test_cond).astype(int)
@@ -663,8 +663,8 @@ def main(args):
         "n_polymers": int(df["Polymer"].nunique()),
         "n_polymers_dev": int(dev_df["Polymer"].nunique()),
         "n_polymers_test": int(test_df["Polymer"].nunique()),
-        "n_soluble": int(df[df["water_soluble"] == 1]["Polymer"].nunique()),
-        "n_insoluble": int(df[df["water_soluble"] == 0]["Polymer"].nunique()),
+        "n_soluble": int(df[df["water_miscible"] == 1]["Polymer"].nunique()),
+        "n_insoluble": int(df[df["water_miscible"] == 0]["Polymer"].nunique()),
         "global_chi_target": float(global_best["chi_target"].iloc[0]),
         "global_balanced_accuracy": float(global_best["balanced_accuracy"].iloc[0]),
         "global_youden_j": float(global_best["youden_j"].iloc[0]),

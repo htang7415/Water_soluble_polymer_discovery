@@ -41,7 +41,7 @@ from src.utils.reporting import save_step_summary, save_artifact_manifest, write
 
 
 WATER_SOLUBLE_PALETTE = {0: "#d62728", 1: "#1f77b4"}
-CLASS_LABEL_INTERNAL = "water_soluble"
+CLASS_LABEL_INTERNAL = "water_miscible"
 CLASS_LABEL_PUBLIC = "water_miscible"
 
 
@@ -83,7 +83,7 @@ class ChiDataset(Dataset):
         self.temperature = torch.tensor(self.df["temperature"].to_numpy(dtype=np.float32), dtype=torch.float32)
         self.phi = torch.tensor(self.df["phi"].to_numpy(dtype=np.float32), dtype=torch.float32)
         self.chi = torch.tensor(self.df["chi"].to_numpy(dtype=np.float32), dtype=torch.float32)
-        self.label = torch.tensor(self.df["water_soluble"].to_numpy(dtype=np.float32), dtype=torch.float32)
+        self.label = torch.tensor(self.df["water_miscible"].to_numpy(dtype=np.float32), dtype=torch.float32)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -109,7 +109,7 @@ class ChiTokenDataset(Dataset):
         self.temperature = torch.tensor(self.df["temperature"].to_numpy(dtype=np.float32), dtype=torch.float32)
         self.phi = torch.tensor(self.df["phi"].to_numpy(dtype=np.float32), dtype=torch.float32)
         self.chi = torch.tensor(self.df["chi"].to_numpy(dtype=np.float32), dtype=torch.float32)
-        self.label = torch.tensor(self.df["water_soluble"].to_numpy(dtype=np.float32), dtype=torch.float32)
+        self.label = torch.tensor(self.df["water_miscible"].to_numpy(dtype=np.float32), dtype=torch.float32)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -419,7 +419,7 @@ def _default_chi_config(config: Dict) -> Dict:
     )
 
     defaults = {
-        "dataset_path": "Data/chi/_50_polymers_T_phi.csv",
+        "dataset_path": "Data/chi/_250_polymers_T_phi.csv",
         "step4_2_dataset_path": [
             "Data/water_solvent/water_miscible_polymer.csv",
             "Data/water_solvent/water_immiscible_polymer.csv",
@@ -941,7 +941,7 @@ def _build_tuning_cv_folds(split_df: pd.DataFrame, train_cfg: TrainConfig) -> Tu
 
     if train_cfg.split_mode == "polymer":
         unit_df = (
-            dev_df[["polymer_id", "water_soluble"]]
+            dev_df[["polymer_id", "water_miscible"]]
             .drop_duplicates(subset=["polymer_id"])
             .sort_values("polymer_id")
             .reset_index(drop=True)
@@ -950,7 +950,7 @@ def _build_tuning_cv_folds(split_df: pd.DataFrame, train_cfg: TrainConfig) -> Tu
         strategy = "polymer_group_stratified"
     else:
         unit_df = (
-            dev_df[["row_id", "water_soluble"]]
+            dev_df[["row_id", "water_miscible"]]
             .drop_duplicates(subset=["row_id"])
             .sort_values("row_id")
             .reset_index(drop=True)
@@ -958,7 +958,7 @@ def _build_tuning_cv_folds(split_df: pd.DataFrame, train_cfg: TrainConfig) -> Tu
         unit_key = "row_id"
         strategy = "row_stratified"
 
-    class_counts = unit_df["water_soluble"].value_counts()
+    class_counts = unit_df["water_miscible"].value_counts()
     max_folds = int(min(len(unit_df), class_counts.min())) if not class_counts.empty else 0
 
     if max_folds < 2:
@@ -978,7 +978,7 @@ def _build_tuning_cv_folds(split_df: pd.DataFrame, train_cfg: TrainConfig) -> Tu
     resolved_folds = int(min(requested_folds, max_folds))
     skf = StratifiedKFold(n_splits=resolved_folds, shuffle=True, random_state=train_cfg.seed)
     unit_ids = unit_df[unit_key].to_numpy()
-    labels = unit_df["water_soluble"].to_numpy(dtype=int)
+    labels = unit_df["water_miscible"].to_numpy(dtype=int)
 
     folds: List[pd.DataFrame] = []
     for _, val_idx in skf.split(unit_ids, labels):
@@ -1002,7 +1002,7 @@ def _summarize_tuning_cv_folds(cv_folds: List[pd.DataFrame]) -> pd.DataFrame:
         for split in ["train", "val"]:
             sub = fold_df[fold_df["split"] == split]
             n_rows = int(len(sub))
-            n_pos = int(sub["water_soluble"].sum()) if n_rows > 0 else 0
+            n_pos = int(sub["water_miscible"].sum()) if n_rows > 0 else 0
             rows.append(
                 {
                     "fold": i,
@@ -1075,7 +1075,7 @@ def _evaluate_trial_with_cv(
             val_sub["chi_pred"] = np.asarray(val_pred["chi_pred"], dtype=float)
             val_sub["fold"] = int(fold_id)
             cv_val_frames.append(
-                val_sub[["fold", "polymer_id", "Polymer", "SMILES", "water_soluble", "chi_true", "chi_pred"]].copy()
+                val_sub[["fold", "polymer_id", "Polymer", "SMILES", "water_miscible", "chi_true", "chi_pred"]].copy()
             )
 
     fold_metrics_df = pd.DataFrame(fold_rows)
@@ -1221,8 +1221,8 @@ def _save_classifier_cv_parity_by_fold_figure(
     plot_df["fold"] = plot_df["fold"].astype(str)
     rng = np.random.default_rng(0)
     jitter = rng.normal(loc=0.0, scale=0.03, size=len(plot_df))
-    plot_df["water_soluble_jitter"] = np.clip(
-        pd.to_numeric(plot_df["water_soluble"], errors="coerce").fillna(0.0).to_numpy(dtype=float) + jitter,
+    plot_df["water_miscible_jitter"] = np.clip(
+        pd.to_numeric(plot_df["water_miscible"], errors="coerce").fillna(0.0).to_numpy(dtype=float) + jitter,
         -0.08,
         1.08,
     )
@@ -1230,7 +1230,7 @@ def _save_classifier_cv_parity_by_fold_figure(
     palette = sns.color_palette("tab10", n_colors=max(n_folds, 3))
     sns.scatterplot(
         data=plot_df,
-        x="water_soluble_jitter",
+        x="water_miscible_jitter",
         y="class_prob",
         hue="fold",
         palette=palette,
@@ -1247,7 +1247,7 @@ def _save_classifier_cv_parity_by_fold_figure(
     ax.set_xlabel(f"True {CLASS_LABEL_PUBLIC}")
     ax.set_ylabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
 
-    cls = classification_metrics(plot_df["water_soluble"], plot_df["class_prob"])
+    cls = classification_metrics(plot_df["water_miscible"], plot_df["class_prob"])
     metrics_text = (
         f"BalAcc={cls['balanced_accuracy']:.3f}\n"
         f"AUROC={cls['auroc']:.3f}\n"
@@ -1361,7 +1361,7 @@ def run_regression_cv_with_best_hyperparameters(
                 "polymer_id",
                 "Polymer",
                 "SMILES",
-                "water_soluble",
+                "water_miscible",
                 "chi_true",
                 "chi_pred",
                 "chi_error",
@@ -1506,7 +1506,7 @@ def run_classifier_cv_with_best_hyperparameters(
 
             class_logit = np.asarray(pred["logit"], dtype=float)
             class_prob = np.asarray(pred["prob"], dtype=float)
-            class_true = pd.to_numeric(sub["water_soluble"], errors="coerce").fillna(0).to_numpy(dtype=int)
+            class_true = pd.to_numeric(sub["water_miscible"], errors="coerce").fillna(0).to_numpy(dtype=int)
             sub["class_logit"] = class_logit
             sub["class_prob"] = class_prob
             sub["class_pred"] = (class_prob >= 0.5).astype(int)
@@ -1522,7 +1522,7 @@ def run_classifier_cv_with_best_hyperparameters(
                 "polymer_id",
                 "Polymer",
                 "SMILES",
-                "water_soluble",
+                "water_miscible",
                 "class_logit",
                 "class_prob",
                 "class_pred",
@@ -2018,7 +2018,7 @@ def _plot_class_prob_density_safe(ax, split_df: pd.DataFrame) -> None:
         sns.kdeplot(
             data=split_df,
             x="class_prob",
-            hue="water_soluble",
+            hue="water_miscible",
             common_norm=False,
             fill=True,
             alpha=0.3,
@@ -2033,7 +2033,7 @@ def _plot_class_prob_density_safe(ax, split_df: pd.DataFrame) -> None:
             raise
 
     for class_value, color in [(1, "#1f77b4"), (0, "#d62728")]:
-        sub = split_df.loc[split_df["water_soluble"] == class_value, "class_prob"]
+        sub = split_df.loc[split_df["water_miscible"] == class_value, "class_prob"]
         _plot_kde_safe_1d(
             ax=ax,
             values=sub,
@@ -2051,9 +2051,9 @@ def _save_binary_confusion_matrix_figure(
     title: str,
     dpi: int,
 ) -> None:
-    if sub.empty or "water_soluble" not in sub.columns:
+    if sub.empty or "water_miscible" not in sub.columns:
         return
-    y_true = pd.to_numeric(sub["water_soluble"], errors="coerce").fillna(0).to_numpy(dtype=int)
+    y_true = pd.to_numeric(sub["water_miscible"], errors="coerce").fillna(0).to_numpy(dtype=int)
     if "class_pred" in sub.columns:
         y_pred = pd.to_numeric(sub["class_pred"], errors="coerce").fillna(0).to_numpy(dtype=int)
     elif "class_prob" in sub.columns:
@@ -2124,7 +2124,7 @@ def _collect_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
 
     for split, sub in pred_df.groupby("split"):
         reg = regression_metrics(sub["chi"], sub["chi_pred"])
-        cls = classification_metrics(sub["water_soluble"], sub["class_prob"])
+        cls = classification_metrics(sub["water_miscible"], sub["class_prob"])
         hit = hit_metrics(sub["chi_error"], epsilons=[0.02, 0.05, 0.1, 0.2])
 
         row = {"split": split}
@@ -2137,7 +2137,7 @@ def _collect_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
             sub,
             y_true_col="chi",
             y_pred_col="chi_pred",
-            group_col="water_soluble",
+            group_col="water_miscible",
         )
         group_metrics.insert(0, "split", split)
         class_rows.append(group_metrics)
@@ -2168,7 +2168,7 @@ def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> 
         data=sub,
         x="chi",
         y="chi_pred",
-        hue="water_soluble",
+        hue="water_miscible",
         palette=WATER_SOLUBLE_PALETTE,
         alpha=0.75,
         s=18,
@@ -2234,13 +2234,13 @@ def _plot_classifier_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend
     plot_df = sub.copy()
     rng = np.random.default_rng(0)
     jitter = rng.normal(loc=0.0, scale=0.03, size=len(plot_df))
-    plot_df["water_soluble_jitter"] = np.clip(plot_df["water_soluble"].to_numpy(dtype=float) + jitter, -0.08, 1.08)
+    plot_df["water_miscible_jitter"] = np.clip(plot_df["water_miscible"].to_numpy(dtype=float) + jitter, -0.08, 1.08)
 
     sns.scatterplot(
         data=plot_df,
-        x="water_soluble_jitter",
+        x="water_miscible_jitter",
         y="class_prob",
-        hue="water_soluble",
+        hue="water_miscible",
         palette={1: "#1f77b4", 0: "#d62728"},
         alpha=0.75,
         s=18,
@@ -2256,7 +2256,7 @@ def _plot_classifier_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend
     ax.set_xlabel(f"True {CLASS_LABEL_PUBLIC}")
     ax.set_ylabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
 
-    cls = classification_metrics(sub["water_soluble"], sub["class_prob"])
+    cls = classification_metrics(sub["water_miscible"], sub["class_prob"])
     metrics_text = (
         f"BalAcc={cls['balanced_accuracy']:.3f}\n"
         f"AUROC={cls['auroc']:.3f}\n"
@@ -2397,7 +2397,7 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
         fig.savefig(fig_dir / f"chi_class_prob_distribution_{split_name}.png", dpi=dpi)
         plt.close(fig)
 
-        y_true = split_df["water_soluble"].to_numpy(dtype=int)
+        y_true = split_df["water_miscible"].to_numpy(dtype=int)
         y_prob = split_df["class_prob"].to_numpy(dtype=float)
         if len(np.unique(y_true)) > 1:
             fpr, tpr, _ = roc_curve(y_true, y_prob)
@@ -2436,7 +2436,7 @@ def _save_coefficient_summary(
     if isinstance(model, BackbonePhysicsGuidedChiModel):
         if tokenizer is None:
             raise ValueError("tokenizer is required to save coefficients for backbone-finetuned model")
-        rec = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].copy().reset_index(drop=True)
+        rec = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_miscible"]].copy().reset_index(drop=True)
         encoded = tokenizer.batch_encode(rec["SMILES"].astype(str).tolist())
         input_ids = torch.tensor(np.asarray(encoded["input_ids"], dtype=np.int64), dtype=torch.long, device=device)
         attention_mask = torch.tensor(np.asarray(encoded["attention_mask"], dtype=np.int64), dtype=torch.long, device=device)
@@ -2461,7 +2461,7 @@ def _save_coefficient_summary(
             coeff = model.coeff_head(features).cpu().numpy()
             logit = model.class_head(features).squeeze(-1).cpu().numpy()
             prob = stable_sigmoid(logit)
-        df = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].copy()
+        df = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_miscible"]].copy()
 
     for i, name in enumerate(COEFF_NAMES):
         df[name] = coeff[:, i]
@@ -3014,7 +3014,7 @@ def _collect_classifier_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     for split, sub in pred_df.groupby("split"):
-        cls = classification_metrics(sub["water_soluble"], sub["class_prob"])
+        cls = classification_metrics(sub["water_miscible"], sub["class_prob"])
         row = {"split": split}
         row.update(cls)
         rows.append(row)
@@ -3060,7 +3060,7 @@ def _collect_regression_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
             sub,
             y_true_col="chi",
             y_pred_col="chi_pred",
-            group_col="water_soluble",
+            group_col="water_miscible",
         )
         group_metrics.insert(0, "split", split)
         class_rows.append(group_metrics)
@@ -3240,7 +3240,7 @@ def _make_classifier_figures(
         fig.savefig(fig_dir / f"class_prob_distribution_{split_name}.png", dpi=dpi)
         plt.close(fig)
 
-        y_true = split_df["water_soluble"].to_numpy(dtype=int)
+        y_true = split_df["water_miscible"].to_numpy(dtype=int)
         y_prob = split_df["class_prob"].to_numpy(dtype=float)
         if len(np.unique(y_true)) > 1:
             fpr, tpr, _ = roc_curve(y_true, y_prob)
@@ -3304,7 +3304,7 @@ def _save_combined_polymer_coefficients(
     if isinstance(reg_model, BackbonePhysicsGuidedChiModel):
         if tokenizer is None:
             raise ValueError("tokenizer is required to save coefficients for backbone-finetuned model")
-        rec = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].copy().reset_index(drop=True)
+        rec = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_miscible"]].copy().reset_index(drop=True)
         encoded = tokenizer.batch_encode(rec["SMILES"].astype(str).tolist())
         input_ids = torch.tensor(np.asarray(encoded["input_ids"], dtype=np.int64), dtype=torch.long, device=device)
         attention_mask = torch.tensor(np.asarray(encoded["attention_mask"], dtype=np.int64), dtype=torch.long, device=device)
@@ -3325,7 +3325,7 @@ def _save_combined_polymer_coefficients(
         with torch.no_grad():
             features = reg_model.encoder(emb_t)
             coeff = reg_model.coeff_head(features).cpu().numpy()
-        df = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].copy()
+        df = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_miscible"]].copy()
 
     emb_for_cls = np.stack(embedding_cache_df["embedding"].to_list(), axis=0)
     emb_cls_t = torch.tensor(emb_for_cls, dtype=torch.float32, device=device)
@@ -3538,7 +3538,7 @@ def main(args):
 
     reg_embedding_table: Optional[np.ndarray] = None
     if run_step41:
-        reg_polymer_df = reg_split_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].drop_duplicates("polymer_id")
+        reg_polymer_df = reg_split_df[["polymer_id", "Polymer", "SMILES", "water_miscible"]].drop_duplicates("polymer_id")
         reg_emb_cache = build_or_load_embedding_cache(
             polymer_df=reg_polymer_df,
             config=config,
@@ -3557,7 +3557,7 @@ def main(args):
 
     cls_embedding_table: Optional[np.ndarray] = None
     if run_step42:
-        cls_polymer_df = cls_split_df[["polymer_id", "Polymer", "SMILES", "water_soluble"]].drop_duplicates("polymer_id")
+        cls_polymer_df = cls_split_df[["polymer_id", "Polymer", "SMILES", "water_miscible"]].drop_duplicates("polymer_id")
         cls_emb_cache = build_or_load_embedding_cache(
             polymer_df=cls_polymer_df,
             config=config,
@@ -3779,7 +3779,7 @@ def main(args):
             dpi=dpi,
             font_size=font_size,
         )
-        reg_poly = reg_pred_df[["polymer_id", "Polymer", "SMILES", "water_soluble"] + COEFF_NAMES].drop_duplicates("polymer_id")
+        reg_poly = reg_pred_df[["polymer_id", "Polymer", "SMILES", "water_miscible"] + COEFF_NAMES].drop_duplicates("polymer_id")
         reg_poly.to_csv(reg_metrics_dir / "polymer_coefficients_regression_only.csv", index=False)
 
     # -------------------------

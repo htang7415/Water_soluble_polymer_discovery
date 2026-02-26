@@ -16,7 +16,7 @@ from sklearn.model_selection import train_test_split
 from src.utils.config import load_config
 from src.utils.model_scales import get_results_dir
 
-CLASS_LABEL_INTERNAL = "water_soluble"
+CLASS_LABEL_INTERNAL = "water_miscible"
 CLASS_LABEL_PUBLIC = "water_miscible"
 
 
@@ -231,14 +231,14 @@ def load_split_dataset(
 
         if mode == "polymer":
             polymer_df = (
-                df[["polymer_id", "water_soluble"]]
+                df[["polymer_id", "water_miscible"]]
                 .drop_duplicates(subset=["polymer_id"])
                 .sort_values("polymer_id")
                 .reset_index(drop=True)
             )
             train_poly, test_poly = _safe_train_test_split(
                 polymer_df,
-                stratify=polymer_df["water_soluble"],
+                stratify=polymer_df["water_miscible"],
                 random_state=int(seed),
                 test_size=float(test_ratio),
             )
@@ -247,10 +247,10 @@ def load_split_dataset(
             split_map.update({int(pid): "test" for pid in test_poly["polymer_id"].tolist()})
             assignments["split"] = df["polymer_id"].map(split_map)
         else:
-            row_df = df[["row_id", "water_soluble"]].copy()
+            row_df = df[["row_id", "water_miscible"]].copy()
             train_rows, test_rows = _safe_train_test_split(
                 row_df,
-                stratify=row_df["water_soluble"],
+                stratify=row_df["water_miscible"],
                 random_state=int(seed),
                 test_size=float(test_ratio),
             )
@@ -295,7 +295,7 @@ def build_tuning_cv_folds(split_df: pd.DataFrame, split_mode: str, tuning_cv_fol
     requested_folds = int(max(2, tuning_cv_folds))
     if split_mode == "polymer":
         unit_df = (
-            dev_df[["polymer_id", "water_soluble"]]
+            dev_df[["polymer_id", "water_miscible"]]
             .drop_duplicates(subset=["polymer_id"])
             .sort_values("polymer_id")
             .reset_index(drop=True)
@@ -304,7 +304,7 @@ def build_tuning_cv_folds(split_df: pd.DataFrame, split_mode: str, tuning_cv_fol
         strategy = "polymer_group_stratified"
     else:
         unit_df = (
-            dev_df[["row_id", "water_soluble"]]
+            dev_df[["row_id", "water_miscible"]]
             .drop_duplicates(subset=["row_id"])
             .sort_values("row_id")
             .reset_index(drop=True)
@@ -312,7 +312,7 @@ def build_tuning_cv_folds(split_df: pd.DataFrame, split_mode: str, tuning_cv_fol
         unit_key = "row_id"
         strategy = "row_stratified"
 
-    class_counts = unit_df["water_soluble"].value_counts()
+    class_counts = unit_df["water_miscible"].value_counts()
     max_folds = int(min(len(unit_df), class_counts.min())) if not class_counts.empty else 0
     if max_folds < 2:
         fallback = dev_df.copy()
@@ -330,7 +330,7 @@ def build_tuning_cv_folds(split_df: pd.DataFrame, split_mode: str, tuning_cv_fol
     resolved_folds = int(min(requested_folds, max_folds))
     skf = StratifiedKFold(n_splits=resolved_folds, shuffle=True, random_state=int(seed))
     unit_ids = unit_df[unit_key].to_numpy()
-    labels = unit_df["water_soluble"].to_numpy(dtype=int)
+    labels = unit_df["water_miscible"].to_numpy(dtype=int)
 
     folds: List[pd.DataFrame] = []
     for _, val_idx in skf.split(unit_ids, labels):
@@ -354,7 +354,7 @@ def summarize_cv_folds(cv_folds: List[pd.DataFrame]) -> pd.DataFrame:
         for split in ["train", "val"]:
             sub = fold_df[fold_df["split"] == split]
             n_rows = int(len(sub))
-            n_pos = int(sub["water_soluble"].sum()) if n_rows > 0 else 0
+            n_pos = int(sub["water_miscible"].sum()) if n_rows > 0 else 0
             rows.append(
                 {
                     "fold": i,

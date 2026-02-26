@@ -17,7 +17,7 @@ from src.model.backbone import DiffusionBackbone
 from src.model.diffusion import DiscreteMaskingDiffusion
 from src.utils.model_scales import get_model_config, get_results_dir
 
-CLASS_LABEL_INTERNAL = "water_soluble"
+CLASS_LABEL_INTERNAL = "water_miscible"
 CLASS_LABEL_PUBLIC = "water_miscible"
 
 
@@ -236,7 +236,6 @@ def save_embedding_cache(cache_npz: Path, embedding_df: pd.DataFrame, metadata: 
         polymer_id=embedding_df["polymer_id"].to_numpy(dtype=int),
         polymer=polymer_arr,
         smiles=smiles_arr,
-        water_soluble=label_arr,
         water_miscible=label_arr,
         embedding=np.stack(embedding_df["embedding"].to_list(), axis=0).astype(np.float32, copy=False),
     )
@@ -248,16 +247,14 @@ def save_embedding_cache(cache_npz: Path, embedding_df: pd.DataFrame, metadata: 
 def load_embedding_cache(cache_npz: Path) -> Tuple[pd.DataFrame, Dict]:
     def _read_arrays(allow_pickle: bool):
         with np.load(cache_npz, allow_pickle=allow_pickle) as arr:
+            # Load label — support both new name and legacy "water_soluble" key
+            _label_key = "water_miscible" if "water_miscible" in arr else "water_soluble"
+            label_data = np.asarray(arr[_label_key]).astype(int)
             return {
                 "polymer_id": np.asarray(arr["polymer_id"]).astype(int),
                 "Polymer": np.asarray(arr["polymer"]).astype(str),
                 "SMILES": np.asarray(arr["smiles"]).astype(str),
-                "water_soluble": np.asarray(arr["water_soluble"]).astype(int),
-                "water_miscible": (
-                    np.asarray(arr["water_miscible"]).astype(int)
-                    if "water_miscible" in arr.files
-                    else np.asarray(arr["water_soluble"]).astype(int)
-                ),
+                "water_miscible": label_data,
                 "embedding": np.asarray(arr["embedding"], dtype=np.float32),
             }
 
@@ -281,7 +278,6 @@ def load_embedding_cache(cache_npz: Path) -> Tuple[pd.DataFrame, Dict]:
             "polymer_id": arrays["polymer_id"],
             "Polymer": arrays["Polymer"],
             "SMILES": arrays["SMILES"],
-            "water_soluble": arrays["water_soluble"],
             "water_miscible": arrays["water_miscible"],
             "embedding": list(arrays["embedding"]),
         }

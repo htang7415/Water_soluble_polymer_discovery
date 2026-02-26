@@ -276,7 +276,7 @@ def _plot_class_prob_density_safe(ax, split_df: pd.DataFrame) -> None:
         sns.kdeplot(
             data=split_df,
             x="class_prob",
-            hue="water_soluble",
+            hue="water_miscible",
             common_norm=False,
             fill=True,
             alpha=0.3,
@@ -288,7 +288,7 @@ def _plot_class_prob_density_safe(ax, split_df: pd.DataFrame) -> None:
             raise
 
     for class_value, color in [(1, "#1f77b4"), (0, "#d62728")]:
-        sub = split_df.loc[split_df["water_soluble"] == class_value, "class_prob"]
+        sub = split_df.loc[split_df["water_miscible"] == class_value, "class_prob"]
         _plot_kde_safe_1d(
             ax=ax,
             values=sub,
@@ -306,9 +306,9 @@ def _save_binary_confusion_matrix_figure(
     title: str,
     dpi: int,
 ) -> None:
-    if sub.empty or "water_soluble" not in sub.columns:
+    if sub.empty or "water_miscible" not in sub.columns:
         return
-    y_true = pd.to_numeric(sub["water_soluble"], errors="coerce").fillna(0).to_numpy(dtype=int)
+    y_true = pd.to_numeric(sub["water_miscible"], errors="coerce").fillna(0).to_numpy(dtype=int)
     if "class_pred" in sub.columns:
         y_pred = pd.to_numeric(sub["class_pred"], errors="coerce").fillna(0).to_numpy(dtype=int)
     elif "class_prob" in sub.columns:
@@ -1180,7 +1180,7 @@ def _evaluate_regression_cv(
                         "polymer_id",
                         "Polymer",
                         "SMILES",
-                        "water_soluble",
+                        "water_miscible",
                         "temperature",
                         "phi",
                         "chi_true",
@@ -1213,15 +1213,15 @@ def _evaluate_classification_cv(
         val_df = fold_df[fold_df["split"] == "val"].copy().reset_index(drop=True)
         if train_df.empty or val_df.empty:
             raise ValueError(f"Invalid CV fold={fold_id}: empty train or val.")
-        if train_df["water_soluble"].nunique() < 2:
+        if train_df["water_miscible"].nunique() < 2:
             raise ValueError(f"CV fold={fold_id} train has single class; cannot fit classifier.")
-        if val_df["water_soluble"].nunique() < 2:
+        if val_df["water_miscible"].nunique() < 2:
             raise ValueError(f"CV fold={fold_id} val has single class; classification metrics would be degenerate.")
 
         X_train = features_from_table(train_df, fingerprint_table)
-        y_train = train_df["water_soluble"].to_numpy(dtype=int)
+        y_train = train_df["water_miscible"].to_numpy(dtype=int)
         X_val = features_from_table(val_df, fingerprint_table)
-        y_val = val_df["water_soluble"].to_numpy(dtype=int)
+        y_val = val_df["water_miscible"].to_numpy(dtype=int)
 
         model = _build_classification_estimator(model_name=model_name, params=model_params, seed=seed)
         model.fit(X_train, y_train)
@@ -1704,10 +1704,10 @@ def _fit_classification_on_final_split(
     seed: int,
 ):
     train_df = final_fit_df[final_fit_df["split"] == "train"].copy().reset_index(drop=True)
-    if train_df["water_soluble"].nunique() < 2:
+    if train_df["water_miscible"].nunique() < 2:
         raise ValueError("Final train split has single class; classification training is not possible.")
     X_train = features_from_table(train_df, fingerprint_table)
-    y_train = train_df["water_soluble"].to_numpy(dtype=int)
+    y_train = train_df["water_miscible"].to_numpy(dtype=int)
     model = _build_classification_estimator(model_name=model_name, params=model_params, seed=seed)
     model.fit(X_train, y_train)
     return model
@@ -1760,7 +1760,7 @@ def _collect_regression_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
         row.update(hit)
         rows.append(row)
 
-        group_metrics = metrics_by_group(sub, y_true_col="chi", y_pred_col="chi_pred", group_col="water_soluble")
+        group_metrics = metrics_by_group(sub, y_true_col="chi", y_pred_col="chi_pred", group_col="water_miscible")
         group_metrics.insert(0, "split", split)
         class_rows.append(group_metrics)
 
@@ -1792,7 +1792,7 @@ def _plot_regression_parity_panel(ax, sub: pd.DataFrame, split: str) -> None:
         data=sub,
         x="chi",
         y="chi_pred",
-        hue="water_soluble",
+        hue="water_miscible",
         palette=WATER_SOLUBLE_PALETTE,
         alpha=0.75,
         s=18,
@@ -1911,7 +1911,7 @@ def _collect_classification_metrics(pred_df: pd.DataFrame, out_dir: Path) -> Non
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     for split, sub in pred_df.groupby("split"):
-        cls = classification_metrics(sub["water_soluble"], sub["class_prob"])
+        cls = classification_metrics(sub["water_miscible"], sub["class_prob"])
         row = {"split": split}
         row.update(cls)
         rows.append(row)
@@ -1965,7 +1965,7 @@ def _make_classification_figures(pred_df: pd.DataFrame, fig_dir: Path, dpi: int,
         fig.savefig(fig_dir / f"class_prob_distribution_{split_name}.png", dpi=dpi)
         plt.close(fig)
 
-        y_true = split_df["water_soluble"].to_numpy(dtype=int)
+        y_true = split_df["water_miscible"].to_numpy(dtype=int)
         y_prob = split_df["class_prob"].to_numpy(dtype=float)
         if len(np.unique(y_true)) > 1:
             fpr, tpr, _ = roc_curve(y_true, y_prob)
@@ -2244,8 +2244,8 @@ def _save_split_diagnostics(split_df: pd.DataFrame, metrics_dir: Path, stage_nam
         "n_rows_val": int(len(val_df)),
         "n_rows_test": int(len(test_df)),
     }
-    if "water_soluble" in split_df.columns:
-        class_counts = split_df.groupby(["split", "water_soluble"], as_index=False).size().rename(columns={"size": "n_rows"})
+    if "water_miscible" in split_df.columns:
+        class_counts = split_df.groupby(["split", "water_miscible"], as_index=False).size().rename(columns={"size": "n_rows"})
         class_counts.to_csv(metrics_dir / "split_class_counts.csv", index=False)
     if "polymer_id" in split_df.columns:
         train_ids = set(pd.to_numeric(train_df["polymer_id"], errors="coerce").dropna().astype(int).tolist())
@@ -2843,7 +2843,7 @@ def main() -> None:
         )
         cls_split_ratios = resolve_split_ratios(cls_cfg.holdout_test_ratio, cls_cfg.tuning_cv_folds)
 
-    reg_dataset = args.regression_dataset_path or shared_cfg.get("regression_dataset_path", "Data/chi/_50_polymers_T_phi.csv")
+    reg_dataset = args.regression_dataset_path or shared_cfg.get("regression_dataset_path", "Data/chi/_250_polymers_T_phi.csv")
     cls_dataset = args.classification_dataset_path or shared_cfg.get(
         "classification_dataset_path",
         [

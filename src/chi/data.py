@@ -13,7 +13,7 @@ from sklearn.model_selection import train_test_split
 
 from src.chi.constants import COEFF_NAMES
 
-CLASS_LABEL_INTERNAL = "water_soluble"
+CLASS_LABEL_INTERNAL = "water_miscible"
 CLASS_LABEL_PUBLIC = "water_miscible"
 
 REQUIRED_CHI_COLUMNS = [
@@ -73,7 +73,7 @@ def _safe_train_test_split(*args, stratify, random_state: int, test_size: float)
 
 
 def _standardize_water_soluble_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize typo/alias variants of class label to water_soluble."""
+    """Normalize typo/alias variants of class label to water_miscible."""
     out = df.copy()
     out.columns = [str(c).strip().lstrip("\ufeff") for c in out.columns]
 
@@ -160,7 +160,7 @@ def make_split_assignments(df: pd.DataFrame, split_cfg: SplitConfig) -> pd.DataF
 
     if split_mode == "polymer":
         polymer_df = (
-            df[["polymer_id", "Polymer", "water_soluble"]]
+            df[["polymer_id", "Polymer", "water_miscible"]]
             .drop_duplicates(subset=["polymer_id"])
             .sort_values("polymer_id")
             .reset_index(drop=True)
@@ -168,7 +168,7 @@ def make_split_assignments(df: pd.DataFrame, split_cfg: SplitConfig) -> pd.DataF
 
         train_poly, temp_poly = _safe_train_test_split(
             polymer_df,
-            stratify=polymer_df["water_soluble"],
+            stratify=polymer_df["water_miscible"],
             random_state=split_cfg.seed,
             test_size=(1.0 - split_cfg.train_ratio),
         )
@@ -176,7 +176,7 @@ def make_split_assignments(df: pd.DataFrame, split_cfg: SplitConfig) -> pd.DataF
         temp_test_ratio = split_cfg.test_ratio / (split_cfg.val_ratio + split_cfg.test_ratio)
         val_poly, test_poly = _safe_train_test_split(
             temp_poly,
-            stratify=temp_poly["water_soluble"],
+            stratify=temp_poly["water_miscible"],
             random_state=split_cfg.seed,
             test_size=temp_test_ratio,
         )
@@ -190,17 +190,17 @@ def make_split_assignments(df: pd.DataFrame, split_cfg: SplitConfig) -> pd.DataF
 
     else:
         # Row-level random split.
-        row_df = df[["row_id", "water_soluble"]].copy()
+        row_df = df[["row_id", "water_miscible"]].copy()
         train_rows, temp_rows = _safe_train_test_split(
             row_df,
-            stratify=row_df["water_soluble"],
+            stratify=row_df["water_miscible"],
             random_state=split_cfg.seed,
             test_size=(1.0 - split_cfg.train_ratio),
         )
         temp_test_ratio = split_cfg.test_ratio / (split_cfg.val_ratio + split_cfg.test_ratio)
         val_rows, test_rows = _safe_train_test_split(
             temp_rows,
-            stratify=temp_rows["water_soluble"],
+            stratify=temp_rows["water_miscible"],
             random_state=split_cfg.seed,
             test_size=temp_test_ratio,
         )

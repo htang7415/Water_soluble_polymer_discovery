@@ -22,7 +22,7 @@ from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars
 from src.utils.figure_style import apply_publication_figure_style
 from src.utils.numerics import stable_sigmoid
 
-CLASS_LABEL_INTERNAL = "water_soluble"
+CLASS_LABEL_INTERNAL = "water_miscible"
 CLASS_LABEL_PUBLIC = "water_miscible"
 
 CLASS_NAME_MAP = {1: "Water-miscible", 0: "Water-immiscible"}
