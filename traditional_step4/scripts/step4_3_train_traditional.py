@@ -8,6 +8,7 @@ import copy
 import importlib.util
 import json
 import random
+import re
 import sys
 import time
 import warnings
@@ -1310,6 +1311,88 @@ def _plot_optuna_objective(trial_df: pd.DataFrame, out_png: Path, objective_name
     plt.close(fig)
 
 
+def _plot_optuna_best_metric_by_trial(
+    trial_df: pd.DataFrame,
+    out_png: Path,
+    objective_name: str,
+    dpi: int,
+    font_size: int,
+    maximize: bool,
+    model_name: str | None = None,
+) -> None:
+    if trial_df.empty:
+        return
+    plot_df = trial_df.copy().sort_values("trial").reset_index(drop=True)
+    if "objective_value" not in plot_df.columns:
+        return
+
+    y_raw = pd.to_numeric(plot_df["objective_value"], errors="coerce")
+    if maximize:
+        y_best = y_raw.cummax()
+    else:
+        y_best = y_raw.cummin()
+
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    x = pd.to_numeric(plot_df["trial"], errors="coerce").to_numpy()
+    y = y_best.to_numpy()
+    ax.plot(x, y, "-o", color="#e76f51", linewidth=2, markersize=4, label="Best trial metric so far")
+    ax.set_xlabel("Optuna trial")
+    ax.set_ylabel(f"Best {objective_name}")
+    title = f"Best trial metric vs trial: {objective_name}"
+    if model_name is not None and str(model_name).strip():
+        title = f"{title} ({str(model_name).strip()})"
+    ax.set_title(title)
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
+def _save_optuna_best_metric_figures(
+    trial_df: pd.DataFrame,
+    tuning_dir: Path,
+    objective_name: str,
+    dpi: int,
+    font_size: int,
+    maximize: bool,
+) -> None:
+    _plot_optuna_best_metric_by_trial(
+        trial_df=trial_df,
+        out_png=tuning_dir / "optuna_best_metric_by_trial.png",
+        objective_name=objective_name,
+        dpi=dpi,
+        font_size=font_size,
+        maximize=maximize,
+        model_name=None,
+    )
+    if "model_name" not in trial_df.columns:
+        return
+
+    model_values = [
+        str(v).strip()
+        for v in trial_df["model_name"].dropna().astype(str).tolist()
+        if str(v).strip()
+    ]
+    for model_name in sorted(set(model_values)):
+        sub_df = trial_df[trial_df["model_name"].astype(str).str.strip() == model_name].copy()
+        if sub_df.empty:
+            continue
+        safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", model_name).strip("._")
+        if not safe_model_name:
+            safe_model_name = "model"
+        _plot_optuna_best_metric_by_trial(
+            trial_df=sub_df,
+            out_png=tuning_dir / f"optuna_best_metric_by_trial_{safe_model_name}.png",
+            objective_name=objective_name,
+            dpi=dpi,
+            font_size=font_size,
+            maximize=maximize,
+            model_name=model_name,
+        )
+
+
 def _tune_regression(
     split_df: pd.DataFrame,
     fingerprint_table: np.ndarray,
@@ -1407,6 +1490,14 @@ def _tune_regression(
     _plot_optuna_objective(
         trial_df=trial_df,
         out_png=tuning_dir / "optuna_optimization_objective.png",
+        objective_name=objective_name,
+        dpi=dpi,
+        font_size=font_size,
+        maximize=True,
+    )
+    _save_optuna_best_metric_figures(
+        trial_df=trial_df,
+        tuning_dir=tuning_dir,
         objective_name=objective_name,
         dpi=dpi,
         font_size=font_size,
@@ -1595,6 +1686,14 @@ def _tune_classification(
     _plot_optuna_objective(
         trial_df=trial_df,
         out_png=tuning_dir / "optuna_optimization_objective.png",
+        objective_name=objective_name,
+        dpi=dpi,
+        font_size=font_size,
+        maximize=True,
+    )
+    _save_optuna_best_metric_figures(
+        trial_df=trial_df,
+        tuning_dir=tuning_dir,
         objective_name=objective_name,
         dpi=dpi,
         font_size=font_size,
@@ -2971,7 +3070,7 @@ def main() -> None:
     )
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
-    font_size = int(config.get("plotting", {}).get("font_size", 12))
+    font_size = int(config.get("plotting", {}).get("font_size", 15))
 
     print("=" * 80)
     print("Step 4_3 traditional pipeline")

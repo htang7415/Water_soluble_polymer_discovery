@@ -134,7 +134,7 @@ chi_training:
   shared:
     dataset_path: "Data/chi/_250_polymers_T_phi.csv"  # labeled chi(T,phi) dataset used in Step 3 and Step4_1
     split_mode: "polymer"  # data split mode: polymer (hold out polymers) | random (row-wise random)
-    classification_split_mode: "random"  # Step4_2 split mode (independent of split_mode used by Step4_1)
+    classification_split_mode: "polymer"  # Step4_2 split mode (independent of split_mode used by Step4_1)
     split:
       # Step 4 split is CV-driven by default:
       # holdout_test_ratio defaults to 1 / tuning_cv_folds if omitted.
@@ -300,5 +300,5 @@ polymer_classes:
 
 plotting:
   figure_size: [4.5, 4.5]
-  font_size: 12
+  font_size: 15
   dpi: 600

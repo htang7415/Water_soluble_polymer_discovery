@@ -1157,6 +1157,44 @@ def _save_cv_parity_by_fold_figure(
     plt.close(fig)
 
 
+def _save_best_metric_vs_trial_figure(
+    trial_df: pd.DataFrame,
+    out_png: Path,
+    y_col: str,
+    y_label: str,
+    title: str,
+    dpi: int,
+    font_size: int,
+) -> None:
+    if trial_df.empty or y_col not in trial_df.columns:
+        return
+    x = pd.to_numeric(trial_df["trial"], errors="coerce").to_numpy()
+    y = pd.to_numeric(trial_df[y_col], errors="coerce").to_numpy()
+    mask = np.isfinite(x) & np.isfinite(y)
+    if not np.any(mask):
+        return
+
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(
+        x[mask],
+        y[mask],
+        "-o",
+        color="#e76f51",
+        linewidth=2,
+        markersize=4,
+        label="Best trial metric so far",
+    )
+    ax.set_xlabel("Optuna trial")
+    ax.set_ylabel(y_label)
+    ax.set_title(title)
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
 def _summarize_cv_fold_metrics(
     fold_metrics_df: pd.DataFrame,
     metric_cols: List[str],
@@ -1599,7 +1637,7 @@ def tune_hyperparameters(
     device: str,
     tuning_dir: Path,
     dpi: int = 300,
-    font_size: int = 12,
+    font_size: int = 15,
 ) -> Dict:
     try:
         import optuna
@@ -1785,6 +1823,15 @@ def tune_hyperparameters(
         trial_df["best_objective_so_far"] = objective_numeric.cummin()
     trial_df.to_csv(tuning_dir / "optuna_optimization_chi_r2.csv", index=False)
     trial_df.to_csv(tuning_dir / "optuna_optimization_objective.csv", index=False)
+    _save_best_metric_vs_trial_figure(
+        trial_df=trial_df,
+        out_png=tuning_dir / "optuna_best_metric_by_trial.png",
+        y_col="best_objective_so_far",
+        y_label=f"Best {objective_name}",
+        title=f"Best trial metric vs trial: {objective_name}",
+        dpi=dpi,
+        font_size=font_size,
+    )
 
     best_params = study.best_params
     best_num_layers = int(best_params["num_layers"])
@@ -2772,7 +2819,7 @@ def tune_classifier_hyperparameters(
     device: str,
     tuning_dir: Path,
     dpi: int = 300,
-    font_size: int = 12,
+    font_size: int = 15,
     backbone_split_mode: Optional[str] = None,
 ) -> Dict:
     try:
@@ -2937,6 +2984,15 @@ def tune_classifier_hyperparameters(
     objective_numeric = pd.to_numeric(trial_df["objective_value"], errors="coerce")
     trial_df["best_objective_so_far"] = objective_numeric.cummax()
     trial_df.to_csv(tuning_dir / "optuna_optimization_objective.csv", index=False)
+    _save_best_metric_vs_trial_figure(
+        trial_df=trial_df,
+        out_png=tuning_dir / "optuna_best_metric_by_trial.png",
+        y_col="best_objective_so_far",
+        y_label=f"Best {objective_name}",
+        title=f"Best trial metric vs trial: {objective_name}",
+        dpi=dpi,
+        font_size=font_size,
+    )
 
     apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
     # Convert Series to NumPy arrays for matplotlib/pandas compatibility.
@@ -3577,7 +3633,7 @@ def main(args):
     tokenizer_for_training = None
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
-    font_size = int(config.get("plotting", {}).get("font_size", 12))
+    font_size = int(config.get("plotting", {}).get("font_size", 15))
 
     reg_checkpoint_path = reg_checkpoint_dir / "chi_regression_best.pt"
     cls_checkpoint_path = cls_checkpoint_dir / "chi_classifier_best.pt"

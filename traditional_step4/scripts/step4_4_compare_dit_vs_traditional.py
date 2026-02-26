@@ -496,7 +496,7 @@ def main() -> None:
         pd.DataFrame().to_csv(metrics_dir / "classification_comparation_summary.csv", index=False)
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
-    font_size = int(config.get("plotting", {}).get("font_size", 12))
+    font_size = int(config.get("plotting", {}).get("font_size", 15))
     if not reg_df.empty:
         _barplot_two_models(
             df=reg_df,

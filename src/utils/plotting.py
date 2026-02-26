@@ -16,7 +16,7 @@ class PlotUtils:
     def __init__(
         self,
         figure_size: Tuple[float, float] = (4.5, 4.5),
-        font_size: int = 12,
+        font_size: int = 15,
         dpi: int = 600
     ):
         """Initialize plotting utilities.
@@ -334,7 +334,7 @@ class PlotUtils:
                 0.05, 0.95, text,
                 transform=ax.transAxes,
                 verticalalignment='top',
-                fontsize=self.font_size - 2,
+                fontsize=self.font_size,
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
             )
 
@@ -470,7 +470,7 @@ class PlotUtils:
                     f"{int(val):,}",
                     ha='center',
                     va='bottom',
-                    fontsize=self.font_size - 2
+                    fontsize=self.font_size
                 )
             ax.set_ylim(0, max_val + pad * 6)
 
@@ -489,7 +489,7 @@ class PlotUtils:
                 transform=ax.transAxes,
                 ha='right',
                 va='top',
-                fontsize=self.font_size - 2,
+                fontsize=self.font_size,
                 bbox=dict(
                     boxstyle='round',
                     facecolor='white',

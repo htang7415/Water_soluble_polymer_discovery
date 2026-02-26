@@ -407,7 +407,7 @@ def _make_step_gallery(step_name: str, step_path: Path, out_png: Path, max_panel
     if len(fig_paths) == 0:
         fig, ax = plt.subplots(figsize=(7.0, 3.2))
         ax.axis("off")
-        ax.text(0.5, 0.5, "No figure files found", ha="center", va="center", fontsize=12)
+        ax.text(0.5, 0.5, "No figure files found", ha="center", va="center", fontsize=15)
         ax.set_title(f"{step_name} figure gallery")
         fig.tight_layout()
         fig.savefig(out_png, dpi=dpi)
@@ -433,8 +433,8 @@ def _make_step_gallery(step_name: str, step_path: Path, out_png: Path, max_panel
             ax.axis("off")
         except Exception:
             ax.axis("off")
-            ax.text(0.5, 0.5, "Could not load image", ha="center", va="center", fontsize=9)
-        ax.set_title(str(rel), fontsize=8)
+            ax.text(0.5, 0.5, "Could not load image", ha="center", va="center", fontsize=15)
+        ax.set_title(str(rel), fontsize=15)
 
     fig.suptitle(f"{step_name} figure gallery ({n}/{len(fig_paths)})")
     fig.tight_layout(rect=(0, 0, 1, 0.96))
@@ -459,8 +459,8 @@ def _make_pipeline_storyboard(step_items: List[Tuple[str, Path]], fig_dir: Path,
         rep = _pick_representative_figure(_collect_step_figure_paths(step_path))
         if rep is None:
             ax.axis("off")
-            ax.text(0.5, 0.5, "No figure", ha="center", va="center", fontsize=10)
-            ax.set_title(step_name, fontsize=10)
+            ax.text(0.5, 0.5, "No figure", ha="center", va="center", fontsize=15)
+            ax.set_title(step_name, fontsize=15)
             continue
 
         try:
@@ -469,10 +469,10 @@ def _make_pipeline_storyboard(step_items: List[Tuple[str, Path]], fig_dir: Path,
             ax.axis("off")
         except Exception:
             ax.axis("off")
-            ax.text(0.5, 0.5, "Could not load image", ha="center", va="center", fontsize=9)
+            ax.text(0.5, 0.5, "Could not load image", ha="center", va="center", fontsize=15)
 
         rel = rep.relative_to(step_path / "figures") if (step_path / "figures") in rep.parents else rep.name
-        ax.set_title(f"{step_name}\n{rel}", fontsize=8)
+        ax.set_title(f"{step_name}\n{rel}", fontsize=15)
 
     fig.suptitle("Pipeline storyboard (representative figure per step)")
     fig.tight_layout(rect=(0, 0, 1, 0.96))
@@ -506,11 +506,11 @@ def _make_step_metric_cards(metric_df: pd.DataFrame, step_order: List[str], fig_
             "\n".join(lines),
             va="top",
             ha="left",
-            fontsize=9,
+            fontsize=15,
             family="monospace",
             transform=ax.transAxes,
         )
-        ax.set_title(step_name, loc="left", fontsize=11)
+        ax.set_title(step_name, loc="left", fontsize=15)
 
     fig.suptitle("Step metric snapshot (from step summaries + auxiliary metric files)")
     fig.tight_layout(rect=(0, 0, 1, 0.98))
@@ -547,7 +547,7 @@ def _make_primary_metric_figure(metric_df: pd.DataFrame, step_order: List[str], 
     if len(labels) == 0:
         fig, ax = plt.subplots(figsize=(8, 3.5))
         ax.axis("off")
-        ax.text(0.5, 0.5, "No primary metrics available", ha="center", va="center", fontsize=12)
+        ax.text(0.5, 0.5, "No primary metrics available", ha="center", va="center", fontsize=15)
         fig.tight_layout()
         fig.savefig(out_png, dpi=dpi)
         plt.close(fig)
@@ -567,7 +567,7 @@ def _make_primary_metric_figure(metric_df: pd.DataFrame, step_order: List[str], 
             f"{names[i]}\n{values[i]:.4g}",
             ha="center",
             va="bottom",
-            fontsize=8,
+            fontsize=15,
         )
     fig.tight_layout()
     fig.savefig(out_png, dpi=dpi)
@@ -583,7 +583,7 @@ def _make_figures(
     max_gallery_panels: int = 9,
 ) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
-    apply_publication_figure_style(font_size=10, dpi=int(dpi), remove_titles=True)
+    apply_publication_figure_style(font_size=15, dpi=int(dpi), remove_titles=True)
     try:
         # Completion by step
         fig, ax = plt.subplots(figsize=(7.5, 4.5))

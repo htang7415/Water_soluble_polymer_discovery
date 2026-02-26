@@ -17,6 +17,16 @@ _ORIGINAL_FIGURE_SAVEFIG = Figure.savefig
 _TITLE_PATCHED = False
 _SAVEFIG_PATCHED = False
 PUBLICATION_DPI = 600
+PUBLICATION_FONT_SIZE = 15
+_CURRENT_PUBLICATION_DPI = PUBLICATION_DPI
+_NATURE_COLOR_CYCLE = [
+    "#0C5DA5",
+    "#00B945",
+    "#FF9500",
+    "#FF2C00",
+    "#845B97",
+    "#474747",
+]
 
 
 def _patch_title_calls() -> None:
@@ -50,7 +60,12 @@ def _patch_savefig_calls() -> None:
         out_name = fname
         if isinstance(fname, (str, Path)):
             out_name = Path(fname).with_suffix(".png")
-        kwargs["dpi"] = PUBLICATION_DPI
+        requested_dpi = kwargs.get("dpi", _CURRENT_PUBLICATION_DPI)
+        try:
+            requested_dpi = int(requested_dpi)
+        except Exception:
+            requested_dpi = _CURRENT_PUBLICATION_DPI
+        kwargs["dpi"] = max(requested_dpi, _CURRENT_PUBLICATION_DPI)
         kwargs["format"] = "png"
         return _ORIGINAL_FIGURE_SAVEFIG(self, out_name, *args, **kwargs)
 
@@ -58,55 +73,74 @@ def _patch_savefig_calls() -> None:
     _SAVEFIG_PATCHED = True
 
 
-def apply_publication_figure_style(font_size: int = 11, dpi: int = 600, remove_titles: bool = True) -> None:
+def apply_publication_figure_style(
+    font_size: int = PUBLICATION_FONT_SIZE,
+    dpi: int = PUBLICATION_DPI,
+    remove_titles: bool = True,
+) -> None:
     """Apply a publication-ready plotting style across matplotlib/seaborn."""
-    _patch_savefig_calls()
-    if remove_titles:
-        _patch_title_calls()
+    _ = remove_titles  # reserved for backward-compatible call signatures
+    global _CURRENT_PUBLICATION_DPI
+    _CURRENT_PUBLICATION_DPI = max(int(dpi), 300)
 
-    base_size = max(int(font_size), 8)
-    tick_size = max(base_size - 1, 7)
-    legend_size = max(base_size - 1, 7)
+    _patch_savefig_calls()
+    _patch_title_calls()
+
+    base_size = max(int(font_size), PUBLICATION_FONT_SIZE)
+    tick_size = max(base_size - 1, PUBLICATION_FONT_SIZE - 1)
+    legend_size = max(base_size - 1, PUBLICATION_FONT_SIZE - 1)
 
     sns.set_theme(
         context="paper",
         style="ticks",
-        palette="colorblind",
+        palette=_NATURE_COLOR_CYCLE,
     )
     plt.rcParams.update(
         {
-            "font.family": "DejaVu Sans",
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Arial", "Helvetica", "Liberation Sans", "DejaVu Sans"],
             "font.size": base_size,
             "axes.labelsize": base_size,
             "axes.titlesize": base_size,
+            "mathtext.default": "regular",
             "xtick.labelsize": tick_size,
             "ytick.labelsize": tick_size,
             "legend.fontsize": legend_size,
+            "axes.spines.left": True,
+            "axes.spines.bottom": True,
             "axes.spines.top": False,
             "axes.spines.right": False,
             "axes.edgecolor": "#222222",
-            "axes.linewidth": 0.8,
+            "axes.linewidth": 1.0,
             "axes.facecolor": "white",
             "axes.grid": False,
+            "axes.prop_cycle": plt.cycler(color=_NATURE_COLOR_CYCLE),
             "figure.facecolor": "white",
-            "figure.dpi": PUBLICATION_DPI,
-            "savefig.dpi": PUBLICATION_DPI,
+            "figure.dpi": _CURRENT_PUBLICATION_DPI,
+            "savefig.dpi": _CURRENT_PUBLICATION_DPI,
             "savefig.bbox": "tight",
             "savefig.pad_inches": 0.02,
+            "savefig.transparent": False,
             "legend.frameon": False,
-            "lines.linewidth": 1.6,
-            "lines.markersize": 5.0,
+            "lines.linewidth": 2.0,
+            "lines.markersize": 6.0,
+            "patch.edgecolor": "#222222",
+            "patch.linewidth": 0.8,
             "xtick.direction": "out",
             "ytick.direction": "out",
-            "xtick.major.size": 3.5,
-            "ytick.major.size": 3.5,
-            "xtick.major.width": 0.8,
-            "ytick.major.width": 0.8,
-            "xtick.minor.size": 2.0,
-            "ytick.minor.size": 2.0,
-            "xtick.minor.width": 0.6,
-            "ytick.minor.width": 0.6,
+            "xtick.major.size": 4.0,
+            "ytick.major.size": 4.0,
+            "xtick.major.width": 1.0,
+            "ytick.major.width": 1.0,
+            "xtick.minor.size": 2.5,
+            "ytick.minor.size": 2.5,
+            "xtick.minor.width": 0.8,
+            "ytick.minor.width": 0.8,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
+
+
+# Enforce global no-title policy for all figure scripts importing this module.
+_patch_title_calls()

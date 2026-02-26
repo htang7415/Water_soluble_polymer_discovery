@@ -695,7 +695,7 @@ def main(args):
 
     # figures
     dpi = int(config.get("plotting", {}).get("dpi", 600))
-    font_size = int(config.get("plotting", {}).get("font_size", 12))
+    font_size = int(config.get("plotting", {}).get("font_size", 15))
     _make_figures(cond_best, global_best, dev_df, objective, figures_dir, dpi=dpi, font_size=font_size)
     save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figures_dir)
 
