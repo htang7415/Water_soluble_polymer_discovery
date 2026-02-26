@@ -44,53 +44,61 @@ backbone:
 # Presets used by --model_size in Step 1/2/3/4/5/6
 model_sizes:
   small:
+    # Architecture (depth-driven)
     hidden_size: 384
     num_layers: 6
     num_heads: 6
     ffn_hidden_size: 1536
     dropout: 0.1
     max_position_embeddings: 256
-    max_steps: 300000
-    warmup_steps: 1000
+    # Training
+    max_steps: 94460
+    warmup_steps: 945
     batch_size: 128
     gradient_accumulation_steps: 4
-    learning_rate: 3.0e-4
+    learning_rate: 2.598e-4
   medium:
-    hidden_size: 640
-    num_layers: 10
-    num_heads: 10
-    ffn_hidden_size: 2560
+    # Architecture (depth-driven)
+    hidden_size: 768
+    num_layers: 12
+    num_heads: 12
+    ffn_hidden_size: 3072
     dropout: 0.1
     max_position_embeddings: 256
-    max_steps: 300000
-    warmup_steps: 2000
+    # Training
+    max_steps: 70850
+    warmup_steps: 708
     batch_size: 128
     gradient_accumulation_steps: 4
     learning_rate: 3.0e-4
   large:
-    hidden_size: 960
-    num_layers: 14
-    num_heads: 12
-    ffn_hidden_size: 3840
+    # Architecture (depth-driven)
+    hidden_size: 1152
+    num_layers: 18
+    num_heads: 18
+    ffn_hidden_size: 4608
     dropout: 0.1
     max_position_embeddings: 256
-    max_steps: 300000
-    warmup_steps: 3000
+    # Training
+    max_steps: 47230
+    warmup_steps: 472
     batch_size: 128
     gradient_accumulation_steps: 8
-    learning_rate: 1.0e-4
+    learning_rate: 3.518e-4
   xl:
-    hidden_size: 1280
-    num_layers: 20
-    num_heads: 16
-    ffn_hidden_size: 5120
+    # Architecture (depth-driven)
+    hidden_size: 1536
+    num_layers: 24
+    num_heads: 24
+    ffn_hidden_size: 6144
     dropout: 0.1
     max_position_embeddings: 256
-    max_steps: 300000
-    warmup_steps: 4000
+    # Training
+    max_steps: 40480
+    warmup_steps: 405
     batch_size: 64
     gradient_accumulation_steps: 16
-    learning_rate: 1.0e-4
+    learning_rate: 3.824e-4
 
 diffusion:
   num_steps: 50

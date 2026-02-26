@@ -124,6 +124,21 @@ def main(args):
     if is_main_process:
         print(f"Vocabulary size: {tokenizer.vocab_size}")
 
+    # Compute average bytes per token from vocabulary (excluding special tokens).
+    # Used to convert cross-entropy loss (nats) to bits-per-byte (BPB).
+    _special_ids = {
+        tokenizer.pad_token_id, tokenizer.mask_token_id,
+        tokenizer.bos_token_id, tokenizer.eos_token_id,
+    }
+    _byte_lens = [
+        len(tok.encode('utf-8'))
+        for tok_id, tok in tokenizer.id_to_token.items()
+        if tok_id not in _special_ids
+    ]
+    bytes_per_token = sum(_byte_lens) / len(_byte_lens) if _byte_lens else 1.0
+    if is_main_process:
+        print(f"Avg bytes/token (vocab): {bytes_per_token:.4f}")
+
     # Print model info if model_size specified
     if args.model_size and is_main_process:
         print_model_info(args.model_size, backbone_config, training_config,
@@ -251,7 +266,8 @@ def main(args):
         distributed=distributed,
         rank=rank,
         world_size=world_size,
-        local_rank=local_rank
+        local_rank=local_rank,
+        bytes_per_token=bytes_per_token,
     )
 
     # Train
@@ -275,6 +291,16 @@ def main(args):
             save_path=figures_dir / 'backbone_loss_curve.png'
         )
 
+        if history['val_bpbs'] or history['train_bpbs']:
+            plotter.bpb_curve(
+                val_bpbs=history['val_bpbs'],
+                train_bpbs=history['train_bpbs'],
+                eval_every=config['training_backbone']['eval_every'],
+                xlabel='Step',
+                ylabel='Bits Per Byte (BPB)',
+                save_path=figures_dir / 'backbone_bpb_curve.png'
+            )
+
         # Save standardized summary and artifact manifest.
         summary = {
             "step": "step1_backbone",
@@ -285,7 +311,9 @@ def main(args):
             "val_samples": int(len(val_df)),
             "num_params": int(num_params),
             "num_trainable_params": int(num_trainable),
+            "bytes_per_token": float(bytes_per_token),
             "best_val_loss": float(history['best_val_loss']),
+            "best_val_bpb": float(history['best_val_bpb']),
             "n_train_loss_points": int(len(history['train_losses'])),
             "n_val_loss_points": int(len(history['val_losses'])),
             "max_steps": int(config['training_backbone']['max_steps']),
@@ -296,6 +324,7 @@ def main(args):
         print("\n" + "=" * 50)
         print("Backbone training complete!")
         print(f"Best validation loss: {history['best_val_loss']:.4f}")
+        print(f"Best validation BPB:  {history['best_val_bpb']:.4f}")
         print(f"Checkpoints saved to: {step_dir / 'checkpoints'}")
         print("=" * 50)
 

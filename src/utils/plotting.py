@@ -232,6 +232,56 @@ class PlotUtils:
 
         return fig
 
+    def bpb_curve(
+        self,
+        val_bpbs: List[float],
+        train_bpbs: Optional[List[float]] = None,
+        eval_every: int = 1,
+        xlabel: str = "Step",
+        ylabel: str = "Bits Per Byte (BPB)",
+        title: Optional[str] = None,
+        save_path: Optional[str] = None,
+    ) -> plt.Figure:
+        """Create train and validation bits-per-byte curve.
+
+        Args:
+            val_bpbs: BPB values recorded at each validation checkpoint.
+            train_bpbs: Per-step train BPB values (same length as train steps).
+            eval_every: Number of training steps between each validation.
+            xlabel: X-axis label.
+            ylabel: Y-axis label.
+            title: Plot title.
+            save_path: Path to save the figure.
+
+        Returns:
+            Matplotlib figure.
+        """
+        fig, ax = plt.subplots(figsize=self.figure_size)
+
+        if train_bpbs:
+            steps = np.arange(1, len(train_bpbs) + 1)
+            ax.plot(steps, train_bpbs, label='Train', color='blue')
+
+        if val_bpbs:
+            val_steps = np.arange(1, len(val_bpbs) + 1) * eval_every
+            ax.plot(val_steps, val_bpbs, label='Validation', color='orange')
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        if title:
+            ax.set_title(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
+            plt.close(fig)
+
+        return fig
+
     def parity_plot(
         self,
         y_true: np.ndarray,

@@ -1,5 +1,6 @@
 """Trainer for diffusion backbone model."""
 
+import math
 import warnings
 import torch
 import torch.nn as nn
@@ -12,7 +13,7 @@ from torch.amp import autocast, GradScaler
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from tqdm import tqdm
 
 
@@ -68,7 +69,8 @@ class BackboneTrainer:
         distributed: bool = False,
         rank: int = 0,
         world_size: int = 1,
-        local_rank: Optional[int] = None
+        local_rank: Optional[int] = None,
+        bytes_per_token: float = 1.0,
     ):
         """Initialize trainer.
 
@@ -84,6 +86,7 @@ class BackboneTrainer:
             rank: Global rank.
             world_size: Total number of ranks.
             local_rank: Local rank (GPU index).
+            bytes_per_token: Average bytes per token in the dataset (used to compute BPB).
         """
         self.model = model.to(device)
         self.train_dataloader = train_dataloader
@@ -97,6 +100,7 @@ class BackboneTrainer:
         self.is_main_process = (not self.distributed) or self.rank == 0
         self.output_dir = Path(output_dir)
         self.step_dir = Path(step_dir) if step_dir else self.output_dir
+        self.bytes_per_token = max(bytes_per_token, 1e-6)
 
         # Create output directories
         self.checkpoint_dir = self.output_dir / 'checkpoints'
@@ -192,10 +196,12 @@ class BackboneTrainer:
         # Training state
         self.global_step = 0
         self.best_val_loss = float('inf')
+        self.best_val_bpb = float('inf')
         self.best_epoch_val_loss = float('inf')
         self.early_stopping_counter = 0
         self.train_losses = []
         self.val_losses = []
+        self.val_bpbs = []
         self.learning_rates = []
 
         # GPU memory monitoring
@@ -292,10 +298,10 @@ class BackboneTrainer:
             train_loss = self._train_epoch(epoch)
 
             # Validation
-            val_loss = self._validate()
+            val_loss, val_bpb = self._validate()
 
             # Save checkpoint
-            self._save_checkpoint(val_loss, epoch)
+            self._save_checkpoint(val_loss, val_bpb, epoch)
 
             # Barrier after checkpoint to prevent rank drift
             if self.distributed and dist.is_available() and dist.is_initialized():
@@ -305,6 +311,7 @@ class BackboneTrainer:
                 print(f"Epoch {epoch+1}/{self.num_epochs} - "
                       f"Train Loss: {train_loss:.4f} - "
                       f"Val Loss: {val_loss:.4f} - "
+                      f"Val BPB: {val_bpb:.4f} - "
                       f"LR: {self.optimizer.param_groups[0]['lr']:.2e}")
 
             if self.global_step >= self.max_steps:
@@ -328,16 +335,19 @@ class BackboneTrainer:
                         break
 
         # Save final checkpoint
-        self._save_checkpoint(val_loss, epoch, final=True)
+        self._save_checkpoint(val_loss, val_bpb, epoch, final=True)
 
         # Save training history
         self._save_history()
 
         return {
             'train_losses': self.train_losses,
+            'train_bpbs': getattr(self, '_train_bpbs_cache', []),
             'val_losses': self.val_losses,
+            'val_bpbs': self.val_bpbs,
             'learning_rates': self.learning_rates,
-            'best_val_loss': self.best_val_loss
+            'best_val_loss': self.best_val_loss,
+            'best_val_bpb': self.best_val_bpb,
         }
 
     def _train_epoch(self, epoch: int) -> float:
@@ -373,11 +383,12 @@ class BackboneTrainer:
 
             # Periodic validation
             if self.global_step > 0 and self.global_step % self.eval_every == 0:
-                val_loss = self._validate()
+                val_loss, val_bpb = self._validate()
                 self.model.train()
                 if self.is_main_process:
                     self.val_losses.append(val_loss)
-                    self._save_checkpoint(val_loss, epoch)
+                    self.val_bpbs.append(val_bpb)
+                    self._save_checkpoint(val_loss, val_bpb, epoch)
                 if self.distributed and dist.is_available() and dist.is_initialized():
                     dist.barrier()
 
@@ -447,11 +458,11 @@ class BackboneTrainer:
 
         return loss.item() * self.grad_accum_steps
 
-    def _validate(self) -> float:
+    def _validate(self) -> Tuple[float, float]:
         """Run validation.
 
         Returns:
-            Average validation loss.
+            Tuple of (average validation loss in nats, bits-per-byte).
         """
         self.model.eval()
         total_loss = 0.0
@@ -468,14 +479,16 @@ class BackboneTrainer:
                 total_loss += outputs['loss'].item()
                 num_batches += 1
 
-        avg_loss = total_loss / max(num_batches, 1)
-        return self._reduce_mean(avg_loss)
+        avg_loss = self._reduce_mean(total_loss / max(num_batches, 1))
+        bpb = avg_loss / math.log(2) / self.bytes_per_token
+        return avg_loss, bpb
 
-    def _save_checkpoint(self, val_loss: float, epoch: int, final: bool = False):
+    def _save_checkpoint(self, val_loss: float, val_bpb: float, epoch: int, final: bool = False):
         """Save model checkpoint.
 
         Args:
-            val_loss: Validation loss.
+            val_loss: Validation loss (nats).
+            val_bpb: Validation bits-per-byte.
             epoch: Current epoch.
             final: Whether this is the final checkpoint.
         """
@@ -489,15 +502,18 @@ class BackboneTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'val_loss': val_loss,
+            'val_bpb': val_bpb,
             'best_val_loss': self.best_val_loss,
+            'best_val_bpb': self.best_val_bpb,
             'config': self.config
         }
 
         # Save best checkpoint
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
+            self.best_val_bpb = val_bpb
             torch.save(checkpoint, self.checkpoint_dir / 'backbone_best.pt')
-            print(f"New best model saved with val_loss: {val_loss:.4f}")
+            print(f"New best model saved with val_loss: {val_loss:.4f}, val_bpb: {val_bpb:.4f}")
 
         # Save final checkpoint
         if final and not self.save_best_only and self.save_last:
@@ -532,10 +548,15 @@ class BackboneTrainer:
         rounded_learning_rates = [round(lr, 8) for lr in self.learning_rates]  # LR needs more precision
         rounded_val_losses = [round(loss, 4) for loss in self.val_losses]
 
+        # Derive per-step train BPB from already-tracked train losses
+        train_bpbs = [loss / math.log(2) / self.bytes_per_token for loss in self.train_losses]
+        rounded_train_bpbs = [round(b, 6) for b in train_bpbs]
+
         # Create loss curve CSV
         history = {
             'step': list(range(len(self.train_losses))),
             'train_loss': rounded_train_losses,
+            'train_bpb': rounded_train_bpbs,
             'learning_rate': rounded_learning_rates
         }
 
@@ -548,16 +569,21 @@ class BackboneTrainer:
         train_df = pd.DataFrame({
             'step': history['step'],
             'train_loss': history['train_loss'],
+            'train_bpb': history['train_bpb'],
             'learning_rate': history['learning_rate']
         })
         train_df.to_csv(self.metrics_dir / 'backbone_loss_curve.csv', index=False)
 
         if self.val_losses:
+            rounded_val_bpbs = [round(b, 6) for b in self.val_bpbs]
             val_df = pd.DataFrame({
                 'step': history['val_step'],
-                'val_loss': history['val_loss']
+                'val_loss': history['val_loss'],
+                'val_bpb': rounded_val_bpbs[:len(history['val_step'])],
             })
             val_df.to_csv(self.metrics_dir / 'backbone_val_loss.csv', index=False)
+
+        self._train_bpbs_cache = train_bpbs
 
         # Save memory stats
         if self.memory_stats:
