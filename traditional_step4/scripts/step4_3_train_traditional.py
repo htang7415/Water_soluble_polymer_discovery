@@ -1215,6 +1215,8 @@ def _evaluate_classification_cv(
             raise ValueError(f"Invalid CV fold={fold_id}: empty train or val.")
         if train_df["water_soluble"].nunique() < 2:
             raise ValueError(f"CV fold={fold_id} train has single class; cannot fit classifier.")
+        if val_df["water_soluble"].nunique() < 2:
+            raise ValueError(f"CV fold={fold_id} val has single class; classification metrics would be degenerate.")
 
         X_train = features_from_table(train_df, fingerprint_table)
         y_train = train_df["water_soluble"].to_numpy(dtype=int)

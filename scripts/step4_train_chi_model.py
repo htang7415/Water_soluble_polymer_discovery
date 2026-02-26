@@ -1455,6 +1455,7 @@ def run_classifier_cv_with_best_hyperparameters(
     figures_dir: Path,
     dpi: int,
     font_size: int,
+    backbone_split_mode: Optional[str] = None,
 ) -> Dict[str, object]:
     metrics_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
@@ -1486,6 +1487,7 @@ def run_classifier_cv_with_best_hyperparameters(
             tokenizer=tokenizer,
             finetune_last_layers=finetune_last_layers,
             timestep_for_embedding=train_cfg.timestep_for_embedding,
+            backbone_split_mode=backbone_split_mode,
         )
 
         fold_hist = pd.DataFrame(history)
@@ -2547,6 +2549,7 @@ def train_one_classifier_model(
     tokenizer=None,
     finetune_last_layers: int = 0,
     timestep_for_embedding: int = 1,
+    backbone_split_mode: Optional[str] = None,
 ) -> Tuple[nn.Module, Dict[str, List[float]], Dict[str, Dict[str, np.ndarray]]]:
     if finetune_last_layers > 0:
         if config is None:
@@ -2562,7 +2565,7 @@ def train_one_classifier_model(
         _, backbone, _ = load_backbone_from_step1(
             config=config,
             model_size=model_size,
-            split_mode=train_cfg.split_mode,
+            split_mode=backbone_split_mode if backbone_split_mode is not None else train_cfg.split_mode,
             checkpoint_path=backbone_checkpoint,
             device=device,
         )
@@ -2711,6 +2714,7 @@ def _evaluate_classifier_trial_with_cv(
     weight_decay: float,
     batch_size: int,
     finetune_last_layers: int,
+    backbone_split_mode: Optional[str] = None,
 ) -> Dict[str, object]:
     fold_rows = []
     for fold_id, fold_df in enumerate(cv_folds, start=1):
@@ -2732,6 +2736,7 @@ def _evaluate_classifier_trial_with_cv(
             tokenizer=tokenizer,
             finetune_last_layers=finetune_last_layers,
             timestep_for_embedding=train_cfg.timestep_for_embedding,
+            backbone_split_mode=backbone_split_mode,
         )
         val_pred = preds["val"]
         val_cls = classification_metrics(val_pred["label"], val_pred["prob"])
@@ -2768,6 +2773,7 @@ def tune_classifier_hyperparameters(
     tuning_dir: Path,
     dpi: int = 300,
     font_size: int = 12,
+    backbone_split_mode: Optional[str] = None,
 ) -> Dict:
     try:
         import optuna
@@ -2891,6 +2897,7 @@ def tune_classifier_hyperparameters(
             weight_decay=wd,
             batch_size=batch_size,
             finetune_last_layers=finetune_last_layers,
+            backbone_split_mode=backbone_split_mode,
         )
         val_bal_acc = float(cv_eval["cv_val_balanced_accuracy"])
         invalid_metrics = int(not np.isfinite(val_bal_acc))
@@ -3414,6 +3421,16 @@ def main(args):
         d.mkdir(parents=True, exist_ok=True)
 
     split_ratios = _resolve_split_ratios(train_cfg)
+    # Compute classification-specific split ratios using its own tuning_cv_folds.
+    _cls_cv_folds_for_split = int(chi_cfg.get("step4_2", {}).get("tuning_cv_folds", train_cfg.tuning_cv_folds))
+    _cls_test = float(train_cfg.holdout_test_ratio)
+    _cls_dev = 1.0 - _cls_test
+    _cls_val = _cls_dev / float(max(2, _cls_cv_folds_for_split))
+    cls_split_ratios = {
+        "train_ratio": _cls_dev - _cls_val,
+        "val_ratio": _cls_val,
+        "test_ratio": _cls_test,
+    }
     reg_csv = args.regression_dataset_path or args.dataset_path or chi_cfg["step4_1_dataset_path"]
     cls_csv = args.classification_dataset_path or chi_cfg["step4_2_dataset_path"]
 
@@ -3496,9 +3513,9 @@ def main(args):
         cls_df,
         SplitConfig(
             split_mode=cls_split_mode,
-            train_ratio=split_ratios["train_ratio"],
-            val_ratio=split_ratios["val_ratio"],
-            test_ratio=split_ratios["test_ratio"],
+            train_ratio=cls_split_ratios["train_ratio"],
+            val_ratio=cls_split_ratios["val_ratio"],
+            test_ratio=cls_split_ratios["test_ratio"],
             seed=train_cfg.seed,
         ),
     )
@@ -3831,6 +3848,7 @@ def main(args):
                 tuning_dir=cls_tuning_dir,
                 dpi=dpi,
                 font_size=font_size,
+                backbone_split_mode=backbone_split_mode,
             )
             print("Step4_2 best params:")
             print(cls_best_params)
@@ -3882,6 +3900,7 @@ def main(args):
                 figures_dir=cls_figures_dir / "cv_best_params",
                 dpi=dpi,
                 font_size=font_size,
+                backbone_split_mode=backbone_split_mode,
             )
         cls_final_fit_df = _build_final_fit_split_df(cls_split_df)
         cls_final_train_rows = int((cls_final_fit_df["split"] == "train").sum())
@@ -3929,6 +3948,7 @@ def main(args):
             tokenizer=tokenizer_for_training,
             finetune_last_layers=cls_finetune_last_layers,
             timestep_for_embedding=cls_cfg.timestep_for_embedding,
+            backbone_split_mode=backbone_split_mode,
         )
 
         cls_checkpoint = {

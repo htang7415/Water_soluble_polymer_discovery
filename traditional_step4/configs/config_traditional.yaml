@@ -22,7 +22,7 @@ traditional_step4:
     split:
       # Holdout ratio for the one-time test split.
       # Train set is (1 - holdout_test_ratio), and CV is performed only inside train.
-      holdout_test_ratio: 0.16
+      holdout_test_ratio: 0.10
     fingerprint:
       radius: 3
       n_bits: 1024
