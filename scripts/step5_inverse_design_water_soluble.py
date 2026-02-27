@@ -473,6 +473,8 @@ def _save_figures(
     candidate_df: pd.DataFrame,
     aggregate_df: pd.DataFrame,
     topk_novelty: pd.DataFrame,
+    target_poly_df: pd.DataFrame,
+    target_poly_summary: Dict[str, float],
     out_dir: Path,
     dpi: int,
     font_size: int,
@@ -598,6 +600,126 @@ def _save_figures(
         fig.tight_layout()
         fig.savefig(out_dir / "topk_novelty_and_error_curve.png", dpi=dpi)
         plt.close(fig)
+
+    # ── NEW: Candidate screening funnel ──────────────────────────────────────
+    _nc = ["#0C5DA5", "#00B945", "#FF9500", "#FF2C00"]
+    n_pool  = int(target_poly_summary.get("total_candidates_screened", 0))
+    n_pass  = int(target_poly_summary.get("filter_pass_count", 0))
+    n_dedup = int(target_poly_summary.get("filter_pass_unique", 0))
+    n_sel   = int(target_poly_summary.get("target_count_selected", 0))
+    if n_pool > 0:
+        stage_labels = ["Candidate pool", "Pass all filters", "After deduplication", "Final selection"]
+        stage_counts = [n_pool, n_pass, n_dedup, n_sel]
+        fig, ax = plt.subplots(figsize=(7, 3.5))
+        ys = np.arange(len(stage_labels))
+        bars = ax.barh(ys, stage_counts, color=_nc, edgecolor="none", height=0.55)
+        x_max = max(stage_counts)
+        for bar, cnt in zip(bars, stage_counts):
+            pct = 100.0 * cnt / n_pool
+            ax.text(
+                cnt + 0.02 * x_max,
+                bar.get_y() + bar.get_height() / 2,
+                f"{cnt:,}  ({pct:.1f}%)",
+                va="center", ha="left", fontsize=max(font_size - 2, 10),
+            )
+        ax.set_yticks(ys)
+        ax.set_yticklabels(stage_labels)
+        ax.invert_yaxis()
+        ax.set_xlabel("Count")
+        ax.set_xlim(0, x_max * 1.55)
+        fig.tight_layout()
+        fig.savefig(out_dir / "candidate_screening_funnel.png", dpi=dpi)
+        plt.close(fig)
+
+    # ── NEW: SA score distribution of final selected polymers ────────────────
+    if not target_poly_df.empty and "sa_score" in target_poly_df.columns:
+        sa_vals = target_poly_df["sa_score"].dropna()
+        if len(sa_vals) >= 2:
+            fig, ax = plt.subplots(figsize=(6, 5))
+            sns.histplot(
+                sa_vals,
+                bins=min(15, max(5, len(sa_vals) // 3)),
+                kde=len(sa_vals) >= 5,
+                color="#0C5DA5",
+                ax=ax,
+                edgecolor="white",
+                linewidth=0.4,
+            )
+            mean_sa = float(sa_vals.mean())
+            ax.axvline(mean_sa, color="#FF2C00", linewidth=1.5, linestyle="--",
+                       label=f"Mean = {mean_sa:.2f}")
+            ax.set_xlabel("Synthetic accessibility score")
+            ax.set_ylabel("Count")
+            ax.legend(frameon=False)
+            fig.tight_layout()
+            fig.savefig(out_dir / "selected_sa_score_distribution.png", dpi=dpi)
+            plt.close(fig)
+
+    # ── NEW: Top-k solubility confidence curve ───────────────────────────────
+    if not topk_novelty.empty and "mean_class_prob" in topk_novelty.columns:
+        k_vals = topk_novelty["k"].to_numpy()
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.plot(k_vals, topk_novelty["mean_class_prob"].to_numpy(dtype=float),
+                marker="o", linewidth=2, color="#0C5DA5", label="Mean confidence")
+        if "mean_class_prob_lcb" in topk_novelty.columns:
+            ax.plot(k_vals, topk_novelty["mean_class_prob_lcb"].to_numpy(dtype=float),
+                    marker="s", linewidth=2, linestyle="--", color="#845B97",
+                    label="Conservative (LCB)")
+        ax.axhline(0.5, color="#474747", linewidth=1.0, linestyle=":", alpha=0.7)
+        ax.set_xlabel("k")
+        ax.set_ylabel("Mean solubility confidence")
+        ax.set_ylim(0, 1.05)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(out_dir / "topk_solubility_confidence_curve.png", dpi=dpi)
+        plt.close(fig)
+
+    # ── NEW: χ parity across all conditions for top selected polymers ────────
+    _nc6 = ["#0C5DA5", "#00B945", "#FF9500", "#FF2C00", "#845B97", "#474747"]
+    if (
+        not target_poly_df.empty
+        and "SMILES" in target_poly_df.columns
+        and "SMILES" in candidate_df.columns
+        and "chi_pred_target" in candidate_df.columns
+        and "target_chi" in candidate_df.columns
+    ):
+        sort_col = "target_rank" if "target_rank" in target_poly_df.columns else target_poly_df.columns[0]
+        top_sel = target_poly_df.sort_values(sort_col).head(min(8, len(target_poly_df)))
+        sel_smiles = set(top_sel["SMILES"].dropna().tolist())
+        smiles_to_name = dict(zip(top_sel["SMILES"], top_sel["Polymer"]))
+        sel_cands = candidate_df[candidate_df["SMILES"].isin(sel_smiles)].copy()
+        if not sel_cands.empty:
+            sel_cands["_pname"] = sel_cands["SMILES"].map(smiles_to_name)
+            sel_cands = sel_cands.dropna(subset=["_pname"])
+            unique_names = list(sel_cands["_pname"].unique())
+            color_map = {nm: _nc6[i % len(_nc6)] for i, nm in enumerate(unique_names)}
+            fig, ax = plt.subplots(figsize=(6, 5))
+            for nm, grp in sel_cands.groupby("_pname"):
+                yerr = grp["chi_pred_std_target"].to_numpy(dtype=float) if "chi_pred_std_target" in grp.columns else None
+                ax.errorbar(
+                    grp["target_chi"].to_numpy(dtype=float),
+                    grp["chi_pred_target"].to_numpy(dtype=float),
+                    yerr=yerr,
+                    fmt="o",
+                    color=color_map[nm],
+                    markersize=5,
+                    linewidth=0,
+                    elinewidth=1.0,
+                    capsize=2,
+                    label=nm,
+                    alpha=0.85,
+                )
+            all_chi = pd.concat([sel_cands["target_chi"], sel_cands["chi_pred_target"]])
+            lo, hi = float(all_chi.min()), float(all_chi.max())
+            pad = (hi - lo) * 0.05 if hi > lo else 0.1
+            ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", linewidth=1, zorder=0)
+            ax.set_xlabel("Target χ")
+            ax.set_ylabel("Predicted χ")
+            ncol = 1 if len(unique_names) <= 4 else 2
+            ax.legend(frameon=False, fontsize=max(font_size - 4, 8), ncol=ncol)
+            fig.tight_layout()
+            fig.savefig(out_dir / "selected_polymer_chi_parity_all_conditions.png", dpi=dpi)
+            plt.close(fig)
 
 
 def main(args):
@@ -960,6 +1082,8 @@ def main(args):
         candidate_df=candidate_df,
         aggregate_df=aggregate_df,
         topk_novelty=post["topk_novelty"],
+        target_poly_df=target_poly_df,
+        target_poly_summary=target_poly_summary,
         out_dir=figures_dir,
         dpi=dpi,
         font_size=font_size,
