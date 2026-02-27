@@ -17,8 +17,9 @@ _ORIGINAL_FIGURE_SAVEFIG = Figure.savefig
 _TITLE_PATCHED = False
 _SAVEFIG_PATCHED = False
 PUBLICATION_DPI = 600
-PUBLICATION_FONT_SIZE = 15
+PUBLICATION_FONT_SIZE = 16
 _CURRENT_PUBLICATION_DPI = PUBLICATION_DPI
+_NATURE_FONT_FAMILIES = ["Arial", "Helvetica", "Liberation Sans", "DejaVu Sans"]
 _NATURE_COLOR_CYCLE = [
     "#0C5DA5",
     "#00B945",
@@ -35,14 +36,18 @@ def _patch_title_calls() -> None:
     if _TITLE_PATCHED:
         return
 
-    def _axes_set_title_no_text(self, _label, *args, **kwargs):
-        return _ORIGINAL_AXES_SET_TITLE(self, "", *args, **kwargs)
+    def _axes_set_title_no_text(self, *args, **kwargs):
+        trailing_args = args[1:] if len(args) > 0 else ()
+        kwargs.setdefault("pad", 0.0)
+        return _ORIGINAL_AXES_SET_TITLE(self, "", *trailing_args, **kwargs)
 
-    def _figure_suptitle_no_text(self, _title, *args, **kwargs):
-        return _ORIGINAL_FIGURE_SUPTITLE(self, "", *args, **kwargs)
+    def _figure_suptitle_no_text(self, *args, **kwargs):
+        trailing_args = args[1:] if len(args) > 0 else ()
+        return _ORIGINAL_FIGURE_SUPTITLE(self, "", *trailing_args, **kwargs)
 
-    def _legend_set_title_no_text(self, _title, *args, **kwargs):
-        return _ORIGINAL_LEGEND_SET_TITLE(self, "", *args, **kwargs)
+    def _legend_set_title_no_text(self, *args, **kwargs):
+        trailing_args = args[1:] if len(args) > 0 else ()
+        return _ORIGINAL_LEGEND_SET_TITLE(self, "", *trailing_args, **kwargs)
 
     Axes.set_title = _axes_set_title_no_text
     Figure.suptitle = _figure_suptitle_no_text
@@ -79,16 +84,16 @@ def apply_publication_figure_style(
     remove_titles: bool = True,
 ) -> None:
     """Apply a publication-ready plotting style across matplotlib/seaborn."""
-    _ = remove_titles  # reserved for backward-compatible call signatures
     global _CURRENT_PUBLICATION_DPI
     _CURRENT_PUBLICATION_DPI = max(int(dpi), 300)
 
     _patch_savefig_calls()
-    _patch_title_calls()
+    if remove_titles:
+        _patch_title_calls()
 
     base_size = max(int(font_size), PUBLICATION_FONT_SIZE)
-    tick_size = max(base_size - 1, PUBLICATION_FONT_SIZE - 1)
-    legend_size = max(base_size - 1, PUBLICATION_FONT_SIZE - 1)
+    tick_size = base_size
+    legend_size = base_size
 
     sns.set_theme(
         context="paper",
@@ -98,49 +103,56 @@ def apply_publication_figure_style(
     plt.rcParams.update(
         {
             "font.family": "sans-serif",
-            "font.sans-serif": ["Arial", "Helvetica", "Liberation Sans", "DejaVu Sans"],
+            "font.sans-serif": _NATURE_FONT_FAMILIES,
             "font.size": base_size,
             "axes.labelsize": base_size,
             "axes.titlesize": base_size,
+            "axes.labelweight": "regular",
+            "axes.titleweight": "regular",
+            "axes.labelpad": 4.0,
+            "axes.axisbelow": True,
             "mathtext.default": "regular",
             "xtick.labelsize": tick_size,
             "ytick.labelsize": tick_size,
             "legend.fontsize": legend_size,
+            "legend.title_fontsize": legend_size,
             "axes.spines.left": True,
             "axes.spines.bottom": True,
             "axes.spines.top": False,
             "axes.spines.right": False,
             "axes.edgecolor": "#222222",
-            "axes.linewidth": 1.0,
+            "axes.linewidth": 1.2,
             "axes.facecolor": "white",
             "axes.grid": False,
             "axes.prop_cycle": plt.cycler(color=_NATURE_COLOR_CYCLE),
             "figure.facecolor": "white",
             "figure.dpi": _CURRENT_PUBLICATION_DPI,
             "savefig.dpi": _CURRENT_PUBLICATION_DPI,
+            "savefig.format": "png",
             "savefig.bbox": "tight",
             "savefig.pad_inches": 0.02,
             "savefig.transparent": False,
             "legend.frameon": False,
-            "lines.linewidth": 2.0,
+            "lines.linewidth": 2.2,
+            "lines.solid_capstyle": "round",
+            "lines.solid_joinstyle": "round",
             "lines.markersize": 6.0,
             "patch.edgecolor": "#222222",
             "patch.linewidth": 0.8,
+            "errorbar.capsize": 3.0,
             "xtick.direction": "out",
             "ytick.direction": "out",
             "xtick.major.size": 4.0,
             "ytick.major.size": 4.0,
             "xtick.major.width": 1.0,
             "ytick.major.width": 1.0,
-            "xtick.minor.size": 2.5,
-            "ytick.minor.size": 2.5,
-            "xtick.minor.width": 0.8,
-            "ytick.minor.width": 0.8,
+            "xtick.minor.visible": False,
+            "ytick.minor.visible": False,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
 
 
-# Enforce global no-title policy for all figure scripts importing this module.
-_patch_title_calls()
+# Enforce global publication defaults for all figure scripts importing this module.
+apply_publication_figure_style()

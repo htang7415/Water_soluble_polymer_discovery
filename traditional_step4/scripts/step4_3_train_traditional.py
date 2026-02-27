@@ -3070,7 +3070,7 @@ def main() -> None:
     )
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
-    font_size = int(config.get("plotting", {}).get("font_size", 15))
+    font_size = int(config.get("plotting", {}).get("font_size", 16))
 
     print("=" * 80)
     print("Step 4_3 traditional pipeline")

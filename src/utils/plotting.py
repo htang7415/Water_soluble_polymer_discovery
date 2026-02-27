@@ -16,7 +16,7 @@ class PlotUtils:
     def __init__(
         self,
         figure_size: Tuple[float, float] = (4.5, 4.5),
-        font_size: int = 15,
+        font_size: int = 16,
         dpi: int = 600
     ):
         """Initialize plotting utilities.

@@ -1072,7 +1072,7 @@ def main(args):
     )
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
-    font_size = int(config.get("plotting", {}).get("font_size", 15))
+    font_size = int(config.get("plotting", {}).get("font_size", 16))
     _save_figures(
         target_metrics_df=target_metrics_df,
         candidate_df=candidate_df,

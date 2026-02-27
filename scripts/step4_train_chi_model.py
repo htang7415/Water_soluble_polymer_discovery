@@ -1637,7 +1637,7 @@ def tune_hyperparameters(
     device: str,
     tuning_dir: Path,
     dpi: int = 300,
-    font_size: int = 15,
+    font_size: int = 16,
 ) -> Dict:
     try:
         import optuna
@@ -2819,7 +2819,7 @@ def tune_classifier_hyperparameters(
     device: str,
     tuning_dir: Path,
     dpi: int = 300,
-    font_size: int = 15,
+    font_size: int = 16,
     backbone_split_mode: Optional[str] = None,
 ) -> Dict:
     try:
@@ -3633,7 +3633,7 @@ def main(args):
     tokenizer_for_training = None
 
     dpi = int(config.get("plotting", {}).get("dpi", 600))
-    font_size = int(config.get("plotting", {}).get("font_size", 15))
+    font_size = int(config.get("plotting", {}).get("font_size", 16))
 
     reg_checkpoint_path = reg_checkpoint_dir / "chi_regression_best.pt"
     cls_checkpoint_path = cls_checkpoint_dir / "chi_classifier_best.pt"

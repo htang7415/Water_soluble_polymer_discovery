@@ -132,12 +132,12 @@ def save_artifact_manifest(
         figures_dir.mkdir(parents=True, exist_ok=True)
         fig_path = figures_dir / "artifact_counts_by_category.png"
         try:
-            apply_publication_figure_style(font_size=15, dpi=int(dpi), remove_titles=True)
+            apply_publication_figure_style(font_size=16, dpi=int(dpi), remove_titles=True)
             fig, ax = plt.subplots(figsize=(5, 4))
             if not by_cat.empty:
                 ax.bar(by_cat["category"], by_cat["n_files"], color="#4c78a8")
                 for i, v in enumerate(by_cat["n_files"].tolist()):
-                    ax.text(i, v, str(v), ha="center", va="bottom", fontsize=15)
+                    ax.text(i, v, str(v), ha="center", va="bottom", fontsize=16)
             ax.set_xlabel("Category")
             ax.set_ylabel("File count")
             ax.set_title("Artifact counts by category")
