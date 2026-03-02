@@ -166,10 +166,10 @@ chi_training:
 
     tune: true
     n_trials: 200
-    tuning_epochs: 100
-    tuning_patience: 20
+    tuning_epochs: 60
+    tuning_patience: 10
     tuning_objective: "val_r2"  # regression objective uses mean CV val_r2
-    tuning_cv_folds: 6
+    tuning_cv_folds: 5
     optuna_search_space:
       # If list has exactly 2 values, it is treated as a continuous range [min, max].
       # If list has >2 values, it is treated as categorical choices.
@@ -202,9 +202,9 @@ chi_training:
 
     tune: true
     n_trials: 200
-    tuning_epochs: 100
-    tuning_patience: 20
-    tuning_cv_folds: 6
+    tuning_epochs: 60
+    tuning_patience: 10
+    tuning_cv_folds: 5
     optuna_search_space:
       # If list has exactly 2 values, it is treated as a continuous range [min, max].
       # If list has >2 values, it is treated as categorical choices.

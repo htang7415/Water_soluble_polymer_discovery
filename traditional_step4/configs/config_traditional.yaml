@@ -31,8 +31,8 @@ traditional_step4:
 
   step4_3_1_regression:
     tune: true
-    n_trials: 90
-    tuning_cv_folds: 6
+    n_trials: 120
+    tuning_cv_folds: 5
     tuning_objective: "val_r2"
     models:
       - "ridge"
@@ -81,8 +81,8 @@ traditional_step4:
 
   step4_3_2_classification:
     tune: true
-    n_trials: 90
-    tuning_cv_folds: 6
+    n_trials: 120
+    tuning_cv_folds: 5
     tuning_objective: "val_balanced_accuracy"
     models:
       - "logistic"
