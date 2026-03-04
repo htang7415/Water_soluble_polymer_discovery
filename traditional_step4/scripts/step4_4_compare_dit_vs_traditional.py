@@ -171,6 +171,192 @@ def _barplot_two_models(
     plt.close(fig)
 
 
+def _sort_by_model_size(df: pd.DataFrame, model_size_order: List[str] | None = None) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    if model_size_order:
+        rank = {str(s): i for i, s in enumerate(model_size_order)}
+        out["__size_rank"] = out["model_size"].astype(str).map(lambda s: rank.get(str(s), len(rank)))
+        out = out.sort_values("__size_rank").drop(columns=["__size_rank"])
+    return out.reset_index(drop=True)
+
+
+def _overview_panel_two_models(
+    df: pd.DataFrame,
+    metric_specs: List[tuple[str, str]],
+    title: str,
+    out_png: Path,
+    dpi: int,
+    font_size: int,
+    model_size_order: List[str] | None = None,
+) -> None:
+    if df.empty or len(metric_specs) == 0:
+        return
+    cols = ["model_size"] + [f"dit_{m}" for m, _ in metric_specs] + [f"traditional_{m}" for m, _ in metric_specs]
+    for c in cols:
+        if c not in df.columns:
+            return
+    plot_df = _sort_by_model_size(df[cols], model_size_order=model_size_order)
+    x = np.arange(len(plot_df), dtype=float)
+    xlabels = plot_df["model_size"].astype(str).tolist()
+
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
+    fig, axes = plt.subplots(1, len(metric_specs), figsize=(5.0 * len(metric_specs), 4.2))
+    if len(metric_specs) == 1:
+        axes = [axes]
+    for ax, (metric, ylabel) in zip(axes, metric_specs):
+        dit_vals = pd.to_numeric(plot_df[f"dit_{metric}"], errors="coerce").to_numpy(dtype=float)
+        trad_vals = pd.to_numeric(plot_df[f"traditional_{metric}"], errors="coerce").to_numpy(dtype=float)
+        ax.plot(x, dit_vals, marker="o", linewidth=2.0, color="#1f77b4", label="DiT")
+        ax.plot(x, trad_vals, marker="s", linewidth=2.0, color="#d62728", label="Traditional")
+        ax.set_xticks(x)
+        ax.set_xticklabels(xlabels)
+        ax.set_xlabel("Model size")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.45)
+    axes[0].legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    fig.suptitle(title, y=1.04)
+    fig.tight_layout(rect=(0, 0, 0.94, 1))
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
+def _delta_heatmap(
+    df: pd.DataFrame,
+    delta_specs: List[tuple[str, str]],
+    title: str,
+    out_png: Path,
+    dpi: int,
+    font_size: int,
+    model_size_order: List[str] | None = None,
+) -> None:
+    if df.empty or len(delta_specs) == 0:
+        return
+    cols = ["model_size"] + [c for c, _ in delta_specs]
+    for c in cols:
+        if c not in df.columns:
+            return
+    plot_df = _sort_by_model_size(df[cols], model_size_order=model_size_order).set_index("model_size")
+    heat = plot_df.rename(columns={c: label for c, label in delta_specs})
+    heat = heat.apply(pd.to_numeric, errors="coerce")
+    if heat.empty:
+        return
+    arr = heat.to_numpy(dtype=float)
+    finite_vals = arr[np.isfinite(arr)]
+    vmax = float(np.max(np.abs(finite_vals))) if finite_vals.size > 0 else 1.0
+    if (not np.isfinite(vmax)) or vmax < 1.0e-8:
+        vmax = 1.0
+
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
+    fig, ax = plt.subplots(figsize=(1.8 * heat.shape[1] + 2.2, 0.9 * heat.shape[0] + 2.2))
+    sns.heatmap(
+        heat,
+        cmap="RdBu_r",
+        center=0.0,
+        vmin=-vmax,
+        vmax=vmax,
+        annot=True,
+        fmt=".3f",
+        linewidths=0.5,
+        linecolor="white",
+        cbar_kws={"label": "Traditional - DiT"},
+        ax=ax,
+    )
+    ax.set_xlabel("Metric")
+    ax.set_ylabel("Model size")
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
+def _winner_count_figure(reg_df: pd.DataFrame, cls_df: pd.DataFrame, out_png: Path, dpi: int, font_size: int) -> None:
+    rows: List[Dict[str, object]] = []
+    specs = [
+        (reg_df, "Regression", "winner_r2", "R2"),
+        (reg_df, "Regression", "winner_rmse", "RMSE"),
+        (cls_df, "Classification", "winner_balanced_accuracy", "Balanced accuracy"),
+        (cls_df, "Classification", "winner_auroc", "AUROC"),
+        (cls_df, "Classification", "winner_f1", "F1"),
+    ]
+    for df, task, winner_col, metric_name in specs:
+        if df.empty or winner_col not in df.columns:
+            continue
+        vc = df[winner_col].astype(str).str.strip().str.lower().value_counts()
+        rows.append({"metric": f"{task}: {metric_name}", "winner": "DiT", "count": int(vc.get("dit", 0))})
+        rows.append({"metric": f"{task}: {metric_name}", "winner": "Traditional", "count": int(vc.get("traditional", 0))})
+    if len(rows) == 0:
+        return
+    plot_df = pd.DataFrame(rows)
+
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
+    fig, ax = plt.subplots(figsize=(10.5, 4.8))
+    sns.barplot(
+        data=plot_df,
+        x="metric",
+        y="count",
+        hue="winner",
+        palette={"DiT": "#1f77b4", "Traditional": "#d62728"},
+        ax=ax,
+    )
+    ax.set_xlabel("Metric")
+    ax.set_ylabel("Model-size wins")
+    ax.set_title("Winner counts by metric")
+    ax.tick_params(axis="x", rotation=20)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    fig.tight_layout(rect=(0, 0, 0.84, 1))
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
+def _missing_inputs_figure(missing_df: pd.DataFrame, out_png: Path, dpi: int, font_size: int) -> None:
+    if missing_df.empty:
+        return
+    plot_df = (
+        missing_df.groupby(["stage", "model_size"], as_index=False)
+        .size()
+        .rename(columns={"size": "n_missing"})
+        .sort_values(["stage", "model_size"])
+        .reset_index(drop=True)
+    )
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
+    fig, ax = plt.subplots(figsize=(11, 5.4))
+    sns.barplot(data=plot_df, x="stage", y="n_missing", hue="model_size", ax=ax)
+    ax.set_xlabel("Missing/invalid input stage")
+    ax.set_ylabel("Count")
+    ax.set_title("Step4_4 missing/invalid inputs by stage")
+    ax.tick_params(axis="x", rotation=20)
+    ax.legend(title="Model size", loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    fig.tight_layout(rect=(0, 0, 0.84, 1))
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
+def _no_data_notice_figure(
+    split_mode: str,
+    model_sizes: List[str],
+    missing_df: pd.DataFrame,
+    out_png: Path,
+    dpi: int,
+    font_size: int,
+) -> None:
+    apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
+    fig, ax = plt.subplots(figsize=(10, 4.2))
+    ax.axis("off")
+    lines = [
+        "Step4_4 comparison: no valid paired metrics available to plot.",
+        f"Split mode: {split_mode}",
+        f"Requested model sizes: {', '.join(model_sizes)}",
+        f"Missing/invalid input rows: {int(len(missing_df))}",
+        "See metrics/missing_or_invalid_inputs.csv for exact missing paths and errors.",
+    ]
+    ax.text(0.02, 0.95, "\n".join(lines), va="top", ha="left", fontsize=font_size)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Step 4_4: compare DiT Step4 vs traditional Step4_3")
     parser.add_argument("--config", type=str, default="traditional_step4/configs/config_traditional.yaml")
@@ -441,17 +627,12 @@ def main() -> None:
         "winner_auroc",
         "winner_f1",
     ]
-    size_rank = {str(s): i for i, s in enumerate(model_sizes)}
     if reg_rows:
-        reg_df = pd.DataFrame(reg_rows)
-        reg_df["__size_rank"] = reg_df["model_size"].astype(str).map(lambda s: size_rank.get(s, len(size_rank)))
-        reg_df = reg_df.sort_values("__size_rank").drop(columns=["__size_rank"]).reset_index(drop=True)
+        reg_df = _sort_by_model_size(pd.DataFrame(reg_rows), model_size_order=model_sizes)
     else:
         reg_df = pd.DataFrame(columns=reg_columns)
     if cls_rows:
-        cls_df = pd.DataFrame(cls_rows)
-        cls_df["__size_rank"] = cls_df["model_size"].astype(str).map(lambda s: size_rank.get(s, len(size_rank)))
-        cls_df = cls_df.sort_values("__size_rank").drop(columns=["__size_rank"]).reset_index(drop=True)
+        cls_df = _sort_by_model_size(pd.DataFrame(cls_rows), model_size_order=model_sizes)
     else:
         cls_df = pd.DataFrame(columns=cls_columns)
     reg_df.to_csv(metrics_dir / "regression_model_size_comparison.csv", index=False)
@@ -518,6 +699,38 @@ def main() -> None:
             font_size=font_size,
             model_size_order=model_sizes,
         )
+        _barplot_two_models(
+            df=reg_df,
+            metric="mae",
+            ylabel="Test MAE",
+            title=f"Step4_1 vs Step4_3_1 (split={split_mode})",
+            out_png=figures_dir / "regression_test_mae_by_model_size.png",
+            dpi=dpi,
+            font_size=font_size,
+            model_size_order=model_sizes,
+        )
+        _overview_panel_two_models(
+            df=reg_df,
+            metric_specs=[("r2", "Test R2"), ("rmse", "Test RMSE"), ("mae", "Test MAE")],
+            title=f"Regression comparison overview (split={split_mode})",
+            out_png=figures_dir / "regression_overview_panel.png",
+            dpi=dpi,
+            font_size=font_size,
+            model_size_order=model_sizes,
+        )
+        _delta_heatmap(
+            df=reg_df,
+            delta_specs=[
+                ("delta_r2_traditional_minus_dit", "Δ R2"),
+                ("delta_rmse_traditional_minus_dit", "Δ RMSE"),
+                ("delta_mae_traditional_minus_dit", "Δ MAE"),
+            ],
+            title="Regression deltas by model size",
+            out_png=figures_dir / "regression_delta_heatmap.png",
+            dpi=dpi,
+            font_size=font_size,
+            model_size_order=model_sizes,
+        )
 
     if not cls_df.empty:
         _barplot_two_models(
@@ -550,20 +763,69 @@ def main() -> None:
             font_size=font_size,
             model_size_order=model_sizes,
         )
+        _overview_panel_two_models(
+            df=cls_df,
+            metric_specs=[
+                ("balanced_accuracy", "Test balanced accuracy"),
+                ("auroc", "Test AUROC"),
+                ("f1", "Test F1"),
+            ],
+            title=f"Classification comparison overview (split={split_mode})",
+            out_png=figures_dir / "classification_overview_panel.png",
+            dpi=dpi,
+            font_size=font_size,
+            model_size_order=model_sizes,
+        )
+        _delta_heatmap(
+            df=cls_df,
+            delta_specs=[
+                ("delta_balanced_accuracy_traditional_minus_dit", "Δ balanced accuracy"),
+                ("delta_auroc_traditional_minus_dit", "Δ AUROC"),
+                ("delta_f1_traditional_minus_dit", "Δ F1"),
+            ],
+            title="Classification deltas by model size",
+            out_png=figures_dir / "classification_delta_heatmap.png",
+            dpi=dpi,
+            font_size=font_size,
+            model_size_order=model_sizes,
+        )
 
+    _winner_count_figure(
+        reg_df=reg_df,
+        cls_df=cls_df,
+        out_png=figures_dir / "winner_counts_by_metric.png",
+        dpi=dpi,
+        font_size=font_size,
+    )
+    _missing_inputs_figure(
+        missing_df=missing_df,
+        out_png=figures_dir / "missing_inputs_by_stage.png",
+        dpi=dpi,
+        font_size=font_size,
+    )
+    if reg_df.empty and cls_df.empty:
+        _no_data_notice_figure(
+            split_mode=split_mode,
+            model_sizes=model_sizes,
+            missing_df=missing_df,
+            out_png=figures_dir / "comparison_no_valid_data_notice.png",
+            dpi=dpi,
+            font_size=font_size,
+        )
+
+    save_artifact_manifest(step_dir=output_dir, metrics_dir=metrics_dir, figures_dir=figures_dir, dpi=dpi)
+    generated_figures = sorted(p.name for p in figures_dir.glob("*.png") if p.is_file())
     payload = {
         "split_mode": split_mode,
         "model_sizes": model_sizes,
         "n_regression_rows": int(len(reg_df)),
         "n_classification_rows": int(len(cls_df)),
         "n_missing_or_invalid": int(len(missing_df)),
+        "n_figures_generated": int(len(generated_figures)),
+        "figure_files": generated_figures,
     }
     with open(metrics_dir / "comparation_run_summary.json", "w") as f:
         json.dump(payload, f, indent=2)
-
-    # Keep artifact-manifest generation robust in constrained environments:
-    # skip the extra artifact-count PNG generated inside save_artifact_manifest.
-    save_artifact_manifest(step_dir=output_dir, metrics_dir=metrics_dir, figures_dir=None, dpi=dpi)
     save_step_summary(
         {
             "step": "step4_4_comparation",
@@ -573,6 +835,7 @@ def main() -> None:
             "n_regression_rows": int(len(reg_df)),
             "n_classification_rows": int(len(cls_df)),
             "n_missing_or_invalid": int(len(missing_df)),
+            "n_figures_generated": int(len(generated_figures)),
         },
         metrics_dir=metrics_dir,
     )

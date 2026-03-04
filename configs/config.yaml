@@ -277,7 +277,7 @@ sampling:
   top_k: null  # token filter: null disables, integer > 0 keeps top-k tokens
   top_p: null  # nucleus filter: null disables, value in (0, 1] enables
   target_stars: 2  # desired count of "*" tokens in generated polymers
-  target_polymer_count: 100  # Step 2 target count after final filtering
+  target_polymer_count: 10000  # Step 2 target count after final filtering
   target_sa_max: 4.0  # SA cutoff for Step 2 target-polymers export
   valid_only: true  # if true, keep sampling rounds until target count is reached
   valid_only_require_target_stars: true  # in valid-only rounds enforce star_count == target_stars

@@ -57,7 +57,13 @@ def normalize_split_mode(split_mode: str) -> str:
     return out
 
 
-def _safe_train_test_split(*args, stratify, random_state: int, test_size: float):
+def _safe_train_test_split(
+    *args,
+    stratify,
+    random_state: int,
+    test_size: float,
+    allow_unstratified_fallback: bool = True,
+):
     """Fallback to unstratified split if stratification is impossible."""
     try:
         return train_test_split(
@@ -67,12 +73,19 @@ def _safe_train_test_split(*args, stratify, random_state: int, test_size: float)
             stratify=stratify,
         )
     except ValueError as exc:
-        warnings.warn(
-            "Stratified split failed; falling back to unstratified split. "
-            f"reason={exc}",
-            RuntimeWarning,
-            stacklevel=2,
+        msg = (
+            "Stratified split failed"
+            + (
+                "; unstratified fallback disabled."
+                if not bool(allow_unstratified_fallback)
+                else "; falling back to unstratified split."
+            )
+            + f" reason={exc}"
         )
+        if not bool(allow_unstratified_fallback):
+            raise ValueError(msg) from exc
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        print(f"[warning] {msg}")
         return train_test_split(
             *args,
             test_size=test_size,
@@ -241,6 +254,7 @@ def load_split_dataset(
                 stratify=polymer_df["water_miscible"],
                 random_state=int(seed),
                 test_size=float(test_ratio),
+                allow_unstratified_fallback=not bool(is_classification_dataset),
             )
             split_map: Dict[int, str] = {}
             split_map.update({int(pid): "train" for pid in train_poly["polymer_id"].tolist()})
@@ -253,6 +267,7 @@ def load_split_dataset(
                 stratify=row_df["water_miscible"],
                 random_state=int(seed),
                 test_size=float(test_ratio),
+                allow_unstratified_fallback=not bool(is_classification_dataset),
             )
             split_map = {}
             split_map.update({int(rid): "train" for rid in train_rows["row_id"].tolist()})
@@ -315,16 +330,87 @@ def build_tuning_cv_folds(split_df: pd.DataFrame, split_mode: str, tuning_cv_fol
     class_counts = unit_df["water_miscible"].value_counts()
     max_folds = int(min(len(unit_df), class_counts.min())) if not class_counts.empty else 0
     if max_folds < 2:
+        warnings.warn(
+            (
+                "Insufficient class support for StratifiedKFold "
+                f"(max_folds={max_folds}, dev_units={len(unit_df)}); "
+                "falling back to a single train/val split."
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
         fallback = dev_df.copy()
+        if len(unit_df) < 2:
+            raise ValueError("Cannot build CV fallback split: fewer than 2 dev units.")
+
+        unit_ids = unit_df[unit_key].to_numpy()
+        labels = unit_df["water_miscible"].to_numpy(dtype=int)
+        n_classes = int(pd.Series(labels).nunique()) if len(labels) > 0 else 0
+        val_size = int(max(1, np.ceil(0.2 * len(unit_ids))))
+        if n_classes > 0:
+            val_size = max(val_size, n_classes)
+        val_size = min(val_size, len(unit_ids) - 1)
+
+        val_ids = None
+        fallback_suffix = "single_split_unit_balanced"
+        can_stratify_single_split = n_classes >= 2 and int(class_counts.min()) >= 2 and val_size >= n_classes
+        if can_stratify_single_split:
+            try:
+                _, val_units = train_test_split(
+                    unit_ids,
+                    test_size=int(val_size),
+                    random_state=int(seed),
+                    stratify=labels,
+                )
+                val_ids = set(np.asarray(val_units).tolist())
+                fallback_suffix = "single_split_stratified"
+            except ValueError as exc:
+                warnings.warn(
+                    "Single-split stratified fallback failed; using class-aware unit-balanced fallback. "
+                    f"reason={exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        if val_ids is None:
+            rng = np.random.default_rng(int(seed))
+            chosen: List[object] = []
+            for _, sub in unit_df.groupby("water_miscible", sort=True):
+                cls_ids = sub[unit_key].to_numpy()
+                if len(cls_ids) <= 1:
+                    continue
+                cls_take = int(max(1, np.floor(0.2 * len(cls_ids))))
+                cls_take = min(cls_take, len(cls_ids) - 1)
+                if cls_take <= 0:
+                    continue
+                perm = rng.permutation(len(cls_ids))
+                chosen.extend(np.asarray(cls_ids)[perm[:cls_take]].tolist())
+            if len(chosen) == 0:
+                chosen = [unit_ids[int(rng.integers(0, len(unit_ids)))]]
+            val_ids = set(chosen)
+            if len(val_ids) >= len(unit_ids):
+                val_ids = set(sorted(val_ids)[: len(unit_ids) - 1])
+
+        fallback["split"] = np.where(fallback[unit_key].isin(val_ids), "val", "train")
         if fallback["split"].nunique() < 2:
-            idx = np.arange(len(fallback))
-            fallback["split"] = np.where((idx % 5) == 0, "val", "train")
+            raise ValueError("Fallback CV split failed to produce both train and val splits.")
+
+        train_cls = int(fallback.loc[fallback["split"] == "train", "water_miscible"].nunique())
+        val_cls = int(fallback.loc[fallback["split"] == "val", "water_miscible"].nunique())
+        if train_cls < 2 or val_cls < 2:
+            warnings.warn(
+                "Fallback CV split has single-class train/val; classification tuning metrics may be invalid.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return [fallback.reset_index(drop=True)], {
-            "strategy": f"{strategy}_fallback_original_split",
+            "strategy": f"{strategy}_fallback_{fallback_suffix}",
             "requested_folds": requested_folds,
             "resolved_folds": 1,
             "dev_rows": int(len(dev_df)),
             "dev_units": int(len(unit_df)),
+            "fallback_train_n_classes": train_cls,
+            "fallback_val_n_classes": val_cls,
         }
 
     resolved_folds = int(min(requested_folds, max_folds))

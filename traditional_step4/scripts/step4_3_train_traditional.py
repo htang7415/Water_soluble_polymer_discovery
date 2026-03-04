@@ -47,14 +47,13 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from matplotlib.lines import Line2D
-from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessClassifier
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, RBF, WhiteKernel
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.multioutput import MultiOutputRegressor
-from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -486,6 +485,27 @@ def _load_gpy_module():
     return GPy
 
 
+def _check_torch_required(model_names: List[str]) -> None:
+    needs_mlp = any(str(m).strip().lower() == "mlp" for m in model_names)
+    if needs_mlp and importlib.util.find_spec("torch") is None:
+        raise ImportError(
+            "PyTorch is required by selected models but is not importable. "
+            "Install torch or remove 'mlp' from config_traditional.yaml models."
+        )
+
+
+def _load_torch_module():
+    try:
+        import torch
+        import torch.nn as nn
+    except Exception as exc:
+        raise ImportError(
+            "PyTorch import failed during model construction. "
+            "Install/fix torch to use model_name='mlp'."
+        ) from exc
+    return torch, nn
+
+
 class GPyRegressor(BaseEstimator, RegressorMixin):
     """Minimal sklearn-compatible wrapper around GPy GPRegression."""
 
@@ -550,6 +570,361 @@ class GPyRegressor(BaseEstimator, RegressorMixin):
         return np.asarray(mean, dtype=np.float64).ravel()
 
 
+def _torch_activation_name(name: str) -> str:
+    text = str(name).strip().lower()
+    if text in {"relu", "tanh"}:
+        return text
+    return "relu"
+
+
+def _torch_make_mlp_layers(input_dim: int, hidden_layers: Tuple[int, ...], activation: str, output_dim: int, nn_module):
+    layers = []
+    prev = int(input_dim)
+    act = _torch_activation_name(activation)
+    for width in hidden_layers:
+        h = int(max(1, int(width)))
+        layers.append(nn_module.Linear(prev, h))
+        if act == "tanh":
+            layers.append(nn_module.Tanh())
+        else:
+            layers.append(nn_module.ReLU())
+        prev = h
+    layers.append(nn_module.Linear(prev, int(output_dim)))
+    return nn_module.Sequential(*layers)
+
+
+class TorchMLPRegressor(BaseEstimator, RegressorMixin):
+    """Simple sklearn-style PyTorch MLP for multi-output regression."""
+
+    def __init__(
+        self,
+        hidden_layers: Tuple[int, ...] = (512, 256),
+        activation: str = "relu",
+        batch_size: int | str = 128,
+        alpha: float = 1.0e-4,
+        learning_rate_init: float = 1.0e-3,
+        max_iter: int = 1000,
+        early_stopping: bool = True,
+        n_iter_no_change: int = 30,
+        random_state: int = 42,
+        validation_fraction: float = 0.1,
+    ):
+        self.hidden_layers = tuple(int(x) for x in hidden_layers)
+        self.activation = str(activation)
+        self.batch_size = batch_size
+        self.alpha = float(alpha)
+        self.learning_rate_init = float(learning_rate_init)
+        self.max_iter = int(max_iter)
+        self.early_stopping = bool(early_stopping)
+        self.n_iter_no_change = int(n_iter_no_change)
+        self.random_state = int(random_state)
+        self.validation_fraction = float(validation_fraction)
+
+    def _resolve_batch_size(self, n_train: int) -> int:
+        b = _resolve_mlp_batch_size(self.batch_size)
+        if isinstance(b, str):
+            return int(max(1, min(200, n_train)))
+        return int(max(1, min(int(b), n_train)))
+
+    def fit(self, X, y):
+        torch, nn_module = _load_torch_module()
+        X_arr = np.asarray(X, dtype=np.float32)
+        y_arr = np.asarray(y, dtype=np.float32)
+        if X_arr.ndim != 2:
+            raise ValueError(f"TorchMLPRegressor expects 2D X, got shape={X_arr.shape}")
+        if y_arr.ndim == 1:
+            y_arr = y_arr.reshape(-1, 1)
+        if y_arr.ndim != 2:
+            raise ValueError(f"TorchMLPRegressor expects 1D/2D y, got shape={y_arr.shape}")
+        if len(X_arr) != len(y_arr):
+            raise ValueError(f"X/y length mismatch: {len(X_arr)} vs {len(y_arr)}")
+        if len(X_arr) < 2:
+            raise ValueError("TorchMLPRegressor requires at least 2 samples.")
+
+        rng = np.random.default_rng(int(self.random_state))
+        torch.manual_seed(int(self.random_state))
+
+        # Scale targets to stabilize learning across coefficients with very different magnitudes.
+        y_mean = y_arr.mean(axis=0, keepdims=True).astype(np.float32)
+        y_std = y_arr.std(axis=0, keepdims=True).astype(np.float32)
+        y_std = np.where(y_std < 1.0e-8, 1.0, y_std).astype(np.float32)
+        y_scaled = ((y_arr - y_mean) / y_std).astype(np.float32)
+
+        n_samples = int(len(X_arr))
+        all_idx = np.arange(n_samples, dtype=np.int64)
+        train_idx = all_idx
+        val_idx = np.array([], dtype=np.int64)
+        if bool(self.early_stopping) and n_samples >= 20:
+            n_val = int(round(float(self.validation_fraction) * n_samples))
+            n_val = int(max(1, min(n_val, n_samples - 1)))
+            perm = rng.permutation(all_idx)
+            val_idx = perm[:n_val]
+            train_idx = perm[n_val:]
+            if len(train_idx) == 0:
+                train_idx = perm[:-1]
+                val_idx = perm[-1:]
+
+        X_train = X_arr[train_idx]
+        y_train = y_scaled[train_idx]
+        X_val = X_arr[val_idx] if len(val_idx) > 0 else np.zeros((0, X_arr.shape[1]), dtype=np.float32)
+        y_val = y_scaled[val_idx] if len(val_idx) > 0 else np.zeros((0, y_scaled.shape[1]), dtype=np.float32)
+
+        model = _torch_make_mlp_layers(
+            input_dim=int(X_arr.shape[1]),
+            hidden_layers=self.hidden_layers,
+            activation=self.activation,
+            output_dim=int(y_arr.shape[1]),
+            nn_module=nn_module,
+        )
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(max(self.learning_rate_init, 1.0e-6)),
+            weight_decay=float(max(self.alpha, 0.0)),
+        )
+        loss_fn = nn_module.MSELoss()
+
+        best_state = copy.deepcopy(model.state_dict())
+        best_score = np.inf
+        epochs_without_improve = 0
+        batch_size = self._resolve_batch_size(len(X_train))
+        max_epochs = int(max(1, self.max_iter))
+        patience = int(max(1, self.n_iter_no_change))
+
+        for epoch in range(max_epochs):
+            model.train()
+            order = rng.permutation(len(X_train))
+            for start in range(0, len(order), batch_size):
+                batch_ids = order[start : start + batch_size]
+                xb = torch.from_numpy(X_train[batch_ids])
+                yb = torch.from_numpy(y_train[batch_ids])
+                optimizer.zero_grad(set_to_none=True)
+                pred = model(xb)
+                loss = loss_fn(pred, yb)
+                loss.backward()
+                nn_module.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                if len(X_val) > 0:
+                    val_loss = float(
+                        loss_fn(
+                            model(torch.from_numpy(X_val)),
+                            torch.from_numpy(y_val),
+                        ).item()
+                    )
+                    score = val_loss
+                else:
+                    train_loss = float(
+                        loss_fn(
+                            model(torch.from_numpy(X_train)),
+                            torch.from_numpy(y_train),
+                        ).item()
+                    )
+                    score = train_loss
+
+            if score < best_score - 1.0e-10:
+                best_score = score
+                best_state = copy.deepcopy(model.state_dict())
+                epochs_without_improve = 0
+            else:
+                epochs_without_improve += 1
+                if bool(self.early_stopping) and epochs_without_improve >= patience:
+                    break
+
+        model.load_state_dict(best_state)
+        model.eval()
+
+        self.model_ = model
+        self.y_mean_ = y_mean.reshape(-1).astype(np.float32)
+        self.y_std_ = y_std.reshape(-1).astype(np.float32)
+        self.n_features_in_ = int(X_arr.shape[1])
+        self.n_outputs_ = int(y_arr.shape[1])
+        self.best_loss_ = float(best_score)
+        return self
+
+    def predict(self, X):
+        torch, _ = _load_torch_module()
+        if not hasattr(self, "model_"):
+            raise RuntimeError("TorchMLPRegressor is not fitted.")
+        X_arr = np.asarray(X, dtype=np.float32)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(1, -1)
+        if X_arr.ndim != 2:
+            raise ValueError(f"TorchMLPRegressor expects 2D X, got shape={X_arr.shape}")
+        with torch.no_grad():
+            pred_scaled = self.model_(torch.from_numpy(X_arr)).cpu().numpy().astype(np.float32, copy=False)
+        pred = pred_scaled * self.y_std_.reshape(1, -1) + self.y_mean_.reshape(1, -1)
+        if int(self.n_outputs_) == 1:
+            return pred.reshape(-1)
+        return pred
+
+
+class TorchMLPClassifier(BaseEstimator, ClassifierMixin):
+    """Simple sklearn-style PyTorch MLP for binary classification."""
+
+    def __init__(
+        self,
+        hidden_layers: Tuple[int, ...] = (512, 256),
+        activation: str = "relu",
+        batch_size: int | str = 128,
+        alpha: float = 1.0e-4,
+        learning_rate_init: float = 1.0e-3,
+        max_iter: int = 1000,
+        early_stopping: bool = True,
+        n_iter_no_change: int = 30,
+        random_state: int = 42,
+        validation_fraction: float = 0.1,
+    ):
+        self.hidden_layers = tuple(int(x) for x in hidden_layers)
+        self.activation = str(activation)
+        self.batch_size = batch_size
+        self.alpha = float(alpha)
+        self.learning_rate_init = float(learning_rate_init)
+        self.max_iter = int(max_iter)
+        self.early_stopping = bool(early_stopping)
+        self.n_iter_no_change = int(n_iter_no_change)
+        self.random_state = int(random_state)
+        self.validation_fraction = float(validation_fraction)
+
+    def _resolve_batch_size(self, n_train: int) -> int:
+        b = _resolve_mlp_batch_size(self.batch_size)
+        if isinstance(b, str):
+            return int(max(1, min(200, n_train)))
+        return int(max(1, min(int(b), n_train)))
+
+    def fit(self, X, y):
+        torch, nn_module = _load_torch_module()
+        X_arr = np.asarray(X, dtype=np.float32)
+        y_arr = np.asarray(y, dtype=np.int64).reshape(-1)
+        if X_arr.ndim != 2:
+            raise ValueError(f"TorchMLPClassifier expects 2D X, got shape={X_arr.shape}")
+        if len(X_arr) != len(y_arr):
+            raise ValueError(f"X/y length mismatch: {len(X_arr)} vs {len(y_arr)}")
+        if len(X_arr) < 2:
+            raise ValueError("TorchMLPClassifier requires at least 2 samples.")
+        uniq = np.unique(y_arr)
+        if len(uniq) < 2:
+            raise ValueError("TorchMLPClassifier requires both classes in training data.")
+
+        rng = np.random.default_rng(int(self.random_state))
+        torch.manual_seed(int(self.random_state))
+
+        n_samples = int(len(X_arr))
+        all_idx = np.arange(n_samples, dtype=np.int64)
+        train_idx = all_idx
+        val_idx = np.array([], dtype=np.int64)
+        if bool(self.early_stopping) and n_samples >= 20:
+            n_val = int(round(float(self.validation_fraction) * n_samples))
+            n_val = int(max(1, min(n_val, n_samples - 1)))
+            perm = rng.permutation(all_idx)
+            val_idx = perm[:n_val]
+            train_idx = perm[n_val:]
+            if len(train_idx) == 0:
+                train_idx = perm[:-1]
+                val_idx = perm[-1:]
+
+        X_train = X_arr[train_idx]
+        y_train = y_arr[train_idx].astype(np.float32)
+        X_val = X_arr[val_idx] if len(val_idx) > 0 else np.zeros((0, X_arr.shape[1]), dtype=np.float32)
+        y_val = y_arr[val_idx].astype(np.float32) if len(val_idx) > 0 else np.zeros((0,), dtype=np.float32)
+
+        model = _torch_make_mlp_layers(
+            input_dim=int(X_arr.shape[1]),
+            hidden_layers=self.hidden_layers,
+            activation=self.activation,
+            output_dim=1,
+            nn_module=nn_module,
+        )
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(max(self.learning_rate_init, 1.0e-6)),
+            weight_decay=float(max(self.alpha, 0.0)),
+        )
+        loss_fn = nn_module.BCEWithLogitsLoss()
+
+        best_state = copy.deepcopy(model.state_dict())
+        best_score = np.inf
+        epochs_without_improve = 0
+        batch_size = self._resolve_batch_size(len(X_train))
+        max_epochs = int(max(1, self.max_iter))
+        patience = int(max(1, self.n_iter_no_change))
+
+        for epoch in range(max_epochs):
+            model.train()
+            order = rng.permutation(len(X_train))
+            for start in range(0, len(order), batch_size):
+                batch_ids = order[start : start + batch_size]
+                xb = torch.from_numpy(X_train[batch_ids])
+                yb = torch.from_numpy(y_train[batch_ids]).reshape(-1, 1)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                nn_module.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                if len(X_val) > 0:
+                    val_loss = float(
+                        loss_fn(
+                            model(torch.from_numpy(X_val)),
+                            torch.from_numpy(y_val).reshape(-1, 1),
+                        ).item()
+                    )
+                    score = val_loss
+                else:
+                    train_loss = float(
+                        loss_fn(
+                            model(torch.from_numpy(X_train)),
+                            torch.from_numpy(y_train).reshape(-1, 1),
+                        ).item()
+                    )
+                    score = train_loss
+
+            if score < best_score - 1.0e-10:
+                best_score = score
+                best_state = copy.deepcopy(model.state_dict())
+                epochs_without_improve = 0
+            else:
+                epochs_without_improve += 1
+                if bool(self.early_stopping) and epochs_without_improve >= patience:
+                    break
+
+        model.load_state_dict(best_state)
+        model.eval()
+        self.model_ = model
+        self.n_features_in_ = int(X_arr.shape[1])
+        self.classes_ = np.array([0, 1], dtype=np.int64)
+        self.best_loss_ = float(best_score)
+        return self
+
+    def decision_function(self, X):
+        torch, _ = _load_torch_module()
+        if not hasattr(self, "model_"):
+            raise RuntimeError("TorchMLPClassifier is not fitted.")
+        X_arr = np.asarray(X, dtype=np.float32)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(1, -1)
+        if X_arr.ndim != 2:
+            raise ValueError(f"TorchMLPClassifier expects 2D X, got shape={X_arr.shape}")
+        with torch.no_grad():
+            logits = self.model_(torch.from_numpy(X_arr)).cpu().numpy().reshape(-1)
+        return logits.astype(float, copy=False)
+
+    def predict_proba(self, X):
+        logits = self.decision_function(X)
+        prob_pos = np.asarray(stable_sigmoid(logits), dtype=float).reshape(-1)
+        prob_pos = np.clip(prob_pos, 1.0e-7, 1.0 - 1.0e-7)
+        prob_neg = 1.0 - prob_pos
+        return np.stack([prob_neg, prob_pos], axis=1)
+
+    def predict(self, X):
+        prob = self.predict_proba(X)[:, 1]
+        return (prob >= 0.5).astype(int)
+
+
 def _build_regression_estimator(model_name: str, params: Dict[str, object], seed: int):
     model_name = str(model_name).strip().lower()
     base_estimator = None
@@ -604,15 +979,15 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
                 ("scaler", StandardScaler()),
                 (
                     "model",
-                    MLPRegressor(
-                        hidden_layer_sizes=hidden_layers,
+                    TorchMLPRegressor(
+                        hidden_layers=hidden_layers,
                         activation=activation,
                         batch_size=batch_size,
                         alpha=alpha,
                         learning_rate_init=lr,
-                        max_iter=1000,
+                        max_iter=int(params.get("max_iter", 1000)),
                         early_stopping=True,
-                        n_iter_no_change=30,
+                        n_iter_no_change=int(params.get("n_iter_no_change", 30)),
                         random_state=int(seed),
                     ),
                 ),
@@ -720,15 +1095,15 @@ def _build_classification_estimator(model_name: str, params: Dict[str, object], 
                 ("scaler", StandardScaler()),
                 (
                     "model",
-                    MLPClassifier(
-                        hidden_layer_sizes=hidden_layers,
+                    TorchMLPClassifier(
+                        hidden_layers=hidden_layers,
                         activation=activation,
                         batch_size=batch_size,
                         alpha=alpha,
                         learning_rate_init=lr,
-                        max_iter=1000,
+                        max_iter=int(params.get("max_iter", 1000)),
                         early_stopping=True,
-                        n_iter_no_change=30,
+                        n_iter_no_change=int(params.get("n_iter_no_change", 30)),
                         random_state=int(seed),
                     ),
                 ),
@@ -1432,16 +1807,19 @@ def _tune_regression(
                 raise ValueError(f"Unsupported regression tuning objective: {objective_name}")
             rmse = float(cv_eval["cv_val_rmse"])
             invalid = int((not np.isfinite(score)) or (not np.isfinite(rmse)))
+            fold_metrics_attr = _to_serializable(cv_eval.get("fold_metrics", pd.DataFrame()).to_dict(orient="records"))
         except Exception as exc:
             score = -1.0e12
             rmse = np.nan
             invalid = 1
+            fold_metrics_attr = []
             trial.set_user_attr("error", str(exc))
 
         trial.set_user_attr("model_name", model_name)
         trial.set_user_attr("model_params", _to_serializable(params))
         trial.set_user_attr("cv_val_r2", score)
         trial.set_user_attr("cv_val_rmse", rmse)
+        trial.set_user_attr("cv_fold_metrics", fold_metrics_attr)
         trial.set_user_attr("cv_n_folds", int(len(cv_folds)))
         trial.set_user_attr("tuning_objective", objective_name)
         trial.set_user_attr("invalid_metrics", invalid)
@@ -1533,30 +1911,12 @@ def _tune_regression(
         objective_at_best = float(best_trial.value)
 
     best_params_by_model = _collect_best_params_by_model(study=study, model_names=stage_cfg.models)
-    best_cv_error = ""
-    try:
-        best_cv = _evaluate_regression_cv(
-            cv_folds=cv_folds,
-            fingerprint_table=fingerprint_table,
-            model_name=best_model_name,
-            model_params=best_params,
-            seed=stage_cfg.seed,
-            collect_val_predictions=True,
-        )
-    except Exception as exc:
-        best_cv = {"fold_metrics": pd.DataFrame(), "cv_val_predictions": pd.DataFrame()}
-        best_cv_error = str(exc)
-
-    best_cv["fold_metrics"].to_csv(tuning_dir / "best_trial_cv_fold_metrics.csv", index=False)
-    best_cv_val = best_cv.get("cv_val_predictions", pd.DataFrame())
-    if isinstance(best_cv_val, pd.DataFrame) and not best_cv_val.empty:
-        best_cv_val.to_csv(tuning_dir / "best_trial_cv_val_predictions.csv", index=False)
-        _save_cv_parity_by_fold_figure(
-            cv_val_df=best_cv_val,
-            out_png=tuning_dir / "cv_parity_by_fold.png",
-            dpi=dpi,
-            font_size=font_size,
-        )
+    best_fold_metrics_df = pd.DataFrame()
+    if best_trial is not None:
+        fold_metrics_attr = best_trial.user_attrs.get("cv_fold_metrics", [])
+        if isinstance(fold_metrics_attr, list):
+            best_fold_metrics_df = pd.DataFrame(fold_metrics_attr)
+    best_fold_metrics_df.to_csv(tuning_dir / "best_trial_cv_fold_metrics.csv", index=False)
 
     with open(tuning_dir / "optuna_best.json", "w") as f:
         json.dump(
@@ -1576,7 +1936,12 @@ def _tune_regression(
                 "invalid_trial_count": int(trial_df["invalid_metrics"].sum()) if "invalid_metrics" in trial_df.columns else 0,
                 "best_trial_number": int(best_trial.number) if best_trial is not None else None,
                 "fallback_reason": fallback_reason,
-                "best_cv_eval_error": best_cv_error,
+                "best_cv_metric_source": "best_trial_user_attrs",
+                "best_cv_eval_error": "skipped_recompute_same_cv_folds",
+                "selection_bias_note": (
+                    "Tuning CV metrics come from folds used during hyperparameter selection; "
+                    "use holdout test metrics for unbiased reporting."
+                ),
             },
             f,
             indent=2,
@@ -1607,6 +1972,14 @@ def _tune_classification(
         seed=stage_cfg.seed,
     )
     summarize_cv_folds(cv_folds).to_csv(tuning_dir / "optuna_tuning_cv_folds.csv", index=False)
+    for fold_id, fold_df in enumerate(cv_folds, start=1):
+        train_n_classes = int(fold_df.loc[fold_df["split"] == "train", "water_miscible"].nunique())
+        val_n_classes = int(fold_df.loc[fold_df["split"] == "val", "water_miscible"].nunique())
+        if train_n_classes < 2 or val_n_classes < 2:
+            raise ValueError(
+                "Classification tuning CV requires both classes in train and val for every fold. "
+                f"fold={fold_id}, train_n_classes={train_n_classes}, val_n_classes={val_n_classes}"
+            )
 
     objective_name = str(stage_cfg.tuning_objective).strip().lower()
     trial_rows: List[Dict[str, object]] = []
@@ -1628,16 +2001,19 @@ def _tune_classification(
                 raise ValueError(f"Unsupported classification tuning objective: {objective_name}")
             auroc = float(cv_eval["cv_val_auroc"])
             invalid = int((not np.isfinite(score)) or (not np.isfinite(auroc)))
+            fold_metrics_attr = _to_serializable(cv_eval.get("fold_metrics", pd.DataFrame()).to_dict(orient="records"))
         except Exception as exc:
             score = -1.0e12
             auroc = np.nan
             invalid = 1
+            fold_metrics_attr = []
             trial.set_user_attr("error", str(exc))
 
         trial.set_user_attr("model_name", model_name)
         trial.set_user_attr("model_params", _to_serializable(params))
         trial.set_user_attr("cv_val_balanced_accuracy", score)
         trial.set_user_attr("cv_val_auroc", auroc)
+        trial.set_user_attr("cv_fold_metrics", fold_metrics_attr)
         trial.set_user_attr("cv_n_folds", int(len(cv_folds)))
         trial.set_user_attr("tuning_objective", objective_name)
         trial.set_user_attr("invalid_metrics", invalid)
@@ -1729,20 +2105,12 @@ def _tune_classification(
         objective_at_best = float(best_trial.value)
 
     best_params_by_model = _collect_best_params_by_model(study=study, model_names=stage_cfg.models)
-    best_cv_error = ""
-    try:
-        best_cv = _evaluate_classification_cv(
-            cv_folds=cv_folds,
-            fingerprint_table=fingerprint_table,
-            model_name=best_model_name,
-            model_params=best_params,
-            seed=stage_cfg.seed,
-        )
-    except Exception as exc:
-        best_cv = {"fold_metrics": pd.DataFrame()}
-        best_cv_error = str(exc)
-
-    best_cv["fold_metrics"].to_csv(tuning_dir / "best_trial_cv_fold_metrics.csv", index=False)
+    best_fold_metrics_df = pd.DataFrame()
+    if best_trial is not None:
+        fold_metrics_attr = best_trial.user_attrs.get("cv_fold_metrics", [])
+        if isinstance(fold_metrics_attr, list):
+            best_fold_metrics_df = pd.DataFrame(fold_metrics_attr)
+    best_fold_metrics_df.to_csv(tuning_dir / "best_trial_cv_fold_metrics.csv", index=False)
 
     with open(tuning_dir / "optuna_best.json", "w") as f:
         json.dump(
@@ -1764,7 +2132,12 @@ def _tune_classification(
                 "invalid_trial_count": int(trial_df["invalid_metrics"].sum()) if "invalid_metrics" in trial_df.columns else 0,
                 "best_trial_number": int(best_trial.number) if best_trial is not None else None,
                 "fallback_reason": fallback_reason,
-                "best_cv_eval_error": best_cv_error,
+                "best_cv_metric_source": "best_trial_user_attrs",
+                "best_cv_eval_error": "skipped_recompute_same_cv_folds",
+                "selection_bias_note": (
+                    "Tuning CV metrics come from folds used during hyperparameter selection; "
+                    "use holdout test metrics for unbiased reporting."
+                ),
             },
             f,
             indent=2,
@@ -1863,14 +2236,33 @@ def _collect_regression_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
         group_metrics.insert(0, "split", split)
         class_rows.append(group_metrics)
 
-        poly = (
-            sub.groupby(["polymer_id", "Polymer"], as_index=False)[["chi", "chi_pred"]]
-            .mean()
-            .rename(columns={"chi": "chi_true_mean", "chi_pred": "chi_pred_mean"})
-        )
-        poly_metric = regression_metrics(poly["chi_true_mean"], poly["chi_pred_mean"], prefix="poly_")
-        poly_row = {"split": split}
-        poly_row.update(poly_metric)
+        per_poly_rows: List[Dict[str, object]] = []
+        for (polymer_id, polymer_name), poly_sub in sub.groupby(["polymer_id", "Polymer"]):
+            poly_reg = regression_metrics(poly_sub["chi"], poly_sub["chi_pred"], prefix="poly_")
+            per_poly_rows.append(
+                {
+                    "polymer_id": int(polymer_id),
+                    "Polymer": str(polymer_name),
+                    "n_conditions": int(len(poly_sub)),
+                    "poly_r2": _safe_float(poly_reg.get("poly_r2", np.nan)),
+                    "poly_rmse": _safe_float(poly_reg.get("poly_rmse", np.nan)),
+                    "poly_mae": _safe_float(poly_reg.get("poly_mae", np.nan)),
+                }
+            )
+        per_poly_df = pd.DataFrame(per_poly_rows)
+        poly_row = {
+            "split": split,
+            "n_polymers": int(len(per_poly_df)),
+            "poly_rmse_mean": _safe_float(np.nanmean(per_poly_df["poly_rmse"])) if not per_poly_df.empty else np.nan,
+            "poly_rmse_median": _safe_float(np.nanmedian(per_poly_df["poly_rmse"])) if not per_poly_df.empty else np.nan,
+            "poly_mae_mean": _safe_float(np.nanmean(per_poly_df["poly_mae"])) if not per_poly_df.empty else np.nan,
+            "poly_mae_median": _safe_float(np.nanmedian(per_poly_df["poly_mae"])) if not per_poly_df.empty else np.nan,
+            "poly_r2_mean": _safe_float(np.nanmean(per_poly_df["poly_r2"])) if not per_poly_df.empty else np.nan,
+            "poly_r2_median": _safe_float(np.nanmedian(per_poly_df["poly_r2"])) if not per_poly_df.empty else np.nan,
+        }
+        poly_row["poly_rmse"] = poly_row["poly_rmse_mean"]
+        poly_row["poly_mae"] = poly_row["poly_mae_mean"]
+        poly_row["poly_r2"] = poly_row["poly_r2_mean"]
         polymer_rows.append(poly_row)
 
     pd.DataFrame(rows).to_csv(out_dir / "chi_metrics_overall.csv", index=False)
@@ -2125,6 +2517,7 @@ def _resolve_stage_config(
     if validate_dependencies:
         _check_xgboost_required(models)
         _check_gpy_required(models)
+        _check_torch_required(models)
 
     optuna_search_space = stage_section.get("optuna_search_space", {})
     if not isinstance(optuna_search_space, dict):
