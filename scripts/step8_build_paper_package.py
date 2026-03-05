@@ -28,6 +28,7 @@ import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib import font_manager
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -95,6 +96,41 @@ def _pick(row: Dict[str, object], keys: List[str], default=np.nan):
     return default
 
 
+def _resolve_truetype_font_path() -> Optional[str]:
+    """Resolve a readable sans-serif TrueType font path on common systems."""
+    candidates: List[str] = []
+    try:
+        found = font_manager.findfont("DejaVu Sans", fallback_to_default=False)
+        if isinstance(found, str) and found.strip():
+            candidates.append(found)
+    except Exception:
+        pass
+
+    candidates.extend(
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "DejaVuSans.ttf",
+            "Arial.ttf",
+        ]
+    )
+
+    seen = set()
+    for p in candidates:
+        norm = str(p).strip()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        try:
+            if Path(norm).is_file():
+                return norm
+        except Exception:
+            continue
+    return None
+
+
 def _make_candidates(base_dirs: List[Optional[Path]], names: List[str]) -> List[Path]:
     out: List[Path] = []
     for d in base_dirs:
@@ -132,6 +168,18 @@ def _draw_missing_panel(ax, caption: str, font_size: int) -> None:
         fontsize=font_size,
         color="#4b5563",
     )
+    if isinstance(caption, str) and caption.strip():
+        ax.text(
+            0.5,
+            0.40,
+            caption.strip(),
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=max(10, font_size - 3),
+            color="#6b7280",
+            wrap=True,
+        )
 
 
 def _compose_figure(
@@ -225,153 +273,250 @@ def _clear_png_files(root_dir: Path) -> None:
             continue
 
 
-def _build_step3_objective_heatmap_from_metrics(
+def _pad_png_canvas(png_path: Path, target_w: int = 3600, target_h: int = 3000) -> None:
+    """Center-pad a generated PNG to a fixed canvas for consistent panel sizing."""
+    if png_path is None or not png_path.exists():
+        return
+    try:
+        img = mpimg.imread(png_path)
+    except Exception:
+        return
+    if img is None or not hasattr(img, "shape") or len(img.shape) < 2:
+        return
+
+    h, w = int(img.shape[0]), int(img.shape[1])
+    if h == target_h and w == target_w:
+        return
+    if h > target_h or w > target_w:
+        return
+
+    if len(img.shape) == 2:
+        canvas = np.ones((target_h, target_w), dtype=img.dtype)
+        y0 = (target_h - h) // 2
+        x0 = (target_w - w) // 2
+        canvas[y0 : y0 + h, x0 : x0 + w] = img
+    else:
+        c = int(img.shape[2])
+        canvas = np.ones((target_h, target_w, c), dtype=img.dtype)
+        if c == 4:
+            canvas[..., 3] = 1.0
+        y0 = (target_h - h) // 2
+        x0 = (target_w - w) // 2
+        canvas[y0 : y0 + h, x0 : x0 + w, :] = img
+    plt.imsave(png_path, canvas, dpi=PAPER_DPI)
+
+
+def _build_step3_global_threshold_curve(
     paths: Dict[str, Optional[Path]],
     metadata_dir: Path,
 ) -> Optional[Path]:
-    """Build a condition-wise balanced-accuracy heatmap for Figure 3(b)."""
+    """Build balanced-accuracy vs χ-threshold curve (non-heatmap) for Figure 3(b)."""
     step3_dir = paths.get("step3_dir")
     if step3_dir is None:
         return None
 
-    best_csv = step3_dir / "metrics" / "chi_target_best_by_condition.csv"
-    scan_csv = step3_dir / "metrics" / "chi_target_scan_by_condition.csv"
-
-    df = _safe_read_csv(best_csv)
-    if df.empty:
-        scan_df = _safe_read_csv(scan_csv)
-        if scan_df.empty or not {"temperature", "phi", "balanced_accuracy"}.issubset(scan_df.columns):
-            return None
-        df = (
-            scan_df.groupby(["temperature", "phi"], as_index=False)["balanced_accuracy"]
-            .max()
-            .sort_values(["temperature", "phi"])
-        )
-    elif not {"temperature", "phi", "balanced_accuracy"}.issubset(df.columns):
+    scan_csv = step3_dir / "metrics" / "chi_target_global_scan.csv"
+    best_csv = step3_dir / "metrics" / "chi_target_global_best.csv"
+    scan_df = _safe_read_csv(scan_csv)
+    if scan_df.empty or not {"threshold", "balanced_accuracy"}.issubset(scan_df.columns):
         return None
 
-    pivot = (
-        df.pivot(index="temperature", columns="phi", values="balanced_accuracy")
-        .sort_index(axis=0)
-        .sort_index(axis=1)
+    scan_df = (
+        scan_df[["threshold", "balanced_accuracy"]]
+        .dropna(subset=["threshold", "balanced_accuracy"])
+        .sort_values("threshold")
     )
-    if pivot.empty:
+    if scan_df.empty:
         return None
 
-    arr = pivot.to_numpy(dtype=float)
-    out_png = metadata_dir / "derived_step3_balanced_accuracy_heatmap.png"
+    best_row = _safe_first_row(best_csv)
+    chi_star = _pick(best_row, ["chi_target", "threshold"], default=np.nan)
+    bal_acc = _pick(best_row, ["balanced_accuracy"], default=np.nan)
+    ci_low = _pick(best_row, ["chi_target_boot_q025"], default=np.nan)
+    ci_high = _pick(best_row, ["chi_target_boot_q975"], default=np.nan)
 
-    fig, ax = plt.subplots(figsize=(4.6, 3.8))
-    vmin = float(np.nanmin(arr)) if np.isfinite(arr).any() else 0.0
-    vmax = float(np.nanmax(arr)) if np.isfinite(arr).any() else 1.0
-    if abs(vmax - vmin) < 1e-8:
-        vmax = vmin + 1e-6
-    im = ax.imshow(arr, cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax)
+    out_png = metadata_dir / "derived_step3_global_threshold_curve.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    ax.plot(
+        scan_df["threshold"].to_numpy(dtype=float),
+        scan_df["balanced_accuracy"].to_numpy(dtype=float),
+        color="#1f77b4",
+        linewidth=2.2,
+    )
+    if np.isfinite(ci_low) and np.isfinite(ci_high) and float(ci_high) >= float(ci_low):
+        ax.axvspan(float(ci_low), float(ci_high), color="#93c5fd", alpha=0.30, linewidth=0)
+    if np.isfinite(chi_star):
+        ax.axvline(float(chi_star), color="#ef4444", linestyle="--", linewidth=2.0)
+    if np.isfinite(chi_star) and np.isfinite(bal_acc):
+        ax.scatter([float(chi_star)], [float(bal_acc)], color="#dc2626", s=45, zorder=5)
+        x_min = float(scan_df["threshold"].min())
+        x_max = float(scan_df["threshold"].max())
+        y_min = float(scan_df["balanced_accuracy"].min())
+        y_max = float(scan_df["balanced_accuracy"].max())
+        x_span = max(1e-12, x_max - x_min)
+        y_span = max(1e-12, y_max - y_min)
+        near_right = float(chi_star) > (x_min + 0.82 * x_span)
+        near_top = float(bal_acc) > (y_min + 0.90 * y_span)
+        text_x = float(chi_star) - 0.015 * x_span if near_right else float(chi_star) + 0.015 * x_span
+        text_y = float(bal_acc) - 0.015 * y_span if near_top else float(bal_acc) + 0.015 * y_span
+        ax.text(
+            text_x,
+            text_y,
+            f"  χ*={float(chi_star):.3f}\n  BA={float(bal_acc):.3f}",
+            fontsize=PAPER_FONT_SIZE,
+            ha="right" if near_right else "left",
+            va="top" if near_top else "bottom",
+            color="#111827",
+        )
 
-    xlabels = [f"{x:.2f}" for x in pivot.columns.to_list()]
-    ylabels = [f"{y:.2f}" for y in pivot.index.to_list()]
-    ax.set_xticks(range(len(xlabels)))
-    ax.set_xticklabels(xlabels, fontsize=PAPER_FONT_SIZE)
-    ax.set_yticks(range(len(ylabels)))
-    ax.set_yticklabels(ylabels, fontsize=PAPER_FONT_SIZE)
-    ax.set_xlabel("phi", fontsize=PAPER_FONT_SIZE)
-    ax.set_ylabel("temperature (K)", fontsize=PAPER_FONT_SIZE)
-
-    for i in range(arr.shape[0]):
-        for j in range(arr.shape[1]):
-            v = arr[i, j]
-            txt = "nan" if pd.isna(v) else f"{v:.2f}"
-            ax.text(
-                j,
-                i,
-                txt,
-                ha="center",
-                va="center",
-                fontsize=PAPER_FONT_SIZE,
-                color="white" if np.isfinite(v) and (v > (vmin + vmax) / 2.0) else "black",
-            )
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.ax.tick_params(labelsize=PAPER_FONT_SIZE)
-
+    ax.set_xlabel("Global χ threshold", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Balanced accuracy", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=PAPER_DPI)
     plt.close(fig)
+    _pad_png_canvas(out_png)
     return out_png
 
 
-def _build_step3_bootstrap_uncertainty_heatmap(
+def _build_step3_threshold_regions_panel(
     paths: Dict[str, Optional[Path]],
     metadata_dir: Path,
 ) -> Optional[Path]:
-    """Build χ_target bootstrap-uncertainty heatmap for Figure 3(b)."""
+    """Build Figure 1(d) by replacing legend text only, keeping the original legend style."""
+    step3_dir = paths.get("step3_dir")
+    if step3_dir is None:
+        return None
+
+    src_png = step3_dir / "figures" / "chi_distribution_global_threshold.png"
+    best_csv = step3_dir / "metrics" / "chi_target_global_best.csv"
+    if not src_png.exists():
+        return None
+
+    best_row = _safe_first_row(best_csv)
+    chi_star = _pick(best_row, ["chi_target", "threshold"], default=np.nan)
+
+    out_png = metadata_dir / "derived_step3_threshold_regions.png"
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        _copy_if_exists(src_png, out_png)
+        return out_png if out_png.exists() else None
+
+    with Image.open(src_png).convert("RGBA") as img:
+        w, h = img.size
+        draw = ImageDraw.Draw(img)
+
+        # Use normalized coordinates so behavior is stable across DPI changes.
+        legend_cover = (0.63, 0.08, 0.965, 0.26)
+        x0, y0 = int(legend_cover[0] * w), int(legend_cover[1] * h)
+        x1, y1 = int(legend_cover[2] * w), int(legend_cover[3] * h)
+
+        # If upstream layout moved, avoid adding a misaligned white box.
+        arr = np.array(img)
+        roi = arr[y0:y1, x0:x1, :3]
+        non_white_pixels = int(np.count_nonzero(np.any(roi < 245, axis=2))) if roi.size else 0
+        roi_pixels = int(roi.shape[0] * roi.shape[1]) if roi.size else 0
+        min_non_white_pixels = max(40, int(round(roi_pixels * 0.00002)))
+        if non_white_pixels < min_non_white_pixels:
+            print(
+                "[WARN] Step3 legend rewrite skipped: expected legend region appears blank "
+                f"(non_white={non_white_pixels}, required>={min_non_white_pixels})."
+            )
+            out_png.parent.mkdir(parents=True, exist_ok=True)
+            img.save(out_png)
+            return out_png
+
+        # Cover only text area inside original legend box; keep legend frame and line handles.
+        draw.rectangle([x0, y0, x1, y1], fill=(255, 255, 255, 255))
+
+        # Match paper style exactly: 16 pt at 600 DPI.
+        font_px = max(12, int(round(PAPER_FONT_SIZE * PAPER_DPI / 72.0)))
+        font = None
+        font_path = _resolve_truetype_font_path()
+        if font_path is not None:
+            try:
+                font = ImageFont.truetype(font_path, font_px)
+            except Exception:
+                font = None
+        if font is None:
+            print(
+                "[WARN] Step3 legend rewrite could not load a TrueType font; "
+                "using original figure without relabeling."
+            )
+            out_png.parent.mkdir(parents=True, exist_ok=True)
+            img.save(out_png)
+            return out_png
+
+        text_color = (31, 41, 55, 255)
+        tx = int(0.645 * w)
+        y1_txt = int(0.105 * h)
+        y2_txt = int(0.163 * h)
+        y3_txt = int(0.221 * h)
+
+        draw.text((tx, y1_txt), "Water-miscible", fill=text_color, font=font)
+        draw.text((tx, y2_txt), "Water-immiscible", fill=text_color, font=font)
+        thr_txt = f"Global χ*={float(chi_star):.3f}" if np.isfinite(chi_star) else "Global χ*"
+        draw.text((tx, y3_txt), thr_txt, fill=text_color, font=font)
+
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        img.save(out_png)
+    return out_png
+
+
+def _build_step3_condition_profiles_panel(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    """Build Figure 3(d): condition-wise χ_target profiles with bootstrap CI (non-heatmap)."""
     step3_dir = paths.get("step3_dir")
     if step3_dir is None:
         return None
 
     best_csv = step3_dir / "metrics" / "chi_target_best_by_condition.csv"
     df = _safe_read_csv(best_csv)
-    if df.empty or not {"temperature", "phi"}.issubset(df.columns):
+    if df.empty or not {"temperature", "phi", "chi_target"}.issubset(df.columns):
         return None
 
-    if "chi_target_boot_std" in df.columns:
-        val_col = "chi_target_boot_std"
-    elif {"chi_target_boot_q975", "chi_target_boot_q025"}.issubset(df.columns):
-        val_col = "chi_target_boot_iqr95"
-        df[val_col] = df["chi_target_boot_q975"] - df["chi_target_boot_q025"]
-    else:
-        return None
+    q025_col = "chi_target_boot_q025" if "chi_target_boot_q025" in df.columns else None
+    q975_col = "chi_target_boot_q975" if "chi_target_boot_q975" in df.columns else None
 
-    pivot = (
-        df.pivot(index="temperature", columns="phi", values=val_col)
-        .sort_index(axis=0)
-        .sort_index(axis=1)
-    )
-    if pivot.empty:
-        return None
+    out_png = metadata_dir / "derived_step3_condition_profiles.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    plot_df = df.copy()
+    plot_df["temperature"] = plot_df["temperature"].astype(float)
+    plot_df["phi"] = plot_df["phi"].astype(float)
+    plot_df["chi_target"] = plot_df["chi_target"].astype(float)
 
-    arr = pivot.to_numpy(dtype=float)
-    out_png = metadata_dir / "derived_step3_chi_bootstrap_uncertainty_heatmap.png"
+    temps = sorted(plot_df["temperature"].dropna().unique().tolist())
+    cmap = plt.colormaps["viridis"] if hasattr(plt, "colormaps") else plt.get_cmap("viridis")
+    for idx, t in enumerate(temps):
+        sub = plot_df[plot_df["temperature"] == t].sort_values("phi")
+        if sub.empty:
+            continue
+        x = sub["phi"].to_numpy(dtype=float)
+        y = sub["chi_target"].to_numpy(dtype=float)
+        color = cmap(idx / max(1, len(temps) - 1))
+        ax.plot(x, y, marker="o", markersize=5.0, linewidth=2.0, color=color, label=f"{t:.2f} K")
+        if q025_col is not None and q975_col is not None:
+            lo = sub[q025_col].astype(float).to_numpy(dtype=float)
+            hi = sub[q975_col].astype(float).to_numpy(dtype=float)
+            yerr = np.vstack([np.maximum(0.0, y - lo), np.maximum(0.0, hi - y)])
+            ax.errorbar(x, y, yerr=yerr, fmt="none", ecolor=color, elinewidth=1.2, capsize=3, alpha=0.55)
 
-    fig, ax = plt.subplots(figsize=(4.6, 3.8))
-    vmin = float(np.nanmin(arr)) if np.isfinite(arr).any() else 0.0
-    vmax = float(np.nanmax(arr)) if np.isfinite(arr).any() else 1.0
-    if abs(vmax - vmin) < 1e-8:
-        vmax = vmin + 1e-6
-    im = ax.imshow(arr, cmap="magma", aspect="auto", vmin=vmin, vmax=vmax)
-
-    xlabels = [f"{x:.2f}" for x in pivot.columns.to_list()]
-    ylabels = [f"{y:.2f}" for y in pivot.index.to_list()]
-    ax.set_xticks(range(len(xlabels)))
-    ax.set_xticklabels(xlabels, fontsize=PAPER_FONT_SIZE)
-    ax.set_yticks(range(len(ylabels)))
-    ax.set_yticklabels(ylabels, fontsize=PAPER_FONT_SIZE)
-    ax.set_xlabel("phi", fontsize=PAPER_FONT_SIZE)
-    ax.set_ylabel("temperature (K)", fontsize=PAPER_FONT_SIZE)
-
-    for i in range(arr.shape[0]):
-        for j in range(arr.shape[1]):
-            v = arr[i, j]
-            txt = "nan" if pd.isna(v) else f"{v:.3f}"
-            ax.text(
-                j,
-                i,
-                txt,
-                ha="center",
-                va="center",
-                fontsize=PAPER_FONT_SIZE,
-                color="white" if np.isfinite(v) and (v > (vmin + vmax) / 2.0) else "black",
-            )
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.ax.tick_params(labelsize=PAPER_FONT_SIZE)
-    cbar.set_label("χ_target bootstrap uncertainty", fontsize=PAPER_FONT_SIZE)
+    ax.set_xlabel("φ", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("χ_target", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
+    ax.legend(title="Temperature", fontsize=PAPER_FONT_SIZE, title_fontsize=PAPER_FONT_SIZE, loc="best", frameon=True)
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=PAPER_DPI)
     plt.close(fig)
+    _pad_png_canvas(out_png)
     return out_png
 
 
@@ -381,7 +526,7 @@ def _resolve_input_artifacts(
     split_mode: str,
 ) -> Dict[str, Optional[Path]]:
     base_results = Path(config["paths"]["results_dir"])
-    results_dir = Path(get_results_dir(model_size, config["paths"]["results_dir"], split_mode=None))
+    results_dir = Path(get_results_dir(model_size, config["paths"]["results_dir"], split_mode=split_mode))
 
     step0_dir = _first_existing([base_results / "step0_data_prep", results_dir / "step0_data_prep"])
     step1_dir = _first_existing([results_dir / "step1_backbone", base_results / "step1_backbone"])
@@ -402,6 +547,8 @@ def _resolve_input_artifacts(
     )
     step4_cls_dir = _first_existing(
         [
+            results_dir / "step4_2_classification" / split_mode,
+            base_results / "step4_2_classification" / split_mode,
             results_dir / "step4_2_classification",
             base_results / "step4_2_classification",
             results_dir / "step4_chi_training" / split_mode / "step4_2_classification",
@@ -536,26 +683,9 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
     block_h_fig_dirs = _blk(paths, "h")
     block_i_fig_dirs = _blk(paths, "i")
 
-    step3_boot_uncertainty_derived = paths.get("step3_bootstrap_uncertainty_heatmap_derived")
-    step3_bal_acc_derived = paths.get("step3_balanced_accuracy_heatmap_derived")
-    step3_bal_acc_candidates: List[Path] = []
-    # Prefer richer Step 7 condition-wise class-contrast maps for Figure 3(b).
-    step3_bal_acc_candidates += _make_candidates(
-        block_a_fig_dirs,
-        ["chi_class_significance_heatmap.png", "chi_class_delta_heatmap.png"],
-    )
-    step3_bal_acc_candidates += _make_candidates(
-        step3_fig_dirs,
-        [
-            "chi_target_balanced_accuracy_heatmap.png",
-            "chi_target_classification_objective_heatmap.png",
-            "chi_target_objective_heatmap.png",
-        ],
-    )
-    if isinstance(step3_boot_uncertainty_derived, Path):
-        step3_bal_acc_candidates.append(step3_boot_uncertainty_derived)
-    if isinstance(step3_bal_acc_derived, Path):
-        step3_bal_acc_candidates.append(step3_bal_acc_derived)
+    step3_global_curve_derived = paths.get("step3_global_threshold_curve_derived")
+    step3_threshold_regions_derived = paths.get("step3_threshold_regions_derived")
+    step3_condition_profiles_derived = paths.get("step3_condition_profiles_derived")
 
     return [
         FigureSpec(
@@ -578,7 +708,16 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                 ),
                 PanelSpec(
                     caption="Global χ distribution with class-separation threshold",
-                    candidates=_make_candidates(step3_fig_dirs, ["chi_distribution_global_threshold.png"]),
+                    candidates=(
+                        [step3_threshold_regions_derived]
+                        if isinstance(step3_threshold_regions_derived, Path)
+                        else []
+                    )
+                    + (
+                        [step3_global_curve_derived]
+                        if isinstance(step3_global_curve_derived, Path)
+                        else []
+                    ),
                 ),
             ],
         ),
@@ -621,8 +760,13 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     candidates=_make_candidates(step3_fig_dirs, ["chi_target_heatmap.png"]),
                 ),
                 PanelSpec(
-                    caption="Condition-wise classification-objective map",
-                    candidates=step3_bal_acc_candidates,
+                    caption="Global balanced-accuracy scan with selected χ threshold",
+                    candidates=(
+                        [step3_global_curve_derived]
+                        if isinstance(step3_global_curve_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step3_fig_dirs, ["chi_distribution_global_threshold.png"]),
                 ),
                 PanelSpec(
                     caption="χ_target trend vs temperature with bootstrap CI",
@@ -632,8 +776,14 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     ),
                 ),
                 PanelSpec(
-                    caption="Global χ distribution and class separation",
-                    candidates=_make_candidates(step3_fig_dirs, ["chi_distribution_global_threshold.png"]),
+                    caption="Condition-wise χ_target profiles with bootstrap confidence intervals",
+                    candidates=(
+                        [step3_condition_profiles_derived]
+                        if isinstance(step3_condition_profiles_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(block_a_fig_dirs, ["chi_vs_temperature_by_phi_and_class.png"])
+                    + _make_candidates(step3_fig_dirs, ["chi_target_vs_temperature_with_ci.png"]),
                 ),
             ],
         ),
@@ -1496,7 +1646,7 @@ def main(args: argparse.Namespace) -> None:
     if model_size not in {"small", "medium", "large", "xl"}:
         raise ValueError("model_size must be one of {'small','medium','large','xl'}")
 
-    results_dir = Path(get_results_dir(model_size, config["paths"]["results_dir"], split_mode=None))
+    results_dir = Path(get_results_dir(model_size, config["paths"]["results_dir"], split_mode=split_mode))
     step_dir = results_dir / "step8_paper_package" / split_mode
     metrics_dir = step_dir / "metrics"
     manuscript_dir = step_dir / "manuscript"
@@ -1573,15 +1723,30 @@ def main(args: argparse.Namespace) -> None:
     artifact_df = pd.DataFrame(artifact_rows)
     artifact_df.to_csv(metadata_dir / "input_artifact_status.csv", index=False)
 
-    # Build a robust condition-wise objective panel for Figure 3(b) from Step 3 metrics.
-    paths["step3_balanced_accuracy_heatmap_derived"] = _build_step3_objective_heatmap_from_metrics(
+    # Build non-heatmap Step 3 panels for manuscript Figure 1(d) and Figure 3(b,d).
+    paths["step3_global_threshold_curve_derived"] = _build_step3_global_threshold_curve(
         paths=paths,
         metadata_dir=metadata_dir,
     )
-    paths["step3_bootstrap_uncertainty_heatmap_derived"] = _build_step3_bootstrap_uncertainty_heatmap(
+    paths["step3_threshold_regions_derived"] = _build_step3_threshold_regions_panel(
         paths=paths,
         metadata_dir=metadata_dir,
     )
+    paths["step3_condition_profiles_derived"] = _build_step3_condition_profiles_panel(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
+    for key in [
+        "step3_global_threshold_curve_derived",
+        "step3_threshold_regions_derived",
+        "step3_condition_profiles_derived",
+    ]:
+        p = paths.get(key)
+        if not isinstance(p, Path) or not p.exists():
+            print(
+                f"[WARN] Derived Step3 panel not generated: {key}. "
+                "Composer will use fallback candidates or a missing placeholder."
+            )
 
     specs = _build_figure_specs(paths)
     panel_manifest_frames: List[pd.DataFrame] = []
