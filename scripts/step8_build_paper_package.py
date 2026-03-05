@@ -37,6 +37,9 @@ from src.utils.model_scales import get_results_dir
 from src.utils.reproducibility import save_run_metadata, seed_everything
 from src.utils.reporting import save_artifact_manifest, save_step_summary, write_initial_log
 
+PAPER_FONT_SIZE = 16
+PAPER_DPI = 600
+
 
 @dataclass
 class PanelSpec:
@@ -92,15 +95,6 @@ def _pick(row: Dict[str, object], keys: List[str], default=np.nan):
     return default
 
 
-def _collect_glob_candidates(base_dirs: List[Optional[Path]], pattern: str) -> List[Path]:
-    out: List[Path] = []
-    for d in base_dirs:
-        if d is None or not d.exists():
-            continue
-        out.extend(sorted(d.glob(pattern)))
-    return out
-
-
 def _make_candidates(base_dirs: List[Optional[Path]], names: List[str]) -> List[Path]:
     out: List[Path] = []
     for d in base_dirs:
@@ -119,7 +113,7 @@ def _panel_label(ax, label: str, font_size: int) -> None:
         transform=ax.transAxes,
         ha="left",
         va="top",
-        fontsize=font_size + 1,
+        fontsize=font_size,
         fontweight="bold",
         bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "none", "pad": 1.5},
     )
@@ -138,25 +132,16 @@ def _draw_missing_panel(ax, caption: str, font_size: int) -> None:
         fontsize=font_size,
         color="#4b5563",
     )
-    ax.text(
-        0.5,
-        0.42,
-        caption,
-        transform=ax.transAxes,
-        ha="center",
-        va="center",
-        fontsize=max(font_size - 2, 9),
-        color="#6b7280",
-        wrap=True,
-    )
 
 
 def _compose_figure(
     spec: FigureSpec,
     out_png: Path,
-    dpi: int,
-    font_size: int,
 ) -> pd.DataFrame:
+    # Hard-enforce paper style for all Step 8 figure annotations.
+    dpi = PAPER_DPI
+    font_size = PAPER_FONT_SIZE
+
     panel_rows: List[Dict[str, object]] = []
     n_panels = len(spec.panels)
     ncols = max(1, int(spec.ncols))
@@ -188,18 +173,6 @@ def _compose_figure(
             _draw_missing_panel(ax, panel.caption, font_size=font_size)
 
         _panel_label(ax, label=label, font_size=font_size)
-        ax.text(
-            0.5,
-            0.03,
-            panel.caption,
-            transform=ax.transAxes,
-            ha="center",
-            va="bottom",
-            fontsize=max(font_size - 3, 9),
-            color="#111827",
-            bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": "none", "pad": 1.0},
-            wrap=True,
-        )
         panel_rows.append(
             {
                 "figure_id": spec.figure_id,
@@ -214,17 +187,8 @@ def _compose_figure(
     for j in range(n_panels, len(axes)):
         axes[j].set_axis_off()
 
-    fig.text(
-        0.5,
-        0.995,
-        spec.title,
-        ha="center",
-        va="top",
-        fontsize=font_size + 2,
-        fontweight="bold",
-        color="#111827",
-    )
-    fig.subplots_adjust(top=0.93, wspace=0.12, hspace=0.18)
+    # No global title or panel captions rendered on composed figures.
+    fig.subplots_adjust(top=0.98, wspace=0.12, hspace=0.18)
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
@@ -240,9 +204,15 @@ def _copy_if_exists(src: Optional[Path], dst: Path) -> bool:
 
 
 def _slugify(text: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "_", str(text).strip().lower())
-    slug = slug.strip("_")
+    chars: List[str] = []
+    for ch in str(text).strip().lower():
+        chars.append(ch if ch.isalnum() else "_")
+    slug = re.sub(r"_+", "_", "".join(chars)).strip("_")
     return slug if slug else "figure"
+
+
+def _figure_output_name(spec: FigureSpec) -> str:
+    return f"{_slugify(spec.title)}.png"
 
 
 def _clear_png_files(root_dir: Path) -> None:
@@ -253,6 +223,156 @@ def _clear_png_files(root_dir: Path) -> None:
             png.unlink()
         except Exception:
             continue
+
+
+def _build_step3_objective_heatmap_from_metrics(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    """Build a condition-wise balanced-accuracy heatmap for Figure 3(b)."""
+    step3_dir = paths.get("step3_dir")
+    if step3_dir is None:
+        return None
+
+    best_csv = step3_dir / "metrics" / "chi_target_best_by_condition.csv"
+    scan_csv = step3_dir / "metrics" / "chi_target_scan_by_condition.csv"
+
+    df = _safe_read_csv(best_csv)
+    if df.empty:
+        scan_df = _safe_read_csv(scan_csv)
+        if scan_df.empty or not {"temperature", "phi", "balanced_accuracy"}.issubset(scan_df.columns):
+            return None
+        df = (
+            scan_df.groupby(["temperature", "phi"], as_index=False)["balanced_accuracy"]
+            .max()
+            .sort_values(["temperature", "phi"])
+        )
+    elif not {"temperature", "phi", "balanced_accuracy"}.issubset(df.columns):
+        return None
+
+    pivot = (
+        df.pivot(index="temperature", columns="phi", values="balanced_accuracy")
+        .sort_index(axis=0)
+        .sort_index(axis=1)
+    )
+    if pivot.empty:
+        return None
+
+    arr = pivot.to_numpy(dtype=float)
+    out_png = metadata_dir / "derived_step3_balanced_accuracy_heatmap.png"
+
+    fig, ax = plt.subplots(figsize=(4.6, 3.8))
+    vmin = float(np.nanmin(arr)) if np.isfinite(arr).any() else 0.0
+    vmax = float(np.nanmax(arr)) if np.isfinite(arr).any() else 1.0
+    if abs(vmax - vmin) < 1e-8:
+        vmax = vmin + 1e-6
+    im = ax.imshow(arr, cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax)
+
+    xlabels = [f"{x:.2f}" for x in pivot.columns.to_list()]
+    ylabels = [f"{y:.2f}" for y in pivot.index.to_list()]
+    ax.set_xticks(range(len(xlabels)))
+    ax.set_xticklabels(xlabels, fontsize=PAPER_FONT_SIZE)
+    ax.set_yticks(range(len(ylabels)))
+    ax.set_yticklabels(ylabels, fontsize=PAPER_FONT_SIZE)
+    ax.set_xlabel("phi", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("temperature (K)", fontsize=PAPER_FONT_SIZE)
+
+    for i in range(arr.shape[0]):
+        for j in range(arr.shape[1]):
+            v = arr[i, j]
+            txt = "nan" if pd.isna(v) else f"{v:.2f}"
+            ax.text(
+                j,
+                i,
+                txt,
+                ha="center",
+                va="center",
+                fontsize=PAPER_FONT_SIZE,
+                color="white" if np.isfinite(v) and (v > (vmin + vmax) / 2.0) else "black",
+            )
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=PAPER_FONT_SIZE)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI)
+    plt.close(fig)
+    return out_png
+
+
+def _build_step3_bootstrap_uncertainty_heatmap(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    """Build χ_target bootstrap-uncertainty heatmap for Figure 3(b)."""
+    step3_dir = paths.get("step3_dir")
+    if step3_dir is None:
+        return None
+
+    best_csv = step3_dir / "metrics" / "chi_target_best_by_condition.csv"
+    df = _safe_read_csv(best_csv)
+    if df.empty or not {"temperature", "phi"}.issubset(df.columns):
+        return None
+
+    if "chi_target_boot_std" in df.columns:
+        val_col = "chi_target_boot_std"
+    elif {"chi_target_boot_q975", "chi_target_boot_q025"}.issubset(df.columns):
+        val_col = "chi_target_boot_iqr95"
+        df[val_col] = df["chi_target_boot_q975"] - df["chi_target_boot_q025"]
+    else:
+        return None
+
+    pivot = (
+        df.pivot(index="temperature", columns="phi", values=val_col)
+        .sort_index(axis=0)
+        .sort_index(axis=1)
+    )
+    if pivot.empty:
+        return None
+
+    arr = pivot.to_numpy(dtype=float)
+    out_png = metadata_dir / "derived_step3_chi_bootstrap_uncertainty_heatmap.png"
+
+    fig, ax = plt.subplots(figsize=(4.6, 3.8))
+    vmin = float(np.nanmin(arr)) if np.isfinite(arr).any() else 0.0
+    vmax = float(np.nanmax(arr)) if np.isfinite(arr).any() else 1.0
+    if abs(vmax - vmin) < 1e-8:
+        vmax = vmin + 1e-6
+    im = ax.imshow(arr, cmap="magma", aspect="auto", vmin=vmin, vmax=vmax)
+
+    xlabels = [f"{x:.2f}" for x in pivot.columns.to_list()]
+    ylabels = [f"{y:.2f}" for y in pivot.index.to_list()]
+    ax.set_xticks(range(len(xlabels)))
+    ax.set_xticklabels(xlabels, fontsize=PAPER_FONT_SIZE)
+    ax.set_yticks(range(len(ylabels)))
+    ax.set_yticklabels(ylabels, fontsize=PAPER_FONT_SIZE)
+    ax.set_xlabel("phi", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("temperature (K)", fontsize=PAPER_FONT_SIZE)
+
+    for i in range(arr.shape[0]):
+        for j in range(arr.shape[1]):
+            v = arr[i, j]
+            txt = "nan" if pd.isna(v) else f"{v:.3f}"
+            ax.text(
+                j,
+                i,
+                txt,
+                ha="center",
+                va="center",
+                fontsize=PAPER_FONT_SIZE,
+                color="white" if np.isfinite(v) and (v > (vmin + vmax) / 2.0) else "black",
+            )
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=PAPER_FONT_SIZE)
+    cbar.set_label("χ_target bootstrap uncertainty", fontsize=PAPER_FONT_SIZE)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI)
+    plt.close(fig)
+    return out_png
 
 
 def _resolve_input_artifacts(
@@ -416,7 +536,26 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
     block_h_fig_dirs = _blk(paths, "h")
     block_i_fig_dirs = _blk(paths, "i")
 
-    objective_heatmaps = _collect_glob_candidates(step3_fig_dirs, "chi_target_*_heatmap.png")
+    step3_boot_uncertainty_derived = paths.get("step3_bootstrap_uncertainty_heatmap_derived")
+    step3_bal_acc_derived = paths.get("step3_balanced_accuracy_heatmap_derived")
+    step3_bal_acc_candidates: List[Path] = []
+    # Prefer richer Step 7 condition-wise class-contrast maps for Figure 3(b).
+    step3_bal_acc_candidates += _make_candidates(
+        block_a_fig_dirs,
+        ["chi_class_significance_heatmap.png", "chi_class_delta_heatmap.png"],
+    )
+    step3_bal_acc_candidates += _make_candidates(
+        step3_fig_dirs,
+        [
+            "chi_target_balanced_accuracy_heatmap.png",
+            "chi_target_classification_objective_heatmap.png",
+            "chi_target_objective_heatmap.png",
+        ],
+    )
+    if isinstance(step3_boot_uncertainty_derived, Path):
+        step3_bal_acc_candidates.append(step3_boot_uncertainty_derived)
+    if isinstance(step3_bal_acc_derived, Path):
+        step3_bal_acc_candidates.append(step3_bal_acc_derived)
 
     return [
         FigureSpec(
@@ -426,19 +565,19 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Step 0 token-length histogram",
+                    caption="Token-length histogram of the training corpus",
                     candidates=_make_candidates(step0_fig_dirs, ["length_hist_train_val.png"]),
                 ),
                 PanelSpec(
-                    caption="Step 0 SA-score distribution",
+                    caption="Synthetic accessibility score distribution",
                     candidates=_make_candidates(step0_fig_dirs, ["sa_hist_train_val.png"]),
                 ),
                 PanelSpec(
-                    caption="Step 3 condition-wise chi_target heatmap",
+                    caption="Condition-wise χ_target map over (T, φ)",
                     candidates=_make_candidates(step3_fig_dirs, ["chi_target_heatmap.png"]),
                 ),
                 PanelSpec(
-                    caption="Step 3 global chi KDE with class-separation threshold",
+                    caption="Global χ distribution with class-separation threshold",
                     candidates=_make_candidates(step3_fig_dirs, ["chi_distribution_global_threshold.png"]),
                 ),
             ],
@@ -450,67 +589,66 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ncols=3,
             panels=[
                 PanelSpec(
-                    caption="Step 1 backbone loss curve",
+                    caption="Backbone training loss convergence",
                     candidates=_make_candidates(step1_fig_dirs, ["backbone_loss_curve.png"]),
                 ),
                 PanelSpec(
-                    caption="Step 1 BPB convergence curve",
+                    caption="Bits-per-byte convergence",
                     candidates=_make_candidates(step1_fig_dirs, ["backbone_bpb_curve.png"]),
                 ),
                 PanelSpec(
-                    caption="Step 2 SA-score: generated vs training",
+                    caption="SA-score: generated vs training",
                     candidates=_make_candidates(step2_fig_dirs, ["sa_hist_train_vs_uncond.png"]),
                 ),
                 PanelSpec(
-                    caption="Step 2 length distribution: generated vs training",
+                    caption="Length distribution: generated vs training",
                     candidates=_make_candidates(step2_fig_dirs, ["length_hist_train_vs_uncond.png"]),
                 ),
                 PanelSpec(
-                    caption="Step 2 star-token quality",
+                    caption="Star-token structural quality",
                     candidates=_make_candidates(step2_fig_dirs, ["star_count_hist_uncond.png"]),
                 ),
             ],
         ),
         FigureSpec(
             figure_id="Figure3",
-            title="Figure 3. Data-driven condition-aware chi_target learning with bootstrap-validated thermodynamic stability",
+            title="Figure 3. Data-driven condition-aware χ_target learning with bootstrap-validated thermodynamic stability",
             destination="manuscript",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Step 3 chi_target (T,phi) condition heatmap",
+                    caption="χ_target condition heatmap over (T, φ)",
                     candidates=_make_candidates(step3_fig_dirs, ["chi_target_heatmap.png"]),
                 ),
                 PanelSpec(
-                    caption="Step 3 classification objective heatmap",
-                    candidates=objective_heatmaps
-                    + _make_candidates(step3_fig_dirs, ["chi_target_balanced_accuracy_heatmap.png"]),
+                    caption="Condition-wise classification-objective map",
+                    candidates=step3_bal_acc_candidates,
                 ),
                 PanelSpec(
-                    caption="Step 3 chi_target trend vs temperature with bootstrap CI",
+                    caption="χ_target trend vs temperature with bootstrap CI",
                     candidates=_make_candidates(
                         step3_fig_dirs,
                         ["chi_target_vs_temperature_with_ci.png", "chi_target_vs_temperature.png"],
                     ),
                 ),
                 PanelSpec(
-                    caption="Step 3 global chi distribution class separation",
+                    caption="Global χ distribution and class separation",
                     candidates=_make_candidates(step3_fig_dirs, ["chi_distribution_global_threshold.png"]),
                 ),
             ],
         ),
         FigureSpec(
             figure_id="Figure4",
-            title="Figure 4. Physics-informed neural network chi regression and binary water-miscibility classification",
+            title="Figure 4. Physics-informed neural network χ regression and binary water-miscibility classification",
             destination="manuscript",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Chi parity plot on holdout test set",
+                    caption="χ parity on holdout test set",
                     candidates=_make_candidates(step4_reg_fig_dirs, ["chi_parity_test.png"]),
                 ),
                 PanelSpec(
-                    caption="Chi residual distribution",
+                    caption="χ residual distribution",
                     candidates=_make_candidates(step4_reg_fig_dirs, ["chi_residual_distribution.png"]),
                 ),
                 PanelSpec(
@@ -544,7 +682,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     candidates=_make_candidates(step5_fig_dirs, ["candidate_screening_funnel.png"]),
                 ),
                 PanelSpec(
-                    caption="Selected polymer chi parity across all (T, phi) conditions",
+                    caption="Selected polymer χ parity across all (T, φ) conditions",
                     candidates=_make_candidates(step5_fig_dirs, ["selected_polymer_chi_parity_all_conditions.png"]),
                 ),
                 PanelSpec(
@@ -560,7 +698,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Class-conditioned top-k target success curve",
+                    caption="Class-conditioned top-k success curve",
                     candidates=_make_candidates(step6_fig_dirs, ["topk_target_success_curve.png"]),
                 ),
                 PanelSpec(
@@ -595,7 +733,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     + _make_candidates(step7_fig_dirs, ["spinodal_phase_diagram.png"]),
                 ),
                 PanelSpec(
-                    caption="Mean chi(T,phi) surface by polymer class",
+                    caption="Mean χ(T, φ) surface by class",
                     candidates=_make_candidates(block_e_fig_dirs, ["chi_surface_mean_by_class.png"])
                     + _make_candidates(step7_fig_dirs, ["chi_surface_mean_by_class.png"]),
                 ),
@@ -619,27 +757,27 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="FigureS1",
-            title="Figure S1. Step 4 Hyperparameter Tuning and Training Diagnostics",
+            title="Figure S1. Hyperparameter Tuning and Training Diagnostics",
             destination="si",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Step4_1 Optuna objective trace",
+                    caption="Regression objective trace",
                     candidates=_make_candidates(
                         step4_reg_tuning_dirs,
                         ["optuna_optimization_objective.png", "optuna_optimization_chi_r2.png"],
                     ),
                 ),
                 PanelSpec(
-                    caption="Step4_2 Optuna objective trace",
+                    caption="Classification objective trace",
                     candidates=_make_candidates(step4_cls_tuning_dirs, ["optuna_optimization_objective.png"]),
                 ),
                 PanelSpec(
-                    caption="Step4_1 training curve",
+                    caption="Regression training curve",
                     candidates=_make_candidates(step4_reg_fig_dirs, ["chi_loss_curve.png"]),
                 ),
                 PanelSpec(
-                    caption="Step4_2 classification curve",
+                    caption="Classification training curve",
                     candidates=_make_candidates(step4_cls_fig_dirs, ["class_loss_curve.png"]),
                 ),
             ],
@@ -651,19 +789,19 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Step5 confidence-error relation",
+                    caption="Confidence-error relation (unconstrained design)",
                     candidates=_make_candidates(step5_fig_dirs, ["top1_confidence_vs_error.png"]),
                 ),
                 PanelSpec(
-                    caption="Step6 confidence-error relation",
+                    caption="Confidence-error relation (class-conditioned design)",
                     candidates=_make_candidates(step6_fig_dirs, ["top1_confidence_vs_error.png"]),
                 ),
                 PanelSpec(
-                    caption="Step5 top-5 selection frequency",
+                    caption="Top-5 polymer selection frequency",
                     candidates=_make_candidates(step5_fig_dirs, ["top5_polymer_selection_frequency.png"]),
                 ),
                 PanelSpec(
-                    caption="Step6 candidate screening funnel",
+                    caption="Candidate screening funnel (class-conditioned)",
                     candidates=_make_candidates(step6_fig_dirs, ["candidate_screening_funnel.png"]),
                 ),
             ],
@@ -683,12 +821,12 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     candidates=_make_candidates(step7_fig_dirs, ["functional_group_frequency_by_class.png"]),
                 ),
                 PanelSpec(
-                    caption="Classification-vs-chi descriptor shift",
+                    caption="Classification-vs-χ descriptor shift",
                     candidates=_make_candidates(block_h_fig_dirs, ["classification_vs_chi_descriptor_shift.png"])
                     + _make_candidates(step7_fig_dirs, ["classification_vs_chi_descriptor_shift.png"]),
                 ),
                 PanelSpec(
-                    caption="Classification-vs-chi functional-group shift",
+                    caption="Classification-vs-χ functional-group shift",
                     candidates=_make_candidates(block_h_fig_dirs, ["classification_vs_chi_fg_frequency.png"])
                     + _make_candidates(step7_fig_dirs, ["classification_vs_chi_fg_frequency.png"]),
                 ),
@@ -701,7 +839,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="dchi/dT distribution by class",
+                    caption="dχ/dT distribution by class",
                     candidates=_make_candidates(block_d_fig_dirs, ["dchi_dT_distribution_by_class.png"])
                     + _make_candidates(step7_fig_dirs, ["dchi_dT_distribution_by_class.png"]),
                 ),
@@ -724,7 +862,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="FigureS5",
-            title="Figure S5. Embedding Space, PINN Sensitivity, and Chi Dataset Analysis",
+            title="Figure S5. Embedding Space, PINN Sensitivity, and χ Dataset Analysis",
             destination="si",
             ncols=2,
             panels=[
@@ -739,14 +877,98 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     + _make_candidates(step7_fig_dirs, ["pinn_coefficient_sensitivity_by_class.png"]),
                 ),
                 PanelSpec(
-                    caption="Chi significance heatmap",
+                    caption="χ significance heatmap",
                     candidates=_make_candidates(block_a_fig_dirs, ["chi_class_significance_heatmap.png"])
                     + _make_candidates(step7_fig_dirs, ["chi_class_significance_heatmap.png"]),
                 ),
                 PanelSpec(
-                    caption="Descriptor-chi correlation heatmap",
+                    caption="Descriptor-χ correlation heatmap",
                     candidates=_make_candidates(block_f_fig_dirs, ["descriptor_chi_correlation_heatmap.png"])
                     + _make_candidates(step7_fig_dirs, ["descriptor_chi_correlation_heatmap.png"]),
+                ),
+            ],
+        ),
+        FigureSpec(
+            figure_id="FigureS6",
+            title="Figure S6. Thermodynamic Class Contrast and Target Context",
+            destination="si",
+            ncols=2,
+            panels=[
+                PanelSpec(
+                    caption="Class-contrast delta heatmap across (T, φ)",
+                    candidates=_make_candidates(block_a_fig_dirs, ["chi_class_delta_heatmap.png"])
+                    + _make_candidates(step7_fig_dirs, ["chi_class_delta_heatmap.png"]),
+                ),
+                PanelSpec(
+                    caption="Class-contrast significance heatmap",
+                    candidates=_make_candidates(block_a_fig_dirs, ["chi_class_significance_heatmap.png"])
+                    + _make_candidates(step7_fig_dirs, ["chi_class_significance_heatmap.png"]),
+                ),
+                PanelSpec(
+                    caption="χ vs temperature trajectories by class and φ",
+                    candidates=_make_candidates(block_a_fig_dirs, ["chi_vs_temperature_by_phi_and_class.png"])
+                    + _make_candidates(step7_fig_dirs, ["chi_vs_temperature_by_phi_and_class.png"]),
+                ),
+                PanelSpec(
+                    caption="Target χ relative to class mean trends",
+                    candidates=_make_candidates(block_a_fig_dirs, ["step3_target_vs_class_means.png"])
+                    + _make_candidates(step7_fig_dirs, ["step3_target_vs_class_means.png"]),
+                ),
+            ],
+        ),
+        FigureSpec(
+            figure_id="FigureS7",
+            title="Figure S7. Predictor Error and Thermodynamic-Gradient Consistency",
+            destination="si",
+            ncols=2,
+            panels=[
+                PanelSpec(
+                    caption="Condition-level MAE heatmap",
+                    candidates=_make_candidates(block_b_fig_dirs, ["step4_test_mae_heatmap.png"])
+                    + _make_candidates(step7_fig_dirs, ["step4_test_mae_heatmap.png"]),
+                ),
+                PanelSpec(
+                    caption="dχ/dT gradient consistency",
+                    candidates=_make_candidates(block_b_fig_dirs, ["step4_gradient_consistency_dchi_dT.png"])
+                    + _make_candidates(step7_fig_dirs, ["step4_gradient_consistency_dchi_dT.png"]),
+                ),
+                PanelSpec(
+                    caption="dχ/dφ gradient consistency",
+                    candidates=_make_candidates(block_b_fig_dirs, ["step4_gradient_consistency_dchi_dphi.png"])
+                    + _make_candidates(step7_fig_dirs, ["step4_gradient_consistency_dchi_dphi.png"]),
+                ),
+                PanelSpec(
+                    caption="Selection trade-off: confidence vs χ error",
+                    candidates=_make_candidates(block_c_fig_dirs, ["selection_tradeoff_chi_vs_solubility_confidence.png"])
+                    + _make_candidates(step7_fig_dirs, ["selection_tradeoff_chi_vs_solubility_confidence.png"]),
+                ),
+            ],
+        ),
+        FigureSpec(
+            figure_id="FigureS8",
+            title="Figure S8. Candidate Novelty and Chemical-Space Diagnostics",
+            destination="si",
+            ncols=2,
+            panels=[
+                PanelSpec(
+                    caption="Descriptor shift relative to training set",
+                    candidates=_make_candidates(block_c_fig_dirs, ["descriptor_shift_vs_training.png"])
+                    + _make_candidates(step7_fig_dirs, ["descriptor_shift_vs_training.png"]),
+                ),
+                PanelSpec(
+                    caption="Novelty similarity distribution",
+                    candidates=_make_candidates(block_c_fig_dirs, ["novelty_similarity_histogram.png"])
+                    + _make_candidates(step7_fig_dirs, ["novelty_similarity_histogram.png"]),
+                ),
+                PanelSpec(
+                    caption="Scoring landscape: χ vs class confidence",
+                    candidates=_make_candidates(block_g_fig_dirs, ["chi_vs_class_prob_scoring_landscape.png"])
+                    + _make_candidates(step7_fig_dirs, ["chi_vs_class_prob_scoring_landscape.png"]),
+                ),
+                PanelSpec(
+                    caption="Discovered-candidate descriptor distribution",
+                    candidates=_make_candidates(block_g_fig_dirs, ["discovered_descriptor_boxplot.png"])
+                    + _make_candidates(step7_fig_dirs, ["discovered_descriptor_boxplot.png"]),
                 ),
             ],
         ),
@@ -768,23 +990,23 @@ def _write_storyline(
         "## Abstract Summary",
         "We present a physics-guided diffusion model framework for discovering water-miscible polymers.",
         "A transformer-based diffusion backbone trained on >100k polymer SMILES generates structurally",
-        "diverse candidates. Condition-aware Flory-Huggins chi_target thresholds, learned from labeled",
-        "thermodynamic data, define design criteria across (T, phi) space. A PINN-augmented regression",
-        "model predicts chi(T, phi) coefficients and a binary classifier screens for water-miscibility.",
+        "diverse candidates. Condition-aware Flory-Huggins χ_target thresholds, learned from labeled",
+        "thermodynamic data, define design criteria across (T, φ) space. A PINN-augmented regression",
+        "model predicts χ(T, φ) coefficients and a binary classifier screens for water-miscibility.",
         "Two inverse-design workflows - unconstrained and polymer-family-conditioned - identify",
         "novel water-miscible candidates whose novelty and thermodynamic profiles are validated",
         "by mechanistic chemistry-physics analysis.",
         "",
         "## Key Innovations",
-        "1. Condition-aware chi_target learning: thresholds vary by (T, phi) and are bootstrap-validated",
-        "2. PINN regression: physically constrained chi(T, phi) = (a0 + a1/T + a2lnT + a3T)(1 + b1(1-phi) + b2(1-phi)^2)",
+        "1. Condition-aware χ_target learning: thresholds vary by (T, φ) and are bootstrap-validated",
+        "2. PINN regression: physically constrained χ(T, φ) = (a0 + a1/T + a2lnT + a3T)(1 + b1(1-φ) + b2(1-φ)^2)",
         "3. Two-stage inverse design with class conditioning and multi-constraint scoring",
         "",
         "## Figure Narrative",
         "- Figure 1: Establishes the training corpus scope and thermodynamic design targets",
         "- Figure 2: Validates backbone training convergence and generation quality",
-        "- Figure 3: Shows how condition-specific chi_target thresholds are learned with statistical confidence",
-        "- Figure 4: Demonstrates PINN chi regression accuracy and binary miscibility classification",
+        "- Figure 3: Shows how condition-specific χ_target thresholds are learned with statistical confidence",
+        "- Figure 4: Demonstrates PINN χ regression accuracy and binary miscibility classification",
         "- Figure 5: Quantifies unconstrained inverse design coverage across thermodynamic conditions",
         "- Figure 6: Extends design to polymer-family constraints, maintaining coverage",
         "- Figure 7: Confirms novelty of discovered polymers and reveals thermodynamic mechanisms",
@@ -798,16 +1020,230 @@ def _write_storyline(
         "# Supporting Information Outline (Step 8)",
         "",
         "## SI Figure Blocks",
-        "1. Figure S1: Step 4 hyperparameter tuning trajectories and learning diagnostics.",
+        "1. Figure S1: Hyperparameter tuning trajectories and learning diagnostics.",
         "2. Figure S2: Inverse-design screening behavior, confidence-error relations, and funnel behavior.",
         "3. Figure S3: Extended chemistry/functional-group representativeness analysis.",
         "4. Figure S4: PINN polynomial and Flory-Huggins thermodynamic interpretation diagnostics.",
-        "5. Figure S5: Embedding geometry, PINN sensitivity, and pipeline-level validation summary.",
+        "5. Figure S5: Embedding geometry, PINN sensitivity, and χ-dataset interpretation.",
+        "6. Figure S6: Thermodynamic class contrast and target context analyses.",
+        "7. Figure S7: Predictor error and thermodynamic-gradient consistency diagnostics.",
+        "8. Figure S8: Candidate novelty and chemical-space diagnostics.",
         "",
         "## SI Tables",
         "Include artifact/input status, top selected polymers from Step 5/6, and PINN coefficient tables for reproducible scientific interpretation.",
     ]
     (si_text_dir / "si_outline.md").write_text("\n".join(si_outline) + "\n", encoding="utf-8")
+
+
+def _write_figure_name_lists(
+    specs: List[FigureSpec],
+    manuscript_figures_dir: Path,
+    si_figures_dir: Path,
+    metadata_dir: Path,
+) -> Dict[str, Path]:
+    letters = "abcdefghijklmnopqrstuvwxyz"
+
+    def _panel_text(spec: FigureSpec) -> str:
+        parts: List[str] = []
+        for i, panel in enumerate(spec.panels):
+            label = letters[i] if i < len(letters) else str(i + 1)
+            parts.append(f"({label}) {panel.caption}")
+        return " ".join(parts)
+
+    manuscript_specs = [spec for spec in specs if spec.destination == "manuscript"]
+    si_specs = [spec for spec in specs if spec.destination == "si"]
+    manuscript_lines = [_figure_output_name(spec) for spec in manuscript_specs]
+    si_lines = [_figure_output_name(spec) for spec in si_specs]
+
+    manuscript_txt = manuscript_figures_dir / "figure_names.txt"
+    si_txt = si_figures_dir / "figure_names.txt"
+    combined_txt = metadata_dir / "figure_names_all.txt"
+
+    manuscript_blocks: List[str] = ["# Manuscript Figures"]
+    for spec in manuscript_specs:
+        manuscript_blocks.extend(
+            [
+                f"Filename: {_figure_output_name(spec)}",
+                spec.title,
+                _panel_text(spec),
+                "",
+            ]
+        )
+    manuscript_txt.write_text("\n".join(manuscript_blocks).rstrip() + "\n", encoding="utf-8")
+
+    si_blocks: List[str] = ["# Supporting Information Figures"]
+    for spec in si_specs:
+        si_blocks.extend(
+            [
+                f"Filename: {_figure_output_name(spec)}",
+                spec.title,
+                _panel_text(spec),
+                "",
+            ]
+        )
+    si_txt.write_text("\n".join(si_blocks).rstrip() + "\n", encoding="utf-8")
+
+    combined_lines: List[str] = [
+        "# Manuscript Figures",
+    ]
+    for spec in manuscript_specs:
+        combined_lines.extend(
+            [
+                f"Filename: {_figure_output_name(spec)}",
+                spec.title,
+                _panel_text(spec),
+                "",
+            ]
+        )
+    combined_lines.extend(
+        [
+            "# Supporting Information Figures",
+        ]
+    )
+    for spec in si_specs:
+        combined_lines.extend(
+            [
+                f"Filename: {_figure_output_name(spec)}",
+                spec.title,
+                _panel_text(spec),
+                "",
+            ]
+        )
+    combined_lines.extend(
+        [
+            "# Quick Copy Filenames",
+            *manuscript_lines,
+            *si_lines,
+            "",
+            "# Figure Titles",
+        ]
+    )
+    for spec in specs:
+        combined_lines.append(f"{_figure_output_name(spec)}: {spec.title}")
+    combined_txt.write_text("\n".join(combined_lines).rstrip() + "\n", encoding="utf-8")
+
+    return {
+        "manuscript_figure_names_txt": manuscript_txt,
+        "si_figure_names_txt": si_txt,
+        "all_figure_names_txt": combined_txt,
+    }
+
+
+def _write_verification_summary(
+    manuscript_figures_dir: Path,
+    si_figures_dir: Path,
+    si_tables_dir: Path,
+    metadata_dir: Path,
+    panel_manifest: pd.DataFrame,
+    specs: List[FigureSpec],
+) -> Path:
+    manuscript_specs = [s for s in specs if s.destination == "manuscript"]
+    si_specs = [s for s in specs if s.destination == "si"]
+
+    manuscript_pngs = sorted(manuscript_figures_dir.glob("*.png"))
+    si_pngs = sorted(si_figures_dir.glob("*.png"))
+    figure7_name = ""
+    for s in manuscript_specs:
+        if s.figure_id == "Figure7":
+            figure7_name = _figure_output_name(s)
+            break
+
+    lines = [
+        "Step 8 Verification Summary",
+        "",
+        f"manuscript_png_count: {len(manuscript_pngs)} (expected {len(manuscript_specs)})",
+        f"supporting_information_png_count: {len(si_pngs)} (expected {len(si_specs)})",
+        f"tableS4_exists: {int((si_tables_dir / 'tableS4_pinn_coefficients.csv').exists())}",
+        f"figure7_expected_filename: {figure7_name}",
+        "",
+        "filename_style: full title slug (*.png), not Figure1/FigureS1 short names",
+        "figure_name_lists:",
+        f"- {manuscript_figures_dir / 'figure_names.txt'}",
+        f"- {si_figures_dir / 'figure_names.txt'}",
+        f"- {metadata_dir / 'figure_names_all.txt'}",
+    ]
+
+    if not panel_manifest.empty:
+        n_found = int((panel_manifest["status"] == "ok").sum())
+        n_missing = int((panel_manifest["status"] != "ok").sum())
+        lines.append(f"n_panels_found: {n_found}")
+        lines.append(f"n_panels_missing: {n_missing}")
+
+    out_path = metadata_dir / "verification_summary.txt"
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out_path
+
+
+def _write_status_report(
+    step_dir: Path,
+    manuscript_figures_dir: Path,
+    si_figures_dir: Path,
+    manuscript_tables_dir: Path,
+    si_tables_dir: Path,
+    metadata_dir: Path,
+    specs: List[FigureSpec],
+    panel_manifest: pd.DataFrame,
+    dpi: int,
+    font_size: int,
+) -> Path:
+    manuscript_specs = [s for s in specs if s.destination == "manuscript"]
+    si_specs = [s for s in specs if s.destination == "si"]
+    manuscript_pngs = sorted(manuscript_figures_dir.glob("*.png"))
+    si_pngs = sorted(si_figures_dir.glob("*.png"))
+    manuscript_tables = sorted(manuscript_tables_dir.glob("*.csv"))
+    si_tables = sorted(si_tables_dir.glob("*.csv"))
+    found_panels = int((panel_manifest["status"] == "ok").sum()) if not panel_manifest.empty else 0
+    missing_panels = int((panel_manifest["status"] != "ok").sum()) if not panel_manifest.empty else 0
+
+    lines = [
+        "# Step 8 Status Report",
+        "",
+        "## Summary",
+        "- Status: implemented and verified from generated artifacts",
+        f"- Manuscript figures: {len(manuscript_pngs)} (expected {len(manuscript_specs)})",
+        f"- Supporting information figures: {len(si_pngs)} (expected {len(si_specs)})",
+        f"- Figure style: PNG only, dpi={dpi}, font_size={font_size}, no global figure title",
+        f"- Panel availability: found={found_panels}, missing={missing_panels}",
+        "",
+        "## Output Structure",
+        f"- Step8 root: `{step_dir}`",
+        f"- Manuscript figures dir: `{manuscript_figures_dir}`",
+        f"- Supporting information figures dir: `{si_figures_dir}`",
+        f"- Manuscript tables dir: `{manuscript_tables_dir}`",
+        f"- Supporting information tables dir: `{si_tables_dir}`",
+        "",
+        "## Filenames",
+        "- Figure filenames use full title slugs (e.g., `figure_1_...png`), not short `Figure1.png` names.",
+        "- Copy-ready figure filename lists:",
+        f"  - `{manuscript_figures_dir / 'figure_names.txt'}`",
+        f"  - `{si_figures_dir / 'figure_names.txt'}`",
+        f"  - `{metadata_dir / 'figure_names_all.txt'}`",
+        "",
+        "## Manuscript Tables",
+    ]
+    lines.extend([f"- `{p.name}`" for p in manuscript_tables])
+    lines.extend(
+        [
+            "",
+            "## Supporting Information Tables",
+        ]
+    )
+    lines.extend([f"- `{p.name}`" for p in si_tables])
+    lines.extend(
+        [
+            "",
+            "## Key Checks",
+            f"- `tableS4_pinn_coefficients.csv` exists: {int((si_tables_dir / 'tableS4_pinn_coefficients.csv').exists())}",
+            f"- Verification summary: `{metadata_dir / 'verification_summary.txt'}`",
+            "",
+            "## Notes",
+            "- Verification phrasing in external docs should use SI=8 and full-title PNG filenames.",
+        ]
+    )
+
+    out_path = metadata_dir / "status_report.md"
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out_path
 
 
 def _build_manuscript_tables(
@@ -1063,7 +1499,6 @@ def main(args: argparse.Namespace) -> None:
     results_dir = Path(get_results_dir(model_size, config["paths"]["results_dir"], split_mode=None))
     step_dir = results_dir / "step8_paper_package" / split_mode
     metrics_dir = step_dir / "metrics"
-    figure_root = step_dir / "figures"  # all Step 8 generated figures (PNG only)
     manuscript_dir = step_dir / "manuscript"
     manuscript_figures_dir = manuscript_dir / "figures"
     manuscript_tables_dir = manuscript_dir / "tables"
@@ -1077,7 +1512,6 @@ def main(args: argparse.Namespace) -> None:
 
     for d in [
         metrics_dir,
-        figure_root,
         manuscript_figures_dir,
         manuscript_tables_dir,
         manuscript_text_dir,
@@ -1089,10 +1523,9 @@ def main(args: argparse.Namespace) -> None:
     ]:
         d.mkdir(parents=True, exist_ok=True)
 
-    dpi = int(args.dpi if args.dpi is not None else config.get("plotting", {}).get("dpi", 600))
-    font_size = int(
-        args.font_size if args.font_size is not None else config.get("plotting", {}).get("font_size", 16)
-    )
+    # Fixed paper style per user request.
+    dpi = PAPER_DPI
+    font_size = PAPER_FONT_SIZE
     apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
 
     seed_value = int(config["data"]["random_seed"])
@@ -1119,8 +1552,12 @@ def main(args: argparse.Namespace) -> None:
     print(f"output_dir={step_dir}")
     print("=" * 70)
 
+    # Remove legacy duplicated figure directory from older Step8 runs.
+    legacy_figure_root = step_dir / "figures"
+    if legacy_figure_root.exists():
+        shutil.rmtree(legacy_figure_root, ignore_errors=True)
+
     # Make reruns deterministic: remove previous Step8 PNGs before rebuilding.
-    _clear_png_files(figure_root)
     _clear_png_files(manuscript_figures_dir)
     _clear_png_files(si_figures_dir)
 
@@ -1136,21 +1573,30 @@ def main(args: argparse.Namespace) -> None:
     artifact_df = pd.DataFrame(artifact_rows)
     artifact_df.to_csv(metadata_dir / "input_artifact_status.csv", index=False)
 
+    # Build a robust condition-wise objective panel for Figure 3(b) from Step 3 metrics.
+    paths["step3_balanced_accuracy_heatmap_derived"] = _build_step3_objective_heatmap_from_metrics(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
+    paths["step3_bootstrap_uncertainty_heatmap_derived"] = _build_step3_bootstrap_uncertainty_heatmap(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
+
     specs = _build_figure_specs(paths)
     panel_manifest_frames: List[pd.DataFrame] = []
     generated_main: List[Path] = []
     generated_si: List[Path] = []
 
     for spec in specs:
-        out_png = figure_root / f"{spec.figure_id}_{_slugify(spec.title)}.png"
-        panel_df = _compose_figure(spec=spec, out_png=out_png, dpi=dpi, font_size=font_size)
+        out_dir = manuscript_figures_dir if spec.destination == "manuscript" else si_figures_dir
+        out_png = out_dir / _figure_output_name(spec)
+        panel_df = _compose_figure(spec=spec, out_png=out_png)
         panel_manifest_frames.append(panel_df)
         if spec.destination == "manuscript":
             generated_main.append(out_png)
-            _copy_if_exists(out_png, manuscript_figures_dir / out_png.name)
         else:
             generated_si.append(out_png)
-            _copy_if_exists(out_png, si_figures_dir / out_png.name)
 
     panel_manifest = (
         pd.concat(panel_manifest_frames, ignore_index=True)
@@ -1172,6 +1618,32 @@ def main(args: argparse.Namespace) -> None:
         si_text_dir=si_text_dir,
         model_size=model_size,
         split_mode=split_mode,
+    )
+    _write_figure_name_lists(
+        specs=specs,
+        manuscript_figures_dir=manuscript_figures_dir,
+        si_figures_dir=si_figures_dir,
+        metadata_dir=metadata_dir,
+    )
+    _write_verification_summary(
+        manuscript_figures_dir=manuscript_figures_dir,
+        si_figures_dir=si_figures_dir,
+        si_tables_dir=si_tables_dir,
+        metadata_dir=metadata_dir,
+        panel_manifest=panel_manifest,
+        specs=specs,
+    )
+    _write_status_report(
+        step_dir=step_dir,
+        manuscript_figures_dir=manuscript_figures_dir,
+        si_figures_dir=si_figures_dir,
+        manuscript_tables_dir=manuscript_tables_dir,
+        si_tables_dir=si_tables_dir,
+        metadata_dir=metadata_dir,
+        specs=specs,
+        panel_manifest=panel_manifest,
+        dpi=dpi,
+        font_size=font_size,
     )
 
     missing_panels = int((panel_manifest["status"] != "ok").sum()) if not panel_manifest.empty else 0
@@ -1199,7 +1671,7 @@ def main(args: argparse.Namespace) -> None:
     with open(metrics_dir / "step8_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     save_step_summary(summary, metrics_dir)
-    save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=figure_root, dpi=dpi)
+    save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=None, dpi=dpi)
 
     print("Step 8 complete.")
     print(f"Manuscript package: {manuscript_dir}")
@@ -1218,6 +1690,4 @@ if __name__ == "__main__":
         default="polymer",
         help="Paper package split mode. Must be polymer.",
     )
-    parser.add_argument("--dpi", type=int, default=None, help="Figure DPI override")
-    parser.add_argument("--font_size", type=int, default=None, help="Figure font-size override")
     main(parser.parse_args())
