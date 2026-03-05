@@ -2,7 +2,7 @@
 """Step 8: build manuscript/SI paper package from Steps 0-7 outputs.
 
 This script curates key results into:
-- manuscript figures (7 multi-panel PNGs)
+- manuscript figures (6 multi-panel PNGs)
 - supporting information figures (PNG)
 - manuscript/SI tables (CSV)
 - source-data and metadata manifests
@@ -729,9 +729,9 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
 
     return [
         FigureSpec(
-            figure_id="Figure1",
-            title="Figure 1. Polymer design foundation: training corpus quality and thermodynamic target landscape",
-            destination="manuscript",
+            figure_id="FigureS1",
+            title="Figure S1. Polymer design foundation: training corpus quality and thermodynamic target landscape",
+            destination="si",
             ncols=2,
             panels=[
                 PanelSpec(
@@ -767,11 +767,22 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                         else []
                     ),
                 ),
+                PanelSpec(
+                    caption="Condition-wise χ_target map over (T, φ)",
+                    candidates=_make_candidates(step3_fig_dirs, ["chi_target_heatmap.png"]),
+                ),
+                PanelSpec(
+                    caption="χ_target trend vs temperature with bootstrap CI",
+                    candidates=_make_candidates(
+                        step3_fig_dirs,
+                        ["chi_target_vs_temperature_with_ci.png", "chi_target_vs_temperature.png"],
+                    ),
+                ),
             ],
         ),
         FigureSpec(
             figure_id="Figure2",
-            title="Figure 2. Diffusion backbone training and novel polymer generation quality",
+            title="Figure 1. Diffusion backbone training and novel polymer generation quality",
             destination="manuscript",
             ncols=3,
             panels=[
@@ -799,7 +810,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="Figure3",
-            title="Figure 3. Data-driven condition-aware χ_target learning with bootstrap-validated thermodynamic stability",
+            title="Figure 2. Data-driven condition-aware χ_target learning with bootstrap-validated thermodynamic stability",
             destination="manuscript",
             ncols=2,
             panels=[
@@ -837,7 +848,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="Figure4",
-            title="Figure 4. Physics-informed neural network χ regression and binary water-miscibility classification",
+            title="Figure 3. Physics-informed neural network χ regression and binary water-miscibility classification",
             destination="manuscript",
             ncols=2,
             panels=[
@@ -867,7 +878,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="Figure5",
-            title="Figure 5. Unconstrained inverse design: water-soluble candidate selection and design-space coverage",
+            title="Figure 4. Unconstrained inverse design: water-soluble candidate selection and design-space coverage",
             destination="manuscript",
             ncols=2,
             panels=[
@@ -891,7 +902,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="Figure6",
-            title="Figure 6. Polymer-family-conditioned inverse design and class-specific thermodynamic coverage",
+            title="Figure 5. Polymer-family-conditioned inverse design and class-specific thermodynamic coverage",
             destination="manuscript",
             ncols=2,
             panels=[
@@ -916,7 +927,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="Figure7",
-            title="Figure 7. Mechanistic interpretation: chemical novelty, thermodynamic profiles, and structure-property coupling",
+            title="Figure 6. Mechanistic interpretation: chemical novelty, thermodynamic profiles, and structure-property coupling",
             destination="manuscript",
             ncols=3,
             panels=[
@@ -953,8 +964,8 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="FigureS1",
-            title="Figure S1. Hyperparameter Tuning and Training Diagnostics",
+            figure_id="FigureS2",
+            title="Figure S2. Hyperparameter Tuning and Training Diagnostics",
             destination="si",
             ncols=2,
             panels=[
@@ -980,8 +991,8 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="FigureS2",
-            title="Figure S2. Inverse-Design Screening and Confidence Diagnostics",
+            figure_id="FigureS3",
+            title="Figure S3. Inverse-Design Screening and Confidence Diagnostics",
             destination="si",
             ncols=2,
             panels=[
@@ -1004,8 +1015,8 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="FigureS3",
-            title="Figure S3. Extended Chemical and Functional-Group Analysis",
+            figure_id="FigureS4",
+            title="Figure S4. Extended Chemical and Functional-Group Analysis",
             destination="si",
             ncols=2,
             panels=[
@@ -1030,8 +1041,8 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="FigureS4",
-            title="Figure S4. PINN Polynomial Thermodynamics and Flory-Huggins Phase Analysis",
+            figure_id="FigureS5",
+            title="Figure S5. PINN Polynomial Thermodynamics and Flory-Huggins Phase Analysis",
             destination="si",
             ncols=2,
             panels=[
@@ -1058,8 +1069,8 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="FigureS5",
-            title="Figure S5. Embedding Space, PINN Sensitivity, and χ Dataset Analysis",
+            figure_id="FigureS6",
+            title="Figure S6. Embedding Space, PINN Sensitivity, and χ Dataset Analysis",
             destination="si",
             ncols=2,
             panels=[
@@ -1086,8 +1097,8 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="FigureS6",
-            title="Figure S6. Thermodynamic Class Contrast and Target Context",
+            figure_id="FigureS7",
+            title="Figure S7. Thermodynamic Class Contrast and Target Context",
             destination="si",
             ncols=2,
             panels=[
@@ -1114,8 +1125,8 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="FigureS7",
-            title="Figure S7. Predictor Error and Thermodynamic-Gradient Consistency",
+            figure_id="FigureS8",
+            title="Figure S8. Predictor Error and Thermodynamic-Gradient Consistency",
             destination="si",
             ncols=2,
             panels=[
@@ -1142,8 +1153,8 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="FigureS8",
-            title="Figure S8. Candidate Novelty and Chemical-Space Diagnostics",
+            figure_id="FigureS9",
+            title="Figure S9. Candidate Novelty and Chemical-Space Diagnostics",
             destination="si",
             ncols=2,
             panels=[
@@ -1170,8 +1181,8 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="FigureS9",
-            title="Figure S9. DiT vs Traditional Baseline Comparison Across Model Sizes",
+            figure_id="FigureS10",
+            title="Figure S10. DiT vs Traditional Baseline Comparison Across Model Sizes",
             destination="si",
             ncols=2,
             panels=[
@@ -1251,13 +1262,14 @@ def _write_storyline(
         "3. Two-stage inverse design with class conditioning and multi-constraint scoring",
         "",
         "## Figure Narrative",
-        "- Figure 1: Establishes the training corpus scope and thermodynamic design targets",
-        "- Figure 2: Validates backbone training convergence and generation quality",
-        "- Figure 3: Shows how condition-specific χ_target thresholds are learned with statistical confidence",
-        "- Figure 4: Demonstrates PINN χ regression accuracy and binary miscibility classification",
-        "- Figure 5: Quantifies unconstrained inverse design coverage across thermodynamic conditions",
-        "- Figure 6: Extends design to polymer-family constraints, maintaining coverage",
-        "- Figure 7: Confirms novelty of discovered polymers and reveals thermodynamic mechanisms",
+        "- Manuscript contains 6 main figures (Figures 1-6).",
+        "- Corpus/target-landscape context figure is moved to Supporting Information.",
+        "- Figure 1: Validates backbone training convergence and generation quality",
+        "- Figure 2: Shows how condition-specific χ_target thresholds are learned with statistical confidence",
+        "- Figure 3: Demonstrates PINN χ regression accuracy and binary miscibility classification",
+        "- Figure 4: Quantifies unconstrained inverse design coverage across thermodynamic conditions",
+        "- Figure 5: Extends design to polymer-family constraints, maintaining coverage",
+        "- Figure 6: Confirms novelty of discovered polymers and reveals thermodynamic mechanisms",
     ]
     (manuscript_text_dir / "manuscript_outline.md").write_text(
         "\n".join(manuscript_outline) + "\n",
@@ -1268,14 +1280,16 @@ def _write_storyline(
         "# Supporting Information Outline (Step 8)",
         "",
         "## SI Figure Blocks",
-        "1. Figure S1: Hyperparameter tuning trajectories and learning diagnostics.",
-        "2. Figure S2: Inverse-design screening behavior, confidence-error relations, and funnel behavior.",
-        "3. Figure S3: Extended chemistry/functional-group representativeness analysis.",
-        "4. Figure S4: PINN polynomial and Flory-Huggins thermodynamic interpretation diagnostics.",
-        "5. Figure S5: Embedding geometry, PINN sensitivity, and χ-dataset interpretation.",
-        "6. Figure S6: Thermodynamic class contrast and target context analyses.",
-        "7. Figure S7: Predictor error and thermodynamic-gradient consistency diagnostics.",
-        "8. Figure S8: Candidate novelty and chemical-space diagnostics.",
+        "1. Figure S1: Polymer design foundation: training-corpus quality and thermodynamic target landscape context.",
+        "2. Figure S2: Hyperparameter tuning trajectories and learning diagnostics.",
+        "3. Figure S3: Inverse-design screening behavior, confidence-error relations, and funnel behavior.",
+        "4. Figure S4: Extended chemistry/functional-group representativeness analysis.",
+        "5. Figure S5: PINN polynomial and Flory-Huggins thermodynamic interpretation diagnostics.",
+        "6. Figure S6: Embedding geometry, PINN sensitivity, and χ-dataset interpretation.",
+        "7. Figure S7: Thermodynamic class contrast and target context analyses.",
+        "8. Figure S8: Predictor error and thermodynamic-gradient consistency diagnostics.",
+        "9. Figure S9: Candidate novelty and chemical-space diagnostics.",
+        "10. Figure S10: DiT vs traditional baseline comparison across model sizes.",
         "",
         "## SI Tables",
         "Include artifact/input status, top selected polymers from Step 5/6, and PINN coefficient tables for reproducible scientific interpretation.",
