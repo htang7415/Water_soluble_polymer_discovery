@@ -326,6 +326,75 @@ def _pad_png_canvas(png_path: Path, target_w: int = 3600, target_h: int = 3000) 
     plt.imsave(png_path, canvas, dpi=PAPER_DPI)
 
 
+def _build_step2_generative_metrics_panel(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    """Build Figure 1(f): compact Step 2 generative-quality score summary."""
+    step2_dir = paths.get("step2_dir")
+
+    metrics_csv = step2_dir / "metrics" / "sampling_generative_metrics.csv" if step2_dir is not None else None
+    metrics_row = _safe_first_row(metrics_csv)
+    if not metrics_row:
+        metrics_row = _safe_first_row(paths.get("step2_summary"))
+    if not metrics_row:
+        return None
+
+    metric_specs = [
+        ("Validity", ["validity"]),
+        ("Validity (star=2)", ["validity_two_stars", "frac_star_eq_2"]),
+        ("Uniqueness", ["uniqueness"]),
+        ("Novelty", ["novelty"]),
+        ("Diversity", ["avg_diversity"]),
+    ]
+    labels: List[str] = []
+    values: List[float] = []
+    for label, keys in metric_specs:
+        raw_val = _pick(metrics_row, keys, default=np.nan)
+        try:
+            val = float(raw_val)
+        except Exception:
+            continue
+        if not np.isfinite(val):
+            continue
+        labels.append(label)
+        values.append(float(np.clip(val, 0.0, 1.0)))
+
+    if len(values) < 3:
+        return None
+
+    out_png = metadata_dir / "derived_step2_generative_metrics_summary.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    ypos = np.arange(len(labels))
+    colors = ["#1d4ed8", "#0ea5e9", "#10b981", "#f59e0b", "#8b5cf6"]
+    ax.barh(ypos, values, color=colors[: len(labels)])
+
+    for i, val in enumerate(values):
+        near_right = val > 0.94
+        ax.text(
+            val - 0.02 if near_right else val + 0.015,
+            i,
+            f"{val:.3f}",
+            va="center",
+            ha="right" if near_right else "left",
+            fontsize=max(11, PAPER_FONT_SIZE - 2),
+            color="#111827",
+        )
+
+    ax.set_yticks(ypos, labels=labels)
+    ax.invert_yaxis()
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("Score", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
+    ax.grid(True, axis="x", linestyle="--", linewidth=0.8, alpha=0.35)
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
 def _build_step3_global_threshold_curve(
     paths: Dict[str, Optional[Path]],
     metadata_dir: Path,
@@ -726,6 +795,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
     step3_global_curve_derived = paths.get("step3_global_threshold_curve_derived")
     step3_threshold_regions_derived = paths.get("step3_threshold_regions_derived")
     step3_condition_profiles_derived = paths.get("step3_condition_profiles_derived")
+    step2_generative_metrics_derived = paths.get("step2_generative_metrics_derived")
 
     return [
         FigureSpec(
@@ -805,6 +875,14 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                 PanelSpec(
                     caption="Star-token structural quality",
                     candidates=_make_candidates(step2_fig_dirs, ["star_count_hist_uncond.png"]),
+                ),
+                PanelSpec(
+                    caption="Core generative quality metrics summary",
+                    candidates=(
+                        [step2_generative_metrics_derived]
+                        if isinstance(step2_generative_metrics_derived, Path)
+                        else []
+                    ),
                 ),
             ],
         ),
@@ -1906,7 +1984,12 @@ def main(args: argparse.Namespace) -> None:
     artifact_df = pd.DataFrame(artifact_rows)
     artifact_df.to_csv(metadata_dir / "input_artifact_status.csv", index=False)
 
-    # Build non-heatmap Step 3 panels for manuscript Figure 1(d) and Figure 3(b,d).
+    # Build derived panels used by manuscript Figures 1 and 2.
+    paths["step2_generative_metrics_derived"] = _build_step2_generative_metrics_panel(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
+    # Build non-heatmap Step 3 panels for manuscript Figure 2 and SI Figure S1.
     paths["step3_global_threshold_curve_derived"] = _build_step3_global_threshold_curve(
         paths=paths,
         metadata_dir=metadata_dir,
@@ -1920,6 +2003,7 @@ def main(args: argparse.Namespace) -> None:
         metadata_dir=metadata_dir,
     )
     for key in [
+        "step2_generative_metrics_derived",
         "step3_global_threshold_curve_derived",
         "step3_threshold_regions_derived",
         "step3_condition_profiles_derived",
@@ -1927,7 +2011,7 @@ def main(args: argparse.Namespace) -> None:
         p = paths.get(key)
         if not isinstance(p, Path) or not p.exists():
             print(
-                f"[WARN] Derived Step3 panel not generated: {key}. "
+                f"[WARN] Derived panel not generated: {key}. "
                 "Composer will use fallback candidates or a missing placeholder."
             )
 
