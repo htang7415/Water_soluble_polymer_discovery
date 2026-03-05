@@ -547,6 +547,7 @@ def _resolve_input_artifacts(
 ) -> Dict[str, Optional[Path]]:
     base_results = Path(config["paths"]["results_dir"])
     results_dir = Path(get_results_dir(model_size, config["paths"]["results_dir"], split_mode=split_mode))
+    project_root = Path(__file__).resolve().parents[1]
 
     step0_dir = _first_existing([base_results / "step0_data_prep", results_dir / "step0_data_prep"])
     step1_dir = _first_existing([results_dir / "step1_backbone", base_results / "step1_backbone"])
@@ -601,6 +602,14 @@ def _resolve_input_artifacts(
             base_results / "step7_chem_physics_analysis" / split_mode,
         ]
     )
+    step4_compare_dir = _first_existing(
+        [
+            project_root / "traditional_step4" / f"results_4_4_comparation_{split_mode}",
+            project_root / "traditional_step4" / "results_4_4_comparation_polymer",
+            base_results.parent / "traditional_step4" / f"results_4_4_comparation_{split_mode}",
+            base_results.parent / "traditional_step4" / "results_4_4_comparation_polymer",
+        ]
+    )
 
     out: Dict[str, Optional[Path]] = {
         "results_dir": results_dir,
@@ -615,6 +624,7 @@ def _resolve_input_artifacts(
         "step5_dir": step5_dir,
         "step6_dir": step6_dir,
         "step7_dir": step7_dir,
+        "step4_compare_dir": step4_compare_dir,
     }
     if out["step7_dir"] is not None:
         for blk in "abcdefghi":
@@ -672,6 +682,13 @@ def _resolve_input_artifacts(
                     base_results / "step7_chem_physics_analysis" / split_mode / "metrics" / "step_summary.csv",
                 ]
             ),
+            "step4_compare_summary": _first_existing(
+                [
+                    step4_compare_dir / "metrics" / "step_summary.csv"
+                    if step4_compare_dir is not None
+                    else None,
+                ]
+            ),
         }
     )
     return out
@@ -689,6 +706,9 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
     step5_fig_dirs = [paths.get("step5_dir") / "figures"] if paths.get("step5_dir") is not None else [None]
     step6_fig_dirs = [paths.get("step6_dir") / "figures"] if paths.get("step6_dir") is not None else [None]
     step7_fig_dirs = [paths.get("step7_dir") / "figures"] if paths.get("step7_dir") is not None else [None]
+    step4_compare_fig_dirs = (
+        [paths.get("step4_compare_dir") / "figures"] if paths.get("step4_compare_dir") is not None else [None]
+    )
     def _blk(paths_obj: Dict[str, Optional[Path]], blk: str) -> List[Optional[Path]]:
         d = paths_obj.get(f"step7_block_{blk}_fig_dir")
         return [d] if d is not None else [None]
@@ -800,7 +820,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     caption="χ_target trend vs temperature with bootstrap CI",
                     candidates=_make_candidates(
                         step3_fig_dirs,
-                        ["chi_target_vs_temperature_with_ci.png", "chi_target_vs_temperature.png"],
+                        ["chi_target_vs_temperature_with_ci.png"],
                     ),
                 ),
                 PanelSpec(
@@ -811,7 +831,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                         else []
                     )
                     + _make_candidates(block_a_fig_dirs, ["chi_vs_temperature_by_phi_and_class.png"])
-                    + _make_candidates(step3_fig_dirs, ["chi_target_vs_temperature_with_ci.png"]),
+                    + _make_candidates(step3_fig_dirs, ["chi_target_vs_temperature.png"]),
                 ),
             ],
         ),
@@ -1146,6 +1166,57 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     caption="Discovered-candidate descriptor distribution",
                     candidates=_make_candidates(block_g_fig_dirs, ["discovered_descriptor_boxplot.png"])
                     + _make_candidates(step7_fig_dirs, ["discovered_descriptor_boxplot.png"]),
+                ),
+            ],
+        ),
+        FigureSpec(
+            figure_id="FigureS9",
+            title="Figure S9. DiT vs Traditional Baseline Comparison Across Model Sizes",
+            destination="si",
+            ncols=2,
+            panels=[
+                PanelSpec(
+                    caption="Regression comparison overview (DiT vs traditional)",
+                    candidates=_make_candidates(
+                        step4_compare_fig_dirs,
+                        [
+                            "regression_overview_panel.png",
+                            "regression_delta_heatmap.png",
+                            "comparison_no_valid_data_notice.png",
+                        ],
+                    ),
+                ),
+                PanelSpec(
+                    caption="Classification comparison overview (DiT vs traditional)",
+                    candidates=_make_candidates(
+                        step4_compare_fig_dirs,
+                        [
+                            "classification_overview_panel.png",
+                            "classification_delta_heatmap.png",
+                            "comparison_no_valid_data_notice.png",
+                        ],
+                    ),
+                ),
+                PanelSpec(
+                    caption="Per-metric winner counts (DiT vs traditional)",
+                    candidates=_make_candidates(
+                        step4_compare_fig_dirs,
+                        [
+                            "winner_counts_by_metric.png",
+                            "comparison_no_valid_data_notice.png",
+                        ],
+                    ),
+                ),
+                PanelSpec(
+                    caption="Missing/invalid comparison inputs by stage and model size",
+                    candidates=_make_candidates(
+                        step4_compare_fig_dirs,
+                        [
+                            "missing_inputs_by_stage.png",
+                            "artifact_counts_by_category.png",
+                            "comparison_no_valid_data_notice.png",
+                        ],
+                    ),
                 ),
             ],
         ),
@@ -1586,6 +1657,63 @@ def _build_manuscript_tables(
     else:
         coeff_df.to_csv(table_s4_path, index=False)
 
+    step4_compare_metrics_dir = (
+        paths["step4_compare_dir"] / "metrics" if paths.get("step4_compare_dir") is not None else None
+    )
+    reg_cmp_df = _safe_read_csv(
+        step4_compare_metrics_dir / "regression_model_size_comparison.csv"
+        if step4_compare_metrics_dir is not None
+        else None
+    )
+    cls_cmp_df = _safe_read_csv(
+        step4_compare_metrics_dir / "classification_model_size_comparison.csv"
+        if step4_compare_metrics_dir is not None
+        else None
+    )
+    table_s5_path = si_tables_dir / "tableS5_step4_dit_vs_traditional_comparison.csv"
+    if reg_cmp_df.empty and cls_cmp_df.empty:
+        pd.DataFrame(
+            [{"note": "Step4_4 comparison metrics not found for this run."}]
+        ).to_csv(table_s5_path, index=False)
+    else:
+        reg_cols = [
+            "model_size",
+            "dit_r2",
+            "traditional_r2",
+            "delta_r2_traditional_minus_dit",
+            "dit_rmse",
+            "traditional_rmse",
+            "delta_rmse_traditional_minus_dit",
+            "dit_mae",
+            "traditional_mae",
+            "delta_mae_traditional_minus_dit",
+        ]
+        cls_cols = [
+            "model_size",
+            "dit_balanced_accuracy",
+            "traditional_balanced_accuracy",
+            "delta_balanced_accuracy_traditional_minus_dit",
+            "dit_auroc",
+            "traditional_auroc",
+            "delta_auroc_traditional_minus_dit",
+            "dit_f1",
+            "traditional_f1",
+            "delta_f1_traditional_minus_dit",
+        ]
+        reg_sub = reg_cmp_df[[c for c in reg_cols if c in reg_cmp_df.columns]].copy()
+        cls_sub = cls_cmp_df[[c for c in cls_cols if c in cls_cmp_df.columns]].copy()
+        if reg_sub.empty:
+            combined = cls_sub.copy()
+        elif cls_sub.empty:
+            combined = reg_sub.copy()
+        else:
+            combined = reg_sub.merge(cls_sub, on="model_size", how="outer")
+        if "model_size" in combined.columns:
+            order_map = {"small": 0, "medium": 1, "large": 2, "xl": 3}
+            combined["_order"] = combined["model_size"].astype(str).str.lower().map(order_map).fillna(999)
+            combined = combined.sort_values(["_order", "model_size"]).drop(columns=["_order"])
+        combined.to_csv(table_s5_path, index=False)
+
     return {
         "table1_pipeline_key_metrics": table1_path,
         "table2_inverse_design_comparison": table2_path,
@@ -1593,6 +1721,7 @@ def _build_manuscript_tables(
         "tableS2_step5_target_polymers_top50": table_s2_path,
         "tableS3_step6_target_polymers_top50": table_s3_path,
         "tableS4_pinn_coefficients": table_s4_path,
+        "tableS5_step4_dit_vs_traditional_comparison": table_s5_path,
     }
 
 
@@ -1642,6 +1771,19 @@ def _copy_source_data(
         )
         to_copy["step7_discovered_descriptor_stats"] = (
             paths["step7_dir"] / "metrics" / "discovered_descriptor_stats.csv"
+        )
+    if paths.get("step4_compare_dir") is not None:
+        to_copy["step4_compare_summary"] = (
+            paths["step4_compare_dir"] / "metrics" / "step_summary.csv"
+        )
+        to_copy["step4_compare_regression_model_size_comparison"] = (
+            paths["step4_compare_dir"] / "metrics" / "regression_model_size_comparison.csv"
+        )
+        to_copy["step4_compare_classification_model_size_comparison"] = (
+            paths["step4_compare_dir"] / "metrics" / "classification_model_size_comparison.csv"
+        )
+        to_copy["step4_compare_missing_or_invalid_inputs"] = (
+            paths["step4_compare_dir"] / "metrics" / "missing_or_invalid_inputs.csv"
         )
 
     for tag, src in to_copy.items():
