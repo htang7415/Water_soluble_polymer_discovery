@@ -247,7 +247,7 @@ chi_training:
     candidate_source: "novel"  # known | novel | hybrid
     property_rule: "upper_bound"
     coverage_topk: 5
-    target_polymer_class: "polyamide"  # all | polyimide | polyester | polyamide | polyurethane | polyether
+    target_polymer_class: "polyimide"  # all | polyimide | polyester | polyamide | polyurethane | polyether
     uncertainty_enabled: false
     uncertainty_mc_samples: 20
     uncertainty_class_z: 1.0
@@ -257,7 +257,7 @@ chi_training:
 
   # Step 7 chemistry + physics analysis
   step7_chem_physics:
-    baseline_max_samples: 3000  # max training polymers sampled for descriptor/novelty baseline
+    baseline_max_samples: 500000  # max training polymers sampled for descriptor/novelty baseline
     novelty_similarity_threshold: 0.40  # novelty cutoff on max Tanimoto to baseline
     descriptor_top_k: 8  # number of top-shift descriptors shown in figure
 

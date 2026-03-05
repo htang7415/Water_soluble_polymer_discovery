@@ -20,6 +20,7 @@ import math
 import re
 import shutil
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -252,8 +253,26 @@ def _copy_if_exists(src: Optional[Path], dst: Path) -> bool:
 
 
 def _slugify(text: str) -> str:
+    # Keep figure filenames portable across OS/filesystems and preserve key symbols semantically.
+    norm_text = str(text)
+    symbol_map = {
+        "χ": "chi",
+        "φ": "phi",
+        "Φ": "phi",
+        "Δ": "delta",
+        "δ": "delta",
+        "β": "beta",
+        "α": "alpha",
+    }
+    for src, dst in symbol_map.items():
+        norm_text = norm_text.replace(src, dst)
+    norm_text = (
+        unicodedata.normalize("NFKD", norm_text)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
     chars: List[str] = []
-    for ch in str(text).strip().lower():
+    for ch in norm_text.strip().lower():
         chars.append(ch if ch.isalnum() else "_")
     slug = re.sub(r"_+", "_", "".join(chars)).strip("_")
     return slug if slug else "figure"
@@ -290,16 +309,17 @@ def _pad_png_canvas(png_path: Path, target_w: int = 3600, target_h: int = 3000) 
     if h > target_h or w > target_w:
         return
 
+    fill_val = np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
     if len(img.shape) == 2:
-        canvas = np.ones((target_h, target_w), dtype=img.dtype)
+        canvas = np.full((target_h, target_w), fill_val, dtype=img.dtype)
         y0 = (target_h - h) // 2
         x0 = (target_w - w) // 2
         canvas[y0 : y0 + h, x0 : x0 + w] = img
     else:
         c = int(img.shape[2])
-        canvas = np.ones((target_h, target_w, c), dtype=img.dtype)
+        canvas = np.full((target_h, target_w, c), fill_val, dtype=img.dtype)
         if c == 4:
-            canvas[..., 3] = 1.0
+            canvas[..., 3] = fill_val
         y0 = (target_h - h) // 2
         x0 = (target_w - w) // 2
         canvas[y0 : y0 + h, x0 : x0 + w, :] = img
@@ -426,7 +446,7 @@ def _build_step3_threshold_regions_panel(
                 f"(non_white={non_white_pixels}, required>={min_non_white_pixels})."
             )
             out_png.parent.mkdir(parents=True, exist_ok=True)
-            img.save(out_png)
+            img.save(out_png, dpi=(PAPER_DPI, PAPER_DPI))
             return out_png
 
         # Cover only text area inside original legend box; keep legend frame and line handles.
@@ -447,7 +467,7 @@ def _build_step3_threshold_regions_panel(
                 "using original figure without relabeling."
             )
             out_png.parent.mkdir(parents=True, exist_ok=True)
-            img.save(out_png)
+            img.save(out_png, dpi=(PAPER_DPI, PAPER_DPI))
             return out_png
 
         text_color = (31, 41, 55, 255)
@@ -462,7 +482,7 @@ def _build_step3_threshold_regions_panel(
         draw.text((tx, y3_txt), thr_txt, fill=text_color, font=font)
 
         out_png.parent.mkdir(parents=True, exist_ok=True)
-        img.save(out_png)
+        img.save(out_png, dpi=(PAPER_DPI, PAPER_DPI))
     return out_png
 
 
@@ -703,8 +723,16 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     candidates=_make_candidates(step0_fig_dirs, ["sa_hist_train_val.png"]),
                 ),
                 PanelSpec(
-                    caption="Condition-wise χ_target map over (T, φ)",
-                    candidates=_make_candidates(step3_fig_dirs, ["chi_target_heatmap.png"]),
+                    caption="Condition-wise threshold-quality heatmap over (T, φ)",
+                    candidates=_make_candidates(
+                        step3_fig_dirs,
+                        [
+                            "chi_target_balanced_accuracy_heatmap.png",
+                            "chi_target_accuracy_heatmap.png",
+                            "chi_target_f1_heatmap.png",
+                            "chi_target_youden_j_heatmap.png",
+                        ],
+                    ),
                 ),
                 PanelSpec(
                     caption="Global χ distribution with class-separation threshold",
@@ -898,10 +926,9 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     + _make_candidates(step7_fig_dirs, ["embedding_pinn_correlation_heatmap.png"]),
                 ),
                 PanelSpec(
-                    caption="Molecular descriptor shift: discovered vs training",
-                    candidates=_make_candidates(block_c_fig_dirs, ["descriptor_shift_vs_training.png"])
-                    + _make_candidates(block_f_fig_dirs, ["descriptor_boxplot_by_class.png"])
-                    + _make_candidates(step7_fig_dirs, ["descriptor_shift_vs_training.png", "descriptor_boxplot_by_class.png"]),
+                    caption="LogP vs mean χ by polymer class",
+                    candidates=_make_candidates(block_f_fig_dirs, ["logp_vs_mean_chi_by_class.png"])
+                    + _make_candidates(step7_fig_dirs, ["logp_vs_mean_chi_by_class.png"]),
                 ),
             ],
         ),
@@ -1027,9 +1054,9 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     + _make_candidates(step7_fig_dirs, ["pinn_coefficient_sensitivity_by_class.png"]),
                 ),
                 PanelSpec(
-                    caption="χ significance heatmap",
-                    candidates=_make_candidates(block_a_fig_dirs, ["chi_class_significance_heatmap.png"])
-                    + _make_candidates(step7_fig_dirs, ["chi_class_significance_heatmap.png"]),
+                    caption="Descriptor shift vs Step2 target pool",
+                    candidates=_make_candidates(block_c_fig_dirs, ["descriptor_shift_vs_step2_target_pool.png"])
+                    + _make_candidates(step7_fig_dirs, ["descriptor_shift_vs_step2_target_pool.png"]),
                 ),
                 PanelSpec(
                     caption="Descriptor-χ correlation heatmap",
