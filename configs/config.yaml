@@ -255,6 +255,12 @@ chi_training:
     uncertainty_score_weight: 0.0
     uncertainty_seed: 42
 
+  # Step 7 chemistry + physics analysis
+  step7_chem_physics:
+    baseline_max_samples: 3000  # max training polymers sampled for descriptor/novelty baseline
+    novelty_similarity_threshold: 0.40  # novelty cutoff on max Tanimoto to baseline
+    descriptor_top_k: 8  # number of top-shift descriptors shown in figure
+
 checkpointing:
   save_best_only: true
   save_last: false
