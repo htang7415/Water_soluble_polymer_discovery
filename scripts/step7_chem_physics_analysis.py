@@ -748,6 +748,148 @@ def _write_figure_index(figures_dir: Path, metrics_dir: Path) -> pd.DataFrame:
     return index_df
 
 
+def _copy_block_artifacts(metrics_dir: Path, figures_dir: Path) -> None:
+    block_metric_map: Dict[str, List[str]] = {
+        "a": [
+            "chi_class_contrast_by_condition.csv",
+            "step3_target_context_vs_class_contrast.csv",
+            "step3_target_context_skipped_reason.csv",
+        ],
+        "b": [
+            "step4_condition_error_metrics.csv",
+            "step4_gradient_consistency_dchi_dT.csv",
+            "step4_gradient_consistency_dchi_dphi.csv",
+            "step4_analysis_skipped_reason.csv",
+        ],
+        "c": [
+            "selected_candidates_unique.csv",
+            "selected_candidates_descriptors.csv",
+            "step2_target_pool_descriptors.csv",
+            "descriptor_shift_vs_step2_target_pool.csv",
+            "baseline_training_smiles_sample.csv",
+            "baseline_training_descriptors.csv",
+            "descriptor_shift_vs_training.csv",
+            "novelty_vs_training.csv",
+            "step6_target_polymer_class_coverage.csv",
+            "candidate_analysis_skipped_reason.csv",
+        ],
+        "d": [
+            "per_polymer_coefficients.csv",
+            "coefficient_class_statistics.csv",
+            "block_d_skipped_reason.csv",
+        ],
+        "e": [
+            "spinodal_miscibility_analysis.csv",
+            "free_energy_analysis_at_target.csv",
+            "block_e_skipped_reason.csv",
+        ],
+        "f": [
+            "chi_dataset_descriptor_stats.csv",
+            "functional_group_frequency.csv",
+            "descriptor_correlation_with_chi.csv",
+            "block_f_skipped_reason.csv",
+        ],
+        "g": [
+            "inverse_candidates_all_combined.csv",
+            "chemical_space_pca_coordinates.csv",
+            "discovered_descriptor_stats.csv",
+            "block_g_skipped_reason.csv",
+        ],
+        "h": [
+            "classification_dataset_overlap_summary.csv",
+            "classification_vs_chi_descriptor_shift.csv",
+            "classification_vs_chi_functional_group_frequency.csv",
+            "chi_subset_descriptor_stats_for_classification_context.csv",
+            "classification_dataset_descriptor_stats.csv",
+            "block_h_skipped_reason.csv",
+        ],
+        "i": [
+            "step1_embedding_coordinates.csv",
+            "step1_embedding_classification_signal.csv",
+            "embedding_pinn_correlation.csv",
+            "pinn_coefficient_sensitivity.csv",
+            "pinn_coefficient_sensitivity_by_class.csv",
+            "block_i_skipped_reason.csv",
+        ],
+    }
+
+    block_figure_map: Dict[str, List[str]] = {
+        "a": [
+            "chi_class_delta_heatmap.png",
+            "chi_class_significance_heatmap.png",
+            "chi_vs_temperature_by_phi_and_class.png",
+            "step3_target_vs_class_means.png",
+        ],
+        "b": [
+            "step4_test_mae_heatmap.png",
+            "step4_gradient_consistency_dchi_dT.png",
+            "step4_gradient_consistency_dchi_dphi.png",
+        ],
+        "c": [
+            "selection_tradeoff_chi_vs_solubility_confidence.png",
+            "descriptor_shift_vs_step2_target_pool.png",
+            "descriptor_shift_vs_training.png",
+            "novelty_similarity_histogram.png",
+            "step6_target_polymer_class_coverage.png",
+        ],
+        "d": [
+            "coefficient_violin_by_class.png",
+            "coefficient_a1_vs_a3_by_class.png",
+            "dchi_dT_distribution_by_class.png",
+        ],
+        "e": [
+            "chi_surface_mean_by_class.png",
+            "spinodal_phase_diagram.png",
+            "miscible_fraction_below_spinodal_by_class.png",
+            "free_energy_mixing_by_class.png",
+        ],
+        "f": [
+            "descriptor_boxplot_by_class.png",
+            "functional_group_frequency_by_class.png",
+            "logp_vs_mean_chi_by_class.png",
+            "tpsa_vs_mean_chi_by_class.png",
+            "descriptor_chi_correlation_heatmap.png",
+        ],
+        "g": [
+            "chemical_space_pca_known_vs_discovered.png",
+            "chi_vs_class_prob_scoring_landscape.png",
+            "discovered_descriptor_boxplot.png",
+        ],
+        "h": [
+            "classification_overlap_counts.png",
+            "classification_vs_chi_descriptor_shift.png",
+            "classification_vs_chi_fg_frequency.png",
+        ],
+        "i": [
+            "step1_embedding_pca_by_source.png",
+            "embedding_pinn_correlation_heatmap.png",
+            "pinn_coefficient_sensitivity_by_class.png",
+        ],
+    }
+
+    for block_name, files in block_metric_map.items():
+        block_dir = metrics_dir / f"block_{block_name}"
+        block_dir.mkdir(parents=True, exist_ok=True)
+        for old in block_dir.glob("*"):
+            if old.is_file():
+                old.unlink()
+        for fname in files:
+            src = metrics_dir / fname
+            if src.exists():
+                shutil.copy2(src, block_dir / fname)
+
+    for block_name, files in block_figure_map.items():
+        block_dir = figures_dir / f"block_{block_name}"
+        block_dir.mkdir(parents=True, exist_ok=True)
+        for old in block_dir.glob("*"):
+            if old.is_file():
+                old.unlink()
+        for fname in files:
+            src = figures_dir / fname
+            if src.exists():
+                shutil.copy2(src, block_dir / fname)
+
+
 def _read_summary_row(path: Optional[Path]) -> Dict[str, object]:
     if path is None or not path.exists():
         return {}
@@ -3387,6 +3529,7 @@ def main(args: argparse.Namespace) -> None:
 
     figure_index_df = _write_figure_index(figures_dir=figures_dir, metrics_dir=metrics_dir)
     summary["n_numbered_figures"] = int(len(figure_index_df))
+    _copy_block_artifacts(metrics_dir=metrics_dir, figures_dir=figures_dir)
     _write_science_highlights(summary, metrics_dir / "science_highlights.md")
     with open(metrics_dir / "step7_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
