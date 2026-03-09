@@ -664,7 +664,11 @@ def _write_science_highlights(summary: Dict[str, object], out_md: Path) -> None:
         f"- Step4 test R2: `{summary.get('step4_test_r2', np.nan):.4f}`",
         f"- Step4 test balanced accuracy: `{summary.get('step4_test_balanced_accuracy', np.nan):.4f}`",
         f"- Step5 target selection success: `{summary.get('step5_target_selection_success_rate', np.nan):.4f}`",
+        f"- Step5 screening yield: `{summary.get('step5_target_screening_yield', np.nan):.4f}`",
+        f"- Step5 sampling attempts used: `{int(_safe_float(summary.get('step5_sampling_attempts_used', 0), default=0.0))}`",
         f"- Step6 target selection success: `{summary.get('step6_target_selection_success_rate', np.nan):.4f}`",
+        f"- Step6 screening yield: `{summary.get('step6_target_screening_yield', np.nan):.4f}`",
+        f"- Step6 sampling attempts used: `{int(_safe_float(summary.get('step6_sampling_attempts_used', 0), default=0.0))}`",
         "",
         "## Thermodynamics",
         f"- Significant χ class-separation conditions (p < 0.05): `{summary.get('n_significant_conditions', 0)}` / `{summary.get('n_conditions', 0)}`",
@@ -702,7 +706,12 @@ def _write_science_highlights(summary: Dict[str, object], out_md: Path) -> None:
         "",
         "## Discovered vs Known",
         f"- Step5 target selection success: `{summary.get('step5_target_selection_success_rate', np.nan):.4f}`",
+        f"- Step5 fresh Step2 sample CSV: `{summary.get('step5_step2_resampling_generated_csv', '')}`",
+        f"- Step5 sampling attempts used: `{int(_safe_float(summary.get('step5_sampling_attempts_used', 0), default=0.0))}`",
+        f"- Step5 sampling attempt log: `{summary.get('step5_sampling_attempt_log_csv', '')}`",
         f"- Step6 target selection success: `{summary.get('step6_target_selection_success_rate', np.nan):.4f}`",
+        f"- Step6 sampling attempts used: `{int(_safe_float(summary.get('step6_sampling_attempts_used', 0), default=0.0))}`",
+        f"- Step6 sampling attempt log: `{summary.get('step6_sampling_attempt_log_csv', '')}`",
         "",
         "## Chemistry and Novelty",
         f"- Unique selected candidates analyzed: `{summary.get('n_selected_unique_candidates', 0)}`",
@@ -910,6 +919,18 @@ def _pick_numeric(row: Dict[str, object], keys: List[str]) -> float:
             if pd.notna(val):
                 return float(val)
     return float(np.nan)
+
+
+def _pick_text(row: Dict[str, object], keys: List[str]) -> str:
+    for key in keys:
+        if key in row:
+            value = row.get(key, "")
+            if pd.notna(value):
+                text = str(value).strip()
+                if text and text.lower() != "nan":
+                    return text
+    return ""
+
 
 def _plot_pipeline_success_rates(df: pd.DataFrame, out_png: Path, dpi: int) -> None:
     if df.empty:
@@ -2775,7 +2796,19 @@ def main(args: argparse.Namespace) -> None:
         "step4_test_r2": np.nan,
         "step4_test_balanced_accuracy": np.nan,
         "step5_target_selection_success_rate": np.nan,
+        "step5_target_screening_yield": np.nan,
+        "step5_sampling_attempts_used": np.nan,
+        "step5_sampling_attempt_log_csv": "",
+        "step5_step2_resampling_generated_csv": "",
+        "step5_step2_resampling_summary_csv": "",
+        "step5_step2_resampling_step_dirs": "",
+        "step5_step2_resampling_generated_csvs": "",
         "step6_target_selection_success_rate": np.nan,
+        "step6_target_screening_yield": np.nan,
+        "step6_sampling_attempts_used": np.nan,
+        "step6_sampling_attempt_log_csv": "",
+        "step6_step2_resampling_step_dirs": "",
+        "step6_step2_resampling_generated_csvs": "",
         "n_conditions": 0,
         "n_significant_conditions": 0,
         "mean_delta_chi_miscible_minus_immiscible": np.nan,
@@ -2837,9 +2870,45 @@ def main(args: argparse.Namespace) -> None:
         summary["step5_target_selection_success_rate"] = _pick_numeric(
             step5_row, ["target_polymer_selection_success_rate"]
         )
+        summary["step5_target_screening_yield"] = _pick_numeric(
+            step5_row, ["target_polymer_screening_yield"]
+        )
+        summary["step5_sampling_attempts_used"] = _pick_numeric(
+            step5_row, ["sampling_attempts_used"]
+        )
+        summary["step5_sampling_attempt_log_csv"] = _pick_text(
+            step5_row, ["sampling_attempt_log_csv"]
+        )
+        summary["step5_step2_resampling_generated_csv"] = _pick_text(
+            step5_row, ["step2_resampling_generated_csv"]
+        )
+        summary["step5_step2_resampling_summary_csv"] = _pick_text(
+            step5_row, ["step2_resampling_summary_csv"]
+        )
+        summary["step5_step2_resampling_step_dirs"] = _pick_text(
+            step5_row, ["step2_resampling_step_dirs"]
+        )
+        summary["step5_step2_resampling_generated_csvs"] = _pick_text(
+            step5_row, ["step2_resampling_generated_csvs"]
+        )
     if step6_row:
         summary["step6_target_selection_success_rate"] = _pick_numeric(
             step6_row, ["target_polymer_selection_success_rate"]
+        )
+        summary["step6_target_screening_yield"] = _pick_numeric(
+            step6_row, ["target_polymer_screening_yield"]
+        )
+        summary["step6_sampling_attempts_used"] = _pick_numeric(
+            step6_row, ["sampling_attempts_used"]
+        )
+        summary["step6_sampling_attempt_log_csv"] = _pick_text(
+            step6_row, ["sampling_attempt_log_csv"]
+        )
+        summary["step6_step2_resampling_step_dirs"] = _pick_text(
+            step6_row, ["step2_resampling_step_dirs"]
+        )
+        summary["step6_step2_resampling_generated_csvs"] = _pick_text(
+            step6_row, ["step2_resampling_generated_csvs"]
         )
 
     # Step4 metrics: prefer step summary; fallback to overall metrics files.
@@ -2908,6 +2977,9 @@ def main(args: argparse.Namespace) -> None:
             "available": int(bool(step5_row)),
             "key_metric_name": "target_polymer_selection_success_rate",
             "key_metric_value": summary["step5_target_selection_success_rate"],
+            "screening_yield": summary["step5_target_screening_yield"],
+            "sampling_attempts_used": summary["step5_sampling_attempts_used"],
+            "sampling_provenance_path": summary["step5_sampling_attempt_log_csv"],
         }
     )
     step_rollup_rows.append(
@@ -2917,6 +2989,9 @@ def main(args: argparse.Namespace) -> None:
             "available": int(bool(step6_row)),
             "key_metric_name": "target_polymer_selection_success_rate",
             "key_metric_value": summary["step6_target_selection_success_rate"],
+            "screening_yield": summary["step6_target_screening_yield"],
+            "sampling_attempts_used": summary["step6_sampling_attempts_used"],
+            "sampling_provenance_path": summary["step6_sampling_attempt_log_csv"],
         }
     )
 
@@ -2930,7 +3005,17 @@ def main(args: argparse.Namespace) -> None:
         ("step6", "step6_target_selection_success_rate"),
     ]:
         rate = _safe_float(summary.get(key, np.nan))
-        success_rows.append({"step": step_name, "success_rate": rate})
+        row = {"step": step_name, "success_rate": rate}
+        if step_name == "step5":
+            row["screening_yield"] = _safe_float(summary.get("step5_target_screening_yield", np.nan))
+            row["sampling_attempts_used"] = _safe_float(summary.get("step5_sampling_attempts_used", np.nan))
+        elif step_name == "step6":
+            row["screening_yield"] = _safe_float(summary.get("step6_target_screening_yield", np.nan))
+            row["sampling_attempts_used"] = _safe_float(summary.get("step6_sampling_attempts_used", np.nan))
+        else:
+            row["screening_yield"] = np.nan
+            row["sampling_attempts_used"] = np.nan
+        success_rows.append(row)
     success_df = pd.DataFrame(success_rows)
     success_df.to_csv(metrics_dir / "step2_step5_step6_success_rates.csv", index=False)
     _plot_pipeline_success_rates(

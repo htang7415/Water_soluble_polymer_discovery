@@ -226,7 +226,8 @@ chi_training:
     # ranking uses independent hard filters (soluble_hit and property_hit) first
     target_polymer_count: 100  # final number of exported target polymers
     target_sa_max: 4.0  # SA upper bound for final target polymer export
-    candidate_source: "novel"  # known | novel | hybrid
+    candidate_source: "novel"  # fresh Step 2 resampling only
+    sampling_attempts_max: 50  # accumulate fresh Step 2 resampling attempts until enough Step 5 targets are found
     property_rule: "upper_bound"  # band | upper_bound | lower_bound
     coverage_topk: 5  # top-k used in coverage/frequency summaries
     uncertainty_enabled: false  # if true, use MC-dropout uncertainty-aware ranking
@@ -244,7 +245,8 @@ chi_training:
     # ranking uses independent hard filters (soluble_hit, property_hit, polymer_class_hit) first
     target_polymer_count: 100
     target_sa_max: 4.0
-    candidate_source: "novel"  # known | novel | hybrid
+    candidate_source: "novel"  # fresh Step 2 resampling only
+    sampling_attempts_max: 50  # accumulate fresh Step 2 resampling attempts until class-matching targets are found
     property_rule: "upper_bound"
     coverage_topk: 5
     target_polymer_class: "polyimide"  # all | polyimide | polyester | polyamide | polyurethane | polyether

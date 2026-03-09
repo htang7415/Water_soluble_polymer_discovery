@@ -15,6 +15,7 @@ Constraint requested by user:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import re
@@ -97,6 +98,83 @@ def _pick(row: Dict[str, object], keys: List[str], default=np.nan):
     return default
 
 
+def _is_missing_value(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _merge_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    merged: Dict[str, object] = {}
+    for row in rows:
+        if not row:
+            continue
+        for key, value in row.items():
+            if key not in merged or _is_missing_value(merged.get(key)):
+                merged[key] = value
+    return merged
+
+
+def _parse_literal_value(raw: object) -> object:
+    if raw is None:
+        return None
+    if isinstance(raw, (list, dict, tuple)):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            return ast.literal_eval(text)
+        except Exception:
+            return text
+    return raw
+
+
+def _load_step0_summary_fallback(step0_dir: Optional[Path]) -> Dict[str, object]:
+    if step0_dir is None:
+        return {}
+
+    metrics_dir = step0_dir / "metrics"
+    roundtrip_df = _safe_read_csv(metrics_dir / "tokenizer_roundtrip.csv")
+    stats_df = _safe_read_csv(metrics_dir / "unlabeled_data_stats.csv")
+    if roundtrip_df.empty and stats_df.empty:
+        return {}
+
+    summary: Dict[str, object] = {"step": "step0_data_prep"}
+    if not roundtrip_df.empty:
+        roundtrip_df = roundtrip_df.copy()
+        roundtrip_df["split"] = roundtrip_df["split"].astype(str).str.lower()
+        train_row = roundtrip_df.loc[roundtrip_df["split"] == "train"]
+        val_row = roundtrip_df.loc[roundtrip_df["split"] == "val"]
+        if not train_row.empty:
+            summary["train_roundtrip_pct"] = _pick(train_row.iloc[0].to_dict(), ["pct"], default=np.nan)
+        if not val_row.empty:
+            summary["val_roundtrip_pct"] = _pick(val_row.iloc[0].to_dict(), ["pct"], default=np.nan)
+
+    if not stats_df.empty:
+        stats_df = stats_df.copy()
+        stats_df["split"] = stats_df["split"].astype(str).str.lower()
+        train_row = stats_df.loc[stats_df["split"] == "train"]
+        val_row = stats_df.loc[stats_df["split"] == "val"]
+        if not train_row.empty:
+            train_data = train_row.iloc[0].to_dict()
+            summary["train_samples"] = _pick(train_data, ["count"], default=np.nan)
+            summary["train_mean_length"] = _pick(train_data, ["length_mean"], default=np.nan)
+            summary["train_mean_sa"] = _pick(train_data, ["sa_mean"], default=np.nan)
+        if not val_row.empty:
+            val_data = val_row.iloc[0].to_dict()
+            summary["val_samples"] = _pick(val_data, ["count"], default=np.nan)
+            summary["val_mean_length"] = _pick(val_data, ["length_mean"], default=np.nan)
+            summary["val_mean_sa"] = _pick(val_data, ["sa_mean"], default=np.nan)
+    return summary
+
+
 def _resolve_truetype_font_path() -> Optional[str]:
     """Resolve a readable sans-serif TrueType font path on common systems."""
     candidates: List[str] = []
@@ -140,6 +218,52 @@ def _make_candidates(base_dirs: List[Optional[Path]], names: List[str]) -> List[
         for name in names:
             out.append(d / name)
     return out
+
+
+def _crop_panel_whitespace(img: np.ndarray, threshold: float = 0.985, pad_px: int = 16) -> np.ndarray:
+    arr = np.asarray(img)
+    if arr.ndim < 2:
+        return arr
+
+    arr_float = arr.astype(np.float32, copy=False)
+    if arr_float.size == 0:
+        return arr
+    if np.issubdtype(arr.dtype, np.integer):
+        denom = float(np.iinfo(arr.dtype).max)
+        if denom > 0:
+            arr_float = arr_float / denom
+    elif float(np.nanmax(arr_float)) > 1.5:
+        arr_float = arr_float / 255.0
+
+    if arr_float.ndim == 2:
+        background = arr_float >= threshold
+    else:
+        rgb = arr_float[..., :3]
+        background = np.all(rgb >= threshold, axis=2)
+        if arr_float.shape[2] >= 4:
+            background = np.logical_or(background, arr_float[..., 3] <= 0.02)
+
+    foreground = ~background
+    if not np.any(foreground):
+        return arr
+
+    rows = np.where(np.any(foreground, axis=1))[0]
+    cols = np.where(np.any(foreground, axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return arr
+
+    y0 = max(int(rows[0]) - pad_px, 0)
+    y1 = min(int(rows[-1]) + pad_px + 1, arr.shape[0])
+    x0 = max(int(cols[0]) - pad_px, 0)
+    x1 = min(int(cols[-1]) + pad_px + 1, arr.shape[1])
+    if arr.ndim == 2:
+        return arr[y0:y1, x0:x1]
+    return arr[y0:y1, x0:x1, ...]
+
+
+def _load_panel_image(src: Path) -> np.ndarray:
+    img = mpimg.imread(src)
+    return _crop_panel_whitespace(img)
 
 
 def _panel_label(ax, label: str, font_size: int) -> None:
@@ -199,9 +323,11 @@ def _compose_figure(
     fig_w = 6.5 * ncols
     fig_h = 5.0 * nrows + 0.7
     fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h))
+    fig.patch.set_facecolor("white")
     axes = np.array(axes).reshape(-1)
 
     letters = "abcdefghijklmnopqrstuvwxyz"
+    missing_count = 0
     for i, panel in enumerate(spec.panels):
         ax = axes[i]
         label = letters[i] if i < len(letters) else str(i + 1)
@@ -211,7 +337,7 @@ def _compose_figure(
 
         if src is not None and src.exists():
             try:
-                img = mpimg.imread(src)
+                img = _load_panel_image(src)
                 ax.imshow(img)
                 ax.set_axis_off()
                 status = "ok"
@@ -220,6 +346,9 @@ def _compose_figure(
                 _draw_missing_panel(ax, panel.caption, font_size=font_size)
         else:
             _draw_missing_panel(ax, panel.caption, font_size=font_size)
+
+        if status != "ok":
+            missing_count += 1
 
         _panel_label(ax, label=label, font_size=font_size)
         panel_rows.append(
@@ -236,10 +365,23 @@ def _compose_figure(
     for j in range(n_panels, len(axes)):
         axes[j].set_axis_off()
 
+    top = 0.98
+    if missing_count > 0:
+        top = 0.94
+        fig.text(
+            0.5,
+            0.992,
+            f"Incomplete figure: {missing_count}/{n_panels} source panels missing",
+            ha="center",
+            va="top",
+            fontsize=max(10, font_size - 2),
+            color="#b91c1c",
+        )
+
     # No global title or panel captions rendered on composed figures.
-    fig.subplots_adjust(top=0.98, wspace=0.12, hspace=0.18)
+    fig.subplots_adjust(top=top, wspace=0.12, hspace=0.18)
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=int(dpi))
+    fig.savefig(out_png, dpi=int(dpi), bbox_inches=None, pad_inches=0.0)
     plt.close(fig)
     return pd.DataFrame(panel_rows)
 
@@ -390,6 +532,190 @@ def _build_step2_generative_metrics_panel(
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=PAPER_DPI)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_step2_star_count_panel(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    summary_row = _safe_first_row(paths.get("step2_summary"))
+    if not summary_row:
+        return None
+
+    total = _pick(summary_row, ["accepted_count_for_evaluation", "target_polymer_count_selected"], default=np.nan)
+    target_stars = _pick(summary_row, ["target_stars"], default=np.nan)
+    frac_target = _pick(summary_row, ["frac_star_eq_2", "validity_two_stars"], default=np.nan)
+    try:
+        total_int = int(float(total))
+        target_star_int = int(float(target_stars))
+        frac_target = float(frac_target)
+    except Exception:
+        return None
+    if total_int <= 0 or not np.isfinite(frac_target):
+        return None
+
+    target_count = int(round(total_int * np.clip(frac_target, 0.0, 1.0)))
+    other_count = max(total_int - target_count, 0)
+    labels = [f"Star={target_star_int}", "Other"]
+    values = [target_count, other_count]
+
+    out_png = metadata_dir / "derived_step2_star_count_summary.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    bars = ax.bar(labels, values, color=["#0C5DA5", "#94a3b8"])
+    y_max = max(1, max(values))
+    for bar, value in zip(bars, values):
+        pct = 100.0 * value / total_int if total_int > 0 else 0.0
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height() + 0.03 * y_max,
+            f"{value:,}\n({pct:.1f}%)",
+            ha="center",
+            va="bottom",
+            fontsize=max(10, PAPER_FONT_SIZE - 2),
+        )
+
+    ax.text(
+        0.98,
+        0.96,
+        f"Total: {total_int:,}",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=max(10, PAPER_FONT_SIZE - 2),
+        color="#111827",
+    )
+    ax.set_xlabel("Star count", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Count", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.35)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_screening_funnel_panel(
+    summary_csv: Optional[Path],
+    out_png: Path,
+) -> Optional[Path]:
+    row = _safe_first_row(summary_csv)
+    if not row:
+        return None
+
+    counts = [
+        _pick(row, ["total_candidates_screened"], default=np.nan),
+        _pick(row, ["filter_pass_count"], default=np.nan),
+        _pick(row, ["filter_pass_unique"], default=np.nan),
+        _pick(row, ["target_count_selected"], default=np.nan),
+    ]
+    try:
+        values = [int(float(v)) for v in counts]
+    except Exception:
+        return None
+    if max(values) <= 0:
+        return None
+
+    labels = ["Candidate pool", "Pass all filters", "After deduplication", "Final selection"]
+    colors = ["#0C5DA5", "#00B945", "#FF9500", "#FF2C00"]
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    ys = np.arange(len(labels))
+    bars = ax.barh(ys, values, color=colors, edgecolor="none", height=0.6)
+    x_max = max(values)
+    for bar, val in zip(bars, values):
+        pct = 100.0 * val / x_max if x_max > 0 else 0.0
+        ax.text(
+            val + 0.02 * x_max,
+            bar.get_y() + bar.get_height() / 2.0,
+            f"{val:,} ({pct:.1f}%)",
+            va="center",
+            ha="left",
+            fontsize=max(10, PAPER_FONT_SIZE - 2),
+        )
+
+    ax.set_yticks(ys, labels=labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("Count", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
+    ax.set_xlim(0, x_max * 1.45)
+    ax.grid(True, axis="x", linestyle="--", linewidth=0.8, alpha=0.35)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_step3_metric_heatmap(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+    value_col: str,
+    out_name: str,
+    colorbar_label: str,
+    cmap_name: str,
+    annotate_fmt: str = "{:.2f}",
+) -> Optional[Path]:
+    step3_dir = paths.get("step3_dir")
+    if step3_dir is None:
+        return None
+
+    best_csv = step3_dir / "metrics" / "chi_target_best_by_condition.csv"
+    df = _safe_read_csv(best_csv)
+    if df.empty or not {"temperature", "phi", value_col}.issubset(df.columns):
+        return None
+
+    plot_df = (
+        df[["temperature", "phi", value_col]]
+        .dropna(subset=["temperature", "phi", value_col])
+        .copy()
+    )
+    if plot_df.empty:
+        return None
+
+    plot_df["temperature"] = plot_df["temperature"].astype(float)
+    plot_df["phi"] = plot_df["phi"].astype(float)
+    plot_df[value_col] = plot_df[value_col].astype(float)
+    pivot = plot_df.pivot(index="temperature", columns="phi", values=value_col).sort_index().sort_index(axis=1)
+    if pivot.empty:
+        return None
+
+    out_png = metadata_dir / out_name
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    cmap = plt.colormaps[cmap_name] if hasattr(plt, "colormaps") else plt.get_cmap(cmap_name)
+    im = ax.imshow(pivot.to_numpy(dtype=float), aspect="auto", cmap=cmap, origin="upper")
+
+    ax.set_xticks(np.arange(len(pivot.columns)))
+    ax.set_xticklabels([f"{float(v):.1f}" for v in pivot.columns], fontsize=PAPER_FONT_SIZE)
+    ax.set_yticks(np.arange(len(pivot.index)))
+    ax.set_yticklabels([f"{float(v):.2f}" for v in pivot.index], fontsize=PAPER_FONT_SIZE)
+    ax.set_xlabel("φ", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Temperature (K)", fontsize=PAPER_FONT_SIZE)
+
+    values = pivot.to_numpy(dtype=float)
+    finite_vals = values[np.isfinite(values)]
+    text_threshold = float(np.nanmedian(finite_vals)) if finite_vals.size else np.nan
+    for i in range(values.shape[0]):
+        for j in range(values.shape[1]):
+            val = values[i, j]
+            if not np.isfinite(val):
+                continue
+            text_color = "white" if np.isfinite(text_threshold) and val >= text_threshold else "#111827"
+            ax.text(j, i, annotate_fmt.format(float(val)), ha="center", va="center", fontsize=12, color=text_color)
+
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.ax.set_ylabel(colorbar_label, fontsize=PAPER_FONT_SIZE)
+    cbar.ax.tick_params(labelsize=max(10, PAPER_FONT_SIZE - 2))
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
     plt.close(fig)
     _pad_png_canvas(out_png)
     return out_png
@@ -609,6 +935,119 @@ def _build_step3_condition_profiles_panel(
     return out_png
 
 
+def _build_step3_temperature_trends_panel(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    step3_dir = paths.get("step3_dir")
+    if step3_dir is None:
+        return None
+
+    best_csv = step3_dir / "metrics" / "chi_target_best_by_condition.csv"
+    df = _safe_read_csv(best_csv)
+    if df.empty or not {"temperature", "phi", "chi_target"}.issubset(df.columns):
+        return None
+
+    plot_df = df.copy()
+    plot_df["temperature"] = plot_df["temperature"].astype(float)
+    plot_df["phi"] = plot_df["phi"].astype(float)
+    plot_df["chi_target"] = plot_df["chi_target"].astype(float)
+
+    q025_col = "chi_target_boot_q025" if "chi_target_boot_q025" in plot_df.columns else None
+    q975_col = "chi_target_boot_q975" if "chi_target_boot_q975" in plot_df.columns else None
+    phis = sorted(plot_df["phi"].dropna().unique().tolist())
+    if not phis:
+        return None
+
+    out_png = metadata_dir / "derived_step3_temperature_trends.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    cmap = plt.colormaps["plasma"] if hasattr(plt, "colormaps") else plt.get_cmap("plasma")
+    for idx, phi in enumerate(phis):
+        sub = plot_df[plot_df["phi"] == phi].sort_values("temperature")
+        if sub.empty:
+            continue
+        x = sub["temperature"].to_numpy(dtype=float)
+        y = sub["chi_target"].to_numpy(dtype=float)
+        color = cmap(idx / max(1, len(phis) - 1))
+        ax.plot(x, y, marker="o", markersize=5.0, linewidth=2.0, color=color, label=f"φ={phi:.1f}")
+        if q025_col is not None and q975_col is not None:
+            lo = sub[q025_col].astype(float).to_numpy(dtype=float)
+            hi = sub[q975_col].astype(float).to_numpy(dtype=float)
+            ax.fill_between(x, lo, hi, color=color, alpha=0.12, linewidth=0)
+
+    ax.set_xlabel("Temperature (K)", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("χ_target", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
+    ax.legend(fontsize=max(10, PAPER_FONT_SIZE - 2), loc="best", frameon=True)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_step6_target_class_coverage_panel(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    summary_row = _safe_first_row(paths.get("step6_summary"))
+    if not summary_row:
+        return None
+
+    raw_classes = _parse_literal_value(_pick(summary_row, ["target_polymer_classes"], default=[]))
+    raw_hits = _parse_literal_value(_pick(summary_row, ["candidate_polymer_class_hits"], default={}))
+    selected_count = _pick(summary_row, ["target_polymer_count_selected"], default=np.nan)
+
+    classes = [str(x) for x in raw_classes] if isinstance(raw_classes, (list, tuple)) else []
+    hits = raw_hits if isinstance(raw_hits, dict) else {}
+    if not classes and hits:
+        classes = [str(k) for k in hits.keys()]
+    if not classes:
+        return None
+
+    values = [float(hits.get(cls, 0) or 0) for cls in classes]
+    out_png = metadata_dir / "derived_step6_target_polymer_class_coverage.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    bars = ax.bar(classes, values, color="#0C5DA5")
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height() + 0.03 * max(1.0, max(values) if values else 1.0),
+            f"{int(round(val))}",
+            ha="center",
+            va="bottom",
+            fontsize=max(10, PAPER_FONT_SIZE - 2),
+        )
+
+    if not _is_missing_value(selected_count):
+        ax.text(
+            0.98,
+            0.96,
+            f"Selected targets: {int(float(selected_count))}",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=max(10, PAPER_FONT_SIZE - 2),
+            color="#111827",
+        )
+
+    ax.set_xlabel("Target polymer class", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Discovered candidates", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="x", labelrotation=35, labelsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="y", labelsize=PAPER_FONT_SIZE)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.35)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
 def _resolve_input_artifacts(
     config: Dict,
     model_size: str,
@@ -729,8 +1168,20 @@ def _resolve_input_artifacts(
                 [
                     results_dir / f"step4_split_pipeline_{split_mode}" / "pipeline_metrics" / "step_summary.csv",
                     base_results / f"step4_split_pipeline_{split_mode}" / "pipeline_metrics" / "step_summary.csv",
+                    step4_reg_dir / "pipeline_metrics" / "step_summary.csv" if step4_reg_dir is not None else None,
+                    step4_cls_dir / "pipeline_metrics" / "step_summary.csv" if step4_cls_dir is not None else None,
                     results_dir / "step4_chi_training" / split_mode / "metrics" / "step_summary.csv",
                     base_results / "step4_chi_training" / split_mode / "metrics" / "step_summary.csv",
+                ]
+            ),
+            "step4_reg_pipeline_summary": _first_existing(
+                [
+                    step4_reg_dir / "pipeline_metrics" / "step_summary.csv" if step4_reg_dir is not None else None,
+                ]
+            ),
+            "step4_cls_pipeline_summary": _first_existing(
+                [
+                    step4_cls_dir / "pipeline_metrics" / "step_summary.csv" if step4_cls_dir is not None else None,
                 ]
             ),
             "step5_summary": _first_existing(
@@ -795,7 +1246,14 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
     step3_global_curve_derived = paths.get("step3_global_threshold_curve_derived")
     step3_threshold_regions_derived = paths.get("step3_threshold_regions_derived")
     step3_condition_profiles_derived = paths.get("step3_condition_profiles_derived")
+    step3_threshold_quality_heatmap_derived = paths.get("step3_threshold_quality_heatmap_derived")
+    step3_chi_target_heatmap_derived = paths.get("step3_chi_target_heatmap_derived")
+    step3_temperature_trends_derived = paths.get("step3_temperature_trends_derived")
     step2_generative_metrics_derived = paths.get("step2_generative_metrics_derived")
+    step2_star_count_derived = paths.get("step2_star_count_derived")
+    step5_screening_funnel_derived = paths.get("step5_screening_funnel_derived")
+    step6_screening_funnel_derived = paths.get("step6_screening_funnel_derived")
+    step6_target_class_coverage_derived = paths.get("step6_target_class_coverage_derived")
 
     return [
         FigureSpec(
@@ -814,7 +1272,12 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                 ),
                 PanelSpec(
                     caption="Condition-wise threshold-quality heatmap over (T, φ)",
-                    candidates=_make_candidates(
+                    candidates=(
+                        [step3_threshold_quality_heatmap_derived]
+                        if isinstance(step3_threshold_quality_heatmap_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(
                         step3_fig_dirs,
                         [
                             "chi_target_balanced_accuracy_heatmap.png",
@@ -839,11 +1302,21 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                 ),
                 PanelSpec(
                     caption="Condition-wise χ_target map over (T, φ)",
-                    candidates=_make_candidates(step3_fig_dirs, ["chi_target_heatmap.png"]),
+                    candidates=(
+                        [step3_chi_target_heatmap_derived]
+                        if isinstance(step3_chi_target_heatmap_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step3_fig_dirs, ["chi_target_heatmap.png"]),
                 ),
                 PanelSpec(
                     caption="χ_target trend vs temperature with bootstrap CI",
-                    candidates=_make_candidates(
+                    candidates=(
+                        [step3_temperature_trends_derived]
+                        if isinstance(step3_temperature_trends_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(
                         step3_fig_dirs,
                         ["chi_target_vs_temperature_with_ci.png", "chi_target_vs_temperature.png"],
                     ),
@@ -874,7 +1347,12 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                 ),
                 PanelSpec(
                     caption="Star-token structural quality",
-                    candidates=_make_candidates(step2_fig_dirs, ["star_count_hist_uncond.png"]),
+                    candidates=(
+                        [step2_star_count_derived]
+                        if isinstance(step2_star_count_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step2_fig_dirs, ["star_count_hist_uncond.png"]),
                 ),
                 PanelSpec(
                     caption="Core generative quality metrics summary",
@@ -894,7 +1372,12 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             panels=[
                 PanelSpec(
                     caption="χ_target condition heatmap over (T, φ)",
-                    candidates=_make_candidates(step3_fig_dirs, ["chi_target_heatmap.png"]),
+                    candidates=(
+                        [step3_chi_target_heatmap_derived]
+                        if isinstance(step3_chi_target_heatmap_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step3_fig_dirs, ["chi_target_heatmap.png"]),
                 ),
                 PanelSpec(
                     caption="Global balanced-accuracy scan with selected χ threshold",
@@ -907,7 +1390,12 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                 ),
                 PanelSpec(
                     caption="χ_target trend vs temperature with bootstrap CI",
-                    candidates=_make_candidates(
+                    candidates=(
+                        [step3_temperature_trends_derived]
+                        if isinstance(step3_temperature_trends_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(
                         step3_fig_dirs,
                         ["chi_target_vs_temperature_with_ci.png"],
                     ),
@@ -966,7 +1454,12 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                 ),
                 PanelSpec(
                     caption="Candidate screening funnel",
-                    candidates=_make_candidates(step5_fig_dirs, ["candidate_screening_funnel.png"]),
+                    candidates=(
+                        [step5_screening_funnel_derived]
+                        if isinstance(step5_screening_funnel_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step5_fig_dirs, ["candidate_screening_funnel.png"]),
                 ),
                 PanelSpec(
                     caption="Selected polymer χ parity across all (T, φ) conditions",
@@ -998,7 +1491,12 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                 ),
                 PanelSpec(
                     caption="Polymer class coverage of discovered targets",
-                    candidates=_make_candidates(block_c_fig_dirs, ["step6_target_polymer_class_coverage.png"])
+                    candidates=(
+                        [step6_target_class_coverage_derived]
+                        if isinstance(step6_target_class_coverage_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(block_c_fig_dirs, ["step6_target_polymer_class_coverage.png"])
                     + _make_candidates(step7_fig_dirs, ["step6_target_polymer_class_coverage.png"]),
                 ),
             ],
@@ -1088,7 +1586,12 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                 ),
                 PanelSpec(
                     caption="Candidate screening funnel (class-conditioned)",
-                    candidates=_make_candidates(step6_fig_dirs, ["candidate_screening_funnel.png"]),
+                    candidates=(
+                        [step6_screening_funnel_derived]
+                        if isinstance(step6_screening_funnel_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step6_fig_dirs, ["candidate_screening_funnel.png"]),
                 ),
             ],
         ),
@@ -1469,6 +1972,30 @@ def _write_figure_name_lists(
     }
 
 
+def _summarize_figure_availability(panel_manifest: pd.DataFrame) -> List[str]:
+    if panel_manifest.empty:
+        return []
+    lines: List[str] = []
+    for figure_id, sub in panel_manifest.groupby("figure_id", sort=False):
+        found = int((sub["status"] == "ok").sum())
+        total = int(len(sub))
+        if found < total:
+            lines.append(f"{figure_id}: found {found}/{total}")
+    return lines
+
+
+def _find_placeholder_tables(table_paths: Dict[str, Path]) -> List[str]:
+    placeholders: List[str] = []
+    for label, path in sorted(table_paths.items()):
+        df = _safe_read_csv(path)
+        if df.empty and path.exists():
+            placeholders.append(path.name)
+            continue
+        if list(df.columns) == ["note"] and len(df) == 1:
+            placeholders.append(path.name)
+    return placeholders
+
+
 def _write_verification_summary(
     manuscript_figures_dir: Path,
     si_figures_dir: Path,
@@ -1476,6 +2003,7 @@ def _write_verification_summary(
     metadata_dir: Path,
     panel_manifest: pd.DataFrame,
     specs: List[FigureSpec],
+    placeholder_tables: List[str],
 ) -> Path:
     manuscript_specs = [s for s in specs if s.destination == "manuscript"]
     si_specs = [s for s in specs if s.destination == "si"]
@@ -1508,6 +2036,12 @@ def _write_verification_summary(
         n_missing = int((panel_manifest["status"] != "ok").sum())
         lines.append(f"n_panels_found: {n_found}")
         lines.append(f"n_panels_missing: {n_missing}")
+        lines.append(f"package_complete: {int(n_missing == 0 and len(placeholder_tables) == 0)}")
+        lines.extend(_summarize_figure_availability(panel_manifest))
+
+    if placeholder_tables:
+        lines.append("placeholder_tables:")
+        lines.extend([f"- {name}" for name in placeholder_tables])
 
     out_path = metadata_dir / "verification_summary.txt"
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1525,6 +2059,7 @@ def _write_status_report(
     panel_manifest: pd.DataFrame,
     dpi: int,
     font_size: int,
+    placeholder_tables: List[str],
 ) -> Path:
     manuscript_specs = [s for s in specs if s.destination == "manuscript"]
     si_specs = [s for s in specs if s.destination == "si"]
@@ -1534,12 +2069,14 @@ def _write_status_report(
     si_tables = sorted(si_tables_dir.glob("*.csv"))
     found_panels = int((panel_manifest["status"] == "ok").sum()) if not panel_manifest.empty else 0
     missing_panels = int((panel_manifest["status"] != "ok").sum()) if not panel_manifest.empty else 0
+    package_complete = missing_panels == 0 and len(placeholder_tables) == 0
+    package_status = "complete" if package_complete else "incomplete_missing_upstream_artifacts"
 
     lines = [
         "# Step 8 Status Report",
         "",
         "## Summary",
-        "- Status: implemented and verified from generated artifacts",
+        f"- Status: {package_status}",
         f"- Manuscript figures: {len(manuscript_pngs)} (expected {len(manuscript_specs)})",
         f"- Supporting information figures: {len(si_pngs)} (expected {len(si_specs)})",
         f"- Figure style: PNG only, dpi={dpi}, font_size={font_size}, no global figure title",
@@ -1576,6 +2113,27 @@ def _write_status_report(
             f"- `tableS4_pinn_coefficients.csv` exists: {int((si_tables_dir / 'tableS4_pinn_coefficients.csv').exists())}",
             f"- Verification summary: `{metadata_dir / 'verification_summary.txt'}`",
             "",
+            "## Incomplete Figures",
+        ]
+    )
+    incomplete_figures = _summarize_figure_availability(panel_manifest)
+    if incomplete_figures:
+        lines.extend([f"- `{entry}`" for entry in incomplete_figures])
+    else:
+        lines.append("- None")
+    lines.extend(
+        [
+            "",
+            "## Placeholder Tables",
+        ]
+    )
+    if placeholder_tables:
+        lines.extend([f"- `{name}`" for name in placeholder_tables])
+    else:
+        lines.append("- None")
+    lines.extend(
+        [
+            "",
             "## Notes",
             "- Verification phrasing in external docs should use SI=8 and full-title PNG filenames.",
         ]
@@ -1595,10 +2153,18 @@ def _build_manuscript_tables(
     si_tables_dir.mkdir(parents=True, exist_ok=True)
 
     s0 = _safe_first_row(paths.get("step0_summary"))
+    if not s0:
+        s0 = _load_step0_summary_fallback(paths.get("step0_dir"))
     s1 = _safe_first_row(paths.get("step1_summary"))
     s2 = _safe_first_row(paths.get("step2_summary"))
     s3 = _safe_first_row(paths.get("step3_summary"))
-    s4 = _safe_first_row(paths.get("step4_summary"))
+    s4 = _merge_rows(
+        [
+            _safe_first_row(paths.get("step4_summary")),
+            _safe_first_row(paths.get("step4_reg_pipeline_summary")),
+            _safe_first_row(paths.get("step4_cls_pipeline_summary")),
+        ]
+    )
     s5 = _safe_first_row(paths.get("step5_summary"))
     s6 = _safe_first_row(paths.get("step6_summary"))
     s7 = _safe_first_row(paths.get("step7_summary"))
@@ -1634,7 +2200,7 @@ def _build_manuscript_tables(
             "key_metric": "global_chi_target",
             "value": _pick(s3, ["global_chi_target"]),
             "secondary_metric": "global_test_balanced_accuracy",
-            "secondary_value": _pick(s3, ["global_test_balanced_accuracy"]),
+            "secondary_value": _pick(s3, ["global_test_balanced_accuracy", "global_balanced_accuracy"]),
         },
         {
             "step": "Step 4",
@@ -1704,7 +2270,7 @@ def _build_manuscript_tables(
     if artifact_df.empty:
         artifact_rows = []
         for name, p in sorted(paths.items()):
-            if name in {"results_dir", "base_results_dir"}:
+            if name in {"results_dir", "base_results_dir"} or name.endswith("_derived"):
                 continue
             if isinstance(p, Path):
                 artifact_rows.append(
@@ -1736,9 +2302,16 @@ def _build_manuscript_tables(
         step6_df.head(50).to_csv(table_s3_path, index=False)
 
     coeff_path = (
-        paths["step4_reg_dir"] / "metrics" / "chi_coefficients.csv"
-        if paths.get("step4_reg_dir") is not None
-        else None
+        _first_existing(
+            [
+                paths["step4_reg_dir"] / "metrics" / "chi_coefficients.csv"
+                if paths.get("step4_reg_dir") is not None
+                else None,
+                paths["step4_reg_dir"] / "metrics" / "polymer_coefficients_regression_only.csv"
+                if paths.get("step4_reg_dir") is not None
+                else None,
+            ]
+        )
     )
     table_s4_path = si_tables_dir / "tableS4_pinn_coefficients.csv"
     coeff_df = _safe_read_csv(coeff_path)
@@ -1830,6 +2403,8 @@ def _copy_source_data(
         "step2_summary": paths.get("step2_summary"),
         "step3_summary": paths.get("step3_summary"),
         "step4_summary": paths.get("step4_summary"),
+        "step4_reg_pipeline_summary": paths.get("step4_reg_pipeline_summary"),
+        "step4_cls_pipeline_summary": paths.get("step4_cls_pipeline_summary"),
         "step5_summary": paths.get("step5_summary"),
         "step6_summary": paths.get("step6_summary"),
         "step7_summary": paths.get("step7_summary"),
@@ -1989,7 +2564,27 @@ def main(args: argparse.Namespace) -> None:
         paths=paths,
         metadata_dir=metadata_dir,
     )
+    paths["step2_star_count_derived"] = _build_step2_star_count_panel(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
     # Build non-heatmap Step 3 panels for manuscript Figure 2 and SI Figure S1.
+    paths["step3_threshold_quality_heatmap_derived"] = _build_step3_metric_heatmap(
+        paths=paths,
+        metadata_dir=metadata_dir,
+        value_col="balanced_accuracy",
+        out_name="derived_step3_threshold_quality_heatmap.png",
+        colorbar_label="Balanced accuracy",
+        cmap_name="YlGnBu",
+    )
+    paths["step3_chi_target_heatmap_derived"] = _build_step3_metric_heatmap(
+        paths=paths,
+        metadata_dir=metadata_dir,
+        value_col="chi_target",
+        out_name="derived_step3_chi_target_heatmap.png",
+        colorbar_label="χ_target",
+        cmap_name="YlOrRd",
+    )
     paths["step3_global_threshold_curve_derived"] = _build_step3_global_threshold_curve(
         paths=paths,
         metadata_dir=metadata_dir,
@@ -2002,11 +2597,42 @@ def main(args: argparse.Namespace) -> None:
         paths=paths,
         metadata_dir=metadata_dir,
     )
+    paths["step3_temperature_trends_derived"] = _build_step3_temperature_trends_panel(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
+    paths["step6_target_class_coverage_derived"] = _build_step6_target_class_coverage_panel(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
+    paths["step5_screening_funnel_derived"] = _build_screening_funnel_panel(
+        summary_csv=(
+            paths["step5_dir"] / "metrics" / "target_polymer_selection_summary.csv"
+            if paths.get("step5_dir") is not None
+            else None
+        ),
+        out_png=metadata_dir / "derived_step5_screening_funnel.png",
+    )
+    paths["step6_screening_funnel_derived"] = _build_screening_funnel_panel(
+        summary_csv=(
+            paths["step6_dir"] / "metrics" / "target_polymer_selection_summary.csv"
+            if paths.get("step6_dir") is not None
+            else None
+        ),
+        out_png=metadata_dir / "derived_step6_screening_funnel.png",
+    )
     for key in [
         "step2_generative_metrics_derived",
+        "step2_star_count_derived",
+        "step3_threshold_quality_heatmap_derived",
+        "step3_chi_target_heatmap_derived",
         "step3_global_threshold_curve_derived",
         "step3_threshold_regions_derived",
         "step3_condition_profiles_derived",
+        "step3_temperature_trends_derived",
+        "step5_screening_funnel_derived",
+        "step6_screening_funnel_derived",
+        "step6_target_class_coverage_derived",
     ]:
         p = paths.get(key)
         if not isinstance(p, Path) or not p.exists():
@@ -2042,6 +2668,7 @@ def main(args: argparse.Namespace) -> None:
         manuscript_tables_dir=manuscript_tables_dir,
         si_tables_dir=si_tables_dir,
     )
+    placeholder_tables = _find_placeholder_tables(table_paths)
     source_manifest = _copy_source_data(paths=paths, source_data_dir=source_data_dir)
     source_manifest.to_csv(metadata_dir / "source_data_copy_manifest.csv", index=False)
 
@@ -2064,6 +2691,7 @@ def main(args: argparse.Namespace) -> None:
         metadata_dir=metadata_dir,
         panel_manifest=panel_manifest,
         specs=specs,
+        placeholder_tables=placeholder_tables,
     )
     _write_status_report(
         step_dir=step_dir,
@@ -2076,11 +2704,13 @@ def main(args: argparse.Namespace) -> None:
         panel_manifest=panel_manifest,
         dpi=dpi,
         font_size=font_size,
+        placeholder_tables=placeholder_tables,
     )
 
     missing_panels = int((panel_manifest["status"] != "ok").sum()) if not panel_manifest.empty else 0
     found_panels = int((panel_manifest["status"] == "ok").sum()) if not panel_manifest.empty else 0
     copied_source_files = int(source_manifest["copied"].sum()) if not source_manifest.empty else 0
+    package_complete = missing_panels == 0 and len(placeholder_tables) == 0
 
     summary = {
         "step": "step8_paper_package",
@@ -2093,6 +2723,8 @@ def main(args: argparse.Namespace) -> None:
         "n_total_panels": int(len(panel_manifest)),
         "n_panels_found": found_panels,
         "n_panels_missing": missing_panels,
+        "package_complete": bool(package_complete),
+        "n_placeholder_tables": int(len(placeholder_tables)),
         "n_key_tables": int(len(table_paths)),
         "n_source_data_files_copied": copied_source_files,
         "step8_output_dir": str(step_dir),
@@ -2106,6 +2738,11 @@ def main(args: argparse.Namespace) -> None:
     save_artifact_manifest(step_dir=step_dir, metrics_dir=metrics_dir, figures_dir=None, dpi=dpi)
 
     print("Step 8 complete.")
+    if not package_complete:
+        print(
+            f"[WARN] Step 8 package is incomplete: missing_panels={missing_panels}, "
+            f"placeholder_tables={len(placeholder_tables)}"
+        )
     print(f"Manuscript package: {manuscript_dir}")
     print(f"Supporting information package: {si_dir}")
 

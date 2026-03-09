@@ -401,15 +401,17 @@ def main(args):
     base_results_dir = config['paths']['results_dir']
     results_dir = Path(get_results_dir(args.model_size, base_results_dir, split_mode))
 
-    # Create output directories
-    step_dir = results_dir / 'step2_sampling'
+    # Create output directories. Inverse-design steps can override this so each
+    # run keeps its own fresh resampling artifacts instead of reusing Step 2 outputs.
+    step_dir = Path(args.output_step_dir) if args.output_step_dir else (results_dir / 'step2_sampling')
     metrics_dir = step_dir / 'metrics'
     figures_dir = step_dir / 'figures'
     metrics_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     # Reproducibility
-    seed_info = seed_everything(config['data']['random_seed'])
+    run_random_seed = int(args.random_seed) if args.random_seed is not None else int(config['data']['random_seed'])
+    seed_info = seed_everything(run_random_seed)
     save_config(config, step_dir / 'config_used.yaml')
     save_run_metadata(step_dir, args.config, seed_info)
     write_initial_log(
@@ -420,6 +422,7 @@ def main(args):
             "model_size": args.model_size,
             "split_mode": split_mode,
             "results_dir": str(results_dir),
+            "output_step_dir": str(step_dir),
             "target_polymer_goal": generation_goal,
             "target_polymer_count_config": target_polymer_count,
             "temperature": temperature,
@@ -436,7 +439,7 @@ def main(args):
             "valid_only_max_rounds": valid_only_max_rounds,
             "valid_only_min_samples_per_round": valid_only_min_samples_per_round,
             "valid_only_fail_on_shortfall": valid_only_fail_on_shortfall,
-            "random_seed": config['data']['random_seed'],
+            "random_seed": run_random_seed,
         },
     )
 
@@ -915,6 +918,10 @@ if __name__ == '__main__':
                         help='Optional split-mode namespace for results dir (default: config chi_training.shared.split_mode)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint')
+    parser.add_argument('--output_step_dir', type=str, default=None,
+                        help='Optional output directory override for this sampling run')
+    parser.add_argument('--random_seed', type=int, default=None,
+                        help='Optional random seed override for this sampling run')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='Batch size for sampling (default: from config)')
     parser.add_argument('--temperature', type=float, default=None,

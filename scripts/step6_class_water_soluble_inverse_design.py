@@ -355,6 +355,162 @@ def _build_polymer_family_map(coeff_df: pd.DataFrame) -> Dict[int, str]:
     return out
 
 
+def _compute_class_coverage(coeff_df: pd.DataFrame, selected_classes: List[str]) -> Dict[str, int]:
+    return {
+        cls: int(coeff_df[f"polymer_class_{cls}"].sum()) if f"polymer_class_{cls}" in coeff_df.columns else 0
+        for cls in selected_classes
+    }
+
+
+def _accumulate_candidate_pools(pool_frames: List[pd.DataFrame]) -> pd.DataFrame:
+    if not pool_frames:
+        return pd.DataFrame()
+
+    coeff_df = pd.concat(pool_frames, ignore_index=True)
+    if "canonical_smiles" not in coeff_df.columns:
+        coeff_df["canonical_smiles"] = coeff_df["SMILES"].astype(str).map(canonicalize_smiles)
+    coeff_df["canonical_smiles"] = coeff_df["canonical_smiles"].where(
+        coeff_df["canonical_smiles"].notna(),
+        coeff_df["SMILES"].astype(str),
+    )
+    if "source_polymer_id" not in coeff_df.columns:
+        coeff_df["source_polymer_id"] = coeff_df.get("polymer_id", pd.Series([-1] * len(coeff_df))).astype(int)
+    else:
+        coeff_df["source_polymer_id"] = coeff_df["source_polymer_id"].fillna(-1).astype(int)
+    coeff_df = coeff_df.drop_duplicates(subset=["canonical_smiles"], keep="first").reset_index(drop=True)
+    coeff_df["polymer_id"] = np.arange(len(coeff_df), dtype=int)
+    return coeff_df
+
+
+def _empty_target_metrics(target_row: pd.Series) -> Dict[str, float]:
+    row = {
+        "target_id": int(target_row["target_id"]),
+        "target_polymer_class": str(target_row["target_polymer_class"]),
+        "property_rule": str(target_row.get("property_rule", "upper_bound")),
+        "temperature": float(target_row["temperature"]),
+        "phi": float(target_row["phi"]),
+        "target_chi": float(target_row["target_chi"]),
+        "n_candidates": 0,
+        "n_soluble_hit": 0,
+        "n_polymer_class_hit": 0,
+        "n_property_hit": 0,
+        "n_joint_hit": 0,
+        "soluble_hit_rate": 0.0,
+        "polymer_class_hit_rate": 0.0,
+        "property_hit_rate": 0.0,
+        "joint_hit_rate": 0.0,
+        "top1_polymer": "",
+        "top1_candidate_source": "unknown",
+        "top1_class_prob": np.nan,
+        "top1_class_prob_std": 0.0,
+        "top1_class_prob_lcb": np.nan,
+        "top1_soluble_hit": 0,
+        "top1_polymer_class_hit": 0,
+        "top1_property_hit": 0,
+        "top1_joint_hit": 0,
+        "top1_property_error": np.nan,
+        "top1_abs_error": np.nan,
+        "top1_pred_chi": np.nan,
+        "top1_pred_chi_std": 0.0,
+        "top1_is_novel_vs_train": np.nan,
+        "best_joint_abs_error": np.nan,
+        "first_joint_rank": np.nan,
+        "mrr_joint": 0.0,
+    }
+    for k in K_LIST:
+        row[f"top{k}_soluble_hit"] = 0
+        row[f"top{k}_polymer_class_hit"] = 0
+        row[f"top{k}_property_hit"] = 0
+        row[f"top{k}_joint_hit"] = 0
+        row[f"top{k}_joint_hit_rate"] = 0.0
+        row[f"top{k}_novel_rate"] = np.nan
+    return row
+
+
+def _score_candidate_pool(
+    coeff_df: pd.DataFrame,
+    target_df: pd.DataFrame,
+    selected_classes: List[str],
+    epsilon: float,
+    default_property_rule: str,
+    uncertainty_enabled: bool,
+    uncertainty_class_z: float,
+    uncertainty_property_z: float,
+    uncertainty_score_weight: float,
+    coverage_topk: int,
+    training_canonical: set[str],
+    target_polymer_count: int,
+    target_stars: int,
+    target_sa_max: float,
+    n_base_conditions: int,
+) -> Dict[str, object]:
+    class_coverage = _compute_class_coverage(coeff_df, selected_classes)
+    polymer_family_map = _build_polymer_family_map(coeff_df)
+
+    all_candidates = []
+    target_metrics = []
+    for _, row in target_df.iterrows():
+        cand = _compute_target_candidates(
+            target_row=row,
+            coeff_df=coeff_df,
+            epsilon=epsilon,
+            default_property_rule=default_property_rule,
+            uncertainty_enabled=uncertainty_enabled,
+            uncertainty_class_z=uncertainty_class_z,
+            uncertainty_property_z=uncertainty_property_z,
+            uncertainty_score_weight=uncertainty_score_weight,
+        )
+        all_candidates.append(cand)
+        target_metrics.append(_target_metrics(cand) if not cand.empty else _empty_target_metrics(row))
+
+    candidate_df = pd.concat(all_candidates, ignore_index=True)
+    target_metrics_df = pd.DataFrame(target_metrics)
+    aggregate_df = _aggregate_metrics(target_metrics_df)
+    post = _postprocess_metrics(candidate_df, target_metrics_df)
+
+    topk = candidate_df[candidate_df["rank"] <= coverage_topk].copy()
+    if "class_prob_lcb" not in topk.columns:
+        topk["class_prob_lcb"] = topk["class_prob"]
+    if "chi_pred_std_target" not in topk.columns:
+        topk["chi_pred_std_target"] = 0.0
+    coverage = (
+        topk.groupby(["target_polymer_class", "candidate_source", "polymer_id", "Polymer"], as_index=False)
+        .agg(
+            selected_count=("rank", "size"),
+            mean_class_prob=("class_prob", "mean"),
+            mean_class_prob_lcb=("class_prob_lcb", "mean"),
+            mean_property_error=("property_error", "mean"),
+            mean_abs_error=("abs_error", "mean"),
+            mean_pred_chi_std=("chi_pred_std_target", "mean"),
+            mean_novel_rate=("is_novel_vs_train", "mean"),
+            mean_polymer_class_hit=("polymer_class_hit", "mean"),
+        )
+        .sort_values(["target_polymer_class", "selected_count"], ascending=[True, False])
+    )
+    coverage["selected_rate"] = coverage["selected_count"] / float(n_base_conditions)
+
+    target_poly_df, target_poly_summary = _select_final_target_polymers(
+        candidate_df=candidate_df,
+        training_canonical=training_canonical,
+        polymer_family_map=polymer_family_map,
+        target_count=target_polymer_count,
+        target_stars=target_stars,
+        sa_max=target_sa_max,
+        total_sampling_points=int(len(coeff_df)),
+    )
+
+    return {
+        "class_coverage": class_coverage,
+        "candidate_df": candidate_df,
+        "target_metrics_df": target_metrics_df,
+        "aggregate_df": aggregate_df,
+        "post": post,
+        "coverage": coverage,
+        "target_poly_df": target_poly_df,
+        "target_poly_summary": target_poly_summary,
+    }
+
+
 def _select_final_target_polymers(
     candidate_df: pd.DataFrame,
     training_canonical: set[str],
@@ -844,6 +1000,11 @@ def main(args):
     sampling_cfg = config.get("sampling", {})
     target_polymer_count = int(chi_cfg.get("target_polymer_count", sampling_cfg.get("target_polymer_count", 100)))
     target_sa_max = float(chi_cfg.get("target_sa_max", sampling_cfg.get("target_sa_max", 4.0)))
+    sampling_attempts_max = int(
+        args.sampling_attempts_max
+        if args.sampling_attempts_max is not None
+        else chi_cfg.get("sampling_attempts_max", 5)
+    )
     target_stars = int(sampling_cfg.get("target_stars", 2))
     if epsilon < 0:
         raise ValueError("epsilon must be >= 0")
@@ -871,6 +1032,8 @@ def main(args):
         raise ValueError("target_polymer_count must be >= 1")
     if target_sa_max <= 0:
         raise ValueError("target_sa_max must be > 0")
+    if sampling_attempts_max < 1:
+        raise ValueError("sampling_attempts_max must be >= 1")
     if legacy_class_weight is not None and abs(legacy_class_weight) > 1e-12:
         print(
             "Note: class_weight is deprecated and ignored. "
@@ -976,6 +1139,8 @@ def main(args):
             "target_polymer_count": target_polymer_count,
             "target_sa_max": target_sa_max,
             "target_stars": target_stars,
+            "sampling_attempts_max": sampling_attempts_max,
+            "step2_resampling_root": str(step_dir),
             "random_seed": config["data"]["random_seed"],
         },
     )
@@ -988,6 +1153,7 @@ def main(args):
     print(f"candidate_source={candidate_source}")
     print(f"target_polymer_class={','.join(selected_classes)}")
     print(f"epsilon={epsilon}")
+    print(f"sampling_attempts_max={sampling_attempts_max}")
     if legacy_class_weight is not None:
         print(f"legacy_class_weight_ignored={legacy_class_weight}")
     if legacy_polymer_class_weight is not None:
@@ -1017,93 +1183,160 @@ def main(args):
     target_df = _build_targets_for_step6(base_target_df, selected_classes)
     target_df.to_csv(metrics_dir / "inverse_targets.csv", index=False)
 
-    coeff_df, pool_summary, training_canonical = build_candidate_pool(
-        args=args,
-        config=config,
-        chi_cfg=chi_cfg,
-        results_dir=results_dir,
-        base_results_dir=base_results_dir,
-        step4_reg_metrics_dir=step4_reg_metrics_dir,
-        step4_cls_metrics_dir=step4_cls_metrics_dir,
-        device=device,
-    )
-    if coeff_df.empty:
-        raise RuntimeError("Candidate pool is empty after filtering. Relax filters or generate more samples.")
+    accumulated_pools: List[pd.DataFrame] = []
+    attempt_rows: List[Dict[str, object]] = []
+    attempt_manifests: List[Dict[str, object]] = []
+    training_canonical: set[str] | None = None
+    score_outputs: Dict[str, object] | None = None
+    coeff_df = pd.DataFrame()
 
-    coeff_df = _annotate_polymer_family_matches(coeff_df, patterns={k.lower(): v for k, v in polymer_patterns.items()})
-    coeff_df.to_csv(metrics_dir / "inverse_candidate_pool.csv", index=False)
-    polymer_family_map = _build_polymer_family_map(coeff_df)
+    for attempt_idx in range(1, sampling_attempts_max + 1):
+        attempt_resampling_dir = step_dir / f"step2_resampling_attempt_{attempt_idx:02d}"
+        attempt_random_seed = int(config["data"]["random_seed"]) + attempt_idx - 1
+        print(f"Sampling attempt {attempt_idx}/{sampling_attempts_max}...")
+        attempt_coeff_df, attempt_pool_summary, attempt_training_canonical = build_candidate_pool(
+            args=args,
+            config=config,
+            chi_cfg=chi_cfg,
+            results_dir=results_dir,
+            base_results_dir=base_results_dir,
+            step4_reg_metrics_dir=step4_reg_metrics_dir,
+            step4_cls_metrics_dir=step4_cls_metrics_dir,
+            device=device,
+            split_mode=split_mode,
+            resampling_step_dir=attempt_resampling_dir,
+            resampling_random_seed=attempt_random_seed,
+        )
+        training_canonical = attempt_training_canonical
+        attempt_pool_summary = dict(attempt_pool_summary)
+        attempt_pool_summary["sampling_attempt"] = attempt_idx
+        attempt_pool_summary["sampling_random_seed"] = attempt_random_seed
+        attempt_pool_summary["selected_polymer_classes"] = selected_classes
 
-    class_coverage = {
-        cls: int(coeff_df[f"polymer_class_{cls}"].sum())
-        for cls in selected_classes
+        if not attempt_coeff_df.empty:
+            attempt_coeff_df["sampling_attempt"] = attempt_idx
+            attempt_coeff_df = _annotate_polymer_family_matches(
+                attempt_coeff_df,
+                patterns={k.lower(): v for k, v in polymer_patterns.items()},
+            )
+            accumulated_pools.append(attempt_coeff_df)
+            coeff_df = _accumulate_candidate_pools(accumulated_pools)
+            score_outputs = _score_candidate_pool(
+                coeff_df=coeff_df,
+                target_df=target_df,
+                selected_classes=selected_classes,
+                epsilon=epsilon,
+                default_property_rule=default_property_rule,
+                uncertainty_enabled=uncertainty_enabled,
+                uncertainty_class_z=uncertainty_class_z,
+                uncertainty_property_z=uncertainty_property_z,
+                uncertainty_score_weight=uncertainty_score_weight,
+                coverage_topk=coverage_topk,
+                training_canonical=training_canonical,
+                target_polymer_count=target_polymer_count,
+                target_stars=target_stars,
+                target_sa_max=target_sa_max,
+                n_base_conditions=int(len(base_target_df)),
+            )
+            class_coverage = score_outputs["class_coverage"]
+            target_poly_summary = score_outputs["target_poly_summary"]
+        elif score_outputs is not None:
+            class_coverage = score_outputs["class_coverage"]
+            target_poly_summary = score_outputs["target_poly_summary"]
+        else:
+            class_coverage = _compute_class_coverage(coeff_df, selected_classes)
+            target_poly_summary = {
+                "n_polymers_pass_all_targets": 0,
+                "n_polymers_pass_any_target_class": 0,
+                "target_count_selected": 0,
+                "target_count_requested": int(target_polymer_count),
+            }
+
+        attempt_pool_summary["candidate_polymer_class_hits"] = class_coverage
+        attempt_pool_summary["accumulated_candidate_count"] = int(len(coeff_df))
+        attempt_pool_summary["target_count_selected"] = int(target_poly_summary["target_count_selected"])
+        attempt_manifests.append(attempt_pool_summary)
+
+        row = {
+            "sampling_attempt": int(attempt_idx),
+            "attempt_candidate_count_after_dedup": int(len(attempt_coeff_df)),
+            "accumulated_candidate_count": int(len(coeff_df)),
+            "target_count_selected": int(target_poly_summary["target_count_selected"]),
+            "n_polymers_pass_all_targets": int(target_poly_summary.get("n_polymers_pass_all_targets", 0)),
+            "n_polymers_pass_any_target_class": int(target_poly_summary.get("n_polymers_pass_any_target_class", 0)),
+            "sampling_random_seed": int(attempt_random_seed),
+        }
+        for cls in selected_classes:
+            row[f"class_hits_{cls}"] = int(class_coverage.get(cls, 0))
+        attempt_rows.append(row)
+
+        class_msg = ", ".join(f"{cls}={class_coverage.get(cls, 0)}" for cls in selected_classes)
+        print(
+            "  accumulated candidates="
+            f"{len(coeff_df)}, selected={target_poly_summary['target_count_selected']}/{target_polymer_count}, "
+            f"class_hits[{class_msg}]"
+        )
+        if int(target_poly_summary["target_count_selected"]) >= int(target_polymer_count):
+            print("  Sampling requirement met; stopping resampling loop.")
+            break
+
+    if training_canonical is None or score_outputs is None:
+        raise RuntimeError("Step 6 failed to build any candidate pool from fresh Step 2 resampling.")
+
+    class_coverage = score_outputs["class_coverage"]
+    candidate_df = score_outputs["candidate_df"]
+    target_metrics_df = score_outputs["target_metrics_df"]
+    aggregate_df = score_outputs["aggregate_df"]
+    post = score_outputs["post"]
+    coverage = score_outputs["coverage"]
+    target_poly_df = score_outputs["target_poly_df"]
+    target_poly_summary = score_outputs["target_poly_summary"]
+
+    if int(target_poly_summary["target_count_selected"]) == 0:
+        coverage_msg = ", ".join(f"{cls}={class_coverage.get(cls, 0)}" for cls in selected_classes)
+        raise RuntimeError(
+            "Step 6 could not find any target polymers that satisfy the class + solubility + property requirements "
+            f"after {len(attempt_rows)} fresh sampling attempts. class_hits[{coverage_msg}]"
+        )
+
+    pool_summary = {
+        "candidate_source": candidate_source,
+        "step4_regression_metrics_dir": str(step4_reg_metrics_dir),
+        "step4_classification_metrics_dir": str(step4_cls_metrics_dir),
+        "uncertainty_enabled": bool(uncertainty_enabled),
+        "uncertainty_mc_samples": int(uncertainty_mc_samples),
+        "uncertainty_seed": int(uncertainty_seed),
+        "sampling_attempts_max": int(sampling_attempts_max),
+        "sampling_attempts_used": int(len(attempt_rows)),
+        "n_generated_input_total": int(sum(int(m.get("n_generated_input", 0)) for m in attempt_manifests)),
+        "n_valid_total": int(sum(int(m.get("n_valid", 0)) for m in attempt_manifests)),
+        "n_valid_two_stars_total": int(sum(int(m.get("n_valid_two_stars", 0)) for m in attempt_manifests)),
+        "novel_candidate_count_total_pre_dedup": int(sum(int(m.get("novel_candidate_count", 0)) for m in attempt_manifests)),
+        "candidate_count_total_before_cross_attempt_dedup": int(
+            sum(int(m.get("candidate_count_after_dedup", 0)) for m in attempt_manifests)
+        ),
+        "candidate_count_after_dedup": int(len(coeff_df)),
+        "selected_polymer_classes": selected_classes,
+        "candidate_polymer_class_hits": class_coverage,
+        "step2_resampling_step_dirs": [m.get("step2_resampling_step_dir", "") for m in attempt_manifests],
+        "step2_resampling_generated_csvs": [m.get("step2_resampling_generated_csv", "") for m in attempt_manifests],
+        "sampling_attempt_log_csv": str(metrics_dir / "sampling_attempts.csv"),
     }
-    pool_summary["selected_polymer_classes"] = selected_classes
-    pool_summary["candidate_polymer_class_hits"] = class_coverage
 
+    coeff_df.to_csv(metrics_dir / "inverse_candidate_pool.csv", index=False)
     with open(metrics_dir / "inverse_candidate_pool_summary.json", "w") as f:
         json.dump(pool_summary, f, indent=2)
-
-    # Per-target candidate ranking
-    all_candidates = []
-    target_metrics = []
-    for _, row in target_df.iterrows():
-        cand = _compute_target_candidates(
-            target_row=row,
-            coeff_df=coeff_df,
-            epsilon=epsilon,
-            default_property_rule=default_property_rule,
-            uncertainty_enabled=uncertainty_enabled,
-            uncertainty_class_z=uncertainty_class_z,
-            uncertainty_property_z=uncertainty_property_z,
-            uncertainty_score_weight=uncertainty_score_weight,
-        )
-        all_candidates.append(cand)
-        target_metrics.append(_target_metrics(cand))
-
-    candidate_df = pd.concat(all_candidates, ignore_index=True)
-    target_metrics_df = pd.DataFrame(target_metrics)
-    aggregate_df = _aggregate_metrics(target_metrics_df)
+    with open(metrics_dir / "sampling_attempt_manifest.json", "w") as f:
+        json.dump(attempt_manifests, f, indent=2)
+    pd.DataFrame(attempt_rows).to_csv(metrics_dir / "sampling_attempts.csv", index=False)
 
     candidate_df.to_csv(metrics_dir / "inverse_candidates_all.csv", index=False)
     target_metrics_df.to_csv(metrics_dir / "inverse_target_metrics.csv", index=False)
     aggregate_df.to_csv(metrics_dir / "inverse_aggregate_metrics.csv", index=False)
-
-    post = _postprocess_metrics(candidate_df, target_metrics_df)
     post["by_condition"].to_csv(metrics_dir / "inverse_metrics_by_class_condition.csv", index=False)
     post["top1_sa"].to_csv(metrics_dir / "inverse_top1_sa_scores.csv", index=False)
-
-    topk = candidate_df[candidate_df["rank"] <= coverage_topk].copy()
-    if "class_prob_lcb" not in topk.columns:
-        topk["class_prob_lcb"] = topk["class_prob"]
-    if "chi_pred_std_target" not in topk.columns:
-        topk["chi_pred_std_target"] = 0.0
-    coverage = (
-        topk.groupby(["target_polymer_class", "candidate_source", "polymer_id", "Polymer"], as_index=False)
-        .agg(
-            selected_count=("rank", "size"),
-            mean_class_prob=("class_prob", "mean"),
-            mean_class_prob_lcb=("class_prob_lcb", "mean"),
-            mean_property_error=("property_error", "mean"),
-            mean_abs_error=("abs_error", "mean"),
-            mean_pred_chi_std=("chi_pred_std_target", "mean"),
-            mean_novel_rate=("is_novel_vs_train", "mean"),
-            mean_polymer_class_hit=("polymer_class_hit", "mean"),
-        )
-        .sort_values(["target_polymer_class", "selected_count"], ascending=[True, False])
-    )
-    coverage["selected_rate"] = coverage["selected_count"] / float(len(base_target_df))
     coverage.to_csv(metrics_dir / "inverse_polymer_coverage.csv", index=False)
 
-    target_poly_df, target_poly_summary = _select_final_target_polymers(
-        candidate_df=candidate_df,
-        training_canonical=training_canonical,
-        polymer_family_map=polymer_family_map,
-        target_count=target_polymer_count,
-        target_stars=target_stars,
-        sa_max=target_sa_max,
-        total_sampling_points=int(len(coeff_df)),
-    )
     target_poly_df.to_csv(metrics_dir / "target_polymers.csv", index=False)
     pd.DataFrame([target_poly_summary]).to_csv(metrics_dir / "target_polymer_selection_summary.csv", index=False)
     if target_poly_summary["target_count_selected"] < target_poly_summary["target_count_requested"]:
@@ -1112,6 +1345,10 @@ def main(args):
             f"selected={target_poly_summary['target_count_selected']}, "
             f"requested={target_poly_summary['target_count_requested']}"
         )
+
+    overall_row = aggregate_df[aggregate_df["scope"] == "overall"].iloc[0].to_dict()
+    target_success_rate = float(overall_row.get("target_success_rate", np.nan))
+    screening_yield = float(target_poly_summary["selection_success_rate"])
 
     summary = {
         "n_targets": int(len(target_df)),
@@ -1136,7 +1373,8 @@ def main(args):
         "coverage_topk": coverage_topk,
         "target_polymer_count_requested": int(target_poly_summary["target_count_requested"]),
         "target_polymer_count_selected": int(target_poly_summary["target_count_selected"]),
-        "target_polymer_selection_success_rate": float(target_poly_summary["selection_success_rate"]),
+        "target_polymer_selection_success_rate": target_success_rate,
+        "target_polymer_screening_yield": screening_yield,
         "target_polymer_diversity": float(target_poly_summary["final_diversity"]),
         "target_polymer_mean_sa": float(target_poly_summary["final_mean_sa"]),
         "target_polymer_std_sa": float(target_poly_summary["final_std_sa"]),
@@ -1147,7 +1385,6 @@ def main(args):
         summary["mean_candidate_pred_chi_std"] = float(np.nanmean(candidate_df["chi_pred_std_target"]))
     if "class_prob_std" in coeff_df.columns:
         summary["mean_candidate_class_prob_std"] = float(np.nanmean(coeff_df["class_prob_std"]))
-    overall_row = aggregate_df[aggregate_df["scope"] == "overall"].iloc[0].to_dict()
     for key, value in overall_row.items():
         if isinstance(value, (np.floating, np.integer)):
             summary[key] = float(value)
@@ -1168,7 +1405,9 @@ def main(args):
             f"total_sampling_examples: {target_poly_summary['total_candidates_screened']}",
             f"target_count_requested: {target_poly_summary['target_count_requested']}",
             f"target_count_selected: {target_poly_summary['target_count_selected']}",
-            f"success_rate: {target_poly_summary['selection_success_rate']:.6f}",
+            f"target_success_rate: {target_success_rate:.6f}",
+            f"screening_yield: {screening_yield:.6f}",
+            f"sampling_attempts_used: {len(attempt_rows)}",
             f"diversity: {target_poly_summary['final_diversity']:.6f}",
             f"mean_sa: {target_poly_summary['final_mean_sa']:.6f}",
             f"std_sa: {target_poly_summary['final_std_sa']:.6f}",
@@ -1223,10 +1462,15 @@ if __name__ == "__main__":
         "--candidate_source",
         type=str,
         default=None,
-        help="Candidate pool source: novel|known|hybrid (aliases: generated/step2->novel, step4/training->known).",
+        help="Candidate pool source. Only fresh Step 2 resampling is supported: novel (aliases: generated/step2).",
     )
-    parser.add_argument("--generated_csv", type=str, default=None, help="Generated samples CSV from Step 2")
-    parser.add_argument("--generated_smiles_column", type=str, default="smiles", help="SMILES column name in generated_csv")
+    parser.add_argument(
+        "--generated_csv",
+        type=str,
+        default=None,
+        help="Unsupported override. Step 6 always launches a fresh Step 2 sampling run.",
+    )
+    parser.add_argument("--generated_smiles_column", type=str, default="smiles", help="SMILES column name in the fresh Step 2 samples CSV")
     parser.add_argument("--allow_non_two_stars", action="store_true", help="Allow generated candidates without exactly two '*' tokens")
     parser.add_argument("--max_novel_candidates", type=int, default=50000, help="Max number of novel generated candidates to keep")
 
@@ -1250,6 +1494,12 @@ if __name__ == "__main__":
     parser.add_argument("--uncertainty_score_weight", type=float, default=None, help="Additional score penalty weight for predictive chi std")
     parser.add_argument("--uncertainty_seed", type=int, default=None, help="Random seed used for MC-dropout inference")
     parser.add_argument("--coverage_topk", type=int, default=None, help="Top-k used for coverage summary")
+    parser.add_argument(
+        "--sampling_attempts_max",
+        type=int,
+        default=None,
+        help="Maximum fresh Step 2 sampling attempts to accumulate before giving up (default: chi_training.step6_class_inverse_design.sampling_attempts_max or 5)",
+    )
 
     parser.add_argument("--embedding_pooling", type=str, default="mean", choices=["mean", "cls", "max"], help="Pooling for embedding extraction on novel candidates")
     parser.add_argument("--embedding_batch_size", type=int, default=None, help="Batch size for novel embedding extraction")

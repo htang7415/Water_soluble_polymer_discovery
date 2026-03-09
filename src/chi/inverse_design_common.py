@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import sys
 from typing import Dict, List, Tuple
 import warnings
 
@@ -127,13 +129,10 @@ def parse_candidate_source(value: str) -> str:
     v = value.strip().lower()
     if v in {"novel", "generated", "step2"}:
         return "novel"
-    if v in {"known", "step4", "training"}:
-        return "known"
-    if v in {"hybrid", "both"}:
-        return "hybrid"
     raise ValueError(
-        "candidate_source must be one of {'novel','known','hybrid'} "
-        "(aliases: generated/step2 -> novel, step4/training -> known, both -> hybrid)"
+        "candidate_source must be 'novel' for this workflow "
+        "(aliases: generated/step2 -> novel). "
+        "Step 5/6 candidate pools are restricted to Step 2-generated polymers."
     )
 
 
@@ -334,6 +333,62 @@ def prepare_novel_candidates(
         "novel_fraction_among_valid_unique": float(n_novel_unique / n_valid_unique) if n_valid_unique > 0 else 0.0,
     }
     return cand_df, summary
+
+
+def launch_fresh_step2_resampling(
+    args,
+    split_mode: str,
+    resampling_step_dir: Path,
+    random_seed: int | None = None,
+) -> Tuple[Path, Dict[str, object]]:
+    repo_root = Path(__file__).resolve().parents[2]
+    step2_script = repo_root / "scripts" / "step2_sample_and_evaluate.py"
+    if not step2_script.exists():
+        raise FileNotFoundError(f"Step 2 sampling script not found: {step2_script}")
+
+    cmd = [
+        sys.executable,
+        str(step2_script),
+        "--config",
+        str(args.config),
+        "--model_size",
+        str(args.model_size),
+        "--split_mode",
+        str(split_mode),
+        "--output_step_dir",
+        str(resampling_step_dir),
+    ]
+    if getattr(args, "backbone_checkpoint", None):
+        cmd.extend(["--checkpoint", str(args.backbone_checkpoint)])
+    if random_seed is not None:
+        cmd.extend(["--random_seed", str(int(random_seed))])
+
+    print(f"Launching fresh Step 2 resampling into: {resampling_step_dir}")
+    try:
+        subprocess.run(cmd, cwd=str(repo_root), check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Fresh Step 2 resampling failed during Step 5/6 candidate generation. "
+            f"Command: {' '.join(cmd)}"
+        ) from exc
+
+    metrics_dir = resampling_step_dir / "metrics"
+    generated_csv = metrics_dir / "generated_samples.csv"
+    if not generated_csv.exists():
+        raise FileNotFoundError(
+            "Fresh Step 2 resampling completed but generated_samples.csv is missing. "
+            f"Expected: {generated_csv}"
+        )
+
+    summary = {
+        "step2_resampling_step_dir": str(resampling_step_dir),
+        "step2_resampling_metrics_dir": str(metrics_dir),
+        "step2_resampling_generated_csv": str(generated_csv),
+        "step2_resampling_target_csv": str(metrics_dir / "target_polymers.csv"),
+        "step2_resampling_summary_csv": str(metrics_dir / "step_summary.csv"),
+        "step2_resampling_random_seed": None if random_seed is None else int(random_seed),
+    }
+    return generated_csv, summary
 
 
 @torch.no_grad()
@@ -699,6 +754,9 @@ def build_candidate_pool(
     step4_reg_metrics_dir: Path,
     step4_cls_metrics_dir: Path,
     device: str,
+    split_mode: str,
+    resampling_step_dir: Path | None = None,
+    resampling_random_seed: int | None = None,
 ) -> Tuple[pd.DataFrame, Dict[str, object], set[str]]:
     source = parse_candidate_source(args.candidate_source)
     training_canonical = resolve_training_smiles(results_dir, base_results_dir)
@@ -730,14 +788,21 @@ def build_candidate_pool(
         pool_frames.append(known_df)
 
     if source in {"novel", "hybrid"}:
-        if args.generated_csv:
-            generated_csv = Path(args.generated_csv)
-        else:
-            default_candidates = [
-                results_dir / "step2_sampling" / "metrics" / "target_polymers.csv",
-                results_dir / "step2_sampling" / "metrics" / "generated_samples.csv",
-            ]
-            generated_csv = next((p for p in default_candidates if p.exists()), default_candidates[0])
+        if getattr(args, "generated_csv", None):
+            raise ValueError(
+                "--generated_csv is unsupported for Step 5/6. "
+                "These steps must launch a fresh Step 2 sampling run from the Step 1 checkpoint."
+            )
+        if resampling_step_dir is None:
+            raise ValueError("resampling_step_dir is required for fresh Step 2 candidate generation.")
+
+        generated_csv, resampling_summary = launch_fresh_step2_resampling(
+            args=args,
+            split_mode=split_mode,
+            resampling_step_dir=resampling_step_dir,
+            random_seed=resampling_random_seed,
+        )
+        summary.update(resampling_summary)
 
         novel_df, novel_summary = prepare_novel_candidates(
             generated_csv=generated_csv,
