@@ -23,6 +23,7 @@ from src.chi.inverse_design_common import (
     build_candidate_pool,
     default_chi_config,
     load_soluble_targets,
+    load_step2_resampling_step_summary,
     parse_candidate_source,
     set_plot_style,
 )
@@ -506,6 +507,7 @@ def _select_final_target_polymers(
                 "SMILES": smiles,
                 "canonical_smiles": canonical,
                 "candidate_source": row.get("candidate_source", "unknown"),
+                "sampling_attempt": int(row["sampling_attempt"]) if not pd.isna(row.get("sampling_attempt", np.nan)) else np.nan,
                 "temperature": float(row["temperature"]),
                 "phi": float(row["phi"]),
                 "target_chi": float(row["target_chi"]),
@@ -606,6 +608,70 @@ def _append_step_log(step_dir: Path, lines: List[str]) -> None:
             f.write(f"{line}\n")
 
 
+def _build_selected_target_candidate_ranked_df(target_poly_df: pd.DataFrame) -> pd.DataFrame:
+    if target_poly_df.empty:
+        return target_poly_df.copy()
+
+    preferred_cols = [
+        "target_rank",
+        "Polymer",
+        "SMILES",
+        "candidate_source",
+        "sampling_attempt",
+        "class_prob",
+        "class_prob_lcb",
+        "max_property_error_all_targets",
+        "mean_property_error_all_targets",
+        "n_targets_joint_hit",
+        "n_targets_required",
+        "passes_all_target_conditions",
+        "sa_score",
+        "polymer_family",
+    ]
+    cols = [c for c in preferred_cols if c in target_poly_df.columns]
+    out = target_poly_df[cols].copy()
+    if "target_rank" in out.columns:
+        out = out.sort_values("target_rank").reset_index(drop=True)
+    return out
+
+
+def _build_sampling_process_summary(
+    attempt_rows: List[Dict[str, object]],
+    target_poly_summary: Dict[str, float],
+    resampling_target_polymer_count: int,
+    sampling_attempts_max: int,
+) -> pd.DataFrame:
+    total_raw = int(sum(int(row.get("step2_generated_count_raw", 0) or 0) for row in attempt_rows))
+    total_accepted = int(sum(int(row.get("step2_accepted_count", 0) or 0) for row in attempt_rows))
+    total_shortfall = int(sum(int(row.get("step2_valid_only_shortfall_count", 0) or 0) for row in attempt_rows))
+    qualified = int(target_poly_summary.get("filter_pass_unique", 0))
+    selected = int(target_poly_summary.get("target_count_selected", 0))
+    screened = int(target_poly_summary.get("total_candidates_screened", 0))
+    return pd.DataFrame(
+        [
+            {
+                "sampling_attempts_max": int(sampling_attempts_max),
+                "sampling_attempts_used": int(len(attempt_rows)),
+                "resampling_target_polymer_count_per_attempt": int(resampling_target_polymer_count),
+                "step2_raw_generated_total": total_raw,
+                "step2_accepted_total": total_accepted,
+                "step2_shortfall_total": total_shortfall,
+                "step2_overall_acceptance_rate": float(total_accepted / total_raw) if total_raw > 0 else np.nan,
+                "step5_candidates_screened_total": screened,
+                "step5_qualified_candidate_count": qualified,
+                "step5_qualified_fraction_of_screened": float(qualified / screened) if screened > 0 else np.nan,
+                "step5_target_count_selected": selected,
+                "step5_selected_fraction_of_qualified": float(selected / qualified) if qualified > 0 else np.nan,
+                "stop_reason": (
+                    "target_count_reached"
+                    if selected >= int(target_poly_summary.get("target_count_requested", 0))
+                    else "max_attempts_reached"
+                ),
+            }
+        ]
+    )
+
+
 def _save_figures(
     target_metrics_df: pd.DataFrame,
     candidate_df: pd.DataFrame,
@@ -613,6 +679,7 @@ def _save_figures(
     topk_novelty: pd.DataFrame,
     target_poly_df: pd.DataFrame,
     target_poly_summary: Dict[str, float],
+    sampling_attempts_df: pd.DataFrame,
     out_dir: Path,
     dpi: int,
     font_size: int,
@@ -695,6 +762,40 @@ def _save_figures(
         ax.set_title("Most frequently selected polymers")
         fig.tight_layout()
         fig.savefig(out_dir / "top5_polymer_selection_frequency.png", dpi=dpi)
+        plt.close(fig)
+
+    # Final selected target candidates by rank
+    if not target_poly_df.empty and "target_rank" in target_poly_df.columns:
+        sel = target_poly_df.sort_values("target_rank").copy()
+        error_col = (
+            "max_property_error_all_targets"
+            if "max_property_error_all_targets" in sel.columns
+            else "property_error"
+        )
+        confidence_col = "class_prob_lcb" if "class_prob_lcb" in sel.columns else "class_prob"
+        fig, ax1 = plt.subplots(figsize=(7, 5))
+        ax1.plot(
+            sel["target_rank"].to_numpy(dtype=float),
+            sel[error_col].to_numpy(dtype=float),
+            marker="o",
+            linewidth=2,
+            color="#e45756",
+        )
+        ax1.set_xlabel("Final target rank")
+        ax1.set_ylabel("Max property error across targets" if error_col == "max_property_error_all_targets" else "Property error")
+        ax2 = ax1.twinx()
+        ax2.plot(
+            sel["target_rank"].to_numpy(dtype=float),
+            sel[confidence_col].to_numpy(dtype=float),
+            marker="s",
+            linewidth=1.8,
+            linestyle="--",
+            color="#4c78a8",
+        )
+        ax2.axhline(0.5, color="#474747", linewidth=1.0, linestyle=":", alpha=0.7)
+        ax2.set_ylabel("Solubility confidence")
+        fig.tight_layout()
+        fig.savefig(out_dir / "selected_target_quality_by_rank.png", dpi=dpi)
         plt.close(fig)
 
     # Top1 confidence vs error
@@ -859,6 +960,79 @@ def _save_figures(
             fig.savefig(out_dir / "selected_polymer_chi_parity_all_conditions.png", dpi=dpi)
             plt.close(fig)
 
+    # Sampling progress across attempts
+    if not sampling_attempts_df.empty and "sampling_attempt" in sampling_attempts_df.columns:
+        progress = sampling_attempts_df.sort_values("sampling_attempt").copy()
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+        count_specs = [
+            ("step2_accepted_count", "Step 2 accepted", "#4c78a8"),
+            ("accumulated_candidate_count", "Accumulated screened", "#54a24b"),
+            ("n_polymers_pass_all_targets", "Qualified", "#f58518"),
+            ("target_count_selected", "Selected", "#e45756"),
+        ]
+        for col, label, color in count_specs:
+            if col in progress.columns:
+                axes[0].plot(
+                    progress["sampling_attempt"].to_numpy(dtype=float),
+                    progress[col].to_numpy(dtype=float),
+                    marker="o",
+                    linewidth=2,
+                    color=color,
+                    label=label,
+                )
+        axes[0].axhline(
+            float(target_poly_summary.get("target_count_requested", 0)),
+            color="#474747",
+            linewidth=1.0,
+            linestyle=":",
+            label="Requested target count",
+        )
+        axes[0].set_xlabel("Sampling attempt")
+        axes[0].set_ylabel("Count")
+        axes[0].legend(frameon=False, fontsize=max(font_size - 4, 8))
+
+        if "step2_valid_only_acceptance_rate" in progress.columns:
+            axes[1].plot(
+                progress["sampling_attempt"].to_numpy(dtype=float),
+                progress["step2_valid_only_acceptance_rate"].to_numpy(dtype=float),
+                marker="o",
+                linewidth=2,
+                color="#4c78a8",
+                label="Step 2 acceptance rate",
+            )
+        if "accumulated_candidate_count" in progress.columns and "n_polymers_pass_all_targets" in progress.columns:
+            denom = progress["accumulated_candidate_count"].replace(0, np.nan).to_numpy(dtype=float)
+            qualified_rate = progress["n_polymers_pass_all_targets"].to_numpy(dtype=float) / denom
+            axes[1].plot(
+                progress["sampling_attempt"].to_numpy(dtype=float),
+                qualified_rate,
+                marker="s",
+                linewidth=2,
+                linestyle="--",
+                color="#f58518",
+                label="Qualified / screened",
+            )
+        if "accumulated_candidate_count" in progress.columns and "target_count_selected" in progress.columns:
+            denom = progress["accumulated_candidate_count"].replace(0, np.nan).to_numpy(dtype=float)
+            selected_rate = progress["target_count_selected"].to_numpy(dtype=float) / denom
+            axes[1].plot(
+                progress["sampling_attempt"].to_numpy(dtype=float),
+                selected_rate,
+                marker="^",
+                linewidth=2,
+                linestyle="-.",
+                color="#e45756",
+                label="Selected / screened",
+            )
+        axes[1].set_xlabel("Sampling attempt")
+        axes[1].set_ylabel("Rate")
+        axes[1].set_ylim(0, 1.05)
+        axes[1].legend(frameon=False, fontsize=max(font_size - 4, 8))
+        fig.tight_layout()
+        fig.savefig(out_dir / "sampling_attempt_progress.png", dpi=dpi)
+        plt.close(fig)
+
 
 def main(args):
     config = load_config(args.config)
@@ -912,6 +1086,11 @@ def main(args):
     sampling_cfg = config.get("sampling", {})
     target_polymer_count = int(chi_cfg.get("target_polymer_count", sampling_cfg.get("target_polymer_count", 100)))
     target_sa_max = float(chi_cfg.get("target_sa_max", sampling_cfg.get("target_sa_max", 4.0)))
+    resampling_target_polymer_count = int(
+        args.resampling_target_polymer_count
+        if args.resampling_target_polymer_count is not None
+        else chi_cfg.get("resampling_target_polymer_count", max(target_polymer_count * 5, 500))
+    )
     sampling_attempts_max = int(
         args.sampling_attempts_max
         if args.sampling_attempts_max is not None
@@ -942,6 +1121,8 @@ def main(args):
         raise ValueError("target_polymer_count must be >= 1")
     if target_sa_max <= 0:
         raise ValueError("target_sa_max must be > 0")
+    if resampling_target_polymer_count < target_polymer_count:
+        raise ValueError("resampling_target_polymer_count must be >= target_polymer_count")
     if sampling_attempts_max < 1:
         raise ValueError("sampling_attempts_max must be >= 1")
     if legacy_class_weight is not None and abs(legacy_class_weight) > 1e-12:
@@ -1034,6 +1215,7 @@ def main(args):
             "target_phi": target_phi,
             "target_polymer_count": target_polymer_count,
             "target_sa_max": target_sa_max,
+            "resampling_target_polymer_count": resampling_target_polymer_count,
             "target_stars": target_stars,
             "sampling_attempts_max": sampling_attempts_max,
             "step2_resampling_root": str(step_dir),
@@ -1048,6 +1230,7 @@ def main(args):
     print(f"split_mode={split_mode}")
     print(f"candidate_source={candidate_source}")
     print(f"epsilon={epsilon}")
+    print(f"resampling_target_polymer_count={resampling_target_polymer_count}")
     print(f"sampling_attempts_max={sampling_attempts_max}")
     if legacy_class_weight is not None:
         print(f"legacy_class_weight_ignored={legacy_class_weight}")
@@ -1098,12 +1281,16 @@ def main(args):
             device=device,
             split_mode=split_mode,
             resampling_step_dir=attempt_resampling_dir,
+            resampling_target_polymer_count=resampling_target_polymer_count,
             resampling_random_seed=attempt_random_seed,
         )
         training_canonical = attempt_training_canonical
         attempt_pool_summary = dict(attempt_pool_summary)
         attempt_pool_summary["sampling_attempt"] = attempt_idx
         attempt_pool_summary["sampling_random_seed"] = attempt_random_seed
+        attempt_pool_summary.update(
+            load_step2_resampling_step_summary(attempt_pool_summary.get("step2_resampling_summary_csv"))
+        )
 
         if not attempt_coeff_df.empty:
             attempt_coeff_df["sampling_attempt"] = attempt_idx
@@ -1146,6 +1333,15 @@ def main(args):
                 "accumulated_candidate_count": int(len(coeff_df)),
                 "target_count_selected": int(target_poly_summary["target_count_selected"]),
                 "n_polymers_pass_all_targets": int(target_poly_summary.get("n_polymers_pass_all_targets", 0)),
+                "step2_generation_goal": attempt_pool_summary.get("step2_generation_goal"),
+                "step2_generated_count_raw": attempt_pool_summary.get("step2_generated_count_raw"),
+                "step2_accepted_count": attempt_pool_summary.get("step2_accepted_count"),
+                "step2_valid_only_rounds": attempt_pool_summary.get("step2_valid_only_rounds"),
+                "step2_valid_only_acceptance_rate": attempt_pool_summary.get("step2_valid_only_acceptance_rate"),
+                "step2_valid_only_shortfall_count": attempt_pool_summary.get("step2_valid_only_shortfall_count"),
+                "step2_valid_only_target_met": attempt_pool_summary.get("step2_valid_only_target_met"),
+                "step2_sampling_time_sec": attempt_pool_summary.get("step2_sampling_time_sec"),
+                "step2_samples_per_sec": attempt_pool_summary.get("step2_samples_per_sec"),
             }
         )
 
@@ -1181,6 +1377,7 @@ def main(args):
         "uncertainty_enabled": bool(uncertainty_enabled),
         "uncertainty_mc_samples": int(uncertainty_mc_samples),
         "uncertainty_seed": int(uncertainty_seed),
+        "resampling_target_polymer_count": int(resampling_target_polymer_count),
         "sampling_attempts_max": int(sampling_attempts_max),
         "sampling_attempts_used": int(len(attempt_rows)),
         "n_generated_input_total": int(sum(int(m.get("n_generated_input", 0)) for m in attempt_manifests)),
@@ -1204,7 +1401,8 @@ def main(args):
         json.dump(pool_summary, f, indent=2)
     with open(metrics_dir / "sampling_attempt_manifest.json", "w") as f:
         json.dump(attempt_manifests, f, indent=2)
-    pd.DataFrame(attempt_rows).to_csv(metrics_dir / "sampling_attempts.csv", index=False)
+    sampling_attempts_df = pd.DataFrame(attempt_rows)
+    sampling_attempts_df.to_csv(metrics_dir / "sampling_attempts.csv", index=False)
 
     candidate_df.to_csv(metrics_dir / "inverse_candidates_all.csv", index=False)
     target_metrics_df.to_csv(metrics_dir / "inverse_target_metrics.csv", index=False)
@@ -1215,6 +1413,15 @@ def main(args):
     coverage.to_csv(metrics_dir / "inverse_polymer_coverage.csv", index=False)
 
     target_poly_df.to_csv(metrics_dir / "target_polymers.csv", index=False)
+    _build_selected_target_candidate_ranked_df(target_poly_df).to_csv(
+        metrics_dir / "selected_target_candidate_ranked.csv", index=False
+    )
+    _build_sampling_process_summary(
+        attempt_rows=attempt_rows,
+        target_poly_summary=target_poly_summary,
+        resampling_target_polymer_count=resampling_target_polymer_count,
+        sampling_attempts_max=sampling_attempts_max,
+    ).to_csv(metrics_dir / "sampling_process_summary.csv", index=False)
     pd.DataFrame([target_poly_summary]).to_csv(metrics_dir / "target_polymer_selection_summary.csv", index=False)
     if target_poly_summary["target_count_selected"] < target_poly_summary["target_count_requested"]:
         print(
@@ -1254,6 +1461,17 @@ def main(args):
         "target_polymer_mean_sa": float(target_poly_summary["final_mean_sa"]),
         "target_polymer_std_sa": float(target_poly_summary["final_std_sa"]),
         "target_polymer_mean_property_error": float(target_poly_summary["final_mean_property_error"]),
+        "qualified_candidate_count": int(target_poly_summary.get("filter_pass_unique", 0)),
+        "qualified_candidate_fraction_of_screened": (
+            float(target_poly_summary.get("filter_pass_unique", 0) / target_poly_summary["total_candidates_screened"])
+            if float(target_poly_summary.get("total_candidates_screened", 0)) > 0
+            else np.nan
+        ),
+        "selected_fraction_of_qualified": (
+            float(target_poly_summary["target_count_selected"] / target_poly_summary.get("filter_pass_unique", 0))
+            if float(target_poly_summary.get("filter_pass_unique", 0)) > 0
+            else np.nan
+        ),
         **pool_summary,
     }
     if "chi_pred_std_target" in candidate_df.columns:
@@ -1300,6 +1518,7 @@ def main(args):
         topk_novelty=post["topk_novelty"],
         target_poly_df=target_poly_df,
         target_poly_summary=target_poly_summary,
+        sampling_attempts_df=sampling_attempts_df,
         out_dir=figures_dir,
         dpi=dpi,
         font_size=font_size,
@@ -1363,6 +1582,12 @@ if __name__ == "__main__":
     parser.add_argument("--uncertainty_score_weight", type=float, default=None, help="Additional score penalty weight for predictive chi std")
     parser.add_argument("--uncertainty_seed", type=int, default=None, help="Random seed used for MC-dropout inference")
     parser.add_argument("--coverage_topk", type=int, default=None, help="Top-k used for coverage summary")
+    parser.add_argument(
+        "--resampling_target_polymer_count",
+        type=int,
+        default=None,
+        help="Accepted Step 2 sample target per fresh resampling attempt (default: chi_training.step5_inverse_design.resampling_target_polymer_count or max(5x target_count, 500))",
+    )
     parser.add_argument(
         "--sampling_attempts_max",
         type=int,

@@ -125,6 +125,62 @@ def set_plot_style(font_size: int) -> None:
     apply_publication_figure_style(font_size=font_size, remove_titles=True)
 
 
+def _safe_numeric(value, default=np.nan):
+    try:
+        if value is None:
+            return default
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def load_step2_resampling_step_summary(summary_csv: str | Path | None) -> Dict[str, object]:
+    if summary_csv is None:
+        return {}
+    path = Path(summary_csv)
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+
+    row = df.iloc[0].to_dict()
+    target_met_raw = row.get("valid_only_target_met", None)
+    target_met = None
+    if target_met_raw is not None and not pd.isna(target_met_raw):
+        if isinstance(target_met_raw, str):
+            target_met = int(target_met_raw.strip().lower() in {"1", "true", "yes", "y"})
+        else:
+            target_met = int(bool(target_met_raw))
+
+    return {
+        "step2_generation_goal": int(_safe_numeric(row.get("generation_goal"), default=np.nan))
+        if np.isfinite(_safe_numeric(row.get("generation_goal"), default=np.nan))
+        else None,
+        "step2_generated_count_raw": int(_safe_numeric(row.get("generated_count"), default=np.nan))
+        if np.isfinite(_safe_numeric(row.get("generated_count"), default=np.nan))
+        else None,
+        "step2_accepted_count": int(_safe_numeric(row.get("accepted_count_for_evaluation"), default=np.nan))
+        if np.isfinite(_safe_numeric(row.get("accepted_count_for_evaluation"), default=np.nan))
+        else None,
+        "step2_valid_only_rounds": int(_safe_numeric(row.get("valid_only_rounds"), default=np.nan))
+        if np.isfinite(_safe_numeric(row.get("valid_only_rounds"), default=np.nan))
+        else None,
+        "step2_valid_only_acceptance_rate": _safe_numeric(row.get("valid_only_acceptance_rate"), default=np.nan),
+        "step2_valid_only_shortfall_count": int(_safe_numeric(row.get("valid_only_shortfall_count"), default=np.nan))
+        if np.isfinite(_safe_numeric(row.get("valid_only_shortfall_count"), default=np.nan))
+        else None,
+        "step2_valid_only_target_met": target_met,
+        "step2_sampling_time_sec": _safe_numeric(row.get("sampling_time_sec"), default=np.nan),
+        "step2_samples_per_sec": _safe_numeric(row.get("samples_per_sec"), default=np.nan),
+    }
+
+
 def parse_candidate_source(value: str) -> str:
     v = value.strip().lower()
     if v in {"novel", "generated", "step2"}:
@@ -339,6 +395,7 @@ def launch_fresh_step2_resampling(
     args,
     split_mode: str,
     resampling_step_dir: Path,
+    target_polymer_count: int | None = None,
     random_seed: int | None = None,
 ) -> Tuple[Path, Dict[str, object]]:
     repo_root = Path(__file__).resolve().parents[2]
@@ -358,6 +415,8 @@ def launch_fresh_step2_resampling(
         "--output_step_dir",
         str(resampling_step_dir),
     ]
+    if target_polymer_count is not None:
+        cmd.extend(["--target_polymer_count", str(int(target_polymer_count))])
     if getattr(args, "backbone_checkpoint", None):
         cmd.extend(["--checkpoint", str(args.backbone_checkpoint)])
     if random_seed is not None:
@@ -386,6 +445,7 @@ def launch_fresh_step2_resampling(
         "step2_resampling_generated_csv": str(generated_csv),
         "step2_resampling_target_csv": str(metrics_dir / "target_polymers.csv"),
         "step2_resampling_summary_csv": str(metrics_dir / "step_summary.csv"),
+        "step2_resampling_target_polymer_count": None if target_polymer_count is None else int(target_polymer_count),
         "step2_resampling_random_seed": None if random_seed is None else int(random_seed),
     }
     return generated_csv, summary
@@ -756,6 +816,7 @@ def build_candidate_pool(
     device: str,
     split_mode: str,
     resampling_step_dir: Path | None = None,
+    resampling_target_polymer_count: int | None = None,
     resampling_random_seed: int | None = None,
 ) -> Tuple[pd.DataFrame, Dict[str, object], set[str]]:
     source = parse_candidate_source(args.candidate_source)
@@ -800,6 +861,7 @@ def build_candidate_pool(
             args=args,
             split_mode=split_mode,
             resampling_step_dir=resampling_step_dir,
+            target_polymer_count=resampling_target_polymer_count,
             random_seed=resampling_random_seed,
         )
         summary.update(resampling_summary)

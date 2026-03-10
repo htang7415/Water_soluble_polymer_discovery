@@ -387,7 +387,11 @@ def main(args):
         valid_only_fail_on_shortfall = True
     elif args.valid_only_continue_on_shortfall:
         valid_only_fail_on_shortfall = False
-    target_polymer_count = int(sampling_cfg.get("target_polymer_count", 100))
+    target_polymer_count = int(
+        args.target_polymer_count
+        if args.target_polymer_count is not None
+        else sampling_cfg.get("target_polymer_count", 100)
+    )
     target_sa_max = float(sampling_cfg.get("target_sa_max", 4.0))
     if target_polymer_count < 1:
         raise ValueError(f"sampling.target_polymer_count must be >=1, got {target_polymer_count}")
@@ -932,6 +936,8 @@ if __name__ == '__main__':
                         help='Top-p nucleus filter (default: sampling.top_p in config)')
     parser.add_argument('--target_stars', type=int, default=None,
                         help='Target number of "*" tokens (default: sampling.target_stars in config)')
+    parser.add_argument('--target_polymer_count', type=int, default=None,
+                        help='Target number of accepted polymers to generate for this sampling run (default: sampling.target_polymer_count in config)')
     parser.add_argument('--valid_only', action='store_true',
                         help='Enable valid-only resampling mode')
     parser.add_argument('--no_valid_only', action='store_true',
