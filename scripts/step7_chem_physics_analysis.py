@@ -666,9 +666,13 @@ def _write_science_highlights(summary: Dict[str, object], out_md: Path) -> None:
         f"- Step5 target selection success: `{summary.get('step5_target_selection_success_rate', np.nan):.4f}`",
         f"- Step5 screening yield: `{summary.get('step5_target_screening_yield', np.nan):.4f}`",
         f"- Step5 sampling attempts used: `{int(_safe_float(summary.get('step5_sampling_attempts_used', 0), default=0.0))}`",
+        f"- Step5 qualified candidates after screening: `{summary.get('step5_qualified_candidate_count', np.nan)}`",
+        f"- Step5 selected fraction of qualified pool: `{summary.get('step5_selected_fraction_of_qualified', np.nan):.4f}`",
         f"- Step6 target selection success: `{summary.get('step6_target_selection_success_rate', np.nan):.4f}`",
         f"- Step6 screening yield: `{summary.get('step6_target_screening_yield', np.nan):.4f}`",
         f"- Step6 sampling attempts used: `{int(_safe_float(summary.get('step6_sampling_attempts_used', 0), default=0.0))}`",
+        f"- Step6 qualified candidates after screening: `{summary.get('step6_qualified_candidate_count', np.nan)}`",
+        f"- Step6 selected fraction of qualified pool: `{summary.get('step6_selected_fraction_of_qualified', np.nan):.4f}`",
         "",
         "## Thermodynamics",
         f"- Significant χ class-separation conditions (p < 0.05): `{summary.get('n_significant_conditions', 0)}` / `{summary.get('n_conditions', 0)}`",
@@ -707,10 +711,18 @@ def _write_science_highlights(summary: Dict[str, object], out_md: Path) -> None:
         "## Discovered vs Known",
         f"- Step5 target selection success: `{summary.get('step5_target_selection_success_rate', np.nan):.4f}`",
         f"- Step5 fresh Step2 sample CSV: `{summary.get('step5_step2_resampling_generated_csv', '')}`",
+        f"- Step5 ranked target CSV: `{summary.get('step5_selected_target_candidate_ranked_csv', '')}`",
+        f"- Step5 sampling process summary: `{summary.get('step5_sampling_process_summary_csv', '')}`",
         f"- Step5 sampling attempts used: `{int(_safe_float(summary.get('step5_sampling_attempts_used', 0), default=0.0))}`",
+        f"- Step5 resampling target per attempt: `{summary.get('step5_resampling_target_polymer_count', np.nan)}`",
+        f"- Step5 Step2 raw/accepted totals: `{summary.get('step5_step2_raw_generated_total', np.nan)}` / `{summary.get('step5_step2_accepted_total', np.nan)}`",
         f"- Step5 sampling attempt log: `{summary.get('step5_sampling_attempt_log_csv', '')}`",
         f"- Step6 target selection success: `{summary.get('step6_target_selection_success_rate', np.nan):.4f}`",
+        f"- Step6 ranked target CSV: `{summary.get('step6_selected_target_candidate_ranked_csv', '')}`",
+        f"- Step6 sampling process summary: `{summary.get('step6_sampling_process_summary_csv', '')}`",
         f"- Step6 sampling attempts used: `{int(_safe_float(summary.get('step6_sampling_attempts_used', 0), default=0.0))}`",
+        f"- Step6 resampling target per attempt: `{summary.get('step6_resampling_target_polymer_count', np.nan)}`",
+        f"- Step6 Step2 raw/accepted totals: `{summary.get('step6_step2_raw_generated_total', np.nan)}` / `{summary.get('step6_step2_accepted_total', np.nan)}`",
         f"- Step6 sampling attempt log: `{summary.get('step6_sampling_attempt_log_csv', '')}`",
         "",
         "## Chemistry and Novelty",
@@ -2556,6 +2568,24 @@ def main(args: argparse.Namespace) -> None:
             base_results_dir / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "step_summary.csv",
         ]
     )
+    step5_selected_ranked_path = _first_existing(
+        [
+            results_dir / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "selected_target_candidate_ranked.csv",
+            base_results_dir / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "selected_target_candidate_ranked.csv",
+        ]
+    )
+    step5_sampling_process_summary_path = _first_existing(
+        [
+            results_dir / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_process_summary.csv",
+            base_results_dir / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_process_summary.csv",
+        ]
+    )
+    step5_sampling_attempts_path = _first_existing(
+        [
+            results_dir / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_attempts.csv",
+            base_results_dir / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_attempts.csv",
+        ]
+    )
     step6_targets_path = (
         Path(args.step6_targets_csv)
         if args.step6_targets_csv
@@ -2570,6 +2600,24 @@ def main(args: argparse.Namespace) -> None:
         [
             results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "step_summary.csv",
             base_results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "step_summary.csv",
+        ]
+    )
+    step6_selected_ranked_path = _first_existing(
+        [
+            results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "selected_target_candidate_ranked.csv",
+            base_results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "selected_target_candidate_ranked.csv",
+        ]
+    )
+    step6_sampling_process_summary_path = _first_existing(
+        [
+            results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_process_summary.csv",
+            base_results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_process_summary.csv",
+        ]
+    )
+    step6_sampling_attempts_path = _first_existing(
+        [
+            results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_attempts.csv",
+            base_results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_attempts.csv",
         ]
     )
     step5_inverse_candidates_path = _first_existing(
@@ -2615,8 +2663,22 @@ def main(args: argparse.Namespace) -> None:
             "step4_cls_overall_path": str(step4_cls_overall_path) if step4_cls_overall_path is not None else "",
             "step5_summary_path": str(step5_summary_path) if step5_summary_path is not None else "",
             "step5_targets_path": str(step5_targets_path) if step5_targets_path is not None else "",
+            "step5_selected_ranked_path": str(step5_selected_ranked_path) if step5_selected_ranked_path is not None else "",
+            "step5_sampling_process_summary_path": (
+                str(step5_sampling_process_summary_path)
+                if step5_sampling_process_summary_path is not None
+                else ""
+            ),
+            "step5_sampling_attempts_path": str(step5_sampling_attempts_path) if step5_sampling_attempts_path is not None else "",
             "step6_summary_path": str(step6_summary_path) if step6_summary_path is not None else "",
             "step6_targets_path": str(step6_targets_path) if step6_targets_path is not None else "",
+            "step6_selected_ranked_path": str(step6_selected_ranked_path) if step6_selected_ranked_path is not None else "",
+            "step6_sampling_process_summary_path": (
+                str(step6_sampling_process_summary_path)
+                if step6_sampling_process_summary_path is not None
+                else ""
+            ),
+            "step6_sampling_attempts_path": str(step6_sampling_attempts_path) if step6_sampling_attempts_path is not None else "",
             "step5_inverse_candidates_path": str(step5_inverse_candidates_path) if step5_inverse_candidates_path is not None else "",
             "step6_inverse_candidates_path": str(step6_inverse_candidates_path) if step6_inverse_candidates_path is not None else "",
             "baseline_train_path": str(baseline_train_path) if baseline_train_path is not None else "",
@@ -2712,6 +2774,31 @@ def main(args: argparse.Namespace) -> None:
                 "exists": int(step5_targets_path is not None and step5_targets_path.exists()),
             },
             {
+                "artifact": "step5_selected_target_candidate_ranked",
+                "path": str(step5_selected_ranked_path) if step5_selected_ranked_path is not None else "",
+                "required": 0,
+                "exists": int(step5_selected_ranked_path is not None and step5_selected_ranked_path.exists()),
+            },
+            {
+                "artifact": "step5_sampling_process_summary",
+                "path": (
+                    str(step5_sampling_process_summary_path)
+                    if step5_sampling_process_summary_path is not None
+                    else ""
+                ),
+                "required": 0,
+                "exists": int(
+                    step5_sampling_process_summary_path is not None
+                    and step5_sampling_process_summary_path.exists()
+                ),
+            },
+            {
+                "artifact": "step5_sampling_attempts",
+                "path": str(step5_sampling_attempts_path) if step5_sampling_attempts_path is not None else "",
+                "required": 0,
+                "exists": int(step5_sampling_attempts_path is not None and step5_sampling_attempts_path.exists()),
+            },
+            {
                 "artifact": "step6_summary",
                 "path": str(step6_summary_path) if step6_summary_path is not None else "",
                 "required": 0,
@@ -2722,6 +2809,31 @@ def main(args: argparse.Namespace) -> None:
                 "path": str(step6_targets_path) if step6_targets_path is not None else "",
                 "required": 0,
                 "exists": int(step6_targets_path is not None and step6_targets_path.exists()),
+            },
+            {
+                "artifact": "step6_selected_target_candidate_ranked",
+                "path": str(step6_selected_ranked_path) if step6_selected_ranked_path is not None else "",
+                "required": 0,
+                "exists": int(step6_selected_ranked_path is not None and step6_selected_ranked_path.exists()),
+            },
+            {
+                "artifact": "step6_sampling_process_summary",
+                "path": (
+                    str(step6_sampling_process_summary_path)
+                    if step6_sampling_process_summary_path is not None
+                    else ""
+                ),
+                "required": 0,
+                "exists": int(
+                    step6_sampling_process_summary_path is not None
+                    and step6_sampling_process_summary_path.exists()
+                ),
+            },
+            {
+                "artifact": "step6_sampling_attempts",
+                "path": str(step6_sampling_attempts_path) if step6_sampling_attempts_path is not None else "",
+                "required": 0,
+                "exists": int(step6_sampling_attempts_path is not None and step6_sampling_attempts_path.exists()),
             },
             {
                 "artifact": "step5_inverse_candidates",
@@ -2798,7 +2910,17 @@ def main(args: argparse.Namespace) -> None:
         "step5_target_selection_success_rate": np.nan,
         "step5_target_screening_yield": np.nan,
         "step5_sampling_attempts_used": np.nan,
+        "step5_resampling_target_polymer_count": np.nan,
+        "step5_qualified_candidate_count": np.nan,
+        "step5_qualified_candidate_fraction_of_screened": np.nan,
+        "step5_selected_fraction_of_qualified": np.nan,
+        "step5_step2_raw_generated_total": np.nan,
+        "step5_step2_accepted_total": np.nan,
+        "step5_step2_overall_acceptance_rate": np.nan,
+        "step5_stop_reason": "",
         "step5_sampling_attempt_log_csv": "",
+        "step5_selected_target_candidate_ranked_csv": "",
+        "step5_sampling_process_summary_csv": "",
         "step5_step2_resampling_generated_csv": "",
         "step5_step2_resampling_summary_csv": "",
         "step5_step2_resampling_step_dirs": "",
@@ -2806,7 +2928,17 @@ def main(args: argparse.Namespace) -> None:
         "step6_target_selection_success_rate": np.nan,
         "step6_target_screening_yield": np.nan,
         "step6_sampling_attempts_used": np.nan,
+        "step6_resampling_target_polymer_count": np.nan,
+        "step6_qualified_candidate_count": np.nan,
+        "step6_qualified_candidate_fraction_of_screened": np.nan,
+        "step6_selected_fraction_of_qualified": np.nan,
+        "step6_step2_raw_generated_total": np.nan,
+        "step6_step2_accepted_total": np.nan,
+        "step6_step2_overall_acceptance_rate": np.nan,
+        "step6_stop_reason": "",
         "step6_sampling_attempt_log_csv": "",
+        "step6_selected_target_candidate_ranked_csv": "",
+        "step6_sampling_process_summary_csv": "",
         "step6_step2_resampling_step_dirs": "",
         "step6_step2_resampling_generated_csvs": "",
         "n_conditions": 0,
@@ -2850,7 +2982,9 @@ def main(args: argparse.Namespace) -> None:
     step3_row = _read_summary_row(step3_summary_path)
     step4_row = _read_summary_row(step4_summary_path)
     step5_row = _read_summary_row(step5_summary_path)
+    step5_sampling_process_row = _read_summary_row(step5_sampling_process_summary_path)
     step6_row = _read_summary_row(step6_summary_path)
+    step6_sampling_process_row = _read_summary_row(step6_sampling_process_summary_path)
 
     if step1_row:
         summary["step1_best_val_bpb"] = _pick_numeric(step1_row, ["best_val_bpb"])
@@ -2876,8 +3010,28 @@ def main(args: argparse.Namespace) -> None:
         summary["step5_sampling_attempts_used"] = _pick_numeric(
             step5_row, ["sampling_attempts_used"]
         )
+        summary["step5_resampling_target_polymer_count"] = _pick_numeric(
+            step5_row, ["resampling_target_polymer_count"]
+        )
+        summary["step5_qualified_candidate_count"] = _pick_numeric(
+            step5_row, ["qualified_candidate_count"]
+        )
+        summary["step5_qualified_candidate_fraction_of_screened"] = _pick_numeric(
+            step5_row, ["qualified_candidate_fraction_of_screened"]
+        )
+        summary["step5_selected_fraction_of_qualified"] = _pick_numeric(
+            step5_row, ["selected_fraction_of_qualified"]
+        )
         summary["step5_sampling_attempt_log_csv"] = _pick_text(
             step5_row, ["sampling_attempt_log_csv"]
+        )
+        summary["step5_selected_target_candidate_ranked_csv"] = (
+            str(step5_selected_ranked_path) if step5_selected_ranked_path is not None else ""
+        )
+        summary["step5_sampling_process_summary_csv"] = (
+            str(step5_sampling_process_summary_path)
+            if step5_sampling_process_summary_path is not None
+            else ""
         )
         summary["step5_step2_resampling_generated_csv"] = _pick_text(
             step5_row, ["step2_resampling_generated_csv"]
@@ -2891,6 +3045,33 @@ def main(args: argparse.Namespace) -> None:
         summary["step5_step2_resampling_generated_csvs"] = _pick_text(
             step5_row, ["step2_resampling_generated_csvs"]
         )
+    if step5_sampling_process_row:
+        summary["step5_resampling_target_polymer_count"] = _pick_numeric(
+            step5_sampling_process_row,
+            ["resampling_target_polymer_count_per_attempt", "resampling_target_polymer_count"],
+        )
+        summary["step5_sampling_attempts_used"] = _pick_numeric(
+            step5_sampling_process_row, ["sampling_attempts_used"]
+        )
+        summary["step5_qualified_candidate_count"] = _pick_numeric(
+            step5_sampling_process_row, ["step5_qualified_candidate_count"]
+        )
+        summary["step5_qualified_candidate_fraction_of_screened"] = _pick_numeric(
+            step5_sampling_process_row, ["step5_qualified_fraction_of_screened"]
+        )
+        summary["step5_selected_fraction_of_qualified"] = _pick_numeric(
+            step5_sampling_process_row, ["step5_selected_fraction_of_qualified"]
+        )
+        summary["step5_step2_raw_generated_total"] = _pick_numeric(
+            step5_sampling_process_row, ["step2_raw_generated_total"]
+        )
+        summary["step5_step2_accepted_total"] = _pick_numeric(
+            step5_sampling_process_row, ["step2_accepted_total"]
+        )
+        summary["step5_step2_overall_acceptance_rate"] = _pick_numeric(
+            step5_sampling_process_row, ["step2_overall_acceptance_rate"]
+        )
+        summary["step5_stop_reason"] = _pick_text(step5_sampling_process_row, ["stop_reason"])
     if step6_row:
         summary["step6_target_selection_success_rate"] = _pick_numeric(
             step6_row, ["target_polymer_selection_success_rate"]
@@ -2901,8 +3082,28 @@ def main(args: argparse.Namespace) -> None:
         summary["step6_sampling_attempts_used"] = _pick_numeric(
             step6_row, ["sampling_attempts_used"]
         )
+        summary["step6_resampling_target_polymer_count"] = _pick_numeric(
+            step6_row, ["resampling_target_polymer_count"]
+        )
+        summary["step6_qualified_candidate_count"] = _pick_numeric(
+            step6_row, ["qualified_candidate_count"]
+        )
+        summary["step6_qualified_candidate_fraction_of_screened"] = _pick_numeric(
+            step6_row, ["qualified_candidate_fraction_of_screened"]
+        )
+        summary["step6_selected_fraction_of_qualified"] = _pick_numeric(
+            step6_row, ["selected_fraction_of_qualified"]
+        )
         summary["step6_sampling_attempt_log_csv"] = _pick_text(
             step6_row, ["sampling_attempt_log_csv"]
+        )
+        summary["step6_selected_target_candidate_ranked_csv"] = (
+            str(step6_selected_ranked_path) if step6_selected_ranked_path is not None else ""
+        )
+        summary["step6_sampling_process_summary_csv"] = (
+            str(step6_sampling_process_summary_path)
+            if step6_sampling_process_summary_path is not None
+            else ""
         )
         summary["step6_step2_resampling_step_dirs"] = _pick_text(
             step6_row, ["step2_resampling_step_dirs"]
@@ -2910,6 +3111,33 @@ def main(args: argparse.Namespace) -> None:
         summary["step6_step2_resampling_generated_csvs"] = _pick_text(
             step6_row, ["step2_resampling_generated_csvs"]
         )
+    if step6_sampling_process_row:
+        summary["step6_resampling_target_polymer_count"] = _pick_numeric(
+            step6_sampling_process_row,
+            ["resampling_target_polymer_count_per_attempt", "resampling_target_polymer_count"],
+        )
+        summary["step6_sampling_attempts_used"] = _pick_numeric(
+            step6_sampling_process_row, ["sampling_attempts_used"]
+        )
+        summary["step6_qualified_candidate_count"] = _pick_numeric(
+            step6_sampling_process_row, ["step6_qualified_candidate_count"]
+        )
+        summary["step6_qualified_candidate_fraction_of_screened"] = _pick_numeric(
+            step6_sampling_process_row, ["step6_qualified_fraction_of_screened"]
+        )
+        summary["step6_selected_fraction_of_qualified"] = _pick_numeric(
+            step6_sampling_process_row, ["step6_selected_fraction_of_qualified"]
+        )
+        summary["step6_step2_raw_generated_total"] = _pick_numeric(
+            step6_sampling_process_row, ["step2_raw_generated_total"]
+        )
+        summary["step6_step2_accepted_total"] = _pick_numeric(
+            step6_sampling_process_row, ["step2_accepted_total"]
+        )
+        summary["step6_step2_overall_acceptance_rate"] = _pick_numeric(
+            step6_sampling_process_row, ["step2_overall_acceptance_rate"]
+        )
+        summary["step6_stop_reason"] = _pick_text(step6_sampling_process_row, ["stop_reason"])
 
     # Step4 metrics: prefer step summary; fallback to overall metrics files.
     summary["step4_test_r2"] = _pick_numeric(step4_row, ["step4_1_test_r2", "step4_test_r2"])
@@ -2979,6 +3207,16 @@ def main(args: argparse.Namespace) -> None:
             "key_metric_value": summary["step5_target_selection_success_rate"],
             "screening_yield": summary["step5_target_screening_yield"],
             "sampling_attempts_used": summary["step5_sampling_attempts_used"],
+            "resampling_target_polymer_count": summary["step5_resampling_target_polymer_count"],
+            "qualified_candidate_count": summary["step5_qualified_candidate_count"],
+            "qualified_fraction_of_screened": summary["step5_qualified_candidate_fraction_of_screened"],
+            "selected_fraction_of_qualified": summary["step5_selected_fraction_of_qualified"],
+            "step2_raw_generated_total": summary["step5_step2_raw_generated_total"],
+            "step2_accepted_total": summary["step5_step2_accepted_total"],
+            "step2_overall_acceptance_rate": summary["step5_step2_overall_acceptance_rate"],
+            "stop_reason": summary["step5_stop_reason"],
+            "selected_target_candidate_ranked_csv": summary["step5_selected_target_candidate_ranked_csv"],
+            "sampling_process_summary_csv": summary["step5_sampling_process_summary_csv"],
             "sampling_provenance_path": summary["step5_sampling_attempt_log_csv"],
         }
     )
@@ -2991,6 +3229,16 @@ def main(args: argparse.Namespace) -> None:
             "key_metric_value": summary["step6_target_selection_success_rate"],
             "screening_yield": summary["step6_target_screening_yield"],
             "sampling_attempts_used": summary["step6_sampling_attempts_used"],
+            "resampling_target_polymer_count": summary["step6_resampling_target_polymer_count"],
+            "qualified_candidate_count": summary["step6_qualified_candidate_count"],
+            "qualified_fraction_of_screened": summary["step6_qualified_candidate_fraction_of_screened"],
+            "selected_fraction_of_qualified": summary["step6_selected_fraction_of_qualified"],
+            "step2_raw_generated_total": summary["step6_step2_raw_generated_total"],
+            "step2_accepted_total": summary["step6_step2_accepted_total"],
+            "step2_overall_acceptance_rate": summary["step6_step2_overall_acceptance_rate"],
+            "stop_reason": summary["step6_stop_reason"],
+            "selected_target_candidate_ranked_csv": summary["step6_selected_target_candidate_ranked_csv"],
+            "sampling_process_summary_csv": summary["step6_sampling_process_summary_csv"],
             "sampling_provenance_path": summary["step6_sampling_attempt_log_csv"],
         }
     )
@@ -3018,6 +3266,45 @@ def main(args: argparse.Namespace) -> None:
         success_rows.append(row)
     success_df = pd.DataFrame(success_rows)
     success_df.to_csv(metrics_dir / "step2_step5_step6_success_rates.csv", index=False)
+    inverse_sampling_rollup = pd.DataFrame(
+        [
+            {
+                "step": "step5",
+                "target_selection_success_rate": _safe_float(summary.get("step5_target_selection_success_rate", np.nan)),
+                "screening_yield": _safe_float(summary.get("step5_target_screening_yield", np.nan)),
+                "sampling_attempts_used": _safe_float(summary.get("step5_sampling_attempts_used", np.nan)),
+                "resampling_target_polymer_count": _safe_float(summary.get("step5_resampling_target_polymer_count", np.nan)),
+                "qualified_candidate_count": _safe_float(summary.get("step5_qualified_candidate_count", np.nan)),
+                "qualified_fraction_of_screened": _safe_float(summary.get("step5_qualified_candidate_fraction_of_screened", np.nan)),
+                "selected_fraction_of_qualified": _safe_float(summary.get("step5_selected_fraction_of_qualified", np.nan)),
+                "step2_raw_generated_total": _safe_float(summary.get("step5_step2_raw_generated_total", np.nan)),
+                "step2_accepted_total": _safe_float(summary.get("step5_step2_accepted_total", np.nan)),
+                "step2_overall_acceptance_rate": _safe_float(summary.get("step5_step2_overall_acceptance_rate", np.nan)),
+                "stop_reason": summary.get("step5_stop_reason", ""),
+                "selected_target_candidate_ranked_csv": summary.get("step5_selected_target_candidate_ranked_csv", ""),
+                "sampling_process_summary_csv": summary.get("step5_sampling_process_summary_csv", ""),
+                "sampling_attempt_log_csv": summary.get("step5_sampling_attempt_log_csv", ""),
+            },
+            {
+                "step": "step6",
+                "target_selection_success_rate": _safe_float(summary.get("step6_target_selection_success_rate", np.nan)),
+                "screening_yield": _safe_float(summary.get("step6_target_screening_yield", np.nan)),
+                "sampling_attempts_used": _safe_float(summary.get("step6_sampling_attempts_used", np.nan)),
+                "resampling_target_polymer_count": _safe_float(summary.get("step6_resampling_target_polymer_count", np.nan)),
+                "qualified_candidate_count": _safe_float(summary.get("step6_qualified_candidate_count", np.nan)),
+                "qualified_fraction_of_screened": _safe_float(summary.get("step6_qualified_candidate_fraction_of_screened", np.nan)),
+                "selected_fraction_of_qualified": _safe_float(summary.get("step6_selected_fraction_of_qualified", np.nan)),
+                "step2_raw_generated_total": _safe_float(summary.get("step6_step2_raw_generated_total", np.nan)),
+                "step2_accepted_total": _safe_float(summary.get("step6_step2_accepted_total", np.nan)),
+                "step2_overall_acceptance_rate": _safe_float(summary.get("step6_step2_overall_acceptance_rate", np.nan)),
+                "stop_reason": summary.get("step6_stop_reason", ""),
+                "selected_target_candidate_ranked_csv": summary.get("step6_selected_target_candidate_ranked_csv", ""),
+                "sampling_process_summary_csv": summary.get("step6_sampling_process_summary_csv", ""),
+                "sampling_attempt_log_csv": summary.get("step6_sampling_attempt_log_csv", ""),
+            },
+        ]
+    )
+    inverse_sampling_rollup.to_csv(metrics_dir / "inverse_design_sampling_process_rollup.csv", index=False)
     _plot_pipeline_success_rates(
         success_df,
         out_png=figures_dir / "pipeline_selection_success_rates.png",
@@ -3025,6 +3312,7 @@ def main(args: argparse.Namespace) -> None:
     )
     summary["n_steps_with_available_summary"] = int(rollup_df["available"].sum())
     analysis_blocks.append("step1_to_step6_summary_rollup")
+    analysis_blocks.append("inverse_design_sampling_process_rollup")
 
     # A) Dataset-level thermodynamic class-separation analysis.
     chi_df = _ensure_class_col(pd.read_csv(chi_path))

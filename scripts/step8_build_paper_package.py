@@ -1190,16 +1190,58 @@ def _resolve_input_artifacts(
                     base_results / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "step_summary.csv",
                 ]
             ),
+            "step5_selected_target_candidate_ranked": _first_existing(
+                [
+                    results_dir / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "selected_target_candidate_ranked.csv",
+                    base_results / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "selected_target_candidate_ranked.csv",
+                ]
+            ),
+            "step5_sampling_process_summary": _first_existing(
+                [
+                    results_dir / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_process_summary.csv",
+                    base_results / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_process_summary.csv",
+                ]
+            ),
+            "step5_sampling_attempts": _first_existing(
+                [
+                    results_dir / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_attempts.csv",
+                    base_results / "step5_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_attempts.csv",
+                ]
+            ),
             "step6_summary": _first_existing(
                 [
                     results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "step_summary.csv",
                     base_results / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "step_summary.csv",
                 ]
             ),
+            "step6_selected_target_candidate_ranked": _first_existing(
+                [
+                    results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "selected_target_candidate_ranked.csv",
+                    base_results / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "selected_target_candidate_ranked.csv",
+                ]
+            ),
+            "step6_sampling_process_summary": _first_existing(
+                [
+                    results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_process_summary.csv",
+                    base_results / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_process_summary.csv",
+                ]
+            ),
+            "step6_sampling_attempts": _first_existing(
+                [
+                    results_dir / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_attempts.csv",
+                    base_results / "step6_polymer_class_water_soluble_inverse_design" / split_mode / "metrics" / "sampling_attempts.csv",
+                ]
+            ),
             "step7_summary": _first_existing(
                 [
                     results_dir / "step7_chem_physics_analysis" / split_mode / "metrics" / "step_summary.csv",
                     base_results / "step7_chem_physics_analysis" / split_mode / "metrics" / "step_summary.csv",
+                ]
+            ),
+            "step7_inverse_design_sampling_rollup": _first_existing(
+                [
+                    results_dir / "step7_chem_physics_analysis" / split_mode / "metrics" / "inverse_design_sampling_process_rollup.csv",
+                    base_results / "step7_chem_physics_analysis" / split_mode / "metrics" / "inverse_design_sampling_process_rollup.csv",
                 ]
             ),
             "step4_compare_summary": _first_existing(
@@ -1568,30 +1610,42 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="FigureS3",
-            title="Figure S3. Inverse-Design Screening and Confidence Diagnostics",
+            title="Figure S3. Inverse-Design Target Quality and Sampling Diagnostics",
             destination="si",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Confidence-error relation (unconstrained design)",
-                    candidates=_make_candidates(step5_fig_dirs, ["top1_confidence_vs_error.png"]),
+                    caption="Selected-target quality by rank (unconstrained design)",
+                    candidates=_make_candidates(
+                        step5_fig_dirs,
+                        ["selected_target_quality_by_rank.png", "top1_confidence_vs_error.png"],
+                    ),
                 ),
                 PanelSpec(
-                    caption="Confidence-error relation (class-conditioned design)",
-                    candidates=_make_candidates(step6_fig_dirs, ["top1_confidence_vs_error.png"]),
+                    caption="Selected-target quality by rank (class-conditioned design)",
+                    candidates=_make_candidates(
+                        step6_fig_dirs,
+                        ["selected_target_quality_by_rank.png", "top1_confidence_vs_error.png"],
+                    ),
                 ),
                 PanelSpec(
-                    caption="Top-5 polymer selection frequency",
-                    candidates=_make_candidates(step5_fig_dirs, ["top5_polymer_selection_frequency.png"]),
+                    caption="Sampling-attempt progress (unconstrained design)",
+                    candidates=_make_candidates(
+                        step5_fig_dirs,
+                        ["sampling_attempt_progress.png", "top5_polymer_selection_frequency.png"],
+                    ),
                 ),
                 PanelSpec(
-                    caption="Candidate screening funnel (class-conditioned)",
+                    caption="Sampling-attempt progress (class-conditioned design)",
                     candidates=(
-                        [step6_screening_funnel_derived]
-                        if isinstance(step6_screening_funnel_derived, Path)
-                        else []
-                    )
-                    + _make_candidates(step6_fig_dirs, ["candidate_screening_funnel.png"]),
+                        _make_candidates(step6_fig_dirs, ["sampling_attempt_progress.png"])
+                        + (
+                            [step6_screening_funnel_derived]
+                            if isinstance(step6_screening_funnel_derived, Path)
+                            else []
+                        )
+                        + _make_candidates(step6_fig_dirs, ["candidate_screening_funnel.png"])
+                    ),
                 ),
             ],
         ),
@@ -1863,7 +1917,7 @@ def _write_storyline(
         "## SI Figure Blocks",
         "1. Figure S1: Polymer design foundation: training-corpus quality and thermodynamic target landscape context.",
         "2. Figure S2: Hyperparameter tuning trajectories and learning diagnostics.",
-        "3. Figure S3: Inverse-design screening behavior, confidence-error relations, and funnel behavior.",
+        "3. Figure S3: Inverse-design target-quality ranking and resampling-process diagnostics.",
         "4. Figure S4: Extended chemistry/functional-group representativeness analysis.",
         "5. Figure S5: PINN polynomial and Flory-Huggins thermodynamic interpretation diagnostics.",
         "6. Figure S6: Embedding geometry, PINN sensitivity, and χ-dataset interpretation.",
@@ -2246,17 +2300,33 @@ def _build_manuscript_tables(
             "workflow": "Step5_water_soluble",
             "target_polymer_selection_success_rate": _pick(s5, ["target_polymer_selection_success_rate"]),
             "target_success_rate": _pick(s5, ["target_success_rate"]),
+            "target_polymer_screening_yield": _pick(s5, ["target_polymer_screening_yield"]),
             "mean_top1_abs_error": _pick(s5, ["mean_top1_abs_error"]),
             "target_polymer_diversity": _pick(s5, ["target_polymer_diversity"]),
             "target_polymer_mean_sa": _pick(s5, ["target_polymer_mean_sa"]),
+            "qualified_candidate_count": _pick(s5, ["qualified_candidate_count"]),
+            "qualified_candidate_fraction_of_screened": _pick(
+                s5, ["qualified_candidate_fraction_of_screened"]
+            ),
+            "selected_fraction_of_qualified": _pick(s5, ["selected_fraction_of_qualified"]),
+            "sampling_attempts_used": _pick(s5, ["sampling_attempts_used"]),
+            "resampling_target_polymer_count": _pick(s5, ["resampling_target_polymer_count"]),
         },
         {
             "workflow": "Step6_class_conditioned",
             "target_polymer_selection_success_rate": _pick(s6, ["target_polymer_selection_success_rate"]),
             "target_success_rate": _pick(s6, ["target_success_rate"]),
+            "target_polymer_screening_yield": _pick(s6, ["target_polymer_screening_yield"]),
             "mean_top1_abs_error": _pick(s6, ["mean_top1_abs_error"]),
             "target_polymer_diversity": _pick(s6, ["target_polymer_diversity"]),
             "target_polymer_mean_sa": _pick(s6, ["target_polymer_mean_sa"]),
+            "qualified_candidate_count": _pick(s6, ["qualified_candidate_count"]),
+            "qualified_candidate_fraction_of_screened": _pick(
+                s6, ["qualified_candidate_fraction_of_screened"]
+            ),
+            "selected_fraction_of_qualified": _pick(s6, ["selected_fraction_of_qualified"]),
+            "sampling_attempts_used": _pick(s6, ["sampling_attempts_used"]),
+            "resampling_target_polymer_count": _pick(s6, ["resampling_target_polymer_count"]),
         },
     ]
     table2 = pd.DataFrame(table2_rows)
@@ -2282,11 +2352,17 @@ def _build_manuscript_tables(
     si_table1_path = si_tables_dir / "tableS1_input_artifact_status.csv"
     artifact_df.to_csv(si_table1_path, index=False)
 
-    step5_targets = (
-        paths["step5_dir"] / "metrics" / "target_polymers.csv" if paths.get("step5_dir") is not None else None
+    step5_targets = _first_existing(
+        [
+            paths.get("step5_selected_target_candidate_ranked"),
+            paths["step5_dir"] / "metrics" / "target_polymers.csv" if paths.get("step5_dir") is not None else None,
+        ]
     )
-    step6_targets = (
-        paths["step6_dir"] / "metrics" / "target_polymers.csv" if paths.get("step6_dir") is not None else None
+    step6_targets = _first_existing(
+        [
+            paths.get("step6_selected_target_candidate_ranked"),
+            paths["step6_dir"] / "metrics" / "target_polymers.csv" if paths.get("step6_dir") is not None else None,
+        ]
     )
     step5_df = _safe_read_csv(step5_targets)
     step6_df = _safe_read_csv(step6_targets)
@@ -2427,15 +2503,23 @@ def _copy_source_data(
             paths["step5_dir"] / "metrics" / "inverse_aggregate_metrics.csv"
         )
         to_copy["step5_target_polymers"] = paths["step5_dir"] / "metrics" / "target_polymers.csv"
+    to_copy["step5_selected_target_candidate_ranked"] = paths.get("step5_selected_target_candidate_ranked")
+    to_copy["step5_sampling_process_summary"] = paths.get("step5_sampling_process_summary")
+    to_copy["step5_sampling_attempts"] = paths.get("step5_sampling_attempts")
     if paths.get("step6_dir") is not None:
         to_copy["step6_inverse_aggregate_metrics"] = (
             paths["step6_dir"] / "metrics" / "inverse_aggregate_metrics.csv"
         )
         to_copy["step6_target_polymers"] = paths["step6_dir"] / "metrics" / "target_polymers.csv"
+    to_copy["step6_selected_target_candidate_ranked"] = paths.get("step6_selected_target_candidate_ranked")
+    to_copy["step6_sampling_process_summary"] = paths.get("step6_sampling_process_summary")
+    to_copy["step6_sampling_attempts"] = paths.get("step6_sampling_attempts")
     if paths.get("step7_dir") is not None:
         to_copy["step7_rollup"] = (
             paths["step7_dir"] / "metrics" / "step1_to_step6_summary_rollup.csv"
         )
+        to_copy["step7_inverse_design_sampling_rollup"] = paths.get("step7_inverse_design_sampling_rollup")
+        to_copy["step7_success_rates"] = paths["step7_dir"] / "metrics" / "step2_step5_step6_success_rates.csv"
         to_copy["step7_discovered_descriptor_stats"] = (
             paths["step7_dir"] / "metrics" / "discovered_descriptor_stats.csv"
         )
