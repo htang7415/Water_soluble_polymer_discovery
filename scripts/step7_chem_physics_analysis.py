@@ -72,41 +72,17 @@ FG_COLUMNS = [
 ]
 
 FIGURE_ORDER: List[Tuple[str, str, str]] = [
-    ("pipeline_selection_success_rates.png", "A0", "Pipeline selection success rates"),
-    ("chi_class_delta_heatmap.png", "A1", "Thermodynamic class delta heatmap"),
-    ("chi_class_significance_heatmap.png", "A2", "Thermodynamic significance heatmap"),
-    ("chi_vs_temperature_by_phi_and_class.png", "A3", "Chi vs temperature by phi and class"),
-    ("step3_target_vs_class_means.png", "A4", "Step3 target vs class means"),
-    ("step4_test_mae_heatmap.png", "B1", "Step4 test MAE heatmap"),
-    ("step4_gradient_consistency_dchi_dT.png", "B2", "Step4 gradient consistency dchi/dT"),
-    ("step4_gradient_consistency_dchi_dphi.png", "B3", "Step4 gradient consistency dchi/dphi"),
-    ("selection_tradeoff_chi_vs_solubility_confidence.png", "C1", "Selection tradeoff chi vs confidence"),
-    ("descriptor_shift_vs_step2_target_pool.png", "C2", "Descriptor shift vs Step2 target pool"),
-    ("descriptor_shift_vs_training.png", "C3", "Descriptor shift vs training"),
-    ("novelty_similarity_histogram.png", "C4", "Novelty similarity histogram"),
-    ("step6_target_polymer_class_coverage.png", "C5", "Step6 target polymer class coverage"),
-    ("coefficient_violin_by_class.png", "D1", "Coefficient violin by class"),
-    ("coefficient_a1_vs_a3_by_class.png", "D2", "Coefficient a1 vs a3 by class"),
-    ("dchi_dT_distribution_by_class.png", "D3", "dchi/dT distribution by class"),
-    ("chi_surface_mean_by_class.png", "E1", "Mean chi surface by class"),
-    ("spinodal_phase_diagram.png", "E2", "Spinodal phase diagram"),
-    ("miscible_fraction_below_spinodal_by_class.png", "E3", "Miscible fraction below spinodal by class"),
-    ("free_energy_mixing_by_class.png", "E4", "Free energy mixing by class"),
-    ("descriptor_boxplot_by_class.png", "F1", "Descriptor boxplot by class"),
-    ("functional_group_frequency_by_class.png", "F2", "Functional group frequency by class"),
-    ("logp_vs_mean_chi_by_class.png", "F3", "LogP vs mean chi by class"),
-    ("tpsa_vs_mean_chi_by_class.png", "F4", "TPSA vs mean chi by class"),
-    ("descriptor_chi_correlation_heatmap.png", "F5", "Descriptor-chi correlation heatmap"),
-    ("classification_overlap_counts.png", "H1", "Classification dataset overlap counts"),
-    ("classification_vs_chi_descriptor_shift.png", "H2", "Classification vs chi descriptor shift"),
-    ("classification_vs_chi_fg_frequency.png", "H3", "Classification vs chi functional-group frequency"),
-    ("step1_embedding_pca_by_source.png", "I1", "Step1 embedding PCA by source"),
-    ("embedding_pinn_correlation_heatmap.png", "I2", "Embedding-PINN coefficient correlation heatmap"),
-    ("pinn_coefficient_sensitivity_by_class.png", "I3", "PINN coefficient sensitivity by class"),
+    ("pipeline_selection_success_rates.png", "A1", "Pipeline selection success rates"),
+    ("target_sampling_funnel_by_step.png", "A2", "Step5/6 target sampling funnel"),
+    ("selected_target_sampling_attempt_progress.png", "A3", "Step5/6 selected-target accumulation by attempt"),
+    ("selected_target_source_overlap.png", "C1", "Selected target overlap between Step5 and Step6"),
+    ("selected_target_requirement_snapshot.png", "C2", "Selected target requirement pass snapshot"),
+    ("selection_tradeoff_chi_vs_solubility_confidence.png", "C3", "Selection tradeoff chi vs confidence"),
+    ("selected_target_chi_confidence_by_source.png", "C4", "Selected target chi and confidence by source"),
+    ("descriptor_shift_vs_training.png", "C5", "Descriptor shift vs training"),
+    ("novelty_similarity_histogram.png", "C6", "Novelty similarity histogram"),
+    ("step6_target_polymer_class_coverage.png", "C7", "Step6 target polymer class coverage"),
     ("chemical_space_pca_known_vs_discovered.png", "G1", "Chemical space PCA known vs discovered"),
-    ("chi_vs_class_prob_scoring_landscape.png", "G2", "Chi vs class probability scoring landscape"),
-    ("discovered_descriptor_boxplot.png", "G3", "Discovered descriptor boxplot"),
-    ("artifact_counts_by_category.png", "Z1", "Artifact counts by category"),
 ]
 
 
@@ -163,6 +139,24 @@ def _safe_mannwhitney(x: np.ndarray, y: np.ndarray) -> float:
         return float(mannwhitneyu(x, y, alternative="two-sided").pvalue)
     except Exception:
         return np.nan
+
+
+def _cleanup_previous_figures(figures_dir: Path) -> None:
+    for old in figures_dir.glob("*.png"):
+        if old.is_file():
+            old.unlink()
+    for block_dir in figures_dir.glob("block_*"):
+        if block_dir.is_dir():
+            for old in block_dir.glob("*"):
+                if old.is_file():
+                    old.unlink()
+
+
+def _prune_generated_figures(figures_dir: Path, keep_files: Iterable[str]) -> None:
+    keep = {str(name) for name in keep_files}
+    for png in figures_dir.glob("*.png"):
+        if png.is_file() and png.name not in keep:
+            png.unlink()
 
 
 def _compute_condition_class_contrast(df: pd.DataFrame) -> pd.DataFrame:
@@ -606,6 +600,271 @@ def _plot_selection_tradeoff(df: pd.DataFrame, out_png: Path, dpi: int) -> None:
     plt.close(fig)
 
 
+def _plot_target_sampling_funnel(stage_df: pd.DataFrame, out_png: Path, dpi: int) -> None:
+    if stage_df.empty:
+        return
+    plot_df = stage_df.copy()
+    plot_df["count"] = pd.to_numeric(plot_df["count"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["count"])
+    if plot_df.empty:
+        return
+
+    stage_order = ["Screened", "Qualified", "Selected"]
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+    sns.barplot(
+        data=plot_df,
+        x="stage",
+        y="count",
+        hue="step",
+        order=stage_order,
+        hue_order=["step5", "step6"],
+        ax=ax,
+    )
+    ax.set_xlabel("")
+    ax.set_ylabel("Candidate count")
+    ax.tick_params(axis="x", rotation=0)
+    for container in ax.containers:
+        labels = []
+        for bar in container:
+            height = bar.get_height()
+            labels.append(f"{int(round(height))}" if np.isfinite(height) else "")
+        ax.bar_label(container, labels=labels, padding=2, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
+def _load_sampling_attempt_progress(path: Optional[Path], step: str) -> pd.DataFrame:
+    if path is None or not path.exists():
+        return pd.DataFrame()
+    df = _normalize_columns(pd.read_csv(path))
+    if "sampling_attempt" not in df.columns:
+        return pd.DataFrame()
+    out = pd.DataFrame(index=df.index)
+    out["step"] = step
+    out["sampling_attempt"] = pd.to_numeric(df["sampling_attempt"], errors="coerce")
+    for col in ["target_count_selected", "n_polymers_pass_all_targets", "accumulated_candidate_count"]:
+        if col in df.columns:
+            out[col] = pd.to_numeric(df[col], errors="coerce")
+    return out.dropna(subset=["sampling_attempt"]).reset_index(drop=True)
+
+
+def _plot_sampling_attempt_progress(df: pd.DataFrame, out_png: Path, dpi: int) -> None:
+    required = {"step", "sampling_attempt", "target_count_selected"}
+    if df.empty or not required.issubset(df.columns):
+        return
+    plot_df = df.copy()
+    plot_df["sampling_attempt"] = pd.to_numeric(plot_df["sampling_attempt"], errors="coerce")
+    plot_df["target_count_selected"] = pd.to_numeric(plot_df["target_count_selected"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["sampling_attempt", "target_count_selected"])
+    if plot_df.empty:
+        return
+
+    right_col = (
+        "n_polymers_pass_all_targets"
+        if "n_polymers_pass_all_targets" in plot_df.columns and plot_df["n_polymers_pass_all_targets"].notna().any()
+        else "accumulated_candidate_count"
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.6), sharex=False)
+    sns.lineplot(
+        data=plot_df,
+        x="sampling_attempt",
+        y="target_count_selected",
+        hue="step",
+        marker="o",
+        ax=axes[0],
+    )
+    axes[0].axhline(100, color="#6b6b6b", linestyle="--", linewidth=1.2)
+    axes[0].set_xlabel("Sampling attempt")
+    axes[0].set_ylabel("Selected target polymers")
+    axes[0].legend(loc="lower right")
+
+    sns.lineplot(
+        data=plot_df,
+        x="sampling_attempt",
+        y=right_col,
+        hue="step",
+        marker="o",
+        ax=axes[1],
+        legend=False,
+    )
+    axes[1].set_xlabel("Sampling attempt")
+    axes[1].set_ylabel(
+        "Candidates passing all target conditions"
+        if right_col == "n_polymers_pass_all_targets"
+        else "Accumulated screened candidates"
+    )
+    for ax in axes:
+        xticks = sorted({int(x) for x in pd.to_numeric(plot_df["sampling_attempt"], errors="coerce").dropna().tolist()})
+        if xticks:
+            ax.set_xticks(xticks)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
+def _compute_selected_source_overlap(step5_df: pd.DataFrame, step6_df: pd.DataFrame) -> pd.DataFrame:
+    step5_set = set(step5_df.get("canonical_smiles", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    step6_set = set(step6_df.get("canonical_smiles", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    shared = step5_set & step6_set
+    rows = [
+        {"group": "Step5 only", "count": int(len(step5_set - step6_set))},
+        {"group": "Shared", "count": int(len(shared))},
+        {"group": "Step6 only", "count": int(len(step6_set - step5_set))},
+    ]
+    return pd.DataFrame(rows)
+
+
+def _plot_selected_source_overlap(df: pd.DataFrame, out_png: Path, dpi: int) -> None:
+    if df.empty:
+        return
+    plot_df = df.copy()
+    order = ["Step5 only", "Shared", "Step6 only"]
+    palette = {"Step5 only": "#2ca02c", "Shared": "#9c755f", "Step6 only": "#17a65b"}
+    fig, ax = plt.subplots(figsize=(6.6, 4.6))
+    sns.barplot(data=plot_df, x="group", y="count", order=order, palette=palette, ax=ax)
+    ax.set_xlabel("")
+    ax.set_ylabel("Unique selected polymers")
+    for i, value in enumerate(plot_df.set_index("group").reindex(order)["count"].fillna(0).tolist()):
+        ax.text(i, value + max(1.0, value * 0.02), f"{int(value)}", ha="center", va="bottom")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
+def _compute_requirement_snapshot(step5_df: pd.DataFrame, step6_df: pd.DataFrame) -> pd.DataFrame:
+    requirement_specs = [
+        ("Soluble hit", "soluble_hit", "binary"),
+        ("Property hit", "property_hit", "binary"),
+        ("Valid", "is_valid", "binary"),
+        ("Two-star", "star_count", "star_count"),
+        ("Novel vs train", "is_novel_vs_train", "binary"),
+        ("SA within limit", "sa_ok", "binary"),
+        ("All target conditions", "passes_all_target_conditions", "binary"),
+        ("All filters", "passes_all_filters", "binary"),
+        ("Target class hit", "polymer_class_hit", "binary"),
+    ]
+    rows: List[Dict[str, object]] = []
+    for source_step, df in [("step5", step5_df), ("step6", step6_df)]:
+        if df.empty:
+            continue
+        for label, col, mode in requirement_specs:
+            if col not in df.columns:
+                continue
+            if mode == "star_count":
+                vals = (pd.to_numeric(df[col], errors="coerce") >= 2).astype(float)
+            else:
+                vals = pd.to_numeric(df[col], errors="coerce")
+            vals = vals.replace([np.inf, -np.inf], np.nan).dropna()
+            if vals.empty:
+                continue
+            rows.append(
+                {
+                    "source_step": source_step,
+                    "requirement": label,
+                    "pass_rate": float(np.mean(vals >= 0.5)),
+                    "n_selected": int(len(vals)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _plot_requirement_snapshot(df: pd.DataFrame, out_png: Path, dpi: int) -> None:
+    if df.empty:
+        return
+    order = [
+        "Soluble hit",
+        "Property hit",
+        "Valid",
+        "Two-star",
+        "Novel vs train",
+        "SA within limit",
+        "All target conditions",
+        "All filters",
+        "Target class hit",
+    ]
+    pivot = df.pivot(index="requirement", columns="source_step", values="pass_rate")
+    pivot = pivot.reindex([label for label in order if label in pivot.index])
+    if pivot.empty:
+        return
+    pivot = pivot.reindex(columns=[c for c in ["step5", "step6"] if c in pivot.columns])
+    fig, ax = plt.subplots(figsize=(5.8, 4.8))
+    sns.heatmap(
+        pivot,
+        vmin=0.0,
+        vmax=1.0,
+        cmap="YlGnBu",
+        annot=True,
+        fmt=".2f",
+        linewidths=0.5,
+        linecolor="white",
+        cbar_kws={"label": "Pass rate"},
+        ax=ax,
+    )
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
+def _compute_selected_source_comparison(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "source_step" not in df.columns:
+        return pd.DataFrame()
+    rows: List[Dict[str, object]] = []
+    prob_col = "class_prob_lcb" if "class_prob_lcb" in df.columns else ("class_prob" if "class_prob" in df.columns else "")
+    for source_step, sub in df.groupby("source_step", sort=True):
+        chi_vals = pd.to_numeric(sub["chi_pred_target"], errors="coerce") if "chi_pred_target" in sub.columns else pd.Series(dtype=float)
+        sa_vals = pd.to_numeric(sub["sa_score"], errors="coerce") if "sa_score" in sub.columns else pd.Series(dtype=float)
+        row: Dict[str, object] = {
+            "source_step": source_step,
+            "n_selected": int(len(sub)),
+            "n_unique": int(sub["canonical_smiles"].nunique()) if "canonical_smiles" in sub.columns else int(len(sub)),
+            "chi_pred_target_mean": _safe_float(chi_vals.mean()),
+            "chi_pred_target_median": _safe_float(chi_vals.median()),
+            "sa_score_mean": _safe_float(sa_vals.mean()),
+            "sa_score_median": _safe_float(sa_vals.median()),
+        }
+        if prob_col:
+            prob_vals = pd.to_numeric(sub[prob_col], errors="coerce") if prob_col in sub.columns else pd.Series(dtype=float)
+            row[f"{prob_col}_mean"] = _safe_float(prob_vals.mean())
+            row[f"{prob_col}_median"] = _safe_float(prob_vals.median())
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _plot_selected_target_chi_confidence_by_source(df: pd.DataFrame, out_png: Path, dpi: int) -> None:
+    if df.empty or "source_step" not in df.columns:
+        return
+    prob_col = "class_prob_lcb" if "class_prob_lcb" in df.columns else ("class_prob" if "class_prob" in df.columns else "")
+    metrics = [("chi_pred_target", "Predicted χ at target")]
+    if prob_col:
+        metrics.append((prob_col, "Conservative soluble confidence" if prob_col == "class_prob_lcb" else "Soluble probability"))
+    n_panels = len(metrics)
+    fig, axes = plt.subplots(1, n_panels, figsize=(5.6 * n_panels, 4.6), sharex=False)
+    if n_panels == 1:
+        axes = [axes]
+    target_ref = _safe_float(pd.to_numeric(df.get("target_chi"), errors="coerce").median())
+    for ax, (col, ylabel) in zip(axes, metrics):
+        sub = df[["source_step", col]].copy()
+        sub[col] = pd.to_numeric(sub[col], errors="coerce")
+        sub = sub.dropna(subset=[col])
+        if sub.empty:
+            ax.set_axis_off()
+            continue
+        sns.boxplot(data=sub, x="source_step", y=col, ax=ax, color="#9ecae1")
+        sns.stripplot(data=sub, x="source_step", y=col, ax=ax, color="#1f4e79", alpha=0.40, size=2.8)
+        ax.set_xlabel("")
+        ax.set_ylabel(ylabel)
+        if col == "chi_pred_target" and np.isfinite(target_ref):
+            ax.axhline(target_ref, color="#d62728", linestyle="--", linewidth=1.2)
+        if col == prob_col and prob_col:
+            ax.axhline(0.5, color="#6b6b6b", linestyle="--", linewidth=1.2)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
 def _load_target_polymers(path: Optional[Path], source_step: str) -> pd.DataFrame:
     if path is None or not path.exists():
         return pd.DataFrame()
@@ -727,6 +986,9 @@ def _write_science_highlights(summary: Dict[str, object], out_md: Path) -> None:
         "",
         "## Chemistry and Novelty",
         f"- Unique selected candidates analyzed: `{summary.get('n_selected_unique_candidates', 0)}`",
+        f"- Step5-only selected unique candidates: `{summary.get('n_selected_step5_only', 0)}`",
+        f"- Step6-only selected unique candidates: `{summary.get('n_selected_step6_only', 0)}`",
+        f"- Shared Step5/Step6 selected unique candidates: `{summary.get('n_selected_overlap_step5_step6', 0)}`",
         f"- Novel candidates (max Tanimoto < threshold): `{summary.get('novel_fraction_under_threshold', np.nan):.4f}`",
         f"- Mean max similarity to training: `{summary.get('mean_max_tanimoto_to_training', np.nan):.4f}`",
         "",
@@ -773,6 +1035,8 @@ def _copy_block_artifacts(metrics_dir: Path, figures_dir: Path) -> None:
     block_metric_map: Dict[str, List[str]] = {
         "a": [
             "chi_class_contrast_by_condition.csv",
+            "inverse_design_target_sampling_funnel.csv",
+            "inverse_design_sampling_attempt_progress.csv",
             "step3_target_context_vs_class_contrast.csv",
             "step3_target_context_skipped_reason.csv",
         ],
@@ -785,6 +1049,9 @@ def _copy_block_artifacts(metrics_dir: Path, figures_dir: Path) -> None:
         "c": [
             "selected_candidates_unique.csv",
             "selected_candidates_descriptors.csv",
+            "selected_target_source_overlap.csv",
+            "selected_target_requirement_snapshot.csv",
+            "selected_target_source_comparison.csv",
             "step2_target_pool_descriptors.csv",
             "descriptor_shift_vs_step2_target_pool.csv",
             "baseline_training_smiles_sample.csv",
@@ -836,55 +1103,21 @@ def _copy_block_artifacts(metrics_dir: Path, figures_dir: Path) -> None:
 
     block_figure_map: Dict[str, List[str]] = {
         "a": [
-            "chi_class_delta_heatmap.png",
-            "chi_class_significance_heatmap.png",
-            "chi_vs_temperature_by_phi_and_class.png",
-            "step3_target_vs_class_means.png",
-        ],
-        "b": [
-            "step4_test_mae_heatmap.png",
-            "step4_gradient_consistency_dchi_dT.png",
-            "step4_gradient_consistency_dchi_dphi.png",
+            "pipeline_selection_success_rates.png",
+            "target_sampling_funnel_by_step.png",
+            "selected_target_sampling_attempt_progress.png",
         ],
         "c": [
+            "selected_target_source_overlap.png",
+            "selected_target_requirement_snapshot.png",
             "selection_tradeoff_chi_vs_solubility_confidence.png",
-            "descriptor_shift_vs_step2_target_pool.png",
+            "selected_target_chi_confidence_by_source.png",
             "descriptor_shift_vs_training.png",
             "novelty_similarity_histogram.png",
             "step6_target_polymer_class_coverage.png",
         ],
-        "d": [
-            "coefficient_violin_by_class.png",
-            "coefficient_a1_vs_a3_by_class.png",
-            "dchi_dT_distribution_by_class.png",
-        ],
-        "e": [
-            "chi_surface_mean_by_class.png",
-            "spinodal_phase_diagram.png",
-            "miscible_fraction_below_spinodal_by_class.png",
-            "free_energy_mixing_by_class.png",
-        ],
-        "f": [
-            "descriptor_boxplot_by_class.png",
-            "functional_group_frequency_by_class.png",
-            "logp_vs_mean_chi_by_class.png",
-            "tpsa_vs_mean_chi_by_class.png",
-            "descriptor_chi_correlation_heatmap.png",
-        ],
         "g": [
             "chemical_space_pca_known_vs_discovered.png",
-            "chi_vs_class_prob_scoring_landscape.png",
-            "discovered_descriptor_boxplot.png",
-        ],
-        "h": [
-            "classification_overlap_counts.png",
-            "classification_vs_chi_descriptor_shift.png",
-            "classification_vs_chi_fg_frequency.png",
-        ],
-        "i": [
-            "step1_embedding_pca_by_source.png",
-            "embedding_pinn_correlation_heatmap.png",
-            "pinn_coefficient_sensitivity_by_class.png",
         ],
     }
 
@@ -2470,6 +2703,7 @@ def main(args: argparse.Namespace) -> None:
     dpi = int(args.dpi if args.dpi is not None else config.get("plotting", {}).get("dpi", 600))
     font_size = int(args.font_size if args.font_size is not None else config.get("plotting", {}).get("font_size", 16))
     apply_publication_figure_style(font_size=font_size, dpi=dpi, remove_titles=True)
+    _cleanup_previous_figures(figures_dir)
 
     chi_path = Path(args.chi_dataset_path or step7_cfg["chi_dataset_path"])
     step1_summary_path = _first_existing(
@@ -2964,6 +3198,9 @@ def main(args: argparse.Namespace) -> None:
         "pinn_top_driver_soluble": "",
         "pinn_top_driver_insoluble": "",
         "n_selected_unique_candidates": 0,
+        "n_selected_step5_only": 0,
+        "n_selected_step6_only": 0,
+        "n_selected_overlap_step5_step6": 0,
         "mean_max_tanimoto_to_training": np.nan,
         "novel_fraction_under_threshold": np.nan,
     }
@@ -3310,6 +3547,47 @@ def main(args: argparse.Namespace) -> None:
         out_png=figures_dir / "pipeline_selection_success_rates.png",
         dpi=dpi,
     )
+    funnel_rows: List[Dict[str, object]] = []
+    for step_name, prefix in [("step5", "step5"), ("step6", "step6")]:
+        sampling_row = step5_sampling_process_row if step_name == "step5" else step6_sampling_process_row
+        summary_row = step5_row if step_name == "step5" else step6_row
+        screened = _pick_numeric(sampling_row, [f"{prefix}_candidates_screened_total"]) if sampling_row else np.nan
+        if not np.isfinite(screened):
+            screened = _pick_numeric(summary_row, ["candidate_count_after_dedup", "n_generated_input_total"]) if summary_row else np.nan
+        qualified = _pick_numeric(sampling_row, [f"{prefix}_qualified_candidate_count"]) if sampling_row else np.nan
+        if not np.isfinite(qualified):
+            qualified = _pick_numeric(summary_row, ["qualified_candidate_count"]) if summary_row else np.nan
+        selected = _pick_numeric(sampling_row, [f"{prefix}_target_count_selected"]) if sampling_row else np.nan
+        if not np.isfinite(selected):
+            selected = _pick_numeric(summary_row, ["target_polymer_count_selected"]) if summary_row else np.nan
+        for stage, count in [("Screened", screened), ("Qualified", qualified), ("Selected", selected)]:
+            if np.isfinite(count):
+                funnel_rows.append({"step": step_name, "stage": stage, "count": float(count)})
+    funnel_df = pd.DataFrame(funnel_rows, columns=["step", "stage", "count"])
+    funnel_df.to_csv(metrics_dir / "inverse_design_target_sampling_funnel.csv", index=False)
+    _plot_target_sampling_funnel(
+        funnel_df,
+        out_png=figures_dir / "target_sampling_funnel_by_step.png",
+        dpi=dpi,
+    )
+
+    sampling_attempt_frames = [
+        _load_sampling_attempt_progress(step5_sampling_attempts_path, step="step5"),
+        _load_sampling_attempt_progress(step6_sampling_attempts_path, step="step6"),
+    ]
+    non_empty_sampling_attempt_frames = [df for df in sampling_attempt_frames if not df.empty]
+    sampling_attempt_df = (
+        pd.concat(non_empty_sampling_attempt_frames, ignore_index=True)
+        if non_empty_sampling_attempt_frames
+        else pd.DataFrame()
+    )
+    if not sampling_attempt_df.empty:
+        sampling_attempt_df.to_csv(metrics_dir / "inverse_design_sampling_attempt_progress.csv", index=False)
+        _plot_sampling_attempt_progress(
+            sampling_attempt_df,
+            out_png=figures_dir / "selected_target_sampling_attempt_progress.png",
+            dpi=dpi,
+        )
     summary["n_steps_with_available_summary"] = int(rollup_df["available"].sum())
     analysis_blocks.append("step1_to_step6_summary_rollup")
     analysis_blocks.append("inverse_design_sampling_process_rollup")
@@ -3473,6 +3751,32 @@ def main(args: argparse.Namespace) -> None:
         summary["n_selected_unique_candidates"] = int(len(selected_unique))
         summary["n_selected_step5"] = int(step5_df["canonical_smiles"].nunique()) if not step5_df.empty else 0
         summary["n_selected_step6"] = int(step6_df["canonical_smiles"].nunique()) if not step6_df.empty else 0
+        overlap_df = _compute_selected_source_overlap(step5_df, step6_df)
+        overlap_df.to_csv(metrics_dir / "selected_target_source_overlap.csv", index=False)
+        _plot_selected_source_overlap(
+            overlap_df,
+            out_png=figures_dir / "selected_target_source_overlap.png",
+            dpi=dpi,
+        )
+        overlap_lookup = overlap_df.set_index("group")["count"].to_dict()
+        summary["n_selected_step5_only"] = int(overlap_lookup.get("Step5 only", 0))
+        summary["n_selected_step6_only"] = int(overlap_lookup.get("Step6 only", 0))
+        summary["n_selected_overlap_step5_step6"] = int(overlap_lookup.get("Shared", 0))
+
+        requirement_snapshot_df = _compute_requirement_snapshot(step5_df, step6_df)
+        requirement_snapshot_df.to_csv(metrics_dir / "selected_target_requirement_snapshot.csv", index=False)
+        _plot_requirement_snapshot(
+            requirement_snapshot_df,
+            out_png=figures_dir / "selected_target_requirement_snapshot.png",
+            dpi=dpi,
+        )
+        source_comparison_df = _compute_selected_source_comparison(selected_df)
+        source_comparison_df.to_csv(metrics_dir / "selected_target_source_comparison.csv", index=False)
+        _plot_selected_target_chi_confidence_by_source(
+            selected_df,
+            out_png=figures_dir / "selected_target_chi_confidence_by_source.png",
+            dpi=dpi,
+        )
 
         if step2_targets_path is not None and step2_targets_path.exists():
             step2_targets_df = _normalize_columns(pd.read_csv(step2_targets_path))
@@ -3900,6 +4204,7 @@ def main(args: argparse.Namespace) -> None:
     summary["analysis_blocks_completed"] = int(len(analysis_blocks))
     summary["analysis_block_names"] = ",".join(analysis_blocks)
 
+    _prune_generated_figures(figures_dir=figures_dir, keep_files=[name for name, _, _ in FIGURE_ORDER])
     figure_index_df = _write_figure_index(figures_dir=figures_dir, metrics_dir=metrics_dir)
     summary["n_numbered_figures"] = int(len(figure_index_df))
     _copy_block_artifacts(metrics_dir=metrics_dir, figures_dir=figures_dir)

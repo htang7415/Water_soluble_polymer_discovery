@@ -608,24 +608,34 @@ def _build_screening_funnel_panel(
     if not row:
         return None
 
-    counts = [
-        _pick(row, ["total_candidates_screened"], default=np.nan),
-        _pick(row, ["filter_pass_count"], default=np.nan),
-        _pick(row, ["filter_pass_unique"], default=np.nan),
-        _pick(row, ["target_count_selected"], default=np.nan),
+    stage_rows: List[tuple[str, int]] = []
+    stage_specs = [
+        ("Candidates screened", ["step5_candidates_screened_total", "step6_candidates_screened_total", "total_candidates_screened"]),
+        ("Qualified after screening", ["step5_qualified_candidate_count", "step6_qualified_candidate_count", "filter_pass_count"]),
+        ("After deduplication", ["filter_pass_unique"]),
+        ("Final selection", ["step5_target_count_selected", "step6_target_count_selected", "target_count_selected"]),
     ]
-    try:
-        values = [int(float(v)) for v in counts]
-    except Exception:
+    for label, keys in stage_specs:
+        value = _pick(row, keys, default=np.nan)
+        if _is_missing_value(value):
+            continue
+        try:
+            int_value = int(float(value))
+        except Exception:
+            continue
+        if stage_rows and label == "After deduplication" and int_value == stage_rows[-1][1]:
+            continue
+        stage_rows.append((label, int_value))
+    if len(stage_rows) < 2:
         return None
+    values = [value for _, value in stage_rows]
     if max(values) <= 0:
         return None
 
-    labels = ["Candidate pool", "Pass all filters", "After deduplication", "Final selection"]
     colors = ["#0C5DA5", "#00B945", "#FF9500", "#FF2C00"]
     fig, ax = plt.subplots(figsize=(6.0, 5.0))
-    ys = np.arange(len(labels))
-    bars = ax.barh(ys, values, color=colors, edgecolor="none", height=0.6)
+    ys = np.arange(len(stage_rows))
+    bars = ax.barh(ys, values, color=colors[: len(stage_rows)], edgecolor="none", height=0.6)
     x_max = max(values)
     for bar, val in zip(bars, values):
         pct = 100.0 * val / x_max if x_max > 0 else 0.0
@@ -638,12 +648,241 @@ def _build_screening_funnel_panel(
             fontsize=max(10, PAPER_FONT_SIZE - 2),
         )
 
-    ax.set_yticks(ys, labels=labels)
+    ax.set_yticks(ys, labels=[label for label, _ in stage_rows])
     ax.invert_yaxis()
     ax.set_xlabel("Count", fontsize=PAPER_FONT_SIZE)
     ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
     ax.set_xlim(0, x_max * 1.45)
     ax.grid(True, axis="x", linestyle="--", linewidth=0.8, alpha=0.35)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_sampling_attempt_progress_panel(
+    attempts_csv: Optional[Path],
+    out_png: Path,
+    target_count: int = 100,
+) -> Optional[Path]:
+    df = _safe_read_csv(attempts_csv)
+    if df.empty or not {"sampling_attempt", "target_count_selected"}.issubset(df.columns):
+        return None
+
+    plot_df = df.copy()
+    plot_df["sampling_attempt"] = pd.to_numeric(plot_df["sampling_attempt"], errors="coerce")
+    plot_df["target_count_selected"] = pd.to_numeric(plot_df["target_count_selected"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["sampling_attempt", "target_count_selected"])
+    if plot_df.empty:
+        return None
+
+    right_col = None
+    for col in ["n_polymers_pass_all_targets", "accumulated_candidate_count"]:
+        if col in plot_df.columns and pd.to_numeric(plot_df[col], errors="coerce").notna().any():
+            plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+            right_col = col
+            break
+
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.6))
+    axes[0].plot(
+        plot_df["sampling_attempt"],
+        plot_df["target_count_selected"],
+        marker="o",
+        linewidth=2.2,
+        color="#0C5DA5",
+    )
+    axes[0].axhline(float(target_count), color="#6B7280", linestyle="--", linewidth=1.4)
+    axes[0].set_xlabel("Sampling attempt", fontsize=PAPER_FONT_SIZE)
+    axes[0].set_ylabel("Selected target polymers", fontsize=PAPER_FONT_SIZE)
+    axes[0].tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
+    axes[0].grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
+
+    if right_col is not None:
+        axes[1].plot(
+            plot_df["sampling_attempt"],
+            plot_df[right_col],
+            marker="o",
+            linewidth=2.2,
+            color="#00B945",
+        )
+        ylabel = (
+            "Candidates passing all targets"
+            if right_col == "n_polymers_pass_all_targets"
+            else "Accumulated candidates"
+        )
+        axes[1].set_ylabel(ylabel, fontsize=PAPER_FONT_SIZE)
+        axes[1].set_xlabel("Sampling attempt", fontsize=PAPER_FONT_SIZE)
+        axes[1].tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
+        axes[1].grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
+    else:
+        axes[1].axis("off")
+
+    xticks = sorted({int(x) for x in plot_df["sampling_attempt"].tolist()})
+    for ax in axes:
+        if xticks and ax.axison:
+            ax.set_xticks(xticks)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_requirement_snapshot_panel(
+    target_csv: Optional[Path],
+    out_png: Path,
+) -> Optional[Path]:
+    df = _safe_read_csv(target_csv)
+    if df.empty:
+        return None
+
+    requirement_specs = [
+        ("Soluble hit", "soluble_hit", "binary"),
+        ("Property hit", "property_hit", "binary"),
+        ("Valid", "is_valid", "binary"),
+        ("Two-star", "star_count", "star_count"),
+        ("Novel vs train", "is_novel_vs_train", "binary"),
+        ("SA within limit", "sa_ok", "binary"),
+        ("All target conditions", "passes_all_target_conditions", "binary"),
+        ("All filters", "passes_all_filters", "binary"),
+        ("Target class hit", "polymer_class_hit", "binary"),
+    ]
+    rows: List[tuple[str, float]] = []
+    for label, col, mode in requirement_specs:
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce")
+        if mode == "star_count":
+            vals = (vals >= 2).astype(float)
+        vals = vals.replace([np.inf, -np.inf], np.nan).dropna()
+        if vals.empty:
+            continue
+        rows.append((label, float((vals >= 0.5).mean())))
+    if not rows:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6.2, 5.2))
+    labels = [label for label, _ in rows]
+    values = [value for _, value in rows]
+    ys = np.arange(len(labels))
+    bars = ax.barh(ys, values, color="#0C5DA5", edgecolor="none", height=0.65)
+    for bar, val in zip(bars, values):
+        ax.text(
+            min(val + 0.02, 1.02),
+            bar.get_y() + bar.get_height() / 2.0,
+            f"{100.0 * val:.0f}%",
+            va="center",
+            ha="left",
+            fontsize=max(10, PAPER_FONT_SIZE - 2),
+        )
+    ax.set_yticks(ys, labels=labels)
+    ax.invert_yaxis()
+    ax.set_xlim(0.0, 1.05)
+    ax.set_xlabel("Pass rate across selected targets", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
+    ax.grid(True, axis="x", linestyle="--", linewidth=0.8, alpha=0.35)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_target_chi_parity_panel(
+    target_csv: Optional[Path],
+    out_png: Path,
+) -> Optional[Path]:
+    df = _safe_read_csv(target_csv)
+    if df.empty or not {"target_chi", "chi_pred_target"}.issubset(df.columns):
+        return None
+
+    plot_df = df[["target_chi", "chi_pred_target"]].copy()
+    plot_df["target_chi"] = pd.to_numeric(plot_df["target_chi"], errors="coerce")
+    plot_df["chi_pred_target"] = pd.to_numeric(plot_df["chi_pred_target"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["target_chi", "chi_pred_target"])
+    if plot_df.empty:
+        return None
+
+    x = plot_df["target_chi"].to_numpy(dtype=float)
+    y = plot_df["chi_pred_target"].to_numpy(dtype=float)
+    lo = float(np.nanmin(np.concatenate([x, y])))
+    hi = float(np.nanmax(np.concatenate([x, y])))
+    pad = max(0.02, 0.05 * (hi - lo if hi > lo else 1.0))
+    mae = float(np.mean(np.abs(y - x)))
+
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    ax.scatter(x, y, color="#0C5DA5", alpha=0.80, s=34)
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], linestyle="--", color="#6B7280", linewidth=1.4)
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_xlabel("Target χ", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Predicted χ at target", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
+    ax.text(
+        0.98,
+        0.04,
+        f"MAE = {mae:.3f}",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=max(10, PAPER_FONT_SIZE - 2),
+        color="#111827",
+    )
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_target_confidence_by_rank_panel(
+    target_csv: Optional[Path],
+    out_png: Path,
+) -> Optional[Path]:
+    df = _safe_read_csv(target_csv)
+    if df.empty:
+        return None
+
+    plot_df = df.copy()
+    if "target_rank" not in plot_df.columns:
+        plot_df["target_rank"] = np.arange(1, len(plot_df) + 1, dtype=int)
+    plot_df["target_rank"] = pd.to_numeric(plot_df["target_rank"], errors="coerce")
+    prob_cols = [col for col in ["class_prob", "class_prob_lcb"] if col in plot_df.columns]
+    if not prob_cols:
+        return None
+    for col in prob_cols:
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+    plot_df = plot_df.dropna(subset=["target_rank"] + prob_cols).sort_values("target_rank")
+    if plot_df.empty:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6.2, 5.0))
+    color_map = {"class_prob": "#0C5DA5", "class_prob_lcb": "#00B945"}
+    label_map = {"class_prob": "Class probability", "class_prob_lcb": "Conservative class probability"}
+    for col in prob_cols:
+        ax.plot(
+            plot_df["target_rank"],
+            plot_df[col],
+            linewidth=2.0,
+            color=color_map.get(col, "#0C5DA5"),
+            label=label_map.get(col, col),
+        )
+    ax.axhline(0.5, color="#6B7280", linestyle="--", linewidth=1.4)
+    ax.set_xlabel("Selected target rank", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Solubility confidence", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
+    ax.legend(loc="lower right", fontsize=max(10, PAPER_FONT_SIZE - 4), frameon=True)
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -1296,6 +1535,14 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
     step5_screening_funnel_derived = paths.get("step5_screening_funnel_derived")
     step6_screening_funnel_derived = paths.get("step6_screening_funnel_derived")
     step6_target_class_coverage_derived = paths.get("step6_target_class_coverage_derived")
+    step5_sampling_attempt_progress_derived = paths.get("step5_sampling_attempt_progress_derived")
+    step6_sampling_attempt_progress_derived = paths.get("step6_sampling_attempt_progress_derived")
+    step5_requirement_snapshot_derived = paths.get("step5_requirement_snapshot_derived")
+    step6_requirement_snapshot_derived = paths.get("step6_requirement_snapshot_derived")
+    step5_target_chi_parity_derived = paths.get("step5_target_chi_parity_derived")
+    step6_target_chi_parity_derived = paths.get("step6_target_chi_parity_derived")
+    step5_target_confidence_by_rank_derived = paths.get("step5_target_confidence_by_rank_derived")
+    step6_target_confidence_by_rank_derived = paths.get("step6_target_confidence_by_rank_derived")
 
     return [
         FigureSpec(
@@ -1486,16 +1733,21 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="Figure5",
-            title="Figure 4. Unconstrained inverse design: water-soluble candidate selection and design-space coverage",
+            title="Figure 4. Unconstrained inverse design: sampling process and constraint satisfaction for the final 100 water-soluble targets",
             destination="manuscript",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Top-k target coverage curve",
-                    candidates=_make_candidates(step5_fig_dirs, ["topk_target_success_curve.png"]),
+                    caption="Sampling-attempt accumulation toward 100 selected targets",
+                    candidates=(
+                        [step5_sampling_attempt_progress_derived]
+                        if isinstance(step5_sampling_attempt_progress_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step5_fig_dirs, ["sampling_attempt_progress.png"]),
                 ),
                 PanelSpec(
-                    caption="Candidate screening funnel",
+                    caption="Candidate screening funnel from screened pool to final 100",
                     candidates=(
                         [step5_screening_funnel_derived]
                         if isinstance(step5_screening_funnel_derived, Path)
@@ -1504,35 +1756,67 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     + _make_candidates(step5_fig_dirs, ["candidate_screening_funnel.png"]),
                 ),
                 PanelSpec(
-                    caption="Selected polymer χ parity across all (T, φ) conditions",
-                    candidates=_make_candidates(step5_fig_dirs, ["selected_polymer_chi_parity_all_conditions.png"]),
+                    caption="Requirement pass rates across the selected 100 polymers",
+                    candidates=(
+                        [step5_requirement_snapshot_derived]
+                        if isinstance(step5_requirement_snapshot_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step5_fig_dirs, ["requirement_pass_rates.png", "selected_target_quality_by_rank.png"]),
                 ),
                 PanelSpec(
-                    caption="Top-1 joint hit heatmap by condition",
-                    candidates=_make_candidates(step5_fig_dirs, ["top1_joint_hit_heatmap.png"]),
+                    caption="Target χ parity for the selected 100 polymers",
+                    candidates=(
+                        [step5_target_chi_parity_derived]
+                        if isinstance(step5_target_chi_parity_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(
+                        step5_fig_dirs,
+                        [
+                            "selected_target_chi_parity.png",
+                            "target_vs_top1_chi_parity.png",
+                            "selected_polymer_chi_parity_all_conditions.png",
+                        ],
+                    ),
                 ),
             ],
         ),
         FigureSpec(
             figure_id="Figure6",
-            title="Figure 5. Polymer-family-conditioned inverse design and class-specific thermodynamic coverage",
+            title="Figure 5. Polymer-class-conditioned inverse design: sampling efficiency, screening selectivity, and class compliance",
             destination="manuscript",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Class-conditioned top-k success curve",
-                    candidates=_make_candidates(step6_fig_dirs, ["topk_target_success_curve.png"]),
+                    caption="Sampling-attempt accumulation toward 100 class-conditioned targets",
+                    candidates=(
+                        [step6_sampling_attempt_progress_derived]
+                        if isinstance(step6_sampling_attempt_progress_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step6_fig_dirs, ["sampling_attempt_progress.png"]),
                 ),
                 PanelSpec(
-                    caption="Target success by polymer class",
-                    candidates=_make_candidates(step6_fig_dirs, ["target_success_by_polymer_class.png"]),
+                    caption="Candidate screening funnel for class-conditioned inverse design",
+                    candidates=(
+                        [step6_screening_funnel_derived]
+                        if isinstance(step6_screening_funnel_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step6_fig_dirs, ["candidate_screening_funnel.png"]),
                 ),
                 PanelSpec(
-                    caption="Joint hit heatmap: polymer class × condition",
-                    candidates=_make_candidates(step6_fig_dirs, ["top1_joint_hit_class_condition_heatmap.png"]),
+                    caption="Requirement pass rates, including polymer-class hit, across the selected 100",
+                    candidates=(
+                        [step6_requirement_snapshot_derived]
+                        if isinstance(step6_requirement_snapshot_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step6_fig_dirs, ["requirement_pass_rates.png", "selected_target_quality_by_rank.png"]),
                 ),
                 PanelSpec(
-                    caption="Polymer class coverage of discovered targets",
+                    caption="Polymer-class coverage of discovered targets",
                     candidates=(
                         [step6_target_class_coverage_derived]
                         if isinstance(step6_target_class_coverage_derived, Path)
@@ -1545,39 +1829,39 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="Figure7",
-            title="Figure 6. Mechanistic interpretation: chemical novelty, thermodynamic profiles, and structure-property coupling",
+            title="Figure 6. Cross-step analysis of the selected target polymers: sampling, overlap, requirements, and chemical novelty",
             destination="manuscript",
             ncols=3,
             panels=[
                 PanelSpec(
-                    caption="Chemical space PCA: known vs discovered polymers",
+                    caption="Pipeline selection success rates across generation and inverse design steps",
+                    candidates=_make_candidates(block_a_fig_dirs, ["pipeline_selection_success_rates.png"])
+                    + _make_candidates(step7_fig_dirs, ["pipeline_selection_success_rates.png"]),
+                ),
+                PanelSpec(
+                    caption="Cross-step target sampling funnel for Step 5 vs Step 6",
+                    candidates=_make_candidates(block_a_fig_dirs, ["target_sampling_funnel_by_step.png"])
+                    + _make_candidates(step7_fig_dirs, ["target_sampling_funnel_by_step.png"]),
+                ),
+                PanelSpec(
+                    caption="Unique-target overlap between unconstrained and class-conditioned design",
+                    candidates=_make_candidates(block_c_fig_dirs, ["selected_target_source_overlap.png"])
+                    + _make_candidates(step7_fig_dirs, ["selected_target_source_overlap.png"]),
+                ),
+                PanelSpec(
+                    caption="Combined requirement snapshot across Step 5 and Step 6 selected targets",
+                    candidates=_make_candidates(block_c_fig_dirs, ["selected_target_requirement_snapshot.png"])
+                    + _make_candidates(step7_fig_dirs, ["selected_target_requirement_snapshot.png"]),
+                ),
+                PanelSpec(
+                    caption="Descriptor shift of discovered targets relative to training polymers",
+                    candidates=_make_candidates(block_c_fig_dirs, ["descriptor_shift_vs_training.png"])
+                    + _make_candidates(step7_fig_dirs, ["descriptor_shift_vs_training.png"]),
+                ),
+                PanelSpec(
+                    caption="Chemical space PCA of known vs discovered polymers",
                     candidates=_make_candidates(block_g_fig_dirs, ["chemical_space_pca_known_vs_discovered.png"])
                     + _make_candidates(step7_fig_dirs, ["chemical_space_pca_known_vs_discovered.png"]),
-                ),
-                PanelSpec(
-                    caption="Spinodal phase diagram from Flory-Huggins theory",
-                    candidates=_make_candidates(block_e_fig_dirs, ["spinodal_phase_diagram.png"])
-                    + _make_candidates(step7_fig_dirs, ["spinodal_phase_diagram.png"]),
-                ),
-                PanelSpec(
-                    caption="Mean χ(T, φ) surface by class",
-                    candidates=_make_candidates(block_e_fig_dirs, ["chi_surface_mean_by_class.png"])
-                    + _make_candidates(step7_fig_dirs, ["chi_surface_mean_by_class.png"]),
-                ),
-                PanelSpec(
-                    caption="PINN coefficient distributions by class",
-                    candidates=_make_candidates(block_d_fig_dirs, ["coefficient_violin_by_class.png"])
-                    + _make_candidates(step7_fig_dirs, ["coefficient_violin_by_class.png"]),
-                ),
-                PanelSpec(
-                    caption="Embedding-PINN correlation heatmap",
-                    candidates=_make_candidates(block_i_fig_dirs, ["embedding_pinn_correlation_heatmap.png"])
-                    + _make_candidates(step7_fig_dirs, ["embedding_pinn_correlation_heatmap.png"]),
-                ),
-                PanelSpec(
-                    caption="LogP vs mean χ by polymer class",
-                    candidates=_make_candidates(block_f_fig_dirs, ["logp_vs_mean_chi_by_class.png"])
-                    + _make_candidates(step7_fig_dirs, ["logp_vs_mean_chi_by_class.png"]),
                 ),
             ],
         ),
@@ -1610,261 +1894,201 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="FigureS3",
-            title="Figure S3. Inverse-Design Target Quality and Sampling Diagnostics",
+            title="Figure S3. Detailed χ-prediction and solubility-confidence diagnostics for the final selected targets",
             destination="si",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Selected-target quality by rank (unconstrained design)",
-                    candidates=_make_candidates(
-                        step5_fig_dirs,
-                        ["selected_target_quality_by_rank.png", "top1_confidence_vs_error.png"],
-                    ),
-                ),
-                PanelSpec(
-                    caption="Selected-target quality by rank (class-conditioned design)",
-                    candidates=_make_candidates(
-                        step6_fig_dirs,
-                        ["selected_target_quality_by_rank.png", "top1_confidence_vs_error.png"],
-                    ),
-                ),
-                PanelSpec(
-                    caption="Sampling-attempt progress (unconstrained design)",
-                    candidates=_make_candidates(
-                        step5_fig_dirs,
-                        ["sampling_attempt_progress.png", "top5_polymer_selection_frequency.png"],
-                    ),
-                ),
-                PanelSpec(
-                    caption="Sampling-attempt progress (class-conditioned design)",
+                    caption="Target χ parity for Step 5 selected polymers",
                     candidates=(
-                        _make_candidates(step6_fig_dirs, ["sampling_attempt_progress.png"])
-                        + (
-                            [step6_screening_funnel_derived]
-                            if isinstance(step6_screening_funnel_derived, Path)
-                            else []
-                        )
-                        + _make_candidates(step6_fig_dirs, ["candidate_screening_funnel.png"])
+                        [step5_target_chi_parity_derived]
+                        if isinstance(step5_target_chi_parity_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(
+                        step5_fig_dirs,
+                        [
+                            "selected_target_chi_parity.png",
+                            "target_vs_top1_chi_parity.png",
+                            "selected_polymer_chi_parity_all_conditions.png",
+                        ],
+                    ),
+                ),
+                PanelSpec(
+                    caption="Solubility confidence by rank for Step 5 selected polymers",
+                    candidates=(
+                        [step5_target_confidence_by_rank_derived]
+                        if isinstance(step5_target_confidence_by_rank_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(
+                        step5_fig_dirs,
+                        ["selected_target_solubility_confidence_by_rank.png", "top1_confidence_vs_error.png"],
+                    ),
+                ),
+                PanelSpec(
+                    caption="Target χ parity for Step 6 selected polymers",
+                    candidates=(
+                        [step6_target_chi_parity_derived]
+                        if isinstance(step6_target_chi_parity_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(
+                        step6_fig_dirs,
+                        [
+                            "selected_target_chi_parity.png",
+                            "target_vs_top1_chi_parity.png",
+                            "selected_polymer_chi_parity_all_conditions.png",
+                        ],
+                    ),
+                ),
+                PanelSpec(
+                    caption="Solubility confidence by rank for Step 6 selected polymers",
+                    candidates=(
+                        [step6_target_confidence_by_rank_derived]
+                        if isinstance(step6_target_confidence_by_rank_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(
+                        step6_fig_dirs,
+                        ["selected_target_solubility_confidence_by_rank.png", "top1_confidence_vs_error.png"],
                     ),
                 ),
             ],
         ),
         FigureSpec(
             figure_id="FigureS4",
-            title="Figure S4. Extended Chemical and Functional-Group Analysis",
+            title="Figure S4. Extended sampling-process and screening diagnostics for the two inverse-design workflows",
             destination="si",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Descriptor boxplot by class",
-                    candidates=_make_candidates(step7_fig_dirs, ["descriptor_boxplot_by_class.png"]),
+                    caption="Step 5 sampling-attempt progress",
+                    candidates=(
+                        [step5_sampling_attempt_progress_derived]
+                        if isinstance(step5_sampling_attempt_progress_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step5_fig_dirs, ["sampling_attempt_progress.png"]),
                 ),
                 PanelSpec(
-                    caption="Functional-group frequencies by class",
-                    candidates=_make_candidates(step7_fig_dirs, ["functional_group_frequency_by_class.png"]),
+                    caption="Step 6 sampling-attempt progress",
+                    candidates=(
+                        [step6_sampling_attempt_progress_derived]
+                        if isinstance(step6_sampling_attempt_progress_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step6_fig_dirs, ["sampling_attempt_progress.png"]),
                 ),
                 PanelSpec(
-                    caption="Classification-vs-χ descriptor shift",
-                    candidates=_make_candidates(block_h_fig_dirs, ["classification_vs_chi_descriptor_shift.png"])
-                    + _make_candidates(step7_fig_dirs, ["classification_vs_chi_descriptor_shift.png"]),
+                    caption="Step 5 screening funnel from screened candidates to final selection",
+                    candidates=(
+                        [step5_screening_funnel_derived]
+                        if isinstance(step5_screening_funnel_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step5_fig_dirs, ["candidate_screening_funnel.png"]),
                 ),
                 PanelSpec(
-                    caption="Classification-vs-χ functional-group shift",
-                    candidates=_make_candidates(block_h_fig_dirs, ["classification_vs_chi_fg_frequency.png"])
-                    + _make_candidates(step7_fig_dirs, ["classification_vs_chi_fg_frequency.png"]),
+                    caption="Step 6 screening funnel from screened candidates to final selection",
+                    candidates=(
+                        [step6_screening_funnel_derived]
+                        if isinstance(step6_screening_funnel_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step6_fig_dirs, ["candidate_screening_funnel.png"]),
                 ),
             ],
         ),
         FigureSpec(
             figure_id="FigureS5",
-            title="Figure S5. PINN Polynomial Thermodynamics and Flory-Huggins Phase Analysis",
+            title="Figure S5. Cross-step candidate novelty and scoring diagnostics for the selected target polymers",
             destination="si",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="dχ/dT distribution by class",
-                    candidates=_make_candidates(block_d_fig_dirs, ["dchi_dT_distribution_by_class.png"])
-                    + _make_candidates(step7_fig_dirs, ["dchi_dT_distribution_by_class.png"]),
-                ),
-                PanelSpec(
-                    caption="PINN coefficient scatter (a1 vs a3)",
-                    candidates=_make_candidates(block_d_fig_dirs, ["coefficient_a1_vs_a3_by_class.png"])
-                    + _make_candidates(step7_fig_dirs, ["coefficient_a1_vs_a3_by_class.png"]),
-                ),
-                PanelSpec(
-                    caption="Free energy of mixing by class",
-                    candidates=_make_candidates(block_e_fig_dirs, ["free_energy_mixing_by_class.png"])
-                    + _make_candidates(step7_fig_dirs, ["free_energy_mixing_by_class.png"]),
-                ),
-                PanelSpec(
-                    caption="Miscible-fraction below spinodal heatmap",
-                    candidates=_make_candidates(block_e_fig_dirs, ["miscible_fraction_below_spinodal_by_class.png"])
-                    + _make_candidates(step7_fig_dirs, ["miscible_fraction_below_spinodal_by_class.png"]),
-                ),
-            ],
-        ),
-        FigureSpec(
-            figure_id="FigureS6",
-            title="Figure S6. Embedding Space, PINN Sensitivity, and χ Dataset Analysis",
-            destination="si",
-            ncols=2,
-            panels=[
-                PanelSpec(
-                    caption="Embedding PCA by source",
-                    candidates=_make_candidates(block_i_fig_dirs, ["step1_embedding_pca_by_source.png"])
-                    + _make_candidates(step7_fig_dirs, ["step1_embedding_pca_by_source.png"]),
-                ),
-                PanelSpec(
-                    caption="PINN coefficient sensitivity by class",
-                    candidates=_make_candidates(block_i_fig_dirs, ["pinn_coefficient_sensitivity_by_class.png"])
-                    + _make_candidates(step7_fig_dirs, ["pinn_coefficient_sensitivity_by_class.png"]),
-                ),
-                PanelSpec(
-                    caption="Descriptor shift vs Step2 target pool",
-                    candidates=_make_candidates(block_c_fig_dirs, ["descriptor_shift_vs_step2_target_pool.png"])
-                    + _make_candidates(step7_fig_dirs, ["descriptor_shift_vs_step2_target_pool.png"]),
-                ),
-                PanelSpec(
-                    caption="Descriptor-χ correlation heatmap",
-                    candidates=_make_candidates(block_f_fig_dirs, ["descriptor_chi_correlation_heatmap.png"])
-                    + _make_candidates(step7_fig_dirs, ["descriptor_chi_correlation_heatmap.png"]),
-                ),
-            ],
-        ),
-        FigureSpec(
-            figure_id="FigureS7",
-            title="Figure S7. Thermodynamic Class Contrast and Target Context",
-            destination="si",
-            ncols=2,
-            panels=[
-                PanelSpec(
-                    caption="Class-contrast delta heatmap across (T, φ)",
-                    candidates=_make_candidates(block_a_fig_dirs, ["chi_class_delta_heatmap.png"])
-                    + _make_candidates(step7_fig_dirs, ["chi_class_delta_heatmap.png"]),
-                ),
-                PanelSpec(
-                    caption="Class-contrast significance heatmap",
-                    candidates=_make_candidates(block_a_fig_dirs, ["chi_class_significance_heatmap.png"])
-                    + _make_candidates(step7_fig_dirs, ["chi_class_significance_heatmap.png"]),
-                ),
-                PanelSpec(
-                    caption="χ vs temperature trajectories by class and φ",
-                    candidates=_make_candidates(block_a_fig_dirs, ["chi_vs_temperature_by_phi_and_class.png"])
-                    + _make_candidates(step7_fig_dirs, ["chi_vs_temperature_by_phi_and_class.png"]),
-                ),
-                PanelSpec(
-                    caption="Target χ relative to class mean trends",
-                    candidates=_make_candidates(block_a_fig_dirs, ["step3_target_vs_class_means.png"])
-                    + _make_candidates(step7_fig_dirs, ["step3_target_vs_class_means.png"]),
-                ),
-            ],
-        ),
-        FigureSpec(
-            figure_id="FigureS8",
-            title="Figure S8. Predictor Error and Thermodynamic-Gradient Consistency",
-            destination="si",
-            ncols=2,
-            panels=[
-                PanelSpec(
-                    caption="Condition-level MAE heatmap",
-                    candidates=_make_candidates(block_b_fig_dirs, ["step4_test_mae_heatmap.png"])
-                    + _make_candidates(step7_fig_dirs, ["step4_test_mae_heatmap.png"]),
-                ),
-                PanelSpec(
-                    caption="dχ/dT gradient consistency",
-                    candidates=_make_candidates(block_b_fig_dirs, ["step4_gradient_consistency_dchi_dT.png"])
-                    + _make_candidates(step7_fig_dirs, ["step4_gradient_consistency_dchi_dT.png"]),
-                ),
-                PanelSpec(
-                    caption="dχ/dφ gradient consistency",
-                    candidates=_make_candidates(block_b_fig_dirs, ["step4_gradient_consistency_dchi_dphi.png"])
-                    + _make_candidates(step7_fig_dirs, ["step4_gradient_consistency_dchi_dphi.png"]),
-                ),
-                PanelSpec(
-                    caption="Selection trade-off: confidence vs χ error",
+                    caption="Selection trade-off between χ prediction and soluble confidence",
                     candidates=_make_candidates(block_c_fig_dirs, ["selection_tradeoff_chi_vs_solubility_confidence.png"])
                     + _make_candidates(step7_fig_dirs, ["selection_tradeoff_chi_vs_solubility_confidence.png"]),
                 ),
-            ],
-        ),
-        FigureSpec(
-            figure_id="FigureS9",
-            title="Figure S9. Candidate Novelty and Chemical-Space Diagnostics",
-            destination="si",
-            ncols=2,
-            panels=[
                 PanelSpec(
-                    caption="Descriptor shift relative to training set",
-                    candidates=_make_candidates(block_c_fig_dirs, ["descriptor_shift_vs_training.png"])
-                    + _make_candidates(step7_fig_dirs, ["descriptor_shift_vs_training.png"]),
+                    caption="Selected-target χ and confidence comparison by source step",
+                    candidates=_make_candidates(block_c_fig_dirs, ["selected_target_chi_confidence_by_source.png"])
+                    + _make_candidates(step7_fig_dirs, ["selected_target_chi_confidence_by_source.png"]),
                 ),
                 PanelSpec(
-                    caption="Novelty similarity distribution",
+                    caption="Novelty similarity distribution relative to training polymers",
                     candidates=_make_candidates(block_c_fig_dirs, ["novelty_similarity_histogram.png"])
                     + _make_candidates(step7_fig_dirs, ["novelty_similarity_histogram.png"]),
                 ),
                 PanelSpec(
-                    caption="Scoring landscape: χ vs class confidence",
-                    candidates=_make_candidates(block_g_fig_dirs, ["chi_vs_class_prob_scoring_landscape.png"])
-                    + _make_candidates(step7_fig_dirs, ["chi_vs_class_prob_scoring_landscape.png"]),
-                ),
-                PanelSpec(
-                    caption="Discovered-candidate descriptor distribution",
-                    candidates=_make_candidates(block_g_fig_dirs, ["discovered_descriptor_boxplot.png"])
-                    + _make_candidates(step7_fig_dirs, ["discovered_descriptor_boxplot.png"]),
+                    caption="Class-coverage of Step 6 selected targets within the cross-step analysis",
+                    candidates=(
+                        [step6_target_class_coverage_derived]
+                        if isinstance(step6_target_class_coverage_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(block_c_fig_dirs, ["step6_target_polymer_class_coverage.png"])
+                    + _make_candidates(step7_fig_dirs, ["step6_target_polymer_class_coverage.png"]),
                 ),
             ],
         ),
-        FigureSpec(
-            figure_id="FigureS10",
-            title="Figure S10. DiT vs Traditional Baseline Comparison Across Model Sizes",
-            destination="si",
-            ncols=2,
-            panels=[
-                PanelSpec(
-                    caption="Regression comparison overview (DiT vs traditional)",
-                    candidates=_make_candidates(
-                        step4_compare_fig_dirs,
-                        [
-                            "regression_overview_panel.png",
-                            "regression_delta_heatmap.png",
-                            "comparison_no_valid_data_notice.png",
-                        ],
-                    ),
-                ),
-                PanelSpec(
-                    caption="Classification comparison overview (DiT vs traditional)",
-                    candidates=_make_candidates(
-                        step4_compare_fig_dirs,
-                        [
-                            "classification_overview_panel.png",
-                            "classification_delta_heatmap.png",
-                            "comparison_no_valid_data_notice.png",
-                        ],
-                    ),
-                ),
-                PanelSpec(
-                    caption="Per-metric winner counts (DiT vs traditional)",
-                    candidates=_make_candidates(
-                        step4_compare_fig_dirs,
-                        [
-                            "winner_counts_by_metric.png",
-                            "comparison_no_valid_data_notice.png",
-                        ],
-                    ),
-                ),
-                PanelSpec(
-                    caption="Missing/invalid comparison inputs by stage and model size",
-                    candidates=_make_candidates(
-                        step4_compare_fig_dirs,
-                        [
-                            "missing_inputs_by_stage.png",
-                            "artifact_counts_by_category.png",
-                            "comparison_no_valid_data_notice.png",
-                        ],
-                    ),
-                ),
-            ],
+        *(
+            [
+                FigureSpec(
+                    figure_id="FigureS10",
+                    title="Figure S10. DiT vs Traditional Baseline Comparison Across Model Sizes",
+                    destination="si",
+                    ncols=2,
+                    panels=[
+                        PanelSpec(
+                            caption="Regression comparison overview (DiT vs traditional)",
+                            candidates=_make_candidates(
+                                step4_compare_fig_dirs,
+                                [
+                                    "regression_overview_panel.png",
+                                    "regression_delta_heatmap.png",
+                                    "comparison_no_valid_data_notice.png",
+                                ],
+                            ),
+                        ),
+                        PanelSpec(
+                            caption="Classification comparison overview (DiT vs traditional)",
+                            candidates=_make_candidates(
+                                step4_compare_fig_dirs,
+                                [
+                                    "classification_overview_panel.png",
+                                    "classification_delta_heatmap.png",
+                                    "comparison_no_valid_data_notice.png",
+                                ],
+                            ),
+                        ),
+                        PanelSpec(
+                            caption="Per-metric winner counts (DiT vs traditional)",
+                            candidates=_make_candidates(
+                                step4_compare_fig_dirs,
+                                [
+                                    "winner_counts_by_metric.png",
+                                    "comparison_no_valid_data_notice.png",
+                                ],
+                            ),
+                        ),
+                        PanelSpec(
+                            caption="Missing/invalid comparison inputs by stage and model size",
+                            candidates=_make_candidates(
+                                step4_compare_fig_dirs,
+                                [
+                                    "missing_inputs_by_stage.png",
+                                    "artifact_counts_by_category.png",
+                                    "comparison_no_valid_data_notice.png",
+                                ],
+                            ),
+                        ),
+                    ],
+                )
+            ]
+            if paths.get("step4_compare_dir") is not None
+            else []
         ),
     ]
 
@@ -1902,9 +2126,9 @@ def _write_storyline(
         "- Figure 1: Validates backbone training convergence and generation quality",
         "- Figure 2: Shows how condition-specific χ_target thresholds are learned with statistical confidence",
         "- Figure 3: Demonstrates PINN χ regression accuracy and binary miscibility classification",
-        "- Figure 4: Quantifies unconstrained inverse design coverage across thermodynamic conditions",
-        "- Figure 5: Extends design to polymer-family constraints, maintaining coverage",
-        "- Figure 6: Confirms novelty of discovered polymers and reveals thermodynamic mechanisms",
+        "- Figure 4: Summarizes Step 5 sampling progress, screening, and constraint satisfaction for the final 100 targets",
+        "- Figure 5: Summarizes Step 6 class-conditioned sampling, screening selectivity, and polymer-class compliance",
+        "- Figure 6: Compares Step 5 and Step 6 selected targets across overlap, requirements, novelty, and chemical space",
     ]
     (manuscript_text_dir / "manuscript_outline.md").write_text(
         "\n".join(manuscript_outline) + "\n",
@@ -2520,6 +2744,21 @@ def _copy_source_data(
         )
         to_copy["step7_inverse_design_sampling_rollup"] = paths.get("step7_inverse_design_sampling_rollup")
         to_copy["step7_success_rates"] = paths["step7_dir"] / "metrics" / "step2_step5_step6_success_rates.csv"
+        to_copy["step7_target_sampling_funnel"] = (
+            paths["step7_dir"] / "metrics" / "inverse_design_target_sampling_funnel.csv"
+        )
+        to_copy["step7_sampling_attempt_progress"] = (
+            paths["step7_dir"] / "metrics" / "inverse_design_sampling_attempt_progress.csv"
+        )
+        to_copy["step7_selected_target_source_overlap"] = (
+            paths["step7_dir"] / "metrics" / "selected_target_source_overlap.csv"
+        )
+        to_copy["step7_selected_target_requirement_snapshot"] = (
+            paths["step7_dir"] / "metrics" / "selected_target_requirement_snapshot.csv"
+        )
+        to_copy["step7_selected_target_source_comparison"] = (
+            paths["step7_dir"] / "metrics" / "selected_target_source_comparison.csv"
+        )
         to_copy["step7_discovered_descriptor_stats"] = (
             paths["step7_dir"] / "metrics" / "discovered_descriptor_stats.csv"
         )
@@ -2689,19 +2928,67 @@ def main(args: argparse.Namespace) -> None:
         paths=paths,
         metadata_dir=metadata_dir,
     )
+    step5_target_csv = (
+        paths["step5_dir"] / "metrics" / "target_polymers.csv"
+        if paths.get("step5_dir") is not None
+        else None
+    )
+    step6_target_csv = (
+        paths["step6_dir"] / "metrics" / "target_polymers.csv"
+        if paths.get("step6_dir") is not None
+        else None
+    )
+    paths["step5_sampling_attempt_progress_derived"] = _build_sampling_attempt_progress_panel(
+        attempts_csv=paths.get("step5_sampling_attempts"),
+        out_png=metadata_dir / "derived_step5_sampling_attempt_progress.png",
+    )
+    paths["step6_sampling_attempt_progress_derived"] = _build_sampling_attempt_progress_panel(
+        attempts_csv=paths.get("step6_sampling_attempts"),
+        out_png=metadata_dir / "derived_step6_sampling_attempt_progress.png",
+    )
+    paths["step5_requirement_snapshot_derived"] = _build_requirement_snapshot_panel(
+        target_csv=step5_target_csv,
+        out_png=metadata_dir / "derived_step5_requirement_snapshot.png",
+    )
+    paths["step6_requirement_snapshot_derived"] = _build_requirement_snapshot_panel(
+        target_csv=step6_target_csv,
+        out_png=metadata_dir / "derived_step6_requirement_snapshot.png",
+    )
+    paths["step5_target_chi_parity_derived"] = _build_target_chi_parity_panel(
+        target_csv=step5_target_csv,
+        out_png=metadata_dir / "derived_step5_target_chi_parity.png",
+    )
+    paths["step6_target_chi_parity_derived"] = _build_target_chi_parity_panel(
+        target_csv=step6_target_csv,
+        out_png=metadata_dir / "derived_step6_target_chi_parity.png",
+    )
+    paths["step5_target_confidence_by_rank_derived"] = _build_target_confidence_by_rank_panel(
+        target_csv=step5_target_csv,
+        out_png=metadata_dir / "derived_step5_target_confidence_by_rank.png",
+    )
+    paths["step6_target_confidence_by_rank_derived"] = _build_target_confidence_by_rank_panel(
+        target_csv=step6_target_csv,
+        out_png=metadata_dir / "derived_step6_target_confidence_by_rank.png",
+    )
     paths["step5_screening_funnel_derived"] = _build_screening_funnel_panel(
-        summary_csv=(
-            paths["step5_dir"] / "metrics" / "target_polymer_selection_summary.csv"
-            if paths.get("step5_dir") is not None
-            else None
+        summary_csv=_first_existing(
+            [
+                paths.get("step5_sampling_process_summary"),
+                paths["step5_dir"] / "metrics" / "target_polymer_selection_summary.csv"
+                if paths.get("step5_dir") is not None
+                else None,
+            ]
         ),
         out_png=metadata_dir / "derived_step5_screening_funnel.png",
     )
     paths["step6_screening_funnel_derived"] = _build_screening_funnel_panel(
-        summary_csv=(
-            paths["step6_dir"] / "metrics" / "target_polymer_selection_summary.csv"
-            if paths.get("step6_dir") is not None
-            else None
+        summary_csv=_first_existing(
+            [
+                paths.get("step6_sampling_process_summary"),
+                paths["step6_dir"] / "metrics" / "target_polymer_selection_summary.csv"
+                if paths.get("step6_dir") is not None
+                else None,
+            ]
         ),
         out_png=metadata_dir / "derived_step6_screening_funnel.png",
     )
@@ -2714,6 +3001,14 @@ def main(args: argparse.Namespace) -> None:
         "step3_threshold_regions_derived",
         "step3_condition_profiles_derived",
         "step3_temperature_trends_derived",
+        "step5_sampling_attempt_progress_derived",
+        "step6_sampling_attempt_progress_derived",
+        "step5_requirement_snapshot_derived",
+        "step6_requirement_snapshot_derived",
+        "step5_target_chi_parity_derived",
+        "step6_target_chi_parity_derived",
+        "step5_target_confidence_by_rank_derived",
+        "step6_target_confidence_by_rank_derived",
         "step5_screening_funnel_derived",
         "step6_screening_funnel_derived",
         "step6_target_class_coverage_derived",
