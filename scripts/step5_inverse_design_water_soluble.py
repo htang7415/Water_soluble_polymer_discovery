@@ -25,6 +25,8 @@ from src.chi.inverse_design_common import (
     load_soluble_targets,
     load_step2_resampling_step_summary,
     parse_candidate_source,
+    prepare_novel_inference_cache,
+    resolve_training_smiles,
     set_plot_style,
 )
 from src.chi.model import predict_chi_mean_std_from_coefficients
@@ -1248,6 +1250,19 @@ def main(args):
     print(f"device={device}")
     print("=" * 70)
 
+    print("Preparing cached novelty reference and Step 4 inference models...")
+    training_canonical = resolve_training_smiles(results_dir, base_results_dir)
+    novel_inference_cache = prepare_novel_inference_cache(
+        args=args,
+        config=config,
+        chi_cfg=chi_cfg,
+        results_dir=results_dir,
+        step4_reg_metrics_dir=step4_reg_metrics_dir,
+        step4_cls_metrics_dir=step4_cls_metrics_dir,
+        device=device,
+        split_mode=split_mode,
+    )
+
     target_df, target_path_used = load_soluble_targets(
         targets_csv=args.targets_csv,
         results_dir=results_dir,
@@ -1262,7 +1277,6 @@ def main(args):
     accumulated_pools: List[pd.DataFrame] = []
     attempt_rows: List[Dict[str, object]] = []
     attempt_manifests: List[Dict[str, object]] = []
-    training_canonical: set[str] | None = None
     score_outputs: Dict[str, object] | None = None
     coeff_df = pd.DataFrame()
 
@@ -1283,6 +1297,8 @@ def main(args):
             resampling_step_dir=attempt_resampling_dir,
             resampling_target_polymer_count=resampling_target_polymer_count,
             resampling_random_seed=attempt_random_seed,
+            training_canonical=training_canonical,
+            novel_inference_cache=novel_inference_cache,
         )
         training_canonical = attempt_training_canonical
         attempt_pool_summary = dict(attempt_pool_summary)

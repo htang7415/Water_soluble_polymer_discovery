@@ -451,69 +451,85 @@ def launch_fresh_step2_resampling(
     return generated_csv, summary
 
 
-@torch.no_grad()
-def infer_coefficients_for_novel_candidates(
-    novel_df: pd.DataFrame,
-    config: Dict,
-    model_size: str | None,
-    split_mode: str | None,
-    chi_checkpoint_path: Path,
-    class_checkpoint_path: Path | None,
-    backbone_checkpoint_path: str | None,
-    device: str,
-    timestep: int,
-    pooling: str,
-    batch_size: int,
-    uncertainty_enabled: bool = False,
-    uncertainty_mc_samples: int = 20,
-    uncertainty_seed: int | None = None,
-) -> pd.DataFrame:
-    mc_enabled = bool(uncertainty_enabled and int(uncertainty_mc_samples) >= 2)
-    if novel_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "polymer_id",
-                "Polymer",
-                "SMILES",
-                "canonical_smiles",
-                CLASS_LABEL_INTERNAL,
-                CLASS_LABEL_PUBLIC,
-                "class_logit",
-                "class_logit_std",
-                "class_prob",
-                "class_prob_std",
-                *COEFF_NAMES,
-                *[f"{name}_std" for name in COEFF_NAMES],
-                "candidate_source",
-                "is_novel_vs_train",
-            ]
-        )
+def _resolve_novel_inference_checkpoints(
+    args,
+    results_dir: Path,
+    step4_reg_metrics_dir: Path,
+    step4_cls_metrics_dir: Path,
+) -> Tuple[Path, Path]:
+    default_reg_candidates = [
+        step4_reg_metrics_dir.parent / "checkpoints" / "chi_regression_best.pt",
+        step4_reg_metrics_dir.parent / "checkpoints" / "chi_physics_best.pt",
+        results_dir / "checkpoints" / "chi_regression_best.pt",
+        results_dir / "checkpoints" / "chi_physics_best.pt",
+    ]
+    if getattr(args, "step4_checkpoint", None):
+        chi_checkpoint = Path(args.step4_checkpoint)
+    else:
+        chi_checkpoint = next((p for p in default_reg_candidates if p.exists()), default_reg_candidates[0])
+    if not chi_checkpoint.exists():
+        raise FileNotFoundError(f"Step4 chi checkpoint not found: {chi_checkpoint}")
 
-    if uncertainty_seed is not None:
-        torch.manual_seed(int(uncertainty_seed))
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(int(uncertainty_seed))
+    if getattr(args, "step4_class_checkpoint", None):
+        class_checkpoint = Path(args.step4_class_checkpoint)
+    else:
+        default_cls_candidates = [
+            step4_cls_metrics_dir.parent / "checkpoints" / "chi_classifier_best.pt",
+            results_dir / "checkpoints" / "chi_classifier_best.pt",
+        ]
+        class_checkpoint = next((p for p in default_cls_candidates if p.exists()), default_cls_candidates[0])
+    if not class_checkpoint.exists():
+        raise FileNotFoundError(
+            "Step4 classification checkpoint not found. "
+            f"Expected: {class_checkpoint}. "
+            "Run Step 4 to produce Step4_2 checkpoint or pass --step4_class_checkpoint."
+        )
+    return chi_checkpoint, class_checkpoint
+
+
+def prepare_novel_inference_cache(
+    args,
+    config: Dict,
+    chi_cfg: Dict,
+    results_dir: Path,
+    step4_reg_metrics_dir: Path,
+    step4_cls_metrics_dir: Path,
+    device: str,
+    split_mode: str,
+) -> Dict[str, object]:
+    uncertainty_enabled = bool(getattr(args, "uncertainty_enabled", chi_cfg.get("uncertainty_enabled", False)))
+    uncertainty_mc_samples = int(
+        getattr(args, "uncertainty_mc_samples", chi_cfg.get("uncertainty_mc_samples", 20))
+        or chi_cfg.get("uncertainty_mc_samples", 20)
+    )
+    timestep = int(chi_cfg.get("embedding_timestep", 1))
+    pooling = str(args.embedding_pooling)
+    mc_enabled = bool(uncertainty_enabled and int(uncertainty_mc_samples) >= 2)
+    chi_checkpoint, class_checkpoint = _resolve_novel_inference_checkpoints(
+        args=args,
+        results_dir=results_dir,
+        step4_reg_metrics_dir=step4_reg_metrics_dir,
+        step4_cls_metrics_dir=step4_cls_metrics_dir,
+    )
 
     tokenizer, step1_backbone, _ = load_backbone_from_step1(
         config=config,
-        model_size=model_size,
+        model_size=args.model_size,
         split_mode=split_mode,
-        checkpoint_path=backbone_checkpoint_path,
+        checkpoint_path=args.backbone_checkpoint,
         device=device,
     )
 
-    reg_ckpt = torch.load(chi_checkpoint_path, map_location=device, weights_only=True)
+    reg_ckpt = torch.load(chi_checkpoint, map_location=device, weights_only=True)
     reg_state = _normalize_checkpoint_state_dict(reg_ckpt["model_state_dict"])
     reg_finetune_last_layers = int(reg_ckpt.get("finetune_last_layers", 0) or 0)
     reg_timestep = int(reg_ckpt.get("timestep_for_embedding", timestep))
-
-    reg_model = None
     if reg_finetune_last_layers > 0:
         _, reg_backbone, _ = load_backbone_from_step1(
             config=config,
-            model_size=model_size,
+            model_size=args.model_size,
             split_mode=split_mode,
-            checkpoint_path=backbone_checkpoint_path,
+            checkpoint_path=args.backbone_checkpoint,
             device=device,
         )
         reg_head = PhysicsGuidedChiModel(
@@ -549,48 +565,47 @@ def infer_coefficients_for_novel_candidates(
     cls_model = None
     cls_finetune_last_layers = 0
     cls_timestep = int(timestep)
-    if class_checkpoint_path is not None and class_checkpoint_path.exists():
-        cls_ckpt = torch.load(class_checkpoint_path, map_location=device, weights_only=True)
-        cls_state = _normalize_checkpoint_state_dict(cls_ckpt["model_state_dict"])
-        cls_finetune_last_layers = int(cls_ckpt.get("finetune_last_layers", 0) or 0)
-        cls_timestep = int(cls_ckpt.get("timestep_for_embedding", timestep))
-        if cls_finetune_last_layers > 0:
-            _, cls_backbone, _ = load_backbone_from_step1(
-                config=config,
-                model_size=model_size,
-                split_mode=split_mode,
-                checkpoint_path=backbone_checkpoint_path,
-                device=device,
-            )
-            cls_head = SolubilityClassifier(
-                embedding_dim=int(cls_ckpt["embedding_dim"]),
-                hidden_sizes=list(cls_ckpt["hidden_sizes"]),
-                dropout=float(cls_ckpt["dropout"]),
-            )
-            cls_model = BackboneSolubilityClassifierModel(
-                backbone=cls_backbone,
-                classifier_head=cls_head,
-                timestep=cls_timestep,
-                pooling=pooling,
-            ).to(device)
-            cls_model.load_state_dict(cls_state, strict=True)
-        else:
-            cls_model = SolubilityClassifier(
-                embedding_dim=int(cls_ckpt["embedding_dim"]),
-                hidden_sizes=list(cls_ckpt["hidden_sizes"]),
-                dropout=float(cls_ckpt["dropout"]),
-            ).to(device)
-            if isinstance(cls_state, dict) and any(str(k).startswith("classifier_head.") for k in cls_state.keys()):
-                cls_state = {
-                    str(k)[len("classifier_head."):]: v
-                    for k, v in cls_state.items()
-                    if str(k).startswith("classifier_head.")
-                }
-            cls_model.load_state_dict(cls_state, strict=True)
-        if mc_enabled:
-            cls_model.train()
-        else:
-            cls_model.eval()
+    cls_ckpt = torch.load(class_checkpoint, map_location=device, weights_only=True)
+    cls_state = _normalize_checkpoint_state_dict(cls_ckpt["model_state_dict"])
+    cls_finetune_last_layers = int(cls_ckpt.get("finetune_last_layers", 0) or 0)
+    cls_timestep = int(cls_ckpt.get("timestep_for_embedding", timestep))
+    if cls_finetune_last_layers > 0:
+        _, cls_backbone, _ = load_backbone_from_step1(
+            config=config,
+            model_size=args.model_size,
+            split_mode=split_mode,
+            checkpoint_path=args.backbone_checkpoint,
+            device=device,
+        )
+        cls_head = SolubilityClassifier(
+            embedding_dim=int(cls_ckpt["embedding_dim"]),
+            hidden_sizes=list(cls_ckpt["hidden_sizes"]),
+            dropout=float(cls_ckpt["dropout"]),
+        )
+        cls_model = BackboneSolubilityClassifierModel(
+            backbone=cls_backbone,
+            classifier_head=cls_head,
+            timestep=cls_timestep,
+            pooling=pooling,
+        ).to(device)
+        cls_model.load_state_dict(cls_state, strict=True)
+    else:
+        cls_model = SolubilityClassifier(
+            embedding_dim=int(cls_ckpt["embedding_dim"]),
+            hidden_sizes=list(cls_ckpt["hidden_sizes"]),
+            dropout=float(cls_ckpt["dropout"]),
+        ).to(device)
+        if isinstance(cls_state, dict) and any(str(k).startswith("classifier_head.") for k in cls_state.keys()):
+            cls_state = {
+                str(k)[len("classifier_head."):]: v
+                for k, v in cls_state.items()
+                if str(k).startswith("classifier_head.")
+            }
+        cls_model.load_state_dict(cls_state, strict=True)
+    if mc_enabled:
+        cls_model.train()
+    else:
+        cls_model.eval()
 
     if reg_finetune_last_layers > 0:
         warnings.warn(
@@ -601,7 +616,7 @@ def infer_coefficients_for_novel_candidates(
             RuntimeWarning,
             stacklevel=2,
         )
-    if cls_model is not None and cls_finetune_last_layers > 0:
+    if cls_finetune_last_layers > 0:
         warnings.warn(
             (
                 f"Loaded Step4 classification checkpoint with finetuned backbone "
@@ -612,10 +627,116 @@ def infer_coefficients_for_novel_candidates(
         )
 
     reg_needs_step1_embeddings = reg_finetune_last_layers == 0
-    cls_needs_step1_embeddings = cls_model is not None and cls_finetune_last_layers == 0
+    cls_needs_step1_embeddings = cls_finetune_last_layers == 0
     if not (reg_needs_step1_embeddings or cls_needs_step1_embeddings):
-        # Avoid keeping an unused backbone resident when both heads are end-to-end finetuned.
         step1_backbone = None
+
+    return {
+        "tokenizer": tokenizer,
+        "step1_backbone": step1_backbone,
+        "reg_model": reg_model,
+        "cls_model": cls_model,
+        "reg_timestep": int(reg_timestep),
+        "cls_timestep": int(cls_timestep),
+        "reg_finetune_last_layers": int(reg_finetune_last_layers),
+        "cls_finetune_last_layers": int(cls_finetune_last_layers),
+        "reg_needs_step1_embeddings": bool(reg_needs_step1_embeddings),
+        "cls_needs_step1_embeddings": bool(cls_needs_step1_embeddings),
+        "mc_enabled": bool(mc_enabled),
+        "device": device,
+        "chi_checkpoint_path": str(chi_checkpoint),
+        "class_checkpoint_path": str(class_checkpoint),
+    }
+
+
+@torch.no_grad()
+def infer_coefficients_for_novel_candidates(
+    novel_df: pd.DataFrame,
+    config: Dict,
+    model_size: str | None,
+    split_mode: str | None,
+    chi_checkpoint_path: Path,
+    class_checkpoint_path: Path | None,
+    backbone_checkpoint_path: str | None,
+    device: str,
+    timestep: int,
+    pooling: str,
+    batch_size: int,
+    uncertainty_enabled: bool = False,
+    uncertainty_mc_samples: int = 20,
+    uncertainty_seed: int | None = None,
+    inference_cache: Dict[str, object] | None = None,
+) -> pd.DataFrame:
+    if novel_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "polymer_id",
+                "Polymer",
+                "SMILES",
+                "canonical_smiles",
+                CLASS_LABEL_INTERNAL,
+                CLASS_LABEL_PUBLIC,
+                "class_logit",
+                "class_logit_std",
+                "class_prob",
+                "class_prob_std",
+                *COEFF_NAMES,
+                *[f"{name}_std" for name in COEFF_NAMES],
+                "candidate_source",
+                "is_novel_vs_train",
+            ]
+        )
+
+    if uncertainty_seed is not None:
+        torch.manual_seed(int(uncertainty_seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(uncertainty_seed))
+
+    mc_enabled = bool(uncertainty_enabled and int(uncertainty_mc_samples) >= 2)
+    if inference_cache is None:
+        class _InlineInferenceArgs:
+            pass
+
+        inline_args = _InlineInferenceArgs()
+        inline_args.model_size = model_size
+        inline_args.step4_checkpoint = str(chi_checkpoint_path)
+        inline_args.step4_class_checkpoint = (
+            str(class_checkpoint_path) if class_checkpoint_path is not None else None
+        )
+        inline_args.backbone_checkpoint = backbone_checkpoint_path
+        inline_args.embedding_pooling = pooling
+        inline_args.uncertainty_enabled = bool(uncertainty_enabled)
+        inline_args.uncertainty_mc_samples = int(uncertainty_mc_samples)
+        inference_cache = prepare_novel_inference_cache(
+            args=inline_args,
+            config=config,
+            chi_cfg={
+                "embedding_timestep": int(timestep),
+                "uncertainty_enabled": bool(uncertainty_enabled),
+                "uncertainty_mc_samples": int(uncertainty_mc_samples),
+            },
+            results_dir=chi_checkpoint_path.parent.parent.parent,
+            step4_reg_metrics_dir=chi_checkpoint_path.parent.parent / "metrics",
+            step4_cls_metrics_dir=(
+                class_checkpoint_path.parent.parent / "metrics"
+                if class_checkpoint_path is not None
+                else chi_checkpoint_path.parent.parent / "metrics"
+            ),
+            device=device,
+            split_mode=str(split_mode) if split_mode is not None else "polymer",
+        )
+
+    tokenizer = inference_cache["tokenizer"]
+    step1_backbone = inference_cache.get("step1_backbone")
+    reg_model = inference_cache["reg_model"]
+    cls_model = inference_cache.get("cls_model")
+    reg_timestep = int(inference_cache["reg_timestep"])
+    cls_timestep = int(inference_cache["cls_timestep"])
+    reg_finetune_last_layers = int(inference_cache["reg_finetune_last_layers"])
+    cls_finetune_last_layers = int(inference_cache["cls_finetune_last_layers"])
+    reg_needs_step1_embeddings = bool(inference_cache["reg_needs_step1_embeddings"])
+    cls_needs_step1_embeddings = bool(inference_cache["cls_needs_step1_embeddings"])
+    mc_enabled = bool(inference_cache.get("mc_enabled", mc_enabled))
 
     coeff_mean_list: List[np.ndarray] = []
     coeff_std_list: List[np.ndarray] = []
@@ -818,9 +939,12 @@ def build_candidate_pool(
     resampling_step_dir: Path | None = None,
     resampling_target_polymer_count: int | None = None,
     resampling_random_seed: int | None = None,
+    training_canonical: set[str] | None = None,
+    novel_inference_cache: Dict[str, object] | None = None,
 ) -> Tuple[pd.DataFrame, Dict[str, object], set[str]]:
     source = parse_candidate_source(args.candidate_source)
-    training_canonical = resolve_training_smiles(results_dir, base_results_dir)
+    if training_canonical is None:
+        training_canonical = resolve_training_smiles(results_dir, base_results_dir)
     uncertainty_enabled = bool(getattr(args, "uncertainty_enabled", chi_cfg.get("uncertainty_enabled", False)))
     uncertainty_mc_samples = int(
         getattr(args, "uncertainty_mc_samples", chi_cfg.get("uncertainty_mc_samples", 20))
@@ -875,34 +999,12 @@ def build_candidate_pool(
         )
         summary.update(novel_summary)
         summary["generated_csv"] = str(generated_csv)
-
-        default_reg_candidates = [
-            step4_reg_metrics_dir.parent / "checkpoints" / "chi_regression_best.pt",
-            step4_reg_metrics_dir.parent / "checkpoints" / "chi_physics_best.pt",
-            results_dir / "checkpoints" / "chi_regression_best.pt",
-            results_dir / "checkpoints" / "chi_physics_best.pt",
-        ]
-        if getattr(args, "step4_checkpoint", None):
-            chi_checkpoint = Path(args.step4_checkpoint)
-        else:
-            chi_checkpoint = next((p for p in default_reg_candidates if p.exists()), default_reg_candidates[0])
-        if not chi_checkpoint.exists():
-            raise FileNotFoundError(f"Step4 chi checkpoint not found: {chi_checkpoint}")
-
-        if getattr(args, "step4_class_checkpoint", None):
-            class_checkpoint = Path(args.step4_class_checkpoint)
-        else:
-            default_cls_candidates = [
-                step4_cls_metrics_dir.parent / "checkpoints" / "chi_classifier_best.pt",
-                results_dir / "checkpoints" / "chi_classifier_best.pt",
-            ]
-            class_checkpoint = next((p for p in default_cls_candidates if p.exists()), default_cls_candidates[0])
-        if not class_checkpoint.exists():
-            raise FileNotFoundError(
-                "Step4 classification checkpoint not found. "
-                f"Expected: {class_checkpoint}. "
-                "Run Step 4 to produce Step4_2 checkpoint or pass --step4_class_checkpoint."
-            )
+        chi_checkpoint, class_checkpoint = _resolve_novel_inference_checkpoints(
+            args=args,
+            results_dir=results_dir,
+            step4_reg_metrics_dir=step4_reg_metrics_dir,
+            step4_cls_metrics_dir=step4_cls_metrics_dir,
+        )
 
         novel_coeff_df = infer_coefficients_for_novel_candidates(
             novel_df=novel_df,
@@ -919,6 +1021,7 @@ def build_candidate_pool(
             uncertainty_enabled=uncertainty_enabled,
             uncertainty_mc_samples=uncertainty_mc_samples,
             uncertainty_seed=uncertainty_seed,
+            inference_cache=novel_inference_cache,
         )
         summary["novel_candidate_count"] = int(len(novel_coeff_df))
         pool_frames.append(novel_coeff_df)
