@@ -251,7 +251,7 @@ chi_training:
     sampling_attempts_max: 1000  # accumulate fresh Step 2 resampling attempts until class-matching targets are found
     property_rule: "upper_bound"
     coverage_topk: 5
-    target_polymer_class: "polyamide"  # all | * | or any key defined under polymer_classes below
+    target_polymer_class: "polyimide"  # all | * | or any key defined under polymer_classes below
     uncertainty_enabled: false
     uncertainty_mc_samples: 20
     uncertainty_class_z: 1.0

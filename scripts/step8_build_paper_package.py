@@ -14,6 +14,7 @@ Constraint requested by user:
 
 from __future__ import annotations
 
+import os
 import argparse
 import ast
 import json
@@ -25,6 +26,11 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# Avoid OpenMP shared-memory failures in restricted environments.
+os.environ.setdefault("MKL_THREADING_LAYER", "SEQUENTIAL")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
@@ -1507,9 +1513,15 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
     step5_fig_dirs = [paths.get("step5_dir") / "figures"] if paths.get("step5_dir") is not None else [None]
     step6_fig_dirs = [paths.get("step6_dir") / "figures"] if paths.get("step6_dir") is not None else [None]
     step7_fig_dirs = [paths.get("step7_dir") / "figures"] if paths.get("step7_dir") is not None else [None]
-    step4_compare_fig_dirs = (
-        [paths.get("step4_compare_dir") / "figures"] if paths.get("step4_compare_dir") is not None else [None]
-    )
+    if paths.get("step4_compare_dir") is not None:
+        step4_compare_fig_dirs = [
+            paths.get("step4_compare_dir") / "figures" / "regression",
+            paths.get("step4_compare_dir") / "figures" / "classification",
+            paths.get("step4_compare_dir") / "figures" / "shared",
+            paths.get("step4_compare_dir") / "figures",
+        ]
+    else:
+        step4_compare_fig_dirs = [None]
     def _blk(paths_obj: Dict[str, Optional[Path]], blk: str) -> List[Optional[Path]]:
         d = paths_obj.get(f"step7_block_{blk}_fig_dir")
         return [d] if d is not None else [None]
@@ -1613,7 +1625,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="Figure2",
+            figure_id="Figure1",
             title="Figure 1. Diffusion backbone training and novel polymer generation quality",
             destination="manuscript",
             ncols=3,
@@ -1654,7 +1666,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="Figure3",
+            figure_id="Figure2",
             title="Figure 2. Data-driven condition-aware χ_target learning with bootstrap-validated thermodynamic stability",
             destination="manuscript",
             ncols=2,
@@ -1702,7 +1714,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="Figure4",
+            figure_id="Figure3",
             title="Figure 3. Physics-informed neural network χ regression and binary water-miscibility classification",
             destination="manuscript",
             ncols=2,
@@ -1732,7 +1744,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="Figure5",
+            figure_id="Figure4",
             title="Figure 4. Unconstrained inverse design: sampling process and constraint satisfaction for the final 100 water-soluble targets",
             destination="manuscript",
             ncols=2,
@@ -1762,7 +1774,10 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                         if isinstance(step5_requirement_snapshot_derived, Path)
                         else []
                     )
-                    + _make_candidates(step5_fig_dirs, ["requirement_pass_rates.png", "selected_target_quality_by_rank.png"]),
+                    + _make_candidates(
+                        step5_fig_dirs,
+                        ["requirement_pass_rates.png", "selected_target_requirements_by_rank.png"],
+                    ),
                 ),
                 PanelSpec(
                     caption="Target χ parity for the selected 100 polymers",
@@ -1783,7 +1798,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="Figure6",
+            figure_id="Figure5",
             title="Figure 5. Polymer-class-conditioned inverse design: sampling efficiency, screening selectivity, and class compliance",
             destination="manuscript",
             ncols=2,
@@ -1813,7 +1828,10 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                         if isinstance(step6_requirement_snapshot_derived, Path)
                         else []
                     )
-                    + _make_candidates(step6_fig_dirs, ["requirement_pass_rates.png", "selected_target_quality_by_rank.png"]),
+                    + _make_candidates(
+                        step6_fig_dirs,
+                        ["requirement_pass_rates.png", "selected_target_requirements_by_rank.png"],
+                    ),
                 ),
                 PanelSpec(
                     caption="Polymer-class coverage of discovered targets",
@@ -1828,7 +1846,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             ],
         ),
         FigureSpec(
-            figure_id="Figure7",
+            figure_id="Figure6",
             title="Figure 6. Cross-step analysis of the selected target polymers: sampling, overlap, requirements, and chemical novelty",
             destination="manuscript",
             ncols=3,
@@ -2037,12 +2055,12 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             [
                 FigureSpec(
                     figure_id="FigureS10",
-                    title="Figure S10. DiT vs Traditional Baseline Comparison Across Model Sizes",
+                    title="Figure S10. DiT vs traditional ML across all baseline models, including train and test performance",
                     destination="si",
                     ncols=2,
                     panels=[
                         PanelSpec(
-                            caption="Regression comparison overview (DiT vs traditional)",
+                            caption="Regression overview across DiT and all traditional models",
                             candidates=_make_candidates(
                                 step4_compare_fig_dirs,
                                 [
@@ -2053,7 +2071,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                             ),
                         ),
                         PanelSpec(
-                            caption="Classification comparison overview (DiT vs traditional)",
+                            caption="Classification overview across DiT and all traditional models",
                             candidates=_make_candidates(
                                 step4_compare_fig_dirs,
                                 [
@@ -2064,7 +2082,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                             ),
                         ),
                         PanelSpec(
-                            caption="Per-metric winner counts (DiT vs traditional)",
+                            caption="Per-metric winner counts across DiT and traditional baselines",
                             candidates=_make_candidates(
                                 step4_compare_fig_dirs,
                                 [
@@ -2139,16 +2157,13 @@ def _write_storyline(
         "# Supporting Information Outline (Step 8)",
         "",
         "## SI Figure Blocks",
+        "Current Step 8 build emits six SI composite figures: Figures S1-S5 and Figure S10.",
         "1. Figure S1: Polymer design foundation: training-corpus quality and thermodynamic target landscape context.",
         "2. Figure S2: Hyperparameter tuning trajectories and learning diagnostics.",
-        "3. Figure S3: Inverse-design target-quality ranking and resampling-process diagnostics.",
-        "4. Figure S4: Extended chemistry/functional-group representativeness analysis.",
-        "5. Figure S5: PINN polynomial and Flory-Huggins thermodynamic interpretation diagnostics.",
-        "6. Figure S6: Embedding geometry, PINN sensitivity, and χ-dataset interpretation.",
-        "7. Figure S7: Thermodynamic class contrast and target context analyses.",
-        "8. Figure S8: Predictor error and thermodynamic-gradient consistency diagnostics.",
-        "9. Figure S9: Candidate novelty and chemical-space diagnostics.",
-        "10. Figure S10: DiT vs traditional baseline comparison across model sizes.",
+        "3. Figure S3: Detailed χ-prediction and solubility-confidence diagnostics for selected targets.",
+        "4. Figure S4: Extended sampling-process and screening diagnostics for Step 5 and Step 6.",
+        "5. Figure S5: Cross-step candidate novelty and scoring diagnostics for selected targets.",
+        "6. Figure S10: DiT vs traditional baseline comparison across model sizes.",
         "",
         "## SI Tables",
         "Include artifact/input status, top selected polymers from Step 5/6, and PINN coefficient tables for reproducible scientific interpretation.",
@@ -2288,11 +2303,7 @@ def _write_verification_summary(
 
     manuscript_pngs = sorted(manuscript_figures_dir.glob("*.png"))
     si_pngs = sorted(si_figures_dir.glob("*.png"))
-    figure7_name = ""
-    for s in manuscript_specs:
-        if s.figure_id == "Figure7":
-            figure7_name = _figure_output_name(s)
-            break
+    final_manuscript_figure_name = _figure_output_name(manuscript_specs[-1]) if manuscript_specs else ""
 
     lines = [
         "Step 8 Verification Summary",
@@ -2300,7 +2311,7 @@ def _write_verification_summary(
         f"manuscript_png_count: {len(manuscript_pngs)} (expected {len(manuscript_specs)})",
         f"supporting_information_png_count: {len(si_pngs)} (expected {len(si_specs)})",
         f"tableS4_exists: {int((si_tables_dir / 'tableS4_pinn_coefficients.csv').exists())}",
-        f"figure7_expected_filename: {figure7_name}",
+        f"final_manuscript_figure_expected_filename: {final_manuscript_figure_name}",
         "",
         "filename_style: full title slug (*.png), not Figure1/FigureS1 short names",
         "figure_name_lists:",
@@ -2642,41 +2653,74 @@ def _build_manuscript_tables(
         ).to_csv(table_s5_path, index=False)
     else:
         reg_cols = [
+            "traditional_model_name",
+            "traditional_rank",
             "model_size",
+            "dit_train_r2",
+            "traditional_train_r2",
             "dit_r2",
             "traditional_r2",
             "delta_r2_traditional_minus_dit",
+            "dit_train_rmse",
+            "traditional_train_rmse",
             "dit_rmse",
             "traditional_rmse",
             "delta_rmse_traditional_minus_dit",
+            "dit_train_mae",
+            "traditional_train_mae",
             "dit_mae",
             "traditional_mae",
             "delta_mae_traditional_minus_dit",
         ]
         cls_cols = [
+            "traditional_model_name",
+            "traditional_rank",
             "model_size",
+            "dit_train_balanced_accuracy",
+            "traditional_train_balanced_accuracy",
             "dit_balanced_accuracy",
             "traditional_balanced_accuracy",
             "delta_balanced_accuracy_traditional_minus_dit",
+            "dit_train_auroc",
+            "traditional_train_auroc",
             "dit_auroc",
             "traditional_auroc",
             "delta_auroc_traditional_minus_dit",
+            "dit_train_f1",
+            "traditional_train_f1",
             "dit_f1",
             "traditional_f1",
             "delta_f1_traditional_minus_dit",
         ]
         reg_sub = reg_cmp_df[[c for c in reg_cols if c in reg_cmp_df.columns]].copy()
         cls_sub = cls_cmp_df[[c for c in cls_cols if c in cls_cmp_df.columns]].copy()
-        if reg_sub.empty:
-            combined = cls_sub.copy()
-        elif cls_sub.empty:
-            combined = reg_sub.copy()
-        else:
-            combined = reg_sub.merge(cls_sub, on="model_size", how="outer")
-        if "model_size" in combined.columns:
-            order_map = {"small": 0, "medium": 1, "large": 2, "xl": 3}
-            combined["_order"] = combined["model_size"].astype(str).str.lower().map(order_map).fillna(999)
-            combined = combined.sort_values(["_order", "model_size"]).drop(columns=["_order"])
+        frames = []
+        if not reg_sub.empty:
+            reg_sub.insert(0, "task", "regression")
+            frames.append(reg_sub)
+        if not cls_sub.empty:
+            cls_sub.insert(0, "task", "classification")
+            frames.append(cls_sub)
+        combined = pd.concat(frames, axis=0, ignore_index=True, sort=False) if frames else pd.DataFrame()
+        if not combined.empty:
+            order_map = {"regression": 0, "classification": 1}
+            size_order_map = {"small": 0, "medium": 1, "large": 2, "xl": 3}
+            combined["_task_order"] = combined["task"].astype(str).str.lower().map(order_map).fillna(999)
+            if "model_size" in combined.columns:
+                combined["_size_order"] = combined["model_size"].astype(str).str.lower().map(size_order_map).fillna(999)
+            else:
+                combined["_size_order"] = 999
+            if "traditional_rank" in combined.columns:
+                combined["_rank_order"] = pd.to_numeric(combined["traditional_rank"], errors="coerce").fillna(999)
+            else:
+                combined["_rank_order"] = 999
+            if "traditional_model_name" in combined.columns:
+                combined["_model_order"] = combined["traditional_model_name"].astype(str).str.lower()
+            else:
+                combined["_model_order"] = ""
+            combined = combined.sort_values(["_task_order", "_size_order", "_rank_order", "_model_order"]).drop(
+                columns=["_task_order", "_size_order", "_rank_order", "_model_order"]
+            )
         combined.to_csv(table_s5_path, index=False)
 
     return {
