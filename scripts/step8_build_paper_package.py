@@ -36,11 +36,17 @@ import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 from matplotlib import font_manager
+from matplotlib.patches import FancyBboxPatch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.chi.constants import COEFF_NAMES
+from src.chi.inverse_design_common import infer_coefficients_for_novel_candidates
+from src.chi.model import predict_chi_from_coefficients
 from src.utils.config import load_config, save_config
+from src.utils.chemistry import canonicalize_smiles
 from src.utils.figure_style import apply_publication_figure_style
 from src.utils.model_scales import get_results_dir
 from src.utils.reproducibility import save_run_metadata, seed_everything
@@ -48,6 +54,28 @@ from src.utils.reporting import save_artifact_manifest, save_step_summary, write
 
 PAPER_FONT_SIZE = 16
 PAPER_DPI = 600
+PANEL_CANVAS_WIDTH_PX = 3600
+PANEL_CANVAS_HEIGHT_PX = 3000
+PANEL_ASPECT = PANEL_CANVAS_WIDTH_PX / PANEL_CANVAS_HEIGHT_PX
+COMPOSED_PANEL_WIDTH_IN = 4.15
+COMPOSED_PANEL_HEIGHT_IN = COMPOSED_PANEL_WIDTH_IN / PANEL_ASPECT
+COMPOSED_GAP_WIDTH_IN = 0.26
+COMPOSED_GAP_HEIGHT_IN = 0.28
+COMPOSED_MARGIN_LEFT_IN = 0.18
+COMPOSED_MARGIN_RIGHT_IN = 0.12
+COMPOSED_MARGIN_BOTTOM_IN = 0.12
+COMPOSED_MARGIN_TOP_IN = 0.18
+COMPOSED_WARNING_BANNER_IN = 0.34
+PANEL_IMAGE_MARGIN_FRAC = 0.035
+NATURE_BLUE = "#0C5DA5"
+NATURE_GREEN = "#00B945"
+NATURE_ORANGE = "#FF9500"
+NATURE_RED = "#FF2C00"
+NATURE_PURPLE = "#845B97"
+NATURE_GRAY = "#474747"
+NATURE_LIGHT_BLUE = "#8FC2E7"
+NATURE_PALETTE = [NATURE_BLUE, NATURE_GREEN, NATURE_ORANGE, NATURE_RED, NATURE_PURPLE, NATURE_GRAY]
+WATER_CLASS_PALETTE = {0: NATURE_RED, 1: NATURE_BLUE}
 
 
 @dataclass
@@ -269,7 +297,71 @@ def _crop_panel_whitespace(img: np.ndarray, threshold: float = 0.985, pad_px: in
 
 def _load_panel_image(src: Path) -> np.ndarray:
     img = mpimg.imread(src)
-    return _crop_panel_whitespace(img)
+    return _pad_image_to_panel_aspect(_add_panel_outer_margin(_crop_panel_whitespace(img)))
+
+
+def _add_panel_outer_margin(img: np.ndarray, margin_frac: float = PANEL_IMAGE_MARGIN_FRAC) -> np.ndarray:
+    arr = np.asarray(img)
+    if arr.ndim < 2:
+        return arr
+
+    h, w = int(arr.shape[0]), int(arr.shape[1])
+    if h <= 0 or w <= 0 or margin_frac <= 0.0:
+        return arr
+
+    pad_y = max(1, int(round(h * float(margin_frac))))
+    pad_x = max(1, int(round(w * float(margin_frac))))
+    fill_val = np.iinfo(arr.dtype).max if np.issubdtype(arr.dtype, np.integer) else 1.0
+
+    if arr.ndim == 2:
+        canvas = np.full((h + 2 * pad_y, w + 2 * pad_x), fill_val, dtype=arr.dtype)
+        canvas[pad_y : pad_y + h, pad_x : pad_x + w] = arr
+        return canvas
+
+    c = int(arr.shape[2])
+    canvas = np.full((h + 2 * pad_y, w + 2 * pad_x, c), fill_val, dtype=arr.dtype)
+    if c == 4:
+        canvas[..., 3] = fill_val
+    canvas[pad_y : pad_y + h, pad_x : pad_x + w, :] = arr
+    return canvas
+
+
+def _pad_image_to_panel_aspect(img: np.ndarray, target_aspect: float = PANEL_ASPECT) -> np.ndarray:
+    arr = np.asarray(img)
+    if arr.ndim < 2:
+        return arr
+
+    h, w = int(arr.shape[0]), int(arr.shape[1])
+    if h <= 0 or w <= 0:
+        return arr
+
+    current_aspect = float(w) / float(h)
+    if np.isclose(current_aspect, float(target_aspect), atol=1.0e-3):
+        return arr
+
+    fill_val = np.iinfo(arr.dtype).max if np.issubdtype(arr.dtype, np.integer) else 1.0
+    if current_aspect < float(target_aspect):
+        target_w = int(math.ceil(h * float(target_aspect)))
+        target_h = h
+    else:
+        target_w = w
+        target_h = int(math.ceil(w / float(target_aspect)))
+
+    if arr.ndim == 2:
+        canvas = np.full((target_h, target_w), fill_val, dtype=arr.dtype)
+        y0 = (target_h - h) // 2
+        x0 = (target_w - w) // 2
+        canvas[y0 : y0 + h, x0 : x0 + w] = arr
+        return canvas
+
+    c = int(arr.shape[2])
+    canvas = np.full((target_h, target_w, c), fill_val, dtype=arr.dtype)
+    if c == 4:
+        canvas[..., 3] = fill_val
+    y0 = (target_h - h) // 2
+    x0 = (target_w - w) // 2
+    canvas[y0 : y0 + h, x0 : x0 + w, :] = arr
+    return canvas
 
 
 def _panel_label(ax, label: str, font_size: int) -> None:
@@ -326,8 +418,18 @@ def _compose_figure(
     ncols = max(1, int(spec.ncols))
     nrows = int(math.ceil(n_panels / ncols))
 
-    fig_w = 6.5 * ncols
-    fig_h = 5.0 * nrows + 0.7
+    fig_w = (
+        COMPOSED_MARGIN_LEFT_IN
+        + COMPOSED_MARGIN_RIGHT_IN
+        + ncols * COMPOSED_PANEL_WIDTH_IN
+        + max(0, ncols - 1) * COMPOSED_GAP_WIDTH_IN
+    )
+    fig_h = (
+        COMPOSED_MARGIN_BOTTOM_IN
+        + COMPOSED_MARGIN_TOP_IN
+        + nrows * COMPOSED_PANEL_HEIGHT_IN
+        + max(0, nrows - 1) * COMPOSED_GAP_HEIGHT_IN
+    )
     fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h))
     fig.patch.set_facecolor("white")
     axes = np.array(axes).reshape(-1)
@@ -371,9 +473,9 @@ def _compose_figure(
     for j in range(n_panels, len(axes)):
         axes[j].set_axis_off()
 
-    top = 0.98
+    top_margin_in = COMPOSED_MARGIN_TOP_IN
     if missing_count > 0:
-        top = 0.94
+        top_margin_in += COMPOSED_WARNING_BANNER_IN
         fig.text(
             0.5,
             0.992,
@@ -385,7 +487,14 @@ def _compose_figure(
         )
 
     # No global title or panel captions rendered on composed figures.
-    fig.subplots_adjust(top=top, wspace=0.12, hspace=0.18)
+    fig.subplots_adjust(
+        left=COMPOSED_MARGIN_LEFT_IN / fig_w,
+        right=1.0 - (COMPOSED_MARGIN_RIGHT_IN / fig_w),
+        bottom=COMPOSED_MARGIN_BOTTOM_IN / fig_h,
+        top=1.0 - (top_margin_in / fig_h),
+        wspace=COMPOSED_GAP_WIDTH_IN / COMPOSED_PANEL_WIDTH_IN,
+        hspace=COMPOSED_GAP_HEIGHT_IN / COMPOSED_PANEL_HEIGHT_IN,
+    )
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=int(dpi), bbox_inches=None, pad_inches=0.0)
     plt.close(fig)
@@ -440,7 +549,11 @@ def _clear_png_files(root_dir: Path) -> None:
             continue
 
 
-def _pad_png_canvas(png_path: Path, target_w: int = 3600, target_h: int = 3000) -> None:
+def _pad_png_canvas(
+    png_path: Path,
+    target_w: int = PANEL_CANVAS_WIDTH_PX,
+    target_h: int = PANEL_CANVAS_HEIGHT_PX,
+) -> None:
     """Center-pad a generated PNG to a fixed canvas for consistent panel sizing."""
     if png_path is None or not png_path.exists():
         return
@@ -472,6 +585,46 @@ def _pad_png_canvas(png_path: Path, target_w: int = 3600, target_h: int = 3000) 
         x0 = (target_w - w) // 2
         canvas[y0 : y0 + h, x0 : x0 + w, :] = img
     plt.imsave(png_path, canvas, dpi=PAPER_DPI)
+
+
+def _boxed_legend(
+    ax: plt.Axes,
+    *,
+    loc: str = "upper right",
+    title: Optional[str] = None,
+    ncol: int = 1,
+    fontsize: Optional[int] = None,
+):
+    handles, labels = ax.get_legend_handles_labels()
+    if len(handles) == 0:
+        return None
+    legend = ax.legend(
+        handles=handles,
+        labels=labels,
+        title=title,
+        loc=loc,
+        ncol=ncol,
+        frameon=True,
+        fancybox=True,
+        framealpha=0.92,
+        facecolor="white",
+        edgecolor="#666666",
+        fontsize=fontsize if fontsize is not None else max(10, PAPER_FONT_SIZE - 3),
+    )
+    if legend is not None and legend.get_title() is not None:
+        legend.get_title().set_fontsize(fontsize if fontsize is not None else max(10, PAPER_FONT_SIZE - 3))
+    return legend
+
+
+def _regression_summary_stats(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mae = float(np.mean(np.abs(y_pred - y_true))) if len(y_true) else np.nan
+    rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2))) if len(y_true) else np.nan
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+    return {"mae": mae, "rmse": rmse, "r2": r2}
 
 
 def _build_step2_generative_metrics_panel(
@@ -514,8 +667,7 @@ def _build_step2_generative_metrics_panel(
     out_png = metadata_dir / "derived_step2_generative_metrics_summary.png"
     fig, ax = plt.subplots(figsize=(6.0, 5.0))
     ypos = np.arange(len(labels))
-    colors = ["#1d4ed8", "#0ea5e9", "#10b981", "#f59e0b", "#8b5cf6"]
-    ax.barh(ypos, values, color=colors[: len(labels)])
+    ax.barh(ypos, values, color=NATURE_PALETTE[: len(labels)])
 
     for i, val in enumerate(values):
         near_right = val > 0.94
@@ -538,6 +690,123 @@ def _build_step2_generative_metrics_panel(
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=PAPER_DPI)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_step2_sampling_information_panel(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    summary_row = _safe_first_row(paths.get("step2_summary"))
+    if not summary_row:
+        return None
+
+    goal = _pick(summary_row, ["generation_goal", "target_polymer_count_requested"], default=np.nan)
+    generated = _pick(summary_row, ["generated_count", "valid_only_raw_generated"], default=np.nan)
+    accepted = _pick(summary_row, ["accepted_count_for_evaluation"], default=np.nan)
+    rounds = _pick(summary_row, ["valid_only_rounds"], default=np.nan)
+    time_sec = _pick(summary_row, ["sampling_time_sec"], default=np.nan)
+    throughput = _pick(summary_row, ["samples_per_sec", "valid_per_sec"], default=np.nan)
+    acceptance_rate = _pick(summary_row, ["valid_only_acceptance_rate"], default=np.nan)
+    shortfall = _pick(summary_row, ["valid_only_shortfall_count"], default=np.nan)
+
+    try:
+        goal_int = int(float(goal))
+        generated_int = int(float(generated))
+        accepted_int = int(float(accepted))
+        rounds_int = int(float(rounds))
+        time_sec_float = float(time_sec)
+        throughput_float = float(throughput)
+    except Exception:
+        return None
+    if goal_int <= 0 or generated_int <= 0 or accepted_int <= 0:
+        return None
+
+    goal_coverage = 100.0 * accepted_int / max(goal_int, 1)
+    footer_bits: List[str] = []
+    try:
+        footer_bits.append(f"Acceptance rate: {100.0 * float(acceptance_rate):.1f}%")
+    except Exception:
+        pass
+    try:
+        footer_bits.append(f"Shortfall: {int(float(shortfall)):,}")
+    except Exception:
+        pass
+    footer_bits.append(f"Valid-only rounds: {rounds_int}")
+
+    cards = [
+        ("Generation goal", f"{goal_int:,}", NATURE_BLUE),
+        ("Raw generated", f"{generated_int:,}", NATURE_GREEN),
+        ("Accepted for evaluation", f"{accepted_int:,}", NATURE_ORANGE),
+        ("Goal achieved", f"{goal_coverage:.1f}%", NATURE_RED),
+        ("Elapsed time", f"{time_sec_float / 60.0:.1f} min", NATURE_PURPLE),
+        ("Throughput", f"{throughput_float:.2f}/s", NATURE_GRAY),
+    ]
+
+    out_png = metadata_dir / "derived_step2_sampling_information_summary.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    ax.set_axis_off()
+    card_w = 0.41
+    card_h = 0.20
+    x_positions = [0.07, 0.52]
+    y_positions = [0.73, 0.47, 0.21]
+
+    for idx, (label, value, color) in enumerate(cards):
+        row = idx // 2
+        col = idx % 2
+        x0 = x_positions[col]
+        y0 = y_positions[row]
+        ax.add_patch(
+            FancyBboxPatch(
+                (x0, y0),
+                card_w,
+                card_h,
+                boxstyle="round,pad=0.012,rounding_size=0.03",
+                transform=ax.transAxes,
+                facecolor=color,
+                edgecolor="none",
+                alpha=0.96,
+            )
+        )
+        ax.text(
+            x0 + 0.035,
+            y0 + card_h - 0.050,
+            label,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=max(10, PAPER_FONT_SIZE - 4),
+            color="white",
+            fontweight="semibold",
+        )
+        ax.text(
+            x0 + card_w / 2.0,
+            y0 + 0.085,
+            value,
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=max(15, PAPER_FONT_SIZE + 2),
+            color="white",
+            fontweight="bold",
+        )
+
+    ax.text(
+        0.5,
+        0.055,
+        " | ".join(footer_bits),
+        transform=ax.transAxes,
+        ha="center",
+        va="center",
+        fontsize=max(10, PAPER_FONT_SIZE - 4),
+        color="#111827",
+    )
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
     plt.close(fig)
     _pad_png_canvas(out_png)
     return out_png
@@ -570,7 +839,7 @@ def _build_step2_star_count_panel(
 
     out_png = metadata_dir / "derived_step2_star_count_summary.png"
     fig, ax = plt.subplots(figsize=(6.0, 5.0))
-    bars = ax.bar(labels, values, color=["#0C5DA5", "#94a3b8"])
+    bars = ax.bar(labels, values, color=[NATURE_BLUE, "#94a3b8"])
     y_max = max(1, max(values))
     for bar, value in zip(bars, values):
         pct = 100.0 * value / total_int if total_int > 0 else 0.0
@@ -638,7 +907,7 @@ def _build_screening_funnel_panel(
     if max(values) <= 0:
         return None
 
-    colors = ["#0C5DA5", "#00B945", "#FF9500", "#FF2C00"]
+    colors = [NATURE_BLUE, NATURE_GREEN, NATURE_ORANGE, NATURE_RED]
     fig, ax = plt.subplots(figsize=(6.0, 5.0))
     ys = np.arange(len(stage_rows))
     bars = ax.barh(ys, values, color=colors[: len(stage_rows)], edgecolor="none", height=0.6)
@@ -675,6 +944,18 @@ def _build_sampling_attempt_progress_panel(
     target_count: int = 100,
 ) -> Optional[Path]:
     df = _safe_read_csv(attempts_csv)
+    return _build_sampling_attempt_progress_panel_from_df(
+        df=df,
+        out_png=out_png,
+        target_count=target_count,
+    )
+
+
+def _build_sampling_attempt_progress_panel_from_df(
+    df: pd.DataFrame,
+    out_png: Path,
+    target_count: int = 100,
+) -> Optional[Path]:
     if df.empty or not {"sampling_attempt", "target_count_selected"}.issubset(df.columns):
         return None
 
@@ -685,51 +966,69 @@ def _build_sampling_attempt_progress_panel(
     if plot_df.empty:
         return None
 
-    right_col = None
-    for col in ["n_polymers_pass_all_targets", "accumulated_candidate_count"]:
-        if col in plot_df.columns and pd.to_numeric(plot_df[col], errors="coerce").notna().any():
-            plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
-            right_col = col
-            break
+    good_col = "target_count_selected"
+    for col in ["n_polymers_pass_all_targets", "qualified_candidate_count", "filter_pass_count", "target_count_selected"]:
+        if col in plot_df.columns:
+            numeric_vals = pd.to_numeric(plot_df[col], errors="coerce")
+            if numeric_vals.notna().any():
+                plot_df[col] = numeric_vals
+                good_col = col
+                break
 
-    fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.6))
-    axes[0].plot(
-        plot_df["sampling_attempt"],
-        plot_df["target_count_selected"],
+    plot_df = plot_df.dropna(subset=[good_col]).sort_values("sampling_attempt")
+    if plot_df.empty:
+        return None
+
+    x = plot_df["sampling_attempt"].to_numpy(dtype=float)
+    y = plot_df[good_col].to_numpy(dtype=float)
+    y_max = max(float(np.nanmax(y)), float(target_count), 1.0)
+    y_span = max(y_max - float(np.nanmin(y)), 1.0)
+    y_pad = max(8.0, 0.10 * y_span)
+
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    ax.plot(
+        x,
+        y,
         marker="o",
-        linewidth=2.2,
-        color="#0C5DA5",
+        markersize=7.0,
+        markerfacecolor="white",
+        markeredgewidth=1.8,
+        linewidth=2.6,
+        color=NATURE_BLUE,
+        zorder=3,
     )
-    axes[0].axhline(float(target_count), color="#6B7280", linestyle="--", linewidth=1.4)
-    axes[0].set_xlabel("Sampling attempt", fontsize=PAPER_FONT_SIZE)
-    axes[0].set_ylabel("Selected target polymers", fontsize=PAPER_FONT_SIZE)
-    axes[0].tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
-    axes[0].grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
-
-    if right_col is not None:
-        axes[1].plot(
-            plot_df["sampling_attempt"],
-            plot_df[right_col],
-            marker="o",
-            linewidth=2.2,
-            color="#00B945",
+    ax.axhline(float(target_count), color=NATURE_RED, linestyle="--", linewidth=1.8, zorder=1)
+    for x_i, y_i in zip(x, y):
+        ax.text(
+            x_i,
+            y_i + 0.04 * y_span + 0.15,
+            f"{int(round(y_i))}",
+            ha="center",
+            va="bottom",
+            fontsize=PAPER_FONT_SIZE,
+            color="#111827",
         )
-        ylabel = (
-            "Candidates passing all targets"
-            if right_col == "n_polymers_pass_all_targets"
-            else "Accumulated candidates"
-        )
-        axes[1].set_ylabel(ylabel, fontsize=PAPER_FONT_SIZE)
-        axes[1].set_xlabel("Sampling attempt", fontsize=PAPER_FONT_SIZE)
-        axes[1].tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
-        axes[1].grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
-    else:
-        axes[1].axis("off")
 
-    xticks = sorted({int(x) for x in plot_df["sampling_attempt"].tolist()})
-    for ax in axes:
-        if xticks and ax.axison:
-            ax.set_xticks(xticks)
+    ax.text(
+        0.03,
+        0.96,
+        f"Target = {int(round(float(target_count))):,}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=PAPER_FONT_SIZE,
+        color=NATURE_RED,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#D1D5DB", "alpha": 0.92},
+    )
+    ax.set_xlabel("Sampling attempt", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Good polymers", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35, zorder=0)
+    ax.set_xlim(float(np.min(x)) - 0.15, float(np.max(x)) + 0.15)
+    ax.set_ylim(bottom=max(0.0, float(np.nanmin(y)) - y_pad), top=y_max + y_pad)
+    xticks = sorted({int(v) for v in x.tolist()})
+    if xticks:
+        ax.set_xticks(xticks)
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -737,6 +1036,90 @@ def _build_sampling_attempt_progress_panel(
     plt.close(fig)
     _pad_png_canvas(out_png)
     return out_png
+
+
+def _resampling_attempt_dirs(step_dir: Optional[Path]) -> List[Path]:
+    if step_dir is None or not step_dir.exists():
+        return []
+
+    def _attempt_key(path: Path) -> int:
+        match = re.search(r"(\d+)$", path.name)
+        return int(match.group(1)) if match else -1
+
+    return sorted(
+        [p for p in step_dir.glob("step2_resampling_attempt_*") if p.is_dir()],
+        key=_attempt_key,
+    )
+
+
+def _latest_resampling_attempt_csv(
+    step_dir: Optional[Path],
+    file_name: str,
+) -> Optional[Path]:
+    for attempt_dir in reversed(_resampling_attempt_dirs(step_dir)):
+        candidate = attempt_dir / "metrics" / file_name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _build_resampling_attempt_progress_panel(
+    step_dir: Optional[Path],
+    out_png: Path,
+) -> Optional[Path]:
+    rows: List[Dict[str, object]] = []
+    target_goal = 0
+    for attempt_dir in _resampling_attempt_dirs(step_dir):
+        match = re.search(r"(\d+)$", attempt_dir.name)
+        if match is None:
+            continue
+        attempt_idx = int(match.group(1))
+        summary_row = _safe_first_row(attempt_dir / "metrics" / "target_polymer_selection_summary.csv")
+        step_row = _safe_first_row(attempt_dir / "metrics" / "step_summary.csv")
+        merged = _merge_rows([summary_row, step_row])
+        if not merged:
+            continue
+
+        selected = _pick(merged, ["target_count_selected", "target_polymer_count_selected"], default=np.nan)
+        qualified = _pick(merged, ["filter_pass_count", "filter_pass_unique", "total_evaluated_for_filters"], default=np.nan)
+        requested = _pick(merged, ["target_count_requested", "target_polymer_count_requested"], default=np.nan)
+        try:
+            selected_int = int(float(selected))
+        except Exception:
+            continue
+        row = {
+            "sampling_attempt": attempt_idx,
+            "target_count_selected": selected_int,
+        }
+        try:
+            row["qualified_candidate_count"] = int(float(qualified))
+        except Exception:
+            pass
+        rows.append(row)
+        try:
+            target_goal = max(target_goal, int(float(requested)))
+        except Exception:
+            target_goal = max(target_goal, selected_int)
+
+    if not rows:
+        return None
+
+    plot_df = pd.DataFrame(rows).sort_values("sampling_attempt").reset_index(drop=True)
+    return _build_sampling_attempt_progress_panel_from_df(
+        df=plot_df,
+        out_png=out_png,
+        target_count=max(target_goal, int(plot_df["target_count_selected"].max())),
+    )
+
+
+def _completed_resampling_attempt_count(step_dir: Optional[Path]) -> int:
+    count = 0
+    for attempt_dir in _resampling_attempt_dirs(step_dir):
+        if (attempt_dir / "metrics" / "target_polymers.csv").exists() or (
+            attempt_dir / "metrics" / "target_polymer_selection_summary.csv"
+        ).exists():
+            count += 1
+    return count
 
 
 def _build_requirement_snapshot_panel(
@@ -748,19 +1131,20 @@ def _build_requirement_snapshot_panel(
         return None
 
     requirement_specs = [
-        ("Soluble hit", "soluble_hit", "binary"),
-        ("Property hit", "property_hit", "binary"),
-        ("Valid", "is_valid", "binary"),
-        ("Two-star", "star_count", "star_count"),
-        ("Novel vs train", "is_novel_vs_train", "binary"),
-        ("SA within limit", "sa_ok", "binary"),
-        ("All target conditions", "passes_all_target_conditions", "binary"),
-        ("All filters", "passes_all_filters", "binary"),
-        ("Target class hit", "polymer_class_hit", "binary"),
+        ("Soluble hit", ["soluble_hit"], "binary"),
+        ("Property hit", ["property_hit"], "binary"),
+        ("Valid", ["is_valid"], "binary"),
+        ("Two-star", ["star_count"], "star_count"),
+        ("Novel vs train", ["is_novel_vs_train", "is_novel"], "binary"),
+        ("SA within limit", ["sa_ok"], "binary"),
+        ("All target conditions", ["passes_all_target_conditions"], "binary"),
+        ("All filters", ["passes_all_filters"], "binary"),
+        ("Target class hit", ["polymer_class_hit"], "binary"),
     ]
     rows: List[tuple[str, float]] = []
-    for label, col, mode in requirement_specs:
-        if col not in df.columns:
+    for label, col_candidates, mode in requirement_specs:
+        col = next((candidate for candidate in col_candidates if candidate in df.columns), None)
+        if col is None:
             continue
         vals = pd.to_numeric(df[col], errors="coerce")
         if mode == "star_count":
@@ -776,7 +1160,7 @@ def _build_requirement_snapshot_panel(
     labels = [label for label, _ in rows]
     values = [value for _, value in rows]
     ys = np.arange(len(labels))
-    bars = ax.barh(ys, values, color="#0C5DA5", edgecolor="none", height=0.65)
+    bars = ax.barh(ys, values, color=NATURE_BLUE, edgecolor="none", height=0.65)
     for bar, val in zip(bars, values):
         ax.text(
             min(val + 0.02, 1.02),
@@ -799,6 +1183,133 @@ def _build_requirement_snapshot_panel(
     plt.close(fig)
     _pad_png_canvas(out_png)
     return out_png
+
+
+def _selection_summary_csv_from_target_csv(target_csv: Optional[Path]) -> Optional[Path]:
+    if target_csv is None:
+        return None
+    candidate = target_csv.parent / "target_polymer_selection_summary.csv"
+    return candidate if candidate.exists() else None
+
+
+def _resolve_step6_target_plot_csv(
+    *,
+    target_csv: Optional[Path],
+    inverse_targets_csv: Optional[Path],
+    step4_reg_dir: Optional[Path],
+    step4_cls_dir: Optional[Path],
+    config: Dict,
+    model_size: str,
+    split_mode: str,
+    cache_csv: Path,
+) -> Optional[Path]:
+    if target_csv is None or not target_csv.exists():
+        return None
+
+    source_df = _safe_read_csv(target_csv)
+    if source_df.empty:
+        return None
+    if {"chi_pred_target", "class_prob", "target_chi"}.issubset(source_df.columns):
+        return target_csv
+
+    if step4_reg_dir is None or step4_cls_dir is None:
+        return target_csv
+
+    reg_checkpoint = step4_reg_dir / "checkpoints" / "chi_regression_best.pt"
+    cls_checkpoint = step4_cls_dir / "checkpoints" / "chi_classifier_best.pt"
+    if not reg_checkpoint.exists() or not cls_checkpoint.exists():
+        return target_csv
+
+    novel_df = source_df.copy()
+    smiles_col = "SMILES" if "SMILES" in novel_df.columns else ("smiles" if "smiles" in novel_df.columns else None)
+    if smiles_col is None:
+        return target_csv
+
+    novel_df["SMILES"] = novel_df[smiles_col].astype(str)
+    if "canonical_smiles" in novel_df.columns:
+        canonical_series = novel_df["canonical_smiles"].astype(str)
+    else:
+        canonical_series = pd.Series([""] * len(novel_df), index=novel_df.index, dtype=object)
+    canonical_series = canonical_series.where(canonical_series.str.strip() != "", novel_df["SMILES"])
+    novel_df["canonical_smiles"] = canonical_series.apply(
+        lambda s: canonicalize_smiles(s) or str(s).strip()
+    )
+    novel_df["Polymer"] = novel_df.get("Polymer", novel_df["canonical_smiles"]).astype(str)
+    novel_df["polymer_id"] = np.arange(1, len(novel_df) + 1, dtype=int)
+
+    if cache_csv.exists():
+        cache_df = _safe_read_csv(cache_csv)
+        required_cols = {"polymer_id", "canonical_smiles", "chi_pred_target", "class_prob", "target_chi", *COEFF_NAMES}
+        if required_cols.issubset(cache_df.columns) and len(cache_df) == len(novel_df):
+            cached_canonical = cache_df["canonical_smiles"].astype(str).fillna("").tolist()
+            source_canonical = novel_df["canonical_smiles"].astype(str).fillna("").tolist()
+            if cached_canonical == source_canonical:
+                return cache_csv
+
+    inverse_df = _safe_read_csv(inverse_targets_csv)
+    inverse_row = inverse_df.iloc[0].to_dict() if not inverse_df.empty else {}
+    temperature = _pick(inverse_row, ["temperature"], default=np.nan)
+    phi = _pick(inverse_row, ["phi"], default=np.nan)
+    target_chi = _pick(inverse_row, ["target_chi"], default=np.nan)
+    property_rule = _pick(inverse_row, ["property_rule"], default="")
+    target_class = _pick(inverse_row, ["target_polymer_class"], default="")
+    if any(not np.isfinite(float(v)) for v in [temperature, phi, target_chi]):
+        return target_csv
+
+    chi_cfg = config.get("chi_training", {})
+    shared_cfg = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared", {}), dict) else {}
+    embedding_cfg = shared_cfg.get("embedding", {}) if isinstance(shared_cfg.get("embedding", {}), dict) else {}
+    batch_size = int(embedding_cfg.get("batch_size", 128))
+    timestep = int(embedding_cfg.get("timestep", config.get("training_property", {}).get("default_timestep", 1)))
+    pooling = str(embedding_cfg.get("pooling", "mean")).strip().lower() or "mean"
+
+    try:
+        inferred_df = infer_coefficients_for_novel_candidates(
+            novel_df=novel_df[["polymer_id", "Polymer", "SMILES", "canonical_smiles"]].copy(),
+            config=config,
+            model_size=model_size,
+            split_mode=split_mode,
+            chi_checkpoint_path=reg_checkpoint,
+            class_checkpoint_path=cls_checkpoint,
+            backbone_checkpoint_path=None,
+            device="cpu",
+            timestep=timestep,
+            pooling=pooling,
+            batch_size=batch_size,
+            uncertainty_enabled=False,
+        )
+    except Exception as exc:
+        print(f"[WARN] Step 6 target rescoring failed; Figure 5 chi/probability panels may be unavailable: {exc}")
+        return target_csv
+
+    if inferred_df.empty or not {"polymer_id", "class_prob", *COEFF_NAMES}.issubset(inferred_df.columns):
+        return target_csv
+
+    merged_df = novel_df.merge(
+        inferred_df[["polymer_id", "class_prob", "class_prob_std", *COEFF_NAMES]],
+        on="polymer_id",
+        how="left",
+    )
+    merged_df["temperature"] = pd.to_numeric(merged_df.get("temperature", temperature), errors="coerce")
+    merged_df["phi"] = pd.to_numeric(merged_df.get("phi", phi), errors="coerce")
+    merged_df["target_chi"] = pd.to_numeric(merged_df.get("target_chi", target_chi), errors="coerce")
+    merged_df["temperature"] = merged_df["temperature"].fillna(float(temperature))
+    merged_df["phi"] = merged_df["phi"].fillna(float(phi))
+    merged_df["target_chi"] = merged_df["target_chi"].fillna(float(target_chi))
+    if "property_rule" not in merged_df.columns or merged_df["property_rule"].isna().all():
+        merged_df["property_rule"] = property_rule
+    if "target_polymer_class" not in merged_df.columns or merged_df["target_polymer_class"].isna().all():
+        merged_df["target_polymer_class"] = target_class
+
+    coeff_matrix = merged_df[COEFF_NAMES].to_numpy(dtype=float)
+    merged_df["chi_pred_target"] = predict_chi_from_coefficients(
+        coefficients=coeff_matrix,
+        temperature=merged_df["temperature"].to_numpy(dtype=float),
+        phi=merged_df["phi"].to_numpy(dtype=float),
+    )
+    cache_csv.parent.mkdir(parents=True, exist_ok=True)
+    merged_df.to_csv(cache_csv, index=False)
+    return cache_csv
 
 
 def _build_target_chi_parity_panel(
@@ -824,7 +1335,7 @@ def _build_target_chi_parity_panel(
     mae = float(np.mean(np.abs(y - x)))
 
     fig, ax = plt.subplots(figsize=(6.0, 5.0))
-    ax.scatter(x, y, color="#0C5DA5", alpha=0.80, s=34)
+    ax.scatter(x, y, color=NATURE_BLUE, alpha=0.80, s=34)
     ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], linestyle="--", color="#6B7280", linewidth=1.4)
     ax.set_xlim(lo - pad, hi + pad)
     ax.set_ylim(lo - pad, hi + pad)
@@ -842,6 +1353,139 @@ def _build_target_chi_parity_panel(
         fontsize=max(10, PAPER_FONT_SIZE - 2),
         color="#111827",
     )
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_target_chi_by_rank_panel(
+    target_csv: Optional[Path],
+    out_png: Path,
+) -> Optional[Path]:
+    df = _safe_read_csv(target_csv)
+    if df.empty or not {"chi_pred_target", "target_chi"}.issubset(df.columns):
+        return None
+
+    plot_df = df.copy()
+    if "target_rank" not in plot_df.columns:
+        plot_df["target_rank"] = np.arange(1, len(plot_df) + 1, dtype=int)
+    plot_df["target_rank"] = pd.to_numeric(plot_df["target_rank"], errors="coerce")
+    plot_df["chi_pred_target"] = pd.to_numeric(plot_df["chi_pred_target"], errors="coerce")
+    plot_df["target_chi"] = pd.to_numeric(plot_df["target_chi"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["target_rank", "chi_pred_target", "target_chi"]).sort_values("target_rank")
+    if plot_df.empty:
+        return None
+
+    y = plot_df["chi_pred_target"].to_numpy(dtype=float)
+    target_y = plot_df["target_chi"].to_numpy(dtype=float)
+    y_min = float(np.nanmin(np.concatenate([y, target_y])))
+    y_max = float(np.nanmax(np.concatenate([y, target_y])))
+    pad = max(0.025, 0.10 * max(y_max - y_min, 0.08))
+    bins = min(20, max(8, int(round(np.sqrt(len(y))))))
+    x_left = y_min - pad
+    x_right = y_max + pad
+    mean_y = float(np.mean(y))
+
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    ax.hist(
+        y,
+        color=NATURE_BLUE,
+        bins=np.linspace(x_left, x_right, bins + 1),
+        edgecolor="white",
+        linewidth=1.0,
+        alpha=0.88,
+        zorder=2,
+        label="Predicted χ",
+    )
+    ax.axvline(mean_y, color=NATURE_BLUE, linewidth=2.0, alpha=0.95, zorder=3)
+    if np.allclose(target_y, target_y[0]):
+        ax.axvline(float(target_y[0]), color=NATURE_RED, linestyle="--", linewidth=2.0, label="Target χ", zorder=3)
+    else:
+        for idx, value in enumerate(np.unique(np.round(target_y, 6))):
+            ax.axvline(
+                float(value),
+                color=NATURE_RED,
+                linestyle="--",
+                linewidth=1.8,
+                label="Target χ" if idx == 0 else None,
+                zorder=3,
+            )
+
+    ax.set_xlabel("χ at target condition", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Count", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35, zorder=0)
+    ax.set_xlim(x_left, x_right)
+    ax.legend(loc="upper right", fontsize=PAPER_FONT_SIZE, frameon=True)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_target_probability_by_rank_panel(
+    target_csv: Optional[Path],
+    out_png: Path,
+) -> Optional[Path]:
+    df = _safe_read_csv(target_csv)
+    if df.empty or "class_prob" not in df.columns:
+        return None
+
+    plot_df = df.copy()
+    if "target_rank" not in plot_df.columns:
+        plot_df["target_rank"] = np.arange(1, len(plot_df) + 1, dtype=int)
+    plot_df["target_rank"] = pd.to_numeric(plot_df["target_rank"], errors="coerce")
+    plot_df["class_prob"] = pd.to_numeric(plot_df["class_prob"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["target_rank", "class_prob"]).sort_values("target_rank")
+    if plot_df.empty:
+        return None
+
+    y = plot_df["class_prob"].to_numpy(dtype=float)
+    prob_min = float(np.nanmin(y))
+    prob_max = float(np.nanmax(y))
+    span = max(prob_max - prob_min, 0.02)
+    x_left = max(0.0, prob_min - 0.12 * span)
+    x_right = min(1.02, prob_max + 0.12 * span)
+    bins = min(20, max(8, int(round(np.sqrt(len(y))))))
+    mean_prob = float(np.mean(y))
+
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    ax.hist(
+        y,
+        color=NATURE_GREEN,
+        bins=np.linspace(x_left, x_right, bins + 1),
+        edgecolor="white",
+        linewidth=1.0,
+        alpha=0.88,
+        zorder=2,
+    )
+    ax.axvline(mean_prob, color=NATURE_GREEN, linewidth=2.0, alpha=0.95, zorder=3)
+    if x_left <= 0.5 <= x_right:
+        ax.axvline(0.5, color=NATURE_GRAY, linestyle="--", linewidth=1.8, zorder=3)
+    else:
+        ax.text(
+            0.03,
+            0.06,
+            "Threshold = 0.50",
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=PAPER_FONT_SIZE,
+            color="#111827",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#D1D5DB", "alpha": 0.92},
+        )
+    ax.set_xlabel("Water-miscible probability", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Count", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35, zorder=0)
+    ax.set_xlim(x_left, x_right)
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -873,14 +1517,14 @@ def _build_target_confidence_by_rank_panel(
         return None
 
     fig, ax = plt.subplots(figsize=(6.2, 5.0))
-    color_map = {"class_prob": "#0C5DA5", "class_prob_lcb": "#00B945"}
+    color_map = {"class_prob": NATURE_BLUE, "class_prob_lcb": NATURE_GREEN}
     label_map = {"class_prob": "Class probability", "class_prob_lcb": "Conservative class probability"}
     for col in prob_cols:
         ax.plot(
             plot_df["target_rank"],
             plot_df[col],
             linewidth=2.0,
-            color=color_map.get(col, "#0C5DA5"),
+            color=color_map.get(col, NATURE_BLUE),
             label=label_map.get(col, col),
         )
     ax.axhline(0.5, color="#6B7280", linestyle="--", linewidth=1.4)
@@ -889,6 +1533,282 @@ def _build_target_confidence_by_rank_panel(
     ax.tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
     ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
     ax.legend(loc="lower right", fontsize=max(10, PAPER_FONT_SIZE - 4), frameon=True)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_target_sa_by_rank_panel(
+    target_csv: Optional[Path],
+    out_png: Path,
+) -> Optional[Path]:
+    df = _safe_read_csv(target_csv)
+    if df.empty or not {"sa_score"}.issubset(df.columns):
+        return None
+
+    plot_df = df.copy()
+    if "target_rank" not in plot_df.columns:
+        plot_df["target_rank"] = np.arange(1, len(plot_df) + 1, dtype=int)
+    plot_df["target_rank"] = pd.to_numeric(plot_df["target_rank"], errors="coerce")
+    plot_df["sa_score"] = pd.to_numeric(plot_df["sa_score"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["target_rank", "sa_score"]).sort_values("target_rank")
+    if plot_df.empty:
+        return None
+
+    mean_sa = float(plot_df["sa_score"].mean())
+    fig, ax = plt.subplots(figsize=(6.2, 5.0))
+    ax.plot(
+        plot_df["target_rank"],
+        plot_df["sa_score"],
+        color=NATURE_PURPLE,
+        linewidth=1.8,
+        marker="o",
+        markersize=4.8,
+    )
+    ax.axhline(mean_sa, color=NATURE_GRAY, linestyle="--", linewidth=1.2)
+    ax.text(
+        0.98,
+        0.96,
+        f"Mean SA = {mean_sa:.2f}",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=max(10, PAPER_FONT_SIZE - 3),
+        color="#111827",
+    )
+    ax.set_xlabel("Selected target rank", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("SA score", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _format_numeric_range(values: pd.Series, decimals: int = 2, suffix: str = "") -> str:
+    arr = pd.to_numeric(values, errors="coerce").dropna().to_numpy(dtype=float)
+    if arr.size == 0:
+        return "n/a"
+    lo = float(np.min(arr))
+    hi = float(np.max(arr))
+    if np.isclose(lo, hi):
+        return f"{lo:.{decimals}f}{suffix}"
+    return f"{lo:.{decimals}f}-{hi:.{decimals}f}{suffix}"
+
+
+def _build_inverse_target_summary_panel(
+    inverse_targets_csv: Optional[Path],
+    out_png: Path,
+) -> Optional[Path]:
+    df = _safe_read_csv(inverse_targets_csv)
+    if df.empty:
+        return None
+
+    target_classes = sorted({str(v).strip() for v in df.get("target_polymer_class", pd.Series(dtype=object)).tolist() if str(v).strip()})
+    property_rules = sorted({str(v).strip() for v in df.get("property_rule", pd.Series(dtype=object)).tolist() if str(v).strip()})
+    class_text = target_classes[0] if len(target_classes) == 1 else f"{len(target_classes)} classes"
+    rule_text = property_rules[0] if len(property_rules) == 1 else f"{len(property_rules)} rules"
+    cards = [
+        ("Inverse targets", f"{len(df):,}", NATURE_BLUE),
+        ("Target class", class_text, NATURE_GREEN),
+        ("Temperature", _format_numeric_range(df.get("temperature", pd.Series(dtype=float)), decimals=2, suffix=" K"), NATURE_ORANGE),
+        ("Volume fraction φ", _format_numeric_range(df.get("phi", pd.Series(dtype=float)), decimals=2), NATURE_RED),
+        ("Target χ", _format_numeric_range(df.get("target_chi", pd.Series(dtype=float)), decimals=3), NATURE_PURPLE),
+        ("Property rule", rule_text, NATURE_GRAY),
+    ]
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    ax.set_axis_off()
+    card_w = 0.41
+    card_h = 0.20
+    x_positions = [0.07, 0.52]
+    y_positions = [0.73, 0.47, 0.21]
+
+    for idx, (label, value, color) in enumerate(cards):
+        row = idx // 2
+        col = idx % 2
+        x0 = x_positions[col]
+        y0 = y_positions[row]
+        ax.add_patch(
+            FancyBboxPatch(
+                (x0, y0),
+                card_w,
+                card_h,
+                boxstyle="round,pad=0.012,rounding_size=0.03",
+                transform=ax.transAxes,
+                facecolor=color,
+                edgecolor="none",
+                alpha=0.96,
+            )
+        )
+        ax.text(
+            x0 + 0.035,
+            y0 + card_h - 0.050,
+            label,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=max(10, PAPER_FONT_SIZE - 4),
+            color="white",
+            fontweight="semibold",
+        )
+        ax.text(
+            x0 + card_w / 2.0,
+            y0 + 0.085,
+            value,
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=max(13, PAPER_FONT_SIZE + 1),
+            color="white",
+            fontweight="bold",
+            wrap=True,
+        )
+
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_selected_target_summary_panel(
+    target_csv: Optional[Path],
+    out_png: Path,
+    *,
+    inverse_targets_csv: Optional[Path] = None,
+    selection_summary_csv: Optional[Path] = None,
+    attempt_count_override: Optional[int] = None,
+) -> Optional[Path]:
+    df = _safe_read_csv(target_csv)
+    if df.empty:
+        return None
+
+    inverse_df = _safe_read_csv(inverse_targets_csv)
+    summary_row = _safe_first_row(selection_summary_csv or _selection_summary_csv_from_target_csv(target_csv))
+    selected_count = int(len(df))
+
+    attempt_text = "n/a"
+    if "sampling_attempt" in df.columns:
+        attempts = pd.to_numeric(df["sampling_attempt"], errors="coerce").dropna().astype(int)
+        if not attempts.empty:
+            lo = int(attempts.min())
+            hi = int(attempts.max())
+            attempt_text = str(lo) if lo == hi else f"{lo}-{hi}"
+    if attempt_text == "n/a" and attempt_count_override is not None and int(attempt_count_override) > 0:
+        attempt_text = f"1-{int(attempt_count_override)}" if int(attempt_count_override) > 1 else "1"
+
+    novel_col = "is_novel_vs_train" if "is_novel_vs_train" in df.columns else ("is_novel" if "is_novel" in df.columns else None)
+    novel_rate = np.nan
+    if novel_col is not None:
+        novel_vals = pd.to_numeric(df[novel_col], errors="coerce").dropna()
+        if not novel_vals.empty:
+            novel_rate = float((novel_vals >= 0.5).mean())
+    if not np.isfinite(novel_rate):
+        novel_rate = float(_pick(summary_row, ["final_novelty"], default=np.nan))
+
+    mean_prob = np.nan
+    if "class_prob" in df.columns:
+        prob_vals = pd.to_numeric(df["class_prob"], errors="coerce").dropna()
+        if not prob_vals.empty:
+            mean_prob = float(prob_vals.mean())
+
+    diversity = float(_pick(summary_row, ["final_diversity"], default=np.nan))
+    if not np.isfinite(diversity):
+        family_col = "polymer_family" if "polymer_family" in df.columns else None
+        if family_col is not None:
+            families = {str(v).strip() for v in df[family_col].tolist() if str(v).strip()}
+            if families:
+                diversity = float(len(families)) / max(selected_count, 1)
+
+    selection_success = float(
+        _pick(summary_row, ["selection_success_rate"], default=np.nan)
+    )
+    if not np.isfinite(selection_success):
+        selection_success = float(
+            _pick(summary_row, ["target_count_selected"], default=np.nan)
+        ) / max(float(_pick(summary_row, ["total_generated"], default=np.nan)), 1.0)
+        if not np.isfinite(selection_success):
+            selection_success = np.nan
+
+    mean_sa = np.nan
+    if "sa_score" in df.columns:
+        sa_vals = pd.to_numeric(df["sa_score"], errors="coerce").dropna()
+        if not sa_vals.empty:
+            mean_sa = float(sa_vals.mean())
+    if not np.isfinite(mean_sa):
+        mean_sa = float(_pick(summary_row, ["final_mean_sa"], default=np.nan))
+
+    target_classes = sorted(
+        {
+            str(v).strip()
+            for v in inverse_df.get("target_polymer_class", pd.Series(dtype=object)).tolist()
+            if str(v).strip()
+        }
+    )
+    target_class_text = ""
+    if target_classes:
+        target_class_text = target_classes[0] if len(target_classes) == 1 else f"{len(target_classes)} classes"
+
+    metric_specs = [
+        ("Diversity", diversity, NATURE_GREEN, "float"),
+        ("Novelty", novel_rate, NATURE_ORANGE, "pct"),
+        ("Mean probability", mean_prob, NATURE_PURPLE, "float"),
+        ("Selection success", selection_success, NATURE_BLUE, "pct"),
+    ]
+    metric_specs = [spec for spec in metric_specs if np.isfinite(spec[1])]
+    if not metric_specs:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    ys = np.arange(len(metric_specs))[::-1]
+    for y, (label, value, color, value_mode) in zip(ys, metric_specs):
+        ax.hlines(y, 0.0, value, color="#D1D5DB", linewidth=4.0, zorder=1)
+        ax.scatter([value], [y], s=120, color=color, edgecolor="white", linewidth=1.1, zorder=3)
+        value_text = f"{100.0 * value:.1f}%" if value_mode == "pct" else f"{value:.2f}"
+        ax.text(
+            min(value + 0.03, 1.03),
+            y,
+            value_text,
+            ha="left",
+            va="center",
+            fontsize=PAPER_FONT_SIZE,
+            color="#111827",
+        )
+
+    ax.set_yticks(ys, labels=[label for label, _, _, _ in metric_specs])
+    ax.set_xlim(0.0, 1.05)
+    ax.set_xlabel("Summary metric value", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=PAPER_FONT_SIZE)
+    ax.grid(True, axis="x", linestyle="--", linewidth=0.8, alpha=0.35)
+    info_lines = [
+        f"Selected polymers: {selected_count:,}",
+        f"Sampling attempts: {attempt_text}",
+    ]
+    if np.isfinite(mean_sa):
+        info_lines.append(f"Mean SA: {mean_sa:.2f}")
+    if target_class_text:
+        info_lines.append(f"Target class: {target_class_text}")
+    ax.text(
+        0.03,
+        0.97,
+        "\n".join(info_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=PAPER_FONT_SIZE,
+        color="#111827",
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#D1D5DB", "alpha": 0.96},
+    )
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -1000,15 +1920,15 @@ def _build_step3_global_threshold_curve(
     ax.plot(
         scan_df["threshold"].to_numpy(dtype=float),
         scan_df["balanced_accuracy"].to_numpy(dtype=float),
-        color="#1f77b4",
+        color=NATURE_BLUE,
         linewidth=2.2,
     )
     if np.isfinite(ci_low) and np.isfinite(ci_high) and float(ci_high) >= float(ci_low):
-        ax.axvspan(float(ci_low), float(ci_high), color="#93c5fd", alpha=0.30, linewidth=0)
+        ax.axvspan(float(ci_low), float(ci_high), color=NATURE_LIGHT_BLUE, alpha=0.30, linewidth=0)
     if np.isfinite(chi_star):
-        ax.axvline(float(chi_star), color="#ef4444", linestyle="--", linewidth=2.0)
+        ax.axvline(float(chi_star), color=NATURE_RED, linestyle="--", linewidth=2.0)
     if np.isfinite(chi_star) and np.isfinite(bal_acc):
-        ax.scatter([float(chi_star)], [float(bal_acc)], color="#dc2626", s=45, zorder=5)
+        ax.scatter([float(chi_star)], [float(bal_acc)], color=NATURE_RED, s=45, zorder=5)
         x_min = float(scan_df["threshold"].min())
         x_max = float(scan_df["threshold"].max())
         y_min = float(scan_df["balanced_accuracy"].min())
@@ -1234,6 +2154,251 @@ def _build_step3_temperature_trends_panel(
     return out_png
 
 
+def _build_step4_regression_parity_panel(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    step4_reg_dir = paths.get("step4_reg_dir")
+    pred_csv = step4_reg_dir / "metrics" / "chi_predictions_test.csv" if step4_reg_dir is not None else None
+    df = _safe_read_csv(pred_csv)
+    required = {"chi", "chi_pred", "water_miscible"}
+    if df.empty or not required.issubset(df.columns):
+        return None
+
+    plot_df = df[list(required)].copy()
+    for col in ["chi", "chi_pred", "water_miscible"]:
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+    plot_df = plot_df.dropna(subset=["chi", "chi_pred", "water_miscible"])
+    if plot_df.empty:
+        return None
+
+    palette = WATER_CLASS_PALETTE
+    out_png = metadata_dir / "derived_step4_regression_parity_test.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    for class_value, label in [(0, "water-immiscible"), (1, "water-miscible")]:
+        sub = plot_df[plot_df["water_miscible"].astype(int) == class_value]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["chi"].to_numpy(dtype=float),
+            sub["chi_pred"].to_numpy(dtype=float),
+            color=palette[class_value],
+            alpha=0.75,
+            s=28,
+            linewidths=0.4,
+            edgecolors="white",
+            label=label,
+        )
+
+    x = plot_df["chi"].to_numpy(dtype=float)
+    y = plot_df["chi_pred"].to_numpy(dtype=float)
+    lo = float(np.nanmin(np.concatenate([x, y])))
+    hi = float(np.nanmax(np.concatenate([x, y])))
+    pad = max(0.02, 0.04 * max(hi - lo, 1.0))
+    lo_plot = lo - pad
+    hi_plot = hi + pad
+    ax.plot([lo_plot, hi_plot], [lo_plot, hi_plot], linestyle="--", color="black", linewidth=1.2)
+    ax.set_xlim(lo_plot, hi_plot)
+    ax.set_ylim(lo_plot, hi_plot)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("True χ", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Predicted χ", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
+
+    reg = _regression_summary_stats(x, y)
+    ax.text(
+        0.03,
+        0.97,
+        f"MAE={reg['mae']:.3f}\nRMSE={reg['rmse']:.3f}\nR2={reg['r2']:.3f}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=max(10, PAPER_FONT_SIZE - 2),
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
+    )
+    _boxed_legend(ax, loc="upper right")
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_step4_regression_residual_panel(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    step4_reg_dir = paths.get("step4_reg_dir")
+    pred_csv = step4_reg_dir / "metrics" / "chi_predictions_all.csv" if step4_reg_dir is not None else None
+    df = _safe_read_csv(pred_csv)
+    if df.empty or not {"chi_error", "split"}.issubset(df.columns):
+        return None
+
+    plot_df = df[["chi_error", "split"]].copy()
+    plot_df["chi_error"] = pd.to_numeric(plot_df["chi_error"], errors="coerce")
+    plot_df["split"] = plot_df["split"].astype(str).str.lower()
+    plot_df = plot_df.dropna(subset=["chi_error"])
+    if plot_df.empty:
+        return None
+
+    out_png = metadata_dir / "derived_step4_regression_residual_distribution.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    plotted_any = False
+    for split_name, color in [("train", NATURE_BLUE), ("val", NATURE_ORANGE), ("test", NATURE_GREEN)]:
+        sub = plot_df.loc[plot_df["split"] == split_name, "chi_error"].to_numpy(dtype=float)
+        sub = sub[np.isfinite(sub)]
+        if sub.size == 0:
+            continue
+        if sub.size >= 2 and not np.isclose(np.std(sub), 0.0):
+            sns.kdeplot(x=sub, ax=ax, color=color, linewidth=2.0, fill=False, label=split_name)
+        else:
+            ax.hist(sub, bins=min(12, max(4, sub.size)), density=True, histtype="step", linewidth=2.0, color=color, label=split_name)
+        plotted_any = True
+
+    ax.axvline(0.0, color="black", linestyle="--", linewidth=1.2)
+    ax.set_xlabel("χ prediction error", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Density", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
+    if plotted_any:
+        _boxed_legend(ax, loc="upper right")
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_step4_class_confusion_panel(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    step4_cls_dir = paths.get("step4_cls_dir")
+    pred_csv = step4_cls_dir / "metrics" / "class_predictions_test.csv" if step4_cls_dir is not None else None
+    df = _safe_read_csv(pred_csv)
+    required = {"water_miscible", "class_pred"}
+    if df.empty or not required.issubset(df.columns):
+        return None
+
+    plot_df = df[list(required)].copy()
+    plot_df["water_miscible"] = pd.to_numeric(plot_df["water_miscible"], errors="coerce")
+    plot_df["class_pred"] = pd.to_numeric(plot_df["class_pred"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["water_miscible", "class_pred"])
+    if plot_df.empty:
+        return None
+
+    y_true = plot_df["water_miscible"].astype(int).to_numpy()
+    y_pred = plot_df["class_pred"].astype(int).to_numpy()
+    cm = np.zeros((2, 2), dtype=int)
+    for true_value, pred_value in zip(y_true, y_pred):
+        if true_value in (0, 1) and pred_value in (0, 1):
+            cm[int(true_value), int(pred_value)] += 1
+
+    out_png = metadata_dir / "derived_step4_class_confusion_test.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    sns.heatmap(
+        cm,
+        annot=False,
+        cbar=False,
+        cmap="Blues",
+        square=True,
+        xticklabels=["water-\nimmiscible", "water-\nmiscible"],
+        yticklabels=["water-\nimmiscible", "water-\nmiscible"],
+        ax=ax,
+    )
+    vmax = float(np.max(cm)) if np.size(cm) else 0.0
+    threshold = 0.55 * vmax if vmax > 0 else 0.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            value = int(cm[i, j])
+            text_color = "white" if float(value) >= threshold else "#1f1f1f"
+            ax.text(
+                j + 0.5,
+                i + 0.5,
+                f"{value:d}",
+                ha="center",
+                va="center",
+                fontsize=PAPER_FONT_SIZE + 2,
+                color=text_color,
+            )
+    ax.set_xlabel("Predicted class", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("True class", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
+def _build_step4_class_prob_distribution_panel(
+    paths: Dict[str, Optional[Path]],
+    metadata_dir: Path,
+) -> Optional[Path]:
+    step4_cls_dir = paths.get("step4_cls_dir")
+    pred_csv = step4_cls_dir / "metrics" / "class_predictions_test.csv" if step4_cls_dir is not None else None
+    df = _safe_read_csv(pred_csv)
+    required = {"water_miscible", "class_prob"}
+    if df.empty or not required.issubset(df.columns):
+        return None
+
+    plot_df = df[list(required)].copy()
+    plot_df["water_miscible"] = pd.to_numeric(plot_df["water_miscible"], errors="coerce")
+    plot_df["class_prob"] = pd.to_numeric(plot_df["class_prob"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["water_miscible", "class_prob"])
+    if plot_df.empty:
+        return None
+
+    palette = WATER_CLASS_PALETTE
+    out_png = metadata_dir / "derived_step4_class_prob_distribution_test.png"
+    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    for class_value, label in [(0, "water-immiscible"), (1, "water-miscible")]:
+        sub = plot_df.loc[plot_df["water_miscible"].astype(int) == class_value, "class_prob"].to_numpy(dtype=float)
+        sub = sub[np.isfinite(sub)]
+        if sub.size == 0:
+            continue
+        if sub.size >= 2 and not np.isclose(np.std(sub), 0.0):
+            sns.kdeplot(
+                x=sub,
+                ax=ax,
+                color=palette[class_value],
+                linewidth=2.0,
+                fill=True,
+                alpha=0.22,
+                label=label,
+            )
+        else:
+            ax.hist(
+                sub,
+                bins=min(12, max(4, sub.size)),
+                density=True,
+                histtype="stepfilled",
+                alpha=0.22,
+                linewidth=1.5,
+                color=palette[class_value],
+                label=label,
+            )
+
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_xlabel("Predicted water-miscible probability", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel("Density", fontsize=PAPER_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.35)
+    _boxed_legend(ax, loc="upper center", ncol=2)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=PAPER_DPI, bbox_inches=None, pad_inches=0.0)
+    plt.close(fig)
+    _pad_png_canvas(out_png)
+    return out_png
+
+
 def _build_step6_target_class_coverage_panel(
     paths: Dict[str, Optional[Path]],
     metadata_dir: Path,
@@ -1256,7 +2421,7 @@ def _build_step6_target_class_coverage_panel(
     values = [float(hits.get(cls, 0) or 0) for cls in classes]
     out_png = metadata_dir / "derived_step6_target_polymer_class_coverage.png"
     fig, ax = plt.subplots(figsize=(6.0, 5.0))
-    bars = ax.bar(classes, values, color="#0C5DA5")
+    bars = ax.bar(classes, values, color=NATURE_BLUE)
     for bar, val in zip(bars, values):
         ax.text(
             bar.get_x() + bar.get_width() / 2.0,
@@ -1542,6 +2707,11 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
     step3_threshold_quality_heatmap_derived = paths.get("step3_threshold_quality_heatmap_derived")
     step3_chi_target_heatmap_derived = paths.get("step3_chi_target_heatmap_derived")
     step3_temperature_trends_derived = paths.get("step3_temperature_trends_derived")
+    step4_regression_parity_test_derived = paths.get("step4_regression_parity_test_derived")
+    step4_regression_residual_distribution_derived = paths.get("step4_regression_residual_distribution_derived")
+    step4_class_confusion_test_derived = paths.get("step4_class_confusion_test_derived")
+    step4_class_prob_distribution_test_derived = paths.get("step4_class_prob_distribution_test_derived")
+    step2_sampling_information_derived = paths.get("step2_sampling_information_derived")
     step2_generative_metrics_derived = paths.get("step2_generative_metrics_derived")
     step2_star_count_derived = paths.get("step2_star_count_derived")
     step5_screening_funnel_derived = paths.get("step5_screening_funnel_derived")
@@ -1553,8 +2723,16 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
     step6_requirement_snapshot_derived = paths.get("step6_requirement_snapshot_derived")
     step5_target_chi_parity_derived = paths.get("step5_target_chi_parity_derived")
     step6_target_chi_parity_derived = paths.get("step6_target_chi_parity_derived")
+    step5_target_chi_by_rank_derived = paths.get("step5_target_chi_by_rank_derived")
+    step6_target_chi_by_rank_derived = paths.get("step6_target_chi_by_rank_derived")
     step5_target_confidence_by_rank_derived = paths.get("step5_target_confidence_by_rank_derived")
     step6_target_confidence_by_rank_derived = paths.get("step6_target_confidence_by_rank_derived")
+    step5_target_probability_by_rank_derived = paths.get("step5_target_probability_by_rank_derived")
+    step6_target_probability_by_rank_derived = paths.get("step6_target_probability_by_rank_derived")
+    step6_target_sa_by_rank_derived = paths.get("step6_target_sa_by_rank_derived")
+    step6_inverse_target_summary_derived = paths.get("step6_inverse_target_summary_derived")
+    step5_selected_target_summary_derived = paths.get("step5_selected_target_summary_derived")
+    step6_selected_target_summary_derived = paths.get("step6_selected_target_summary_derived")
 
     return [
         FigureSpec(
@@ -1647,8 +2825,13 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     candidates=_make_candidates(step2_fig_dirs, ["length_hist_train_vs_uncond.png"]),
                 ),
                 PanelSpec(
-                    caption="Star-token structural quality",
+                    caption="Sampling-information summary for valid-only generation",
                     candidates=(
+                        [step2_sampling_information_derived]
+                        if isinstance(step2_sampling_information_derived, Path)
+                        else []
+                    )
+                    + (
                         [step2_star_count_derived]
                         if isinstance(step2_star_count_derived, Path)
                         else []
@@ -1721,22 +2904,42 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
             panels=[
                 PanelSpec(
                     caption="χ parity on holdout test set",
-                    candidates=_make_candidates(step4_reg_fig_dirs, ["chi_parity_test.png"]),
+                    candidates=(
+                        [step4_regression_parity_test_derived]
+                        if isinstance(step4_regression_parity_test_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step4_reg_fig_dirs, ["chi_parity_test.png"]),
                 ),
                 PanelSpec(
                     caption="χ residual distribution",
-                    candidates=_make_candidates(step4_reg_fig_dirs, ["chi_residual_distribution.png"]),
+                    candidates=(
+                        [step4_regression_residual_distribution_derived]
+                        if isinstance(step4_regression_residual_distribution_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(step4_reg_fig_dirs, ["chi_residual_distribution.png"]),
                 ),
                 PanelSpec(
-                    caption="ROC curve on test set",
-                    candidates=_make_candidates(
+                    caption="Confusion matrix on test set",
+                    candidates=(
+                        [step4_class_confusion_test_derived]
+                        if isinstance(step4_class_confusion_test_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(
                         step4_cls_fig_dirs,
-                        ["classifier_roc_test.png", "chi_classifier_roc_test.png"],
+                        ["class_confusion_matrix_test.png", "chi_classifier_confusion_matrix_test.png"],
                     ),
                 ),
                 PanelSpec(
                     caption="Class probability distribution",
-                    candidates=_make_candidates(
+                    candidates=(
+                        [step4_class_prob_distribution_test_derived]
+                        if isinstance(step4_class_prob_distribution_test_derived, Path)
+                        else []
+                    )
+                    + _make_candidates(
                         step4_cls_fig_dirs,
                         ["class_prob_distribution_test.png", "chi_class_prob_distribution_test.png"],
                     ),
@@ -1745,12 +2948,12 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="Figure4",
-            title="Figure 4. Unconstrained inverse design: sampling process and constraint satisfaction for the final 100 water-soluble targets",
+            title="Figure 4. Unconstrained inverse design: sampling success, target-set summary, predicted χ values, and water-miscible probabilities",
             destination="manuscript",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Sampling-attempt accumulation toward 100 selected targets",
+                    caption="Number of good polymers discovered in each sampling attempt",
                     candidates=(
                         [step5_sampling_attempt_progress_derived]
                         if isinstance(step5_sampling_attempt_progress_derived, Path)
@@ -1759,52 +2962,39 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     + _make_candidates(step5_fig_dirs, ["sampling_attempt_progress.png"]),
                 ),
                 PanelSpec(
-                    caption="Candidate screening funnel from screened pool to final 100",
+                    caption="Target-set summary across the final selected polymers",
                     candidates=(
-                        [step5_screening_funnel_derived]
-                        if isinstance(step5_screening_funnel_derived, Path)
+                        [step5_selected_target_summary_derived]
+                        if isinstance(step5_selected_target_summary_derived, Path)
                         else []
                     )
-                    + _make_candidates(step5_fig_dirs, ["candidate_screening_funnel.png"]),
                 ),
                 PanelSpec(
-                    caption="Requirement pass rates across the selected 100 polymers",
+                    caption="Predicted χ values for the selected target polymers",
                     candidates=(
-                        [step5_requirement_snapshot_derived]
-                        if isinstance(step5_requirement_snapshot_derived, Path)
+                        [step5_target_chi_by_rank_derived]
+                        if isinstance(step5_target_chi_by_rank_derived, Path)
                         else []
-                    )
-                    + _make_candidates(
-                        step5_fig_dirs,
-                        ["requirement_pass_rates.png", "selected_target_requirements_by_rank.png"],
                     ),
                 ),
                 PanelSpec(
-                    caption="Target χ parity for the selected 100 polymers",
+                    caption="Water-miscible probabilities for the selected target polymers",
                     candidates=(
-                        [step5_target_chi_parity_derived]
-                        if isinstance(step5_target_chi_parity_derived, Path)
+                        [step5_target_probability_by_rank_derived]
+                        if isinstance(step5_target_probability_by_rank_derived, Path)
                         else []
-                    )
-                    + _make_candidates(
-                        step5_fig_dirs,
-                        [
-                            "selected_target_chi_parity.png",
-                            "target_vs_top1_chi_parity.png",
-                            "selected_polymer_chi_parity_all_conditions.png",
-                        ],
                     ),
                 ),
             ],
         ),
         FigureSpec(
             figure_id="Figure5",
-            title="Figure 5. Polymer-class-conditioned inverse design: sampling efficiency, screening selectivity, and class compliance",
+            title="Figure 5. Polymer-class-conditioned inverse design: sampling success, target-set summary, predicted χ values, and water-miscible probabilities",
             destination="manuscript",
             ncols=2,
             panels=[
                 PanelSpec(
-                    caption="Sampling-attempt accumulation toward 100 class-conditioned targets",
+                    caption="Number of good polymers discovered in each sampling attempt",
                     candidates=(
                         [step6_sampling_attempt_progress_derived]
                         if isinstance(step6_sampling_attempt_progress_derived, Path)
@@ -1813,35 +3003,28 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     + _make_candidates(step6_fig_dirs, ["sampling_attempt_progress.png"]),
                 ),
                 PanelSpec(
-                    caption="Candidate screening funnel for class-conditioned inverse design",
+                    caption="Target-set summary across the final selected polymers",
                     candidates=(
-                        [step6_screening_funnel_derived]
-                        if isinstance(step6_screening_funnel_derived, Path)
+                        [step6_selected_target_summary_derived]
+                        if isinstance(step6_selected_target_summary_derived, Path)
                         else []
                     )
-                    + _make_candidates(step6_fig_dirs, ["candidate_screening_funnel.png"]),
                 ),
                 PanelSpec(
-                    caption="Requirement pass rates, including polymer-class hit, across the selected 100",
+                    caption="Predicted χ values for the selected target polymers",
                     candidates=(
-                        [step6_requirement_snapshot_derived]
-                        if isinstance(step6_requirement_snapshot_derived, Path)
+                        [step6_target_chi_by_rank_derived]
+                        if isinstance(step6_target_chi_by_rank_derived, Path)
                         else []
-                    )
-                    + _make_candidates(
-                        step6_fig_dirs,
-                        ["requirement_pass_rates.png", "selected_target_requirements_by_rank.png"],
                     ),
                 ),
                 PanelSpec(
-                    caption="Polymer-class coverage of discovered targets",
+                    caption="Water-miscible probabilities for the selected target polymers",
                     candidates=(
-                        [step6_target_class_coverage_derived]
-                        if isinstance(step6_target_class_coverage_derived, Path)
+                        [step6_target_probability_by_rank_derived]
+                        if isinstance(step6_target_probability_by_rank_derived, Path)
                         else []
                     )
-                    + _make_candidates(block_c_fig_dirs, ["step6_target_polymer_class_coverage.png"])
-                    + _make_candidates(step7_fig_dirs, ["step6_target_polymer_class_coverage.png"]),
                 ),
             ],
         ),
@@ -2927,6 +4110,10 @@ def main(args: argparse.Namespace) -> None:
     artifact_df.to_csv(metadata_dir / "input_artifact_status.csv", index=False)
 
     # Build derived panels used by manuscript Figures 1 and 2.
+    paths["step2_sampling_information_derived"] = _build_step2_sampling_information_panel(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
     paths["step2_generative_metrics_derived"] = _build_step2_generative_metrics_panel(
         paths=paths,
         metadata_dir=metadata_dir,
@@ -2968,6 +4155,22 @@ def main(args: argparse.Namespace) -> None:
         paths=paths,
         metadata_dir=metadata_dir,
     )
+    paths["step4_regression_parity_test_derived"] = _build_step4_regression_parity_panel(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
+    paths["step4_regression_residual_distribution_derived"] = _build_step4_regression_residual_panel(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
+    paths["step4_class_confusion_test_derived"] = _build_step4_class_confusion_panel(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
+    paths["step4_class_prob_distribution_test_derived"] = _build_step4_class_prob_distribution_panel(
+        paths=paths,
+        metadata_dir=metadata_dir,
+    )
     paths["step6_target_class_coverage_derived"] = _build_step6_target_class_coverage_panel(
         paths=paths,
         metadata_dir=metadata_dir,
@@ -2977,11 +4180,42 @@ def main(args: argparse.Namespace) -> None:
         if paths.get("step5_dir") is not None
         else None
     )
-    step6_target_csv = (
-        paths["step6_dir"] / "metrics" / "target_polymers.csv"
+    step5_selection_summary_csv = (
+        paths["step5_dir"] / "metrics" / "target_polymer_selection_summary.csv"
+        if paths.get("step5_dir") is not None
+        else None
+    )
+    step6_target_csv = _first_existing(
+        [
+            paths["step6_dir"] / "metrics" / "target_polymers.csv"
+            if paths.get("step6_dir") is not None
+            else None,
+            _latest_resampling_attempt_csv(paths.get("step6_dir"), "target_polymers.csv"),
+        ]
+    )
+    step6_selection_summary_csv = (
+        step6_target_csv.parent / "target_polymer_selection_summary.csv"
+        if isinstance(step6_target_csv, Path)
+        else None
+    )
+    step6_inverse_targets_csv = (
+        paths.get("step6_dir") / "metrics" / "inverse_targets.csv"
         if paths.get("step6_dir") is not None
         else None
     )
+    step6_plot_target_csv = _resolve_step6_target_plot_csv(
+        target_csv=step6_target_csv,
+        inverse_targets_csv=step6_inverse_targets_csv,
+        step4_reg_dir=paths.get("step4_reg_dir"),
+        step4_cls_dir=paths.get("step4_cls_dir"),
+        config=config,
+        model_size=model_size,
+        split_mode=split_mode,
+        cache_csv=metadata_dir / "derived_step6_target_polymers_scored.csv",
+    )
+    if not isinstance(step6_plot_target_csv, Path) or not step6_plot_target_csv.exists():
+        step6_plot_target_csv = step6_target_csv
+    step6_attempt_count = _completed_resampling_attempt_count(paths.get("step6_dir"))
     paths["step5_sampling_attempt_progress_derived"] = _build_sampling_attempt_progress_panel(
         attempts_csv=paths.get("step5_sampling_attempts"),
         out_png=metadata_dir / "derived_step5_sampling_attempt_progress.png",
@@ -2990,12 +4224,17 @@ def main(args: argparse.Namespace) -> None:
         attempts_csv=paths.get("step6_sampling_attempts"),
         out_png=metadata_dir / "derived_step6_sampling_attempt_progress.png",
     )
+    if not isinstance(paths.get("step6_sampling_attempt_progress_derived"), Path) or not paths["step6_sampling_attempt_progress_derived"].exists():
+        paths["step6_sampling_attempt_progress_derived"] = _build_resampling_attempt_progress_panel(
+            step_dir=paths.get("step6_dir"),
+            out_png=metadata_dir / "derived_step6_sampling_attempt_progress.png",
+        )
     paths["step5_requirement_snapshot_derived"] = _build_requirement_snapshot_panel(
         target_csv=step5_target_csv,
         out_png=metadata_dir / "derived_step5_requirement_snapshot.png",
     )
     paths["step6_requirement_snapshot_derived"] = _build_requirement_snapshot_panel(
-        target_csv=step6_target_csv,
+        target_csv=step6_plot_target_csv,
         out_png=metadata_dir / "derived_step6_requirement_snapshot.png",
     )
     paths["step5_target_chi_parity_derived"] = _build_target_chi_parity_panel(
@@ -3003,16 +4242,52 @@ def main(args: argparse.Namespace) -> None:
         out_png=metadata_dir / "derived_step5_target_chi_parity.png",
     )
     paths["step6_target_chi_parity_derived"] = _build_target_chi_parity_panel(
-        target_csv=step6_target_csv,
+        target_csv=step6_plot_target_csv,
         out_png=metadata_dir / "derived_step6_target_chi_parity.png",
+    )
+    paths["step5_target_chi_by_rank_derived"] = _build_target_chi_by_rank_panel(
+        target_csv=step5_target_csv,
+        out_png=metadata_dir / "derived_step5_target_chi_by_rank.png",
+    )
+    paths["step6_target_chi_by_rank_derived"] = _build_target_chi_by_rank_panel(
+        target_csv=step6_plot_target_csv,
+        out_png=metadata_dir / "derived_step6_target_chi_by_rank.png",
     )
     paths["step5_target_confidence_by_rank_derived"] = _build_target_confidence_by_rank_panel(
         target_csv=step5_target_csv,
         out_png=metadata_dir / "derived_step5_target_confidence_by_rank.png",
     )
     paths["step6_target_confidence_by_rank_derived"] = _build_target_confidence_by_rank_panel(
-        target_csv=step6_target_csv,
+        target_csv=step6_plot_target_csv,
         out_png=metadata_dir / "derived_step6_target_confidence_by_rank.png",
+    )
+    paths["step5_target_probability_by_rank_derived"] = _build_target_probability_by_rank_panel(
+        target_csv=step5_target_csv,
+        out_png=metadata_dir / "derived_step5_target_probability_by_rank.png",
+    )
+    paths["step6_target_probability_by_rank_derived"] = _build_target_probability_by_rank_panel(
+        target_csv=step6_plot_target_csv,
+        out_png=metadata_dir / "derived_step6_target_probability_by_rank.png",
+    )
+    paths["step6_target_sa_by_rank_derived"] = _build_target_sa_by_rank_panel(
+        target_csv=step6_plot_target_csv,
+        out_png=metadata_dir / "derived_step6_target_sa_by_rank.png",
+    )
+    paths["step5_selected_target_summary_derived"] = _build_selected_target_summary_panel(
+        target_csv=step5_target_csv,
+        out_png=metadata_dir / "derived_step5_selected_target_summary.png",
+        selection_summary_csv=step5_selection_summary_csv,
+    )
+    paths["step6_selected_target_summary_derived"] = _build_selected_target_summary_panel(
+        target_csv=step6_plot_target_csv,
+        out_png=metadata_dir / "derived_step6_selected_target_summary.png",
+        inverse_targets_csv=step6_inverse_targets_csv,
+        selection_summary_csv=step6_selection_summary_csv,
+        attempt_count_override=step6_attempt_count,
+    )
+    paths["step6_inverse_target_summary_derived"] = _build_inverse_target_summary_panel(
+        inverse_targets_csv=step6_inverse_targets_csv,
+        out_png=metadata_dir / "derived_step6_inverse_target_summary.png",
     )
     paths["step5_screening_funnel_derived"] = _build_screening_funnel_panel(
         summary_csv=_first_existing(
@@ -3037,6 +4312,7 @@ def main(args: argparse.Namespace) -> None:
         out_png=metadata_dir / "derived_step6_screening_funnel.png",
     )
     for key in [
+        "step2_sampling_information_derived",
         "step2_generative_metrics_derived",
         "step2_star_count_derived",
         "step3_threshold_quality_heatmap_derived",
@@ -3045,14 +4321,26 @@ def main(args: argparse.Namespace) -> None:
         "step3_threshold_regions_derived",
         "step3_condition_profiles_derived",
         "step3_temperature_trends_derived",
+        "step4_regression_parity_test_derived",
+        "step4_regression_residual_distribution_derived",
+        "step4_class_confusion_test_derived",
+        "step4_class_prob_distribution_test_derived",
         "step5_sampling_attempt_progress_derived",
         "step6_sampling_attempt_progress_derived",
         "step5_requirement_snapshot_derived",
         "step6_requirement_snapshot_derived",
         "step5_target_chi_parity_derived",
         "step6_target_chi_parity_derived",
+        "step5_target_chi_by_rank_derived",
+        "step6_target_chi_by_rank_derived",
         "step5_target_confidence_by_rank_derived",
         "step6_target_confidence_by_rank_derived",
+        "step5_target_probability_by_rank_derived",
+        "step6_target_probability_by_rank_derived",
+        "step6_target_sa_by_rank_derived",
+        "step6_inverse_target_summary_derived",
+        "step5_selected_target_summary_derived",
+        "step6_selected_target_summary_derived",
         "step5_screening_funnel_derived",
         "step6_screening_funnel_derived",
         "step6_target_class_coverage_derived",

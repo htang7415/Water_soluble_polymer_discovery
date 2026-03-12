@@ -224,11 +224,11 @@ chi_training:
     target_phi: 0.2             # polymer fraction
     epsilon: 0.05  # tolerance for property hit when property_rule=band
     # ranking uses independent hard filters (soluble_hit and property_hit) first
-    target_polymer_count: 100  # final number of exported target polymers
+    target_polymer_count: 100  # final total number of exported target polymers across all Step 5 resampling attempts
     target_sa_max: 4.0  # SA upper bound for final target polymer export
     candidate_source: "novel"  # fresh Step 2 resampling only
-    resampling_target_polymer_count: 100  # accepted Step 2 candidates per attempt before Step 5 scoring
-    sampling_attempts_max: 5000  # accumulate fresh Step 2 resampling attempts until enough Step 5 targets are found
+    resampling_target_polymer_count: 100  # accepted Step 2 candidates requested per fresh attempt before Step 5 scoring
+    sampling_attempts_max: 5000  # stop early once 100 final Step 5 targets are found; otherwise keep resampling until the max is reached
     property_rule: "upper_bound"  # band | upper_bound | lower_bound
     coverage_topk: 5  # top-k used in coverage/frequency summaries
     uncertainty_enabled: false  # if true, use MC-dropout uncertainty-aware ranking
@@ -244,11 +244,11 @@ chi_training:
     target_phi: 0.2             # polymer fraction
     epsilon: 0.05
     # ranking uses independent hard filters (soluble_hit, property_hit, polymer_class_hit) first
-    target_polymer_count: 100
+    target_polymer_count: 100  # final total number of exported target polymers across all Step 6 resampling attempts
     target_sa_max: 4.0
     candidate_source: "novel"  # fresh Step 2 resampling only
-    resampling_target_polymer_count: 500  # accepted Step 2 candidates per attempt before Step 6 scoring
-    sampling_attempts_max: 1000  # accumulate fresh Step 2 resampling attempts until class-matching targets are found
+    resampling_target_polymer_count: 100  # accepted Step 2 candidates requested per fresh attempt before Step 6 scoring
+    sampling_attempts_max: 5000  # stop early once 100 final Step 6 targets are found; otherwise keep resampling until the max is reached
     property_rule: "upper_bound"
     coverage_topk: 5
     target_polymer_class: "polyimide"  # all | * | or any key defined under polymer_classes below

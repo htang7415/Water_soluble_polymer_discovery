@@ -43,6 +43,21 @@ from src.utils.reporting import save_step_summary, save_artifact_manifest, write
 WATER_SOLUBLE_PALETTE = {0: "#d62728", 1: "#1f77b4"}
 CLASS_LABEL_INTERNAL = "water_miscible"
 CLASS_LABEL_PUBLIC = "water_miscible"
+CLASS_DISPLAY_LABELS = {0: "water-immiscible", 1: "water-miscible"}
+CLASS_DISPLAY_TICKLABELS = ["water-\nimmiscible", "water-\nmiscible"]
+CLASS_DISPLAY_LEGEND_TITLE = "Class"
+
+
+def _class_display_label(value: object) -> str:
+    try:
+        class_value = int(float(value))
+    except Exception:
+        return str(value)
+    return CLASS_DISPLAY_LABELS.get(class_value, str(value))
+
+
+def _class_display_labels(values: Iterable[object]) -> List[str]:
+    return [_class_display_label(value) for value in values]
 
 
 @dataclass
@@ -1281,9 +1296,9 @@ def _save_classifier_cv_parity_by_fold_figure(
     ax.set_ylim(-0.02, 1.02)
     ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
     ax.set_xticks([0.0, 1.0])
-    ax.set_xticklabels(["0", "1"])
-    ax.set_xlabel(f"True {CLASS_LABEL_PUBLIC}")
-    ax.set_ylabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
+    ax.set_xticklabels(CLASS_DISPLAY_TICKLABELS)
+    ax.set_xlabel("True class")
+    ax.set_ylabel("Predicted water-miscible probability")
 
     cls = classification_metrics(plot_df["water_miscible"], plot_df["class_prob"])
     metrics_text = (
@@ -2066,6 +2081,8 @@ def _plot_class_prob_density_safe(ax, split_df: pd.DataFrame) -> None:
             data=split_df,
             x="class_prob",
             hue="water_miscible",
+            hue_order=[0, 1],
+            palette=WATER_SOLUBLE_PALETTE,
             common_norm=False,
             fill=True,
             alpha=0.3,
@@ -2073,7 +2090,9 @@ def _plot_class_prob_density_safe(ax, split_df: pd.DataFrame) -> None:
         )
         legend = ax.get_legend()
         if legend is not None:
-            legend.set_title(CLASS_LABEL_PUBLIC)
+            legend.set_title(CLASS_DISPLAY_LEGEND_TITLE)
+            for text in legend.get_texts():
+                text.set_text(_class_display_label(text.get_text()))
         return
     except Exception as exc:
         if "Multi-dimensional indexing" not in str(exc):
@@ -2084,7 +2103,7 @@ def _plot_class_prob_density_safe(ax, split_df: pd.DataFrame) -> None:
         _plot_kde_safe_1d(
             ax=ax,
             values=sub,
-            label=str(class_value),
+            label=_class_display_label(class_value),
             color=color,
             linewidth=2.0,
             fill=False,
@@ -2119,12 +2138,12 @@ def _save_binary_confusion_matrix_figure(
         cbar=False,
         cmap="Blues",
         square=True,
-        xticklabels=["0", "1"],
-        yticklabels=["0", "1"],
+        xticklabels=CLASS_DISPLAY_TICKLABELS,
+        yticklabels=CLASS_DISPLAY_TICKLABELS,
         ax=ax,
     )
-    ax.set_xlabel(f"Predicted {CLASS_LABEL_PUBLIC}")
-    ax.set_ylabel(f"True {CLASS_LABEL_PUBLIC}")
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("True class")
     ax.set_title(f"{title} (n={len(y_true)})")
     fig.tight_layout()
     fig.savefig(out_png, dpi=dpi)
@@ -2262,11 +2281,14 @@ def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> 
             ]
             ax.legend(
                 handles=handles,
-                labels=["0 (red)", "1 (blue)"],
-                title=CLASS_LABEL_PUBLIC,
-                loc="upper left",
-                bbox_to_anchor=(1.02, 1.0),
-                borderaxespad=0.0,
+                labels=_class_display_labels([0, 1]),
+                title=CLASS_DISPLAY_LEGEND_TITLE,
+                loc="upper right",
+                frameon=True,
+                fancybox=True,
+                framealpha=0.92,
+                facecolor="white",
+                edgecolor="#666666",
             )
         else:
             legend.remove()
@@ -2299,9 +2321,9 @@ def _plot_classifier_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend
     ax.set_ylim(-0.02, 1.02)
     ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
     ax.set_xticks([0.0, 1.0])
-    ax.set_xticklabels(["0", "1"])
-    ax.set_xlabel(f"True {CLASS_LABEL_PUBLIC}")
-    ax.set_ylabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
+    ax.set_xticklabels(CLASS_DISPLAY_TICKLABELS)
+    ax.set_xlabel("True class")
+    ax.set_ylabel("Predicted water-miscible probability")
 
     cls = classification_metrics(sub["water_miscible"], sub["class_prob"])
     metrics_text = (
@@ -2329,11 +2351,14 @@ def _plot_classifier_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend
             legend.remove()
             ax.legend(
                 handles=handles,
-                labels=labels,
-                title=CLASS_LABEL_PUBLIC,
-                loc="upper left",
-                bbox_to_anchor=(1.02, 1.0),
-                borderaxespad=0.0,
+                labels=_class_display_labels(labels),
+                title=CLASS_DISPLAY_LEGEND_TITLE,
+                loc="upper right",
+                frameon=True,
+                fancybox=True,
+                framealpha=0.92,
+                facecolor="white",
+                edgecolor="#666666",
             )
         else:
             legend.remove()
@@ -2371,7 +2396,7 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     train = pred_df[pred_df["split"] == "train"].copy()
     fig, ax = plt.subplots(figsize=(6, 5))
     _plot_parity_panel(ax, sub=train, split="train", show_legend=True)
-    fig.tight_layout(rect=(0, 0, 0.82, 1))
+    fig.tight_layout()
     fig.savefig(fig_dir / "chi_parity_train.png", dpi=dpi)
     plt.close(fig)
     _save_binary_confusion_matrix_figure(
@@ -2384,7 +2409,7 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     test = pred_df[pred_df["split"] == "test"].copy()
     fig, ax = plt.subplots(figsize=(6, 5))
     _plot_parity_panel(ax, sub=test, split="test", show_legend=True)
-    fig.tight_layout(rect=(0, 0, 0.82, 1))
+    fig.tight_layout()
     fig.savefig(fig_dir / "chi_parity_test.png", dpi=dpi)
     plt.close(fig)
     _save_binary_confusion_matrix_figure(
@@ -2412,7 +2437,14 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     ax.set_xlabel("χ prediction error")
     ax.set_title("Residual distribution by split")
     if plotted_any:
-        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+        ax.legend(
+            loc="upper right",
+            frameon=True,
+            fancybox=True,
+            framealpha=0.92,
+            facecolor="white",
+            edgecolor="#666666",
+        )
     else:
         ax.text(0.5, 0.5, "Insufficient residual variance for KDE", ha="center", va="center", transform=ax.transAxes)
     fig.tight_layout()
@@ -2425,7 +2457,7 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
 
         fig, ax = plt.subplots(figsize=(6, 5))
         _plot_class_prob_density_safe(ax=ax, split_df=split_df)
-        ax.set_xlabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
+        ax.set_xlabel("Predicted water-miscible probability")
         ax.set_title(f"Class probability distribution ({split_name})")
         legend = ax.get_legend()
         if legend is not None:
@@ -2434,13 +2466,17 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
             legend.remove()
             ax.legend(
                 handles=handles,
-                labels=labels,
-                title=CLASS_LABEL_PUBLIC,
-                loc="upper left",
-                bbox_to_anchor=(1.02, 1.0),
-                borderaxespad=0.0,
+                labels=_class_display_labels(labels),
+                title=CLASS_DISPLAY_LEGEND_TITLE,
+                loc="upper center",
+                ncol=min(2, len(labels)),
+                frameon=True,
+                fancybox=True,
+                framealpha=0.92,
+                facecolor="white",
+                edgecolor="#666666",
             )
-        fig.tight_layout(rect=(0, 0, 0.82, 1))
+        fig.tight_layout()
         fig.savefig(fig_dir / f"chi_class_prob_distribution_{split_name}.png", dpi=dpi)
         plt.close(fig)
 
@@ -3201,7 +3237,14 @@ def _make_regression_figures(
     ax.set_xlabel("chi prediction error")
     ax.set_title("Residual distribution by split")
     if plotted_any:
-        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+        ax.legend(
+            loc="upper right",
+            frameon=True,
+            fancybox=True,
+            framealpha=0.92,
+            facecolor="white",
+            edgecolor="#666666",
+        )
     else:
         ax.text(0.5, 0.5, "Insufficient residual variance for KDE", ha="center", va="center", transform=ax.transAxes)
     fig.tight_layout()
@@ -3247,7 +3290,7 @@ def _make_classifier_figures(
     if not train.empty:
         fig, ax = plt.subplots(figsize=(6, 5))
         _plot_classifier_parity_panel(ax=ax, sub=train, split="train", show_legend=True)
-        fig.tight_layout(rect=(0, 0, 0.82, 1))
+        fig.tight_layout()
         fig.savefig(fig_dir / "class_parity_train.png", dpi=dpi)
         plt.close(fig)
     _save_binary_confusion_matrix_figure(
@@ -3261,7 +3304,7 @@ def _make_classifier_figures(
     if not test.empty:
         fig, ax = plt.subplots(figsize=(6, 5))
         _plot_classifier_parity_panel(ax=ax, sub=test, split="test", show_legend=True)
-        fig.tight_layout(rect=(0, 0, 0.82, 1))
+        fig.tight_layout()
         fig.savefig(fig_dir / "class_parity_test.png", dpi=dpi)
         plt.close(fig)
     _save_binary_confusion_matrix_figure(
@@ -3277,7 +3320,7 @@ def _make_classifier_figures(
 
         fig, ax = plt.subplots(figsize=(6, 5))
         _plot_class_prob_density_safe(ax=ax, split_df=split_df)
-        ax.set_xlabel(f"Predicted {CLASS_LABEL_PUBLIC} probability")
+        ax.set_xlabel("Predicted water-miscible probability")
         ax.set_title(f"Class probability distribution ({split_name})")
         legend = ax.get_legend()
         if legend is not None:
@@ -3286,13 +3329,17 @@ def _make_classifier_figures(
             legend.remove()
             ax.legend(
                 handles=handles,
-                labels=labels,
-                title=CLASS_LABEL_PUBLIC,
-                loc="upper left",
-                bbox_to_anchor=(1.02, 1.0),
-                borderaxespad=0.0,
+                labels=_class_display_labels(labels),
+                title=CLASS_DISPLAY_LEGEND_TITLE,
+                loc="upper center",
+                ncol=min(2, len(labels)),
+                frameon=True,
+                fancybox=True,
+                framealpha=0.92,
+                facecolor="white",
+                edgecolor="#666666",
             )
-        fig.tight_layout(rect=(0, 0, 0.82, 1))
+        fig.tight_layout()
         fig.savefig(fig_dir / f"class_prob_distribution_{split_name}.png", dpi=dpi)
         plt.close(fig)
 
