@@ -421,6 +421,16 @@ def launch_fresh_step2_resampling(
         cmd.extend(["--checkpoint", str(args.backbone_checkpoint)])
     if random_seed is not None:
         cmd.extend(["--random_seed", str(int(random_seed))])
+    if getattr(args, "decode_constraint_class", None):
+        cmd.extend(["--decode_constraint_class", str(args.decode_constraint_class)])
+    if getattr(args, "decode_constraint_motif_bank_json", None):
+        cmd.extend(["--decode_constraint_motif_bank_json", str(args.decode_constraint_motif_bank_json)])
+    if getattr(args, "decode_constraint_center_min_frac", None) is not None:
+        cmd.extend(["--decode_constraint_center_min_frac", str(float(args.decode_constraint_center_min_frac))])
+    if getattr(args, "decode_constraint_center_max_frac", None) is not None:
+        cmd.extend(["--decode_constraint_center_max_frac", str(float(args.decode_constraint_center_max_frac))])
+    if bool(getattr(args, "decode_constraint_enforce_class_match", False)):
+        cmd.append("--decode_constraint_enforce_class_match")
 
     print(f"Launching fresh Step 2 resampling into: {resampling_step_dir}")
     try:

@@ -1507,32 +1507,29 @@ def _build_target_confidence_by_rank_panel(
     if "target_rank" not in plot_df.columns:
         plot_df["target_rank"] = np.arange(1, len(plot_df) + 1, dtype=int)
     plot_df["target_rank"] = pd.to_numeric(plot_df["target_rank"], errors="coerce")
-    prob_cols = [col for col in ["class_prob", "class_prob_lcb"] if col in plot_df.columns]
-    if not prob_cols:
+    prob_col = "class_prob" if "class_prob" in plot_df.columns else ("class_prob_lcb" if "class_prob_lcb" in plot_df.columns else None)
+    if prob_col is None:
         return None
-    for col in prob_cols:
-        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
-    plot_df = plot_df.dropna(subset=["target_rank"] + prob_cols).sort_values("target_rank")
+    plot_df[prob_col] = pd.to_numeric(plot_df[prob_col], errors="coerce")
+    plot_df = plot_df.dropna(subset=["target_rank", prob_col]).sort_values("target_rank")
     if plot_df.empty:
         return None
 
     fig, ax = plt.subplots(figsize=(6.2, 5.0))
-    color_map = {"class_prob": NATURE_BLUE, "class_prob_lcb": NATURE_GREEN}
-    label_map = {"class_prob": "Class probability", "class_prob_lcb": "Conservative class probability"}
-    for col in prob_cols:
-        ax.plot(
-            plot_df["target_rank"],
-            plot_df[col],
-            linewidth=2.0,
-            color=color_map.get(col, NATURE_BLUE),
-            label=label_map.get(col, col),
-        )
+    ax.plot(
+        plot_df["target_rank"],
+        plot_df[prob_col],
+        linewidth=2.0,
+        color=NATURE_BLUE,
+    )
     ax.axhline(0.5, color="#6B7280", linestyle="--", linewidth=1.4)
     ax.set_xlabel("Selected target rank", fontsize=PAPER_FONT_SIZE)
-    ax.set_ylabel("Solubility confidence", fontsize=PAPER_FONT_SIZE)
+    ax.set_ylabel(
+        "Predicted water-miscible probability" if prob_col == "class_prob" else "Estimated water-miscible probability",
+        fontsize=PAPER_FONT_SIZE,
+    )
     ax.tick_params(axis="both", labelsize=max(10, PAPER_FONT_SIZE - 2))
     ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.35)
-    ax.legend(loc="lower right", fontsize=max(10, PAPER_FONT_SIZE - 4), frameon=True)
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -3095,7 +3092,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
         ),
         FigureSpec(
             figure_id="FigureS3",
-            title="Figure S3. Detailed χ-prediction and solubility-confidence diagnostics for the final selected targets",
+            title="Figure S3. Detailed χ-prediction and water-miscible-probability diagnostics for the final selected targets",
             destination="si",
             ncols=2,
             panels=[
@@ -3116,7 +3113,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     ),
                 ),
                 PanelSpec(
-                    caption="Solubility confidence by rank for Step 5 selected polymers",
+                    caption="Water-miscible probability by rank for Step 5 selected polymers",
                     candidates=(
                         [step5_target_confidence_by_rank_derived]
                         if isinstance(step5_target_confidence_by_rank_derived, Path)
@@ -3144,7 +3141,7 @@ def _build_figure_specs(paths: Dict[str, Optional[Path]]) -> List[FigureSpec]:
                     ),
                 ),
                 PanelSpec(
-                    caption="Solubility confidence by rank for Step 6 selected polymers",
+                    caption="Water-miscible probability by rank for Step 6 selected polymers",
                     candidates=(
                         [step6_target_confidence_by_rank_derived]
                         if isinstance(step6_target_confidence_by_rank_derived, Path)
@@ -3343,7 +3340,7 @@ def _write_storyline(
         "Current Step 8 build emits six SI composite figures: Figures S1-S5 and Figure S10.",
         "1. Figure S1: Polymer design foundation: training-corpus quality and thermodynamic target landscape context.",
         "2. Figure S2: Hyperparameter tuning trajectories and learning diagnostics.",
-        "3. Figure S3: Detailed χ-prediction and solubility-confidence diagnostics for selected targets.",
+        "3. Figure S3: Detailed χ-prediction and water-miscible-probability diagnostics for selected targets.",
         "4. Figure S4: Extended sampling-process and screening diagnostics for Step 5 and Step 6.",
         "5. Figure S5: Cross-step candidate novelty and scoring diagnostics for selected targets.",
         "6. Figure S10: DiT vs traditional baseline comparison across model sizes.",

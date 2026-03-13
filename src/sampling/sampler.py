@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn.functional as F
-from typing import Optional, List, Tuple
+from typing import Optional, List, Sequence, Tuple
 import numpy as np
 from tqdm import tqdm
 
@@ -1057,6 +1057,123 @@ class ConstrainedSampler:
                     show_progress=False
                 )
 
+            all_ids.append(ids)
+            all_smiles.extend(smiles)
+            sample_idx += current_batch_size
+
+        return all_ids, all_smiles
+
+    def sample_with_fixed_spans(
+        self,
+        span_token_ids: Sequence[Sequence[int]],
+        span_start_positions: Sequence[int],
+        seq_length: int,
+        lengths: Optional[Sequence[int]] = None,
+        show_progress: bool = True
+    ) -> Tuple[torch.Tensor, List[str]]:
+        """Sample by fixing one interior token span per sequence.
+
+        Args:
+            span_token_ids: Token-id spans to keep fixed for each sample.
+            span_start_positions: Start positions for each fixed span.
+            seq_length: Shared padded sequence length.
+            lengths: Optional per-sample sequence lengths including BOS/EOS.
+            show_progress: Whether to show progress bar.
+
+        Returns:
+            Tuple of (token_ids, smiles_strings).
+        """
+        batch_size = len(span_token_ids)
+        if len(span_start_positions) != batch_size:
+            raise ValueError("span_start_positions must match span_token_ids")
+        if lengths is not None and len(lengths) != batch_size:
+            raise ValueError("lengths must match span_token_ids")
+
+        ids = torch.full(
+            (batch_size, seq_length),
+            self.mask_id,
+            dtype=torch.long,
+            device=self.device
+        )
+        attention_mask = torch.ones_like(ids)
+        fixed_mask = torch.zeros_like(ids, dtype=torch.bool)
+
+        ids[:, 0] = self.bos_id
+        fixed_mask[:, 0] = True
+
+        effective_lengths: List[int] = []
+        if lengths is None:
+            ids[:, -1] = self.eos_id
+            fixed_mask[:, -1] = True
+            effective_lengths = [int(seq_length)] * batch_size
+        else:
+            attention_mask = torch.zeros_like(ids)
+            for i, raw_length in enumerate(lengths):
+                length = max(2, int(raw_length))
+                if length > seq_length:
+                    raise ValueError(f"length {length} exceeds seq_length={seq_length}")
+                effective_lengths.append(length)
+                eos_pos = length - 1
+                ids[i, eos_pos] = self.eos_id
+                fixed_mask[i, eos_pos] = True
+                attention_mask[i, :length] = 1
+                if length < seq_length:
+                    ids[i, length:] = self.pad_id
+                    fixed_mask[i, length:] = True
+
+        for i, (span_ids, start_pos) in enumerate(zip(span_token_ids, span_start_positions)):
+            span = list(int(token_id) for token_id in span_ids)
+            if not span:
+                continue
+            effective_length = effective_lengths[i]
+            if effective_length < 2:
+                raise ValueError(f"effective length must be >= 2, got {effective_length}")
+            end_pos = int(start_pos) + len(span)
+            if int(start_pos) < 1 or end_pos > (effective_length - 1):
+                raise ValueError(
+                    f"Fixed span [{start_pos}, {end_pos}) does not fit sequence length {effective_length}"
+                )
+            ids[i, int(start_pos):end_pos] = torch.tensor(span, dtype=torch.long, device=self.device)
+            fixed_mask[i, int(start_pos):end_pos] = True
+
+        return self._sample_from_ids(ids, attention_mask, fixed_mask, show_progress)
+
+    def sample_batch_with_fixed_spans(
+        self,
+        num_samples: int,
+        seq_length: int,
+        span_token_ids: Sequence[Sequence[int]],
+        span_start_positions: Sequence[int],
+        batch_size: int = 256,
+        show_progress: bool = True,
+        lengths: Optional[Sequence[int]] = None
+    ) -> Tuple[List[torch.Tensor], List[str]]:
+        """Batch wrapper for fixed-span constrained sampling."""
+        if len(span_token_ids) != num_samples:
+            raise ValueError("span_token_ids must match num_samples")
+        if len(span_start_positions) != num_samples:
+            raise ValueError("span_start_positions must match num_samples")
+        if lengths is not None and len(lengths) != num_samples:
+            raise ValueError("lengths must match num_samples")
+
+        all_ids = []
+        all_smiles = []
+        num_batches = (num_samples + batch_size - 1) // batch_size
+        sample_idx = 0
+
+        for _ in tqdm(range(num_batches), desc="Batch sampling", disable=not show_progress):
+            current_batch_size = min(batch_size, num_samples - sample_idx)
+            batch_span_ids = span_token_ids[sample_idx:sample_idx + current_batch_size]
+            batch_span_starts = span_start_positions[sample_idx:sample_idx + current_batch_size]
+            batch_lengths = None if lengths is None else lengths[sample_idx:sample_idx + current_batch_size]
+
+            ids, smiles = self.sample_with_fixed_spans(
+                span_token_ids=batch_span_ids,
+                span_start_positions=batch_span_starts,
+                seq_length=seq_length,
+                lengths=batch_lengths,
+                show_progress=False,
+            )
             all_ids.append(ids)
             all_smiles.extend(smiles)
             sample_idx += current_batch_size

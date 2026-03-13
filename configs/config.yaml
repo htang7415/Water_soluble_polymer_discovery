@@ -225,7 +225,7 @@ chi_training:
     epsilon: 0.05  # tolerance for property hit when property_rule=band
     # ranking uses independent hard filters (soluble_hit and property_hit) first
     target_polymer_count: 100  # final total number of exported target polymers across all Step 5 resampling attempts
-    target_sa_max: 4.0  # SA upper bound for final target polymer export
+    target_sa_max: 3.6  # SA upper bound for final target polymer export
     candidate_source: "novel"  # fresh Step 2 resampling only
     resampling_target_polymer_count: 100  # accepted Step 2 candidates requested per fresh attempt before Step 5 scoring
     sampling_attempts_max: 5000  # stop early once 100 final Step 5 targets are found; otherwise keep resampling until the max is reached
@@ -245,7 +245,7 @@ chi_training:
     epsilon: 0.05
     # ranking uses independent hard filters (soluble_hit, property_hit, polymer_class_hit) first
     target_polymer_count: 100  # final total number of exported target polymers across all Step 6 resampling attempts
-    target_sa_max: 4.0
+    target_sa_max: 3.6
     candidate_source: "novel"  # fresh Step 2 resampling only
     resampling_target_polymer_count: 100  # accepted Step 2 candidates requested per fresh attempt before Step 6 scoring
     sampling_attempts_max: 5000  # stop early once 100 final Step 6 targets are found; otherwise keep resampling until the max is reached
@@ -258,6 +258,12 @@ chi_training:
     uncertainty_property_z: 1.0
     uncertainty_score_weight: 0.0
     uncertainty_seed: 42
+    decode_constraint_enabled: true  # Step 6 only: inject class-specific token motifs during fresh Step 2 resampling
+    decode_constraint_motif_bank_json: null  # optional JSON mapping class -> list of p-SMILES motif fragments
+    decode_constraint_max_motifs: 6
+    decode_constraint_center_min_frac: 0.25  # motif center placement lower bound as a fraction of sequence length
+    decode_constraint_center_max_frac: 0.75  # motif center placement upper bound as a fraction of sequence length
+    decode_constraint_enforce_class_match: true  # exact SMARTS class filter during constrained Step 2 valid-only acceptance
 
   # Step 7 chemistry + physics analysis
   step7_chem_physics:

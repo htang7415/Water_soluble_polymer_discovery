@@ -908,42 +908,88 @@ def _save_figures(
 
     if not target_poly_df.empty and "target_rank" in target_poly_df.columns:
         sel = target_poly_df.sort_values("target_rank").copy()
-        confidence_col = "class_prob_lcb" if "class_prob_lcb" in sel.columns else "class_prob"
-        sel["property_margin"] = _compute_property_requirement_margin(sel, epsilon=epsilon)
-        sel["solubility_margin"] = sel[confidence_col].astype(float) - 0.5
-        sel["sa_margin"] = float(target_sa_max) - sel["sa_score"].astype(float)
+        prob_col = "class_prob" if "class_prob" in sel.columns else ("class_prob_lcb" if "class_prob_lcb" in sel.columns else None)
 
-        fig, axes = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
-        plot_specs = [
-            ("property_margin", "χ margin to target", "#e45756"),
-            ("solubility_margin", "Solubility margin to 0.5", "#4c78a8"),
-            ("sa_margin", f"SA margin to {target_sa_max:.1f}", "#54a24b"),
-        ]
-        for ax, (col, ylabel, color) in zip(axes, plot_specs):
-            ax.plot(
-                sel["target_rank"].to_numpy(dtype=float),
-                sel[col].to_numpy(dtype=float),
-                color=color,
-                linewidth=1.6,
-                alpha=0.8,
+        plot_specs = []
+        if {"chi_pred_target", "target_chi"}.issubset(sel.columns):
+            plot_specs.append(
+                {
+                    "col": "chi_pred_target",
+                    "ylabel": "Predicted χ",
+                    "color": "#e45756",
+                    "target_col": "target_chi",
+                    "target_label": "Target χ",
+                }
             )
-            ax.scatter(
-                sel["target_rank"].to_numpy(dtype=float),
-                sel[col].to_numpy(dtype=float),
-                color=color,
-                s=22,
-                alpha=0.9,
+        if prob_col is not None:
+            plot_specs.append(
+                {
+                    "col": prob_col,
+                    "ylabel": "Water-miscible probability",
+                    "color": "#4c78a8",
+                    "ref_line": 0.5,
+                    "ref_label": "Miscible threshold",
+                    "ylim": (0.0, 1.05),
+                }
             )
-            ax.axhline(0.0, color="#474747", linewidth=1.0, linestyle=":")
-            ax.set_ylabel(ylabel)
-        axes[-1].set_xlabel("Selected polymer rank")
-        fig.suptitle("Step 5 selected polymers: requirement margins by rank", y=0.98)
-        fig.tight_layout()
-        fig.savefig(out_dir / "selected_target_requirements_by_rank.png", dpi=dpi)
-        plt.close(fig)
+        if "sa_score" in sel.columns:
+            plot_specs.append(
+                {
+                    "col": "sa_score",
+                    "ylabel": "SA score",
+                    "color": "#54a24b",
+                    "ref_line": float(target_sa_max),
+                    "ref_label": f"SA limit ({target_sa_max:.1f})",
+                }
+            )
+
+        if plot_specs:
+            fig, axes = plt.subplots(len(plot_specs), 1, figsize=(9, 2.4 * len(plot_specs) + 1.2), sharex=True)
+            axes = np.atleast_1d(axes)
+            for ax, spec in zip(axes, plot_specs):
+                x_vals = sel["target_rank"].to_numpy(dtype=float)
+                y_vals = sel[spec["col"]].to_numpy(dtype=float)
+                ax.plot(x_vals, y_vals, color=spec["color"], linewidth=1.6, alpha=0.8)
+                ax.scatter(x_vals, y_vals, color=spec["color"], s=22, alpha=0.9)
+
+                target_col = spec.get("target_col")
+                if target_col is not None and target_col in sel.columns:
+                    ax.plot(
+                        x_vals,
+                        sel[target_col].to_numpy(dtype=float),
+                        color="#474747",
+                        linewidth=1.0,
+                        linestyle=":",
+                        label=spec.get("target_label", "Target"),
+                    )
+                    ax.legend(frameon=False, fontsize=max(font_size - 4, 8), loc="best")
+
+                ref_line = spec.get("ref_line")
+                if ref_line is not None:
+                    ax.axhline(
+                        float(ref_line),
+                        color="#474747",
+                        linewidth=1.0,
+                        linestyle=":",
+                        label=spec.get("ref_label"),
+                    )
+                    ax.legend(frameon=False, fontsize=max(font_size - 4, 8), loc="best")
+
+                if spec.get("ylim") is not None:
+                    ax.set_ylim(*spec["ylim"])
+                ax.set_ylabel(spec["ylabel"])
+
+            axes[-1].set_xlabel("Selected polymer rank")
+            fig.suptitle("Step 5 selected polymers: predicted values by rank", y=0.98)
+            fig.tight_layout()
+            fig.savefig(out_dir / "selected_target_requirements_by_rank.png", dpi=dpi)
+            plt.close(fig)
 
     if not target_poly_df.empty and {"target_chi", "chi_pred_target"}.issubset(target_poly_df.columns):
-        sel = target_poly_df.sort_values("target_rank" if "target_rank" in target_poly_df.columns else target_poly_df.columns[0]).copy()
+        sel = target_poly_df.copy()
+        if "target_rank" not in sel.columns:
+            sel["target_rank"] = np.arange(1, len(sel) + 1, dtype=int)
+        sel = sel.sort_values("target_rank").copy()
         fig, ax = plt.subplots(figsize=(5.8, 5.2))
         sns.scatterplot(data=sel, x="target_chi", y="chi_pred_target", color="#4c78a8", s=60, ax=ax)
         if "chi_pred_std_target" in sel.columns and np.nanmax(sel["chi_pred_std_target"].to_numpy(dtype=float)) > 0:
@@ -968,70 +1014,63 @@ def _save_figures(
         fig.savefig(out_dir / "selected_target_chi_parity.png", dpi=dpi)
         plt.close(fig)
 
-        sel["chi_margin"] = _compute_property_requirement_margin(sel, epsilon=epsilon)
         fig, ax = plt.subplots(figsize=(6.2, 4.8))
-        sns.histplot(sel["chi_margin"].dropna(), bins=min(20, max(8, len(sel) // 6)), color="#e45756", ax=ax)
-        ax.axvline(0.0, color="#474747", linewidth=1.0, linestyle=":")
-        ax.set_xlabel("χ margin to target requirement")
+        sns.histplot(sel["chi_pred_target"].dropna(), bins=min(20, max(8, len(sel) // 6)), color="#e45756", ax=ax)
+        target_vals = pd.to_numeric(sel["target_chi"], errors="coerce").dropna().to_numpy(dtype=float)
+        for idx, value in enumerate(np.unique(np.round(target_vals, 6))):
+            ax.axvline(
+                float(value),
+                color="#474747",
+                linewidth=1.0,
+                linestyle=":",
+                label="Target χ" if idx == 0 else None,
+            )
+        ax.set_xlabel("Predicted χ at target condition")
         ax.set_ylabel("Count")
-        ax.set_title("Step 5 selected polymers: χ margin distribution")
+        ax.set_title("Step 5 selected polymers: predicted χ distribution")
+        if target_vals.size > 0:
+            ax.legend(frameon=False)
         fig.tight_layout()
         fig.savefig(out_dir / "selected_target_chi_margin_distribution.png", dpi=dpi)
         plt.close(fig)
 
-    if not target_poly_df.empty and "class_prob_lcb" in target_poly_df.columns:
-        sel = target_poly_df.sort_values("target_rank" if "target_rank" in target_poly_df.columns else target_poly_df.columns[0]).copy()
+    prob_col = "class_prob" if "class_prob" in target_poly_df.columns else ("class_prob_lcb" if "class_prob_lcb" in target_poly_df.columns else None)
+    if not target_poly_df.empty and prob_col is not None:
+        sel = target_poly_df.copy()
+        if "target_rank" not in sel.columns:
+            sel["target_rank"] = np.arange(1, len(sel) + 1, dtype=int)
+        sel = sel.sort_values("target_rank").copy()
+        probability_label = "Predicted water-miscible probability" if prob_col == "class_prob" else "Estimated water-miscible probability"
+
         fig, ax = plt.subplots(figsize=(8.0, 4.6))
-        if "class_prob" in sel.columns:
-            ax.plot(
-                sel["target_rank"].to_numpy(dtype=float),
-                sel["class_prob"].to_numpy(dtype=float),
-                marker="o",
-                linewidth=1.6,
-                color="#9ecae1",
-                label="Raw classifier probability",
-            )
         ax.plot(
             sel["target_rank"].to_numpy(dtype=float),
-            sel["class_prob_lcb"].to_numpy(dtype=float),
-            marker="s",
+            sel[prob_col].to_numpy(dtype=float),
+            marker="o",
             linewidth=1.8,
             color="#1f77b4",
-            label="Conservative probability",
         )
         ax.axhline(0.5, color="#474747", linewidth=1.0, linestyle=":")
         ax.set_xlabel("Selected polymer rank")
-        ax.set_ylabel("Water-solubility classifier confidence")
+        ax.set_ylabel(probability_label)
         ax.set_ylim(0, 1.05)
-        ax.set_title("Step 5 selected polymers: classification confidence by rank")
-        ax.legend(frameon=False)
+        ax.set_title("Step 5 selected polymers: water-miscible probability by rank")
         fig.tight_layout()
         fig.savefig(out_dir / "selected_target_solubility_confidence_by_rank.png", dpi=dpi)
         plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(6.4, 4.8))
-        if "class_prob" in sel.columns:
-            sns.histplot(
-                sel["class_prob"].dropna(),
-                bins=min(20, max(8, len(sel) // 6)),
-                color="#9ecae1",
-                alpha=0.45,
-                label="Raw probability",
-                ax=ax,
-            )
         sns.histplot(
-            sel["class_prob_lcb"].dropna(),
+            sel[prob_col].dropna(),
             bins=min(20, max(8, len(sel) // 6)),
             color="#1f77b4",
-            alpha=0.65,
-            label="Conservative probability",
+            alpha=0.75,
             ax=ax,
         )
         ax.axvline(0.5, color="#474747", linewidth=1.0, linestyle=":")
-        ax.set_xlabel("Water-solubility classifier confidence")
+        ax.set_xlabel(probability_label)
         ax.set_ylabel("Count")
-        ax.set_title("Step 5 selected polymers: classification confidence distribution")
-        ax.legend(frameon=False)
+        ax.set_title("Step 5 selected polymers: water-miscible probability distribution")
         fig.tight_layout()
         fig.savefig(out_dir / "selected_target_solubility_confidence_distribution.png", dpi=dpi)
         plt.close(fig)
