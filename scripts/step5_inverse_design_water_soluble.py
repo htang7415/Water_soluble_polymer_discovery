@@ -28,6 +28,7 @@ from src.chi.inverse_design_common import (
     prepare_novel_inference_cache,
     resolve_training_smiles,
     set_plot_style,
+    unique_preserving_order,
 )
 from src.chi.model import predict_chi_mean_std_from_coefficients
 from src.chi.constants import COEFF_NAMES
@@ -69,22 +70,25 @@ def _compute_target_candidates(
         raise ValueError(f"Candidate pool missing required columns: {missing}")
 
     coeff_std_cols = [f"{name}_std" for name in COEFF_NAMES]
-    copy_cols = required_cols + [
-        c
-        for c in [
-            CLASS_LABEL_INTERNAL,
-            CLASS_LABEL_PUBLIC,
-            "candidate_source",
-            "sampling_attempt",
-            "canonical_smiles",
-            "class_logit",
-            "class_logit_std",
-            "class_prob_std",
-            "is_novel_vs_train",
-            *coeff_std_cols,
+    copy_cols = unique_preserving_order(
+        required_cols
+        + [
+            c
+            for c in [
+                CLASS_LABEL_INTERNAL,
+                CLASS_LABEL_PUBLIC,
+                "candidate_source",
+                "sampling_attempt",
+                "canonical_smiles",
+                "class_logit",
+                "class_logit_std",
+                "class_prob_std",
+                "is_novel_vs_train",
+                *coeff_std_cols,
+            ]
+            if c in coeff_df.columns
         ]
-        if c in coeff_df.columns
-    ]
+    )
     out = coeff_df[copy_cols].copy()
     for col in ["class_prob_std", "class_logit_std", *coeff_std_cols]:
         if col not in out.columns:

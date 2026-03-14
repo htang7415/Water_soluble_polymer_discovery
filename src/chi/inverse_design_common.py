@@ -30,6 +30,17 @@ CLASS_LABEL_PUBLIC = "water_miscible"
 CLASS_NAME_MAP = {1: "Water-miscible", 0: "Water-immiscible"}
 
 
+def unique_preserving_order(values: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
 def _ensure_internal_label(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if CLASS_LABEL_INTERNAL not in out.columns and CLASS_LABEL_PUBLIC in out.columns:
@@ -679,7 +690,7 @@ def infer_coefficients_for_novel_candidates(
 ) -> pd.DataFrame:
     if novel_df.empty:
         return pd.DataFrame(
-            columns=[
+            columns=unique_preserving_order([
                 "polymer_id",
                 "Polymer",
                 "SMILES",
@@ -694,7 +705,7 @@ def infer_coefficients_for_novel_candidates(
                 *[f"{name}_std" for name in COEFF_NAMES],
                 "candidate_source",
                 "is_novel_vs_train",
-            ]
+            ])
         )
 
     if uncertainty_seed is not None:
@@ -1038,7 +1049,7 @@ def build_candidate_pool(
 
     if not pool_frames:
         empty = pd.DataFrame(
-            columns=[
+            columns=unique_preserving_order([
                 "polymer_id",
                 "Polymer",
                 "SMILES",
@@ -1053,7 +1064,7 @@ def build_candidate_pool(
                 *[f"{name}_std" for name in COEFF_NAMES],
                 "candidate_source",
                 "is_novel_vs_train",
-            ]
+            ])
         )
         summary["candidate_count_total"] = 0
         summary["candidate_count_after_dedup"] = 0
