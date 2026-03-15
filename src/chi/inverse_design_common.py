@@ -168,6 +168,20 @@ def load_step2_resampling_step_summary(summary_csv: str | Path | None) -> Dict[s
             target_met = int(target_met_raw.strip().lower() in {"1", "true", "yes", "y"})
         else:
             target_met = int(bool(target_met_raw))
+    skip_novelty_raw = row.get("valid_only_skip_novelty_filter", None)
+    skip_novelty = None
+    if skip_novelty_raw is not None and not pd.isna(skip_novelty_raw):
+        if isinstance(skip_novelty_raw, str):
+            skip_novelty = int(skip_novelty_raw.strip().lower() in {"1", "true", "yes", "y"})
+        else:
+            skip_novelty = int(bool(skip_novelty_raw))
+    skip_sa_raw = row.get("valid_only_skip_sa_filter", None)
+    skip_sa = None
+    if skip_sa_raw is not None and not pd.isna(skip_sa_raw):
+        if isinstance(skip_sa_raw, str):
+            skip_sa = int(skip_sa_raw.strip().lower() in {"1", "true", "yes", "y"})
+        else:
+            skip_sa = int(bool(skip_sa_raw))
 
     return {
         "step2_generation_goal": int(_safe_numeric(row.get("generation_goal"), default=np.nan))
@@ -187,6 +201,8 @@ def load_step2_resampling_step_summary(summary_csv: str | Path | None) -> Dict[s
         if np.isfinite(_safe_numeric(row.get("valid_only_shortfall_count"), default=np.nan))
         else None,
         "step2_valid_only_target_met": target_met,
+        "step2_valid_only_skip_novelty_filter": skip_novelty,
+        "step2_valid_only_skip_sa_filter": skip_sa,
         "step2_sampling_time_sec": _safe_numeric(row.get("sampling_time_sec"), default=np.nan),
         "step2_samples_per_sec": _safe_numeric(row.get("samples_per_sec"), default=np.nan),
     }
@@ -442,6 +458,10 @@ def launch_fresh_step2_resampling(
         cmd.extend(["--decode_constraint_center_max_frac", str(float(args.decode_constraint_center_max_frac))])
     if bool(getattr(args, "decode_constraint_enforce_class_match", False)):
         cmd.append("--decode_constraint_enforce_class_match")
+    if bool(getattr(args, "resampling_skip_novelty_filter", False)):
+        cmd.append("--valid_only_skip_novelty_filter")
+    if bool(getattr(args, "resampling_skip_sa_filter", False)):
+        cmd.append("--valid_only_skip_sa_filter")
 
     print(f"Launching fresh Step 2 resampling into: {resampling_step_dir}")
     try:

@@ -176,6 +176,9 @@ def _filter_step2_target_candidates(
     sa_cache: dict[str, float | None] | None = None,
     required_polymer_class: str | None = None,
     polymer_classifier: PolymerClassifier | None = None,
+    enforce_novelty: bool = True,
+    enforce_unique: bool = True,
+    enforce_sa: bool = True,
 ):
     sa_cache = sa_cache if sa_cache is not None else {}
     accepted = []
@@ -193,19 +196,22 @@ def _filter_step2_target_candidates(
             and not bool(polymer_classifier.classify(smiles).get(required_polymer_class, False))
         ):
             continue
-        if canonical in training_canonical:
+        if enforce_novelty and canonical in training_canonical:
             continue
-        if canonical in seen_canonical:
+        if enforce_unique and canonical in seen_canonical:
             continue
-        sa = _sa_score_cached(smiles, sa_cache)
-        if sa is None or float(sa) >= float(sa_max):
-            continue
-        seen_canonical.add(canonical)
+        sa = None
+        if enforce_sa:
+            sa = _sa_score_cached(smiles, sa_cache)
+            if sa is None or float(sa) >= float(sa_max):
+                continue
+        if enforce_unique:
+            seen_canonical.add(canonical)
         accepted.append(
             {
                 "smiles": smiles,
                 "canonical_smiles": canonical,
-                "sa_score": float(sa),
+                "sa_score": float(sa) if sa is not None else np.nan,
             }
         )
     return accepted
@@ -501,6 +507,8 @@ def main(args):
         valid_only_fail_on_shortfall = True
     elif args.valid_only_continue_on_shortfall:
         valid_only_fail_on_shortfall = False
+    valid_only_skip_novelty_filter = bool(getattr(args, "valid_only_skip_novelty_filter", False))
+    valid_only_skip_sa_filter = bool(getattr(args, "valid_only_skip_sa_filter", False))
     target_polymer_count = int(
         args.target_polymer_count
         if args.target_polymer_count is not None
@@ -595,6 +603,8 @@ def main(args):
             "valid_only_max_rounds": valid_only_max_rounds,
             "valid_only_min_samples_per_round": valid_only_min_samples_per_round,
             "valid_only_fail_on_shortfall": valid_only_fail_on_shortfall,
+            "valid_only_skip_novelty_filter": bool(valid_only_skip_novelty_filter),
+            "valid_only_skip_sa_filter": bool(valid_only_skip_sa_filter),
             "decode_constraint_enabled": bool(decode_constraint_enabled),
             "decode_constraint_class": decode_constraint_class,
             "decode_constraint_motif_bank_json": None if decode_constraint_motif_bank_json is None else str(decode_constraint_motif_bank_json),
@@ -849,7 +859,9 @@ def main(args):
     if valid_only:
         print(
             f"   Valid-only mode ON (require_target_stars={valid_only_require_target_stars}, "
-            f"max_rounds={valid_only_max_rounds})"
+            f"max_rounds={valid_only_max_rounds}, "
+            f"skip_novelty={valid_only_skip_novelty_filter}, "
+            f"skip_sa={valid_only_skip_sa_filter})"
         )
         generated_smiles = []
         seen_canonical = set()
@@ -882,6 +894,9 @@ def main(args):
                 sa_cache=sa_cache,
                 required_polymer_class=decode_constraint_class if decode_constraint_enforce_class_match else None,
                 polymer_classifier=decode_constraint_classifier,
+                enforce_novelty=not valid_only_skip_novelty_filter,
+                enforce_unique=True,
+                enforce_sa=not valid_only_skip_sa_filter,
             )
             accepted = min(remaining, len(batch_accepted))
             if accepted > 0:
@@ -1127,6 +1142,8 @@ def main(args):
         "valid_only_rejected_count": int(valid_only_stats["valid_only_rejected_count"]),
         "valid_only_target_met": bool(valid_only_stats["valid_only_target_met"]),
         "valid_only_shortfall_count": int(valid_only_stats["valid_only_shortfall_count"]),
+        "valid_only_skip_novelty_filter": bool(valid_only_skip_novelty_filter),
+        "valid_only_skip_sa_filter": bool(valid_only_skip_sa_filter),
         "decode_constraint_enabled": bool(decode_constraint_enabled),
         "decode_constraint_class": decode_constraint_class,
         "decode_constraint_motif_count": int(len(decode_constraint_token_ids)),
@@ -1223,6 +1240,10 @@ if __name__ == '__main__':
                         help='Raise an error if valid-only rounds do not reach target count')
     parser.add_argument('--valid_only_continue_on_shortfall', action='store_true',
                         help='Continue with accepted subset if valid-only rounds do not reach target count')
+    parser.add_argument('--valid_only_skip_novelty_filter', action='store_true',
+                        help='In valid-only mode, do not require novelty during acceptance; defer novelty filtering downstream')
+    parser.add_argument('--valid_only_skip_sa_filter', action='store_true',
+                        help='In valid-only mode, do not require SA < target_sa_max during acceptance; defer SA filtering downstream')
     parser.add_argument('--variable_length', action='store_true',
                         help='Enable variable length sampling (or set sampling.variable_length=true in config)')
     parser.add_argument('--min_length', type=int, default=None,

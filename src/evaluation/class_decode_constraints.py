@@ -245,9 +245,29 @@ def resolve_class_decode_motifs(
     patterns: Dict[str, str],
     configured_bank_path: Path | None = None,
     max_motifs: int = 6,
+    resolution_strategy: str = "configured_or_local_mined_or_defaults",
 ) -> Tuple[List[str], str]:
-    """Resolve decode motifs from user config, mined corpus fragments, or defaults."""
+    """Resolve decode motifs from user config, mined corpus fragments, or defaults.
+
+    resolution_strategy controls fallback order:
+    - configured_or_local_mined_or_defaults: current legacy behavior
+    - configured_or_defaults: prefer explicit or curated defaults; skip auto-mined local motifs
+    - configured_only: require an explicit configured motif bank
+    - defaults_only: require built-in defaults
+    """
     target_key = str(target_class).strip().lower()
+    strategy = str(resolution_strategy).strip().lower()
+    valid_strategies = {
+        "configured_or_local_mined_or_defaults",
+        "configured_or_defaults",
+        "configured_only",
+        "defaults_only",
+    }
+    if strategy not in valid_strategies:
+        raise ValueError(
+            f"Unknown decode-constraint resolution_strategy='{resolution_strategy}'. "
+            f"Expected one of {sorted(valid_strategies)}"
+        )
 
     if configured_bank_path is not None:
         configured = load_class_motifs_from_json(configured_bank_path, target_key)
@@ -258,15 +278,21 @@ def resolve_class_decode_motifs(
             )
         return normalized, "configured_json"
 
-    mined = mine_class_decode_motifs(
-        target_class=target_key,
-        tokenizer=tokenizer,
-        source_smiles=source_smiles,
-        patterns=patterns,
-        max_motifs=max_motifs,
-    )
-    if mined:
-        return mined, "mined_local_corpus"
+    if strategy == "configured_only":
+        raise ValueError(
+            f"Configured decode-constraint motif bank required for class '{target_key}', but none was provided."
+        )
+
+    if strategy == "configured_or_local_mined_or_defaults":
+        mined = mine_class_decode_motifs(
+            target_class=target_key,
+            tokenizer=tokenizer,
+            source_smiles=source_smiles,
+            patterns=patterns,
+            max_motifs=max_motifs,
+        )
+        if mined:
+            return mined, "mined_local_corpus"
 
     fallback = _normalize_fragments(DEFAULT_CLASS_MOTIFS.get(target_key, []), tokenizer, max_motifs=max_motifs)
     if fallback:
