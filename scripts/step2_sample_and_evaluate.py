@@ -149,6 +149,7 @@ def _filter_valid_samples(
     target_stars: int,
     required_polymer_class: str | None = None,
     polymer_classifier: PolymerClassifier | None = None,
+    enforce_backbone_class_match: bool = False,
 ):
     valid = []
     for smiles in smiles_list:
@@ -156,12 +157,12 @@ def _filter_valid_samples(
             continue
         if require_target_stars and count_stars(smiles) != target_stars:
             continue
-        if (
-            required_polymer_class is not None
-            and polymer_classifier is not None
-            and not bool(polymer_classifier.classify(smiles).get(required_polymer_class, False))
-        ):
-            continue
+        if required_polymer_class is not None and polymer_classifier is not None:
+            if enforce_backbone_class_match:
+                if not bool(polymer_classifier.classify_backbone(smiles).get(required_polymer_class, False)):
+                    continue
+            elif not bool(polymer_classifier.classify(smiles).get(required_polymer_class, False)):
+                continue
         valid.append(smiles)
     return valid
 
@@ -179,6 +180,7 @@ def _filter_step2_target_candidates(
     enforce_novelty: bool = True,
     enforce_unique: bool = True,
     enforce_sa: bool = True,
+    enforce_backbone_class_match: bool = False,
 ):
     sa_cache = sa_cache if sa_cache is not None else {}
     accepted = []
@@ -190,12 +192,12 @@ def _filter_step2_target_candidates(
         canonical = canonicalize_smiles(smiles)
         if canonical is None:
             continue
-        if (
-            required_polymer_class is not None
-            and polymer_classifier is not None
-            and not bool(polymer_classifier.classify(smiles).get(required_polymer_class, False))
-        ):
-            continue
+        if required_polymer_class is not None and polymer_classifier is not None:
+            if enforce_backbone_class_match:
+                if not bool(polymer_classifier.classify_backbone(smiles).get(required_polymer_class, False)):
+                    continue
+            elif not bool(polymer_classifier.classify(smiles).get(required_polymer_class, False)):
+                continue
         if enforce_novelty and canonical in training_canonical:
             continue
         if enforce_unique and canonical in seen_canonical:
@@ -237,6 +239,28 @@ def _load_decode_constraint_fragments(path: Path, target_class: str) -> List[str
             return [str(x).strip() for x in data[target_key] if str(x).strip()]
 
     raise ValueError(f"Could not load motifs for class '{target_class}' from {path}")
+
+
+def _load_decode_constraint_length_prior(path: Path, target_class: str) -> List[int]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    raw_lengths: List[int] = []
+    if isinstance(data, list):
+        raw_lengths = [int(x) for x in data]
+    elif isinstance(data, dict):
+        target_key = str(target_class).strip().lower()
+        if isinstance(data.get("lengths"), list):
+            target_in_file = str(data.get("target_class", target_key)).strip().lower()
+            if target_in_file not in {"", target_key}:
+                raise ValueError(
+                    f"decode constraint length prior target_class mismatch: requested={target_key}, file={target_in_file}"
+                )
+            raw_lengths = [int(x) for x in data["lengths"]]
+        elif target_key in data and isinstance(data[target_key], list):
+            raw_lengths = [int(x) for x in data[target_key]]
+
+    return [int(x) for x in raw_lengths if int(x) >= 2]
 
 
 def _prepare_decode_constraint_token_ids(
@@ -308,6 +332,153 @@ def _build_decode_constraint_spans(
         start = max(1, min(max_start, candidate_start))
         chosen_spans.append(motif_ids)
         start_positions.append(start)
+
+    return chosen_spans, start_positions, adjusted_lengths
+
+
+def _place_multi_spans_for_length(
+    *,
+    motifs: List[List[int]],
+    effective_length: int,
+    center_min_frac: float,
+    center_max_frac: float,
+    min_gap_tokens: int = 2,
+) -> List[int]:
+    if not motifs:
+        return []
+
+    usable_token_count = max(0, int(effective_length) - 2)
+    required_token_count = sum(len(motif_ids) for motif_ids in motifs) + (
+        max(0, len(motifs) - 1) * int(min_gap_tokens)
+    )
+    if required_token_count > usable_token_count:
+        raise ValueError(
+            f"Could not place {len(motifs)} decode-time motifs within effective length {effective_length}"
+        )
+
+    if len(motifs) == 1:
+        motif_ids = motifs[0]
+        max_start = int(effective_length) - 1 - len(motif_ids)
+        center_frac = (
+            center_min_frac
+            if center_min_frac == center_max_frac
+            else float(np.random.uniform(center_min_frac, center_max_frac))
+        )
+        center_target = center_frac * float(max(1, effective_length - 1))
+        candidate_start = int(round(center_target - (0.5 * len(motif_ids))))
+        return [max(1, min(max_start, candidate_start))]
+
+    anchors = np.linspace(center_min_frac, center_max_frac, len(motifs) + 2)[1:-1]
+    future_requirements: List[int] = [0] * len(motifs)
+    running_requirement = 0
+    for idx in range(len(motifs) - 1, -1, -1):
+        future_requirements[idx] = running_requirement
+        running_requirement += len(motifs[idx]) + int(min_gap_tokens)
+
+    starts: List[int] = []
+    prev_end = 1
+    for idx, (anchor_frac, motif_ids) in enumerate(zip(anchors, motifs)):
+        max_start = (
+            int(effective_length) - 1 - len(motif_ids) - future_requirements[idx]
+        )
+        candidate_start = int(round(anchor_frac * float(max(1, effective_length - 1)) - (0.5 * len(motif_ids))))
+        min_start = 1 if idx == 0 else prev_end + int(min_gap_tokens)
+        if max_start < min_start:
+            raise ValueError(
+                f"Could not place {len(motifs)} decode-time motifs within effective length {effective_length}"
+            )
+        start = max(min_start, min(max_start, candidate_start))
+        starts.append(start)
+        prev_end = start + len(motif_ids)
+
+    return starts
+
+
+def _build_decode_constraint_multi_spans(
+    *,
+    motif_token_ids: List[List[int]],
+    lengths: List[int],
+    center_min_frac: float,
+    center_max_frac: float,
+    seq_length: int,
+    spans_per_sample: int,
+    min_gap_tokens: int = 2,
+) -> tuple[List[List[List[int]]], List[List[int]], List[int]]:
+    if spans_per_sample < 1:
+        raise ValueError(f"spans_per_sample must be >= 1, got {spans_per_sample}")
+    if spans_per_sample == 1:
+        spans, starts, adjusted = _build_decode_constraint_spans(
+            motif_token_ids=motif_token_ids,
+            lengths=lengths,
+            center_min_frac=center_min_frac,
+            center_max_frac=center_max_frac,
+            seq_length=seq_length,
+        )
+        return [[span] for span in spans], [[start] for start in starts], adjusted
+
+    max_motif_len = max(len(ids) for ids in motif_token_ids)
+    adjusted_lengths = [
+        min(
+            seq_length,
+            max(int(raw_length), max_motif_len + 4),
+        )
+        for raw_length in lengths
+    ]
+
+    chosen_spans: List[List[List[int]]] = []
+    start_positions: List[List[int]] = []
+    for effective_length in adjusted_lengths:
+        fitting = [ids for ids in motif_token_ids if len(ids) <= max(1, effective_length - 2)]
+        if not fitting:
+            raise ValueError(
+                f"No decode-time motif fits effective sequence length {effective_length}. "
+                "Increase allowed lengths or shorten motifs."
+            )
+        min_len = min(len(ids) for ids in fitting)
+        shortest_pool = [ids for ids in fitting if len(ids) <= (min_len + 1)]
+        usable_pool = shortest_pool if shortest_pool else fitting
+        max_spans_fit = max(
+            1,
+            int((max(1, effective_length - 2) + int(min_gap_tokens)) // (min_len + int(min_gap_tokens))),
+        )
+        sample_span_count = max(1, min(int(spans_per_sample), int(max_spans_fit)))
+
+        sample_spans: List[List[int]] | None = None
+        sample_starts: List[int] | None = None
+        available_token_count = max(0, int(effective_length) - 2)
+        for current_span_count in range(sample_span_count, 0, -1):
+            pool = usable_pool if current_span_count > 1 else fitting
+            for _ in range(32):
+                candidate_spans = [
+                    list(pool[np.random.randint(0, len(pool))])
+                    for _ in range(current_span_count)
+                ]
+                required_token_count = sum(len(ids) for ids in candidate_spans) + (
+                    max(0, current_span_count - 1) * int(min_gap_tokens)
+                )
+                if required_token_count > available_token_count:
+                    continue
+                try:
+                    candidate_starts = _place_multi_spans_for_length(
+                        motifs=candidate_spans,
+                        effective_length=int(effective_length),
+                        center_min_frac=float(center_min_frac),
+                        center_max_frac=float(center_max_frac),
+                        min_gap_tokens=int(min_gap_tokens),
+                    )
+                except ValueError:
+                    continue
+                sample_spans = candidate_spans
+                sample_starts = candidate_starts
+                break
+            if sample_spans is not None and sample_starts is not None:
+                break
+        if sample_spans is None or sample_starts is None:
+            raise ValueError(
+                f"Could not construct {sample_span_count} decode-time motifs within effective length {effective_length}"
+            )
+        chosen_spans.append(sample_spans)
+        start_positions.append(sample_starts)
 
     return chosen_spans, start_positions, adjusted_lengths
 
@@ -530,11 +701,21 @@ def main(args):
         if getattr(args, "decode_constraint_motif_bank_json", None) is not None
         else None
     )
+    decode_constraint_length_prior_json = (
+        Path(args.decode_constraint_length_prior_json)
+        if getattr(args, "decode_constraint_length_prior_json", None) is not None
+        else None
+    )
     decode_constraint_enabled = bool(decode_constraint_class is not None and decode_constraint_motif_bank_json is not None)
     if (decode_constraint_class is None) != (decode_constraint_motif_bank_json is None):
         raise ValueError(
             "decode constraint requires both --decode_constraint_class and --decode_constraint_motif_bank_json"
         )
+    decode_constraint_spans_per_sample = int(
+        args.decode_constraint_spans_per_sample
+        if getattr(args, "decode_constraint_spans_per_sample", None) is not None
+        else 1
+    )
     decode_constraint_center_min_frac = float(
         args.decode_constraint_center_min_frac
         if getattr(args, "decode_constraint_center_min_frac", None) is not None
@@ -548,14 +729,24 @@ def main(args):
     decode_constraint_enforce_class_match = bool(
         decode_constraint_enabled and getattr(args, "decode_constraint_enforce_class_match", False)
     )
+    decode_constraint_enforce_backbone_class_match = bool(
+        decode_constraint_enforce_class_match
+        and getattr(args, "decode_constraint_enforce_backbone_class_match", False)
+    )
     if decode_constraint_enabled and not decode_constraint_motif_bank_json.exists():
         raise FileNotFoundError(
             f"decode constraint motif bank not found: {decode_constraint_motif_bank_json}"
+        )
+    if decode_constraint_length_prior_json is not None and not decode_constraint_length_prior_json.exists():
+        raise FileNotFoundError(
+            f"decode constraint length prior not found: {decode_constraint_length_prior_json}"
         )
     if decode_constraint_enabled and not (0.0 <= decode_constraint_center_min_frac <= decode_constraint_center_max_frac <= 1.0):
         raise ValueError(
             "decode constraint center fractions must satisfy 0 <= min <= max <= 1"
         )
+    if decode_constraint_spans_per_sample < 1:
+        raise ValueError(f"decode_constraint_spans_per_sample must be >= 1, got {decode_constraint_spans_per_sample}")
 
     # Set device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -608,6 +799,8 @@ def main(args):
             "decode_constraint_enabled": bool(decode_constraint_enabled),
             "decode_constraint_class": decode_constraint_class,
             "decode_constraint_motif_bank_json": None if decode_constraint_motif_bank_json is None else str(decode_constraint_motif_bank_json),
+            "decode_constraint_length_prior_json": None if decode_constraint_length_prior_json is None else str(decode_constraint_length_prior_json),
+            "decode_constraint_spans_per_sample": int(decode_constraint_spans_per_sample),
             "decode_constraint_center_min_frac": float(decode_constraint_center_min_frac),
             "decode_constraint_center_max_frac": float(decode_constraint_center_max_frac),
             "decode_constraint_enforce_class_match": bool(decode_constraint_enforce_class_match),
@@ -640,6 +833,7 @@ def main(args):
         )
     decode_constraint_fragments: List[str] = []
     decode_constraint_token_ids: List[List[int]] = []
+    decode_constraint_length_prior_lengths: List[int] = []
     decode_constraint_classifier: PolymerClassifier | None = None
     if decode_constraint_enabled:
         decode_constraint_fragments = _load_decode_constraint_fragments(
@@ -659,6 +853,15 @@ def main(args):
                 "decode constraint motifs are too long for tokenizer.max_length="
                 f"{tokenizer.max_length}"
             )
+        if decode_constraint_length_prior_json is not None:
+            decode_constraint_length_prior_lengths = _load_decode_constraint_length_prior(
+                decode_constraint_length_prior_json,
+                decode_constraint_class,
+            )
+            decode_constraint_length_prior_lengths = [
+                max(max(len(ids) for ids in decode_constraint_token_ids) + 4, min(int(tokenizer.max_length), int(x)))
+                for x in decode_constraint_length_prior_lengths
+            ]
         if decode_constraint_enforce_class_match:
             patterns = {str(k).strip().lower(): v for k, v in config.get("polymer_classes", {}).items()}
             if decode_constraint_class not in patterns:
@@ -669,9 +872,18 @@ def main(args):
         print(
             "   decode constraint active: "
             f"class={decode_constraint_class}, motifs={len(decode_constraint_token_ids)}, "
+            f"spans_per_sample={decode_constraint_spans_per_sample}, "
             f"center={decode_constraint_center_min_frac:.2f}-{decode_constraint_center_max_frac:.2f}, "
-            f"enforce_class_match={decode_constraint_enforce_class_match}"
+            f"enforce_class_match={decode_constraint_enforce_class_match}, "
+            f"enforce_backbone={decode_constraint_enforce_backbone_class_match}"
         )
+        if decode_constraint_length_prior_lengths:
+            print(
+                "   decode class length prior: "
+                f"count={len(decode_constraint_length_prior_lengths)}, "
+                f"min={min(decode_constraint_length_prior_lengths)}, "
+                f"max={max(decode_constraint_length_prior_lengths)}"
+            )
         _append_step_log(
             step_dir=step_dir,
             lines=[
@@ -680,6 +892,9 @@ def main(args):
                 f"class: {decode_constraint_class}",
                 f"motif_bank_json: {decode_constraint_motif_bank_json}",
                 f"motif_count: {len(decode_constraint_token_ids)}",
+                f"spans_per_sample: {int(decode_constraint_spans_per_sample)}",
+                f"length_prior_json: {decode_constraint_length_prior_json}",
+                f"length_prior_count: {len(decode_constraint_length_prior_lengths)}",
                 f"center_min_frac: {decode_constraint_center_min_frac:.4f}",
                 f"center_max_frac: {decode_constraint_center_max_frac:.4f}",
                 f"enforce_class_match: {bool(decode_constraint_enforce_class_match)}",
@@ -748,13 +963,39 @@ def main(args):
         device=device
     )
 
+    # Apply class-enriched token logit bias if provided (Step 6 decode constraints)
+    if getattr(args, "decode_constraint_class_token_bias_json", None):
+        _bias_json_path = Path(args.decode_constraint_class_token_bias_json)
+        if _bias_json_path.exists():
+            with open(_bias_json_path, "r", encoding="utf-8") as f:
+                _bias_data = json.load(f)
+            _bias_values = _bias_data.get("bias") if isinstance(_bias_data, dict) else _bias_data
+            if isinstance(_bias_values, list) and len(_bias_values) == tokenizer.vocab_size:
+                sampler.set_class_token_logit_bias(_bias_values)
+                print(f"   class token logit bias loaded: {_bias_json_path.name}")
+
     # Sample
     sampling_start = time.time()
     batch_size = args.batch_size or config['sampling']['batch_size']
     print(f"\n5. Sampling target polymers (goal={generation_goal}, batch_size={batch_size})...")
 
-    def sample_candidates(n_requested: int, show_progress: bool = True):
+    def sample_candidates(n_requested: int, show_progress: bool = True, spans_per_sample_override: int | None = None):
+        effective_spans_per_sample = (
+            int(spans_per_sample_override)
+            if spans_per_sample_override is not None
+            else int(decode_constraint_spans_per_sample)
+        )
         length_buffer = max((len(ids) for ids in decode_constraint_token_ids), default=0) + 4
+        def _sample_decode_constraint_lengths(count: int) -> List[int]:
+            if decode_constraint_length_prior_lengths:
+                sampled_lengths = np.random.choice(
+                    np.asarray(decode_constraint_length_prior_lengths, dtype=np.int32),
+                    size=int(count),
+                    replace=True,
+                )
+                return [int(x) for x in sampled_lengths.tolist()]
+            return []
+
         if variable_length:
             min_len = variable_length_min_tokens
             max_len = variable_length_max_tokens
@@ -781,42 +1022,65 @@ def main(args):
                 )
                 return sampled_smiles
 
-            lengths = [
-                int(np.random.randint(min_len, max_len + 1))
-                for _ in range(int(n_requested))
-            ]
-            spans, span_starts, lengths = _build_decode_constraint_spans(
+            lengths = _sample_decode_constraint_lengths(int(n_requested))
+            if not lengths:
+                lengths = [
+                    int(np.random.randint(min_len, max_len + 1))
+                    for _ in range(int(n_requested))
+                ]
+            multi_spans, multi_span_starts, lengths = _build_decode_constraint_multi_spans(
                 motif_token_ids=decode_constraint_token_ids,
                 lengths=lengths,
                 center_min_frac=decode_constraint_center_min_frac,
                 center_max_frac=decode_constraint_center_max_frac,
                 seq_length=int(tokenizer.max_length),
+                spans_per_sample=effective_spans_per_sample,
             )
-            _, sampled_smiles = sampler.sample_batch_with_fixed_spans(
-                n_requested,
-                seq_length=int(tokenizer.max_length),
-                span_token_ids=spans,
-                span_start_positions=span_starts,
-                batch_size=batch_size,
-                show_progress=show_progress,
-                lengths=lengths,
-            )
+            if effective_spans_per_sample == 1:
+                _, sampled_smiles = sampler.sample_batch_with_fixed_spans(
+                    n_requested,
+                    seq_length=int(tokenizer.max_length),
+                    span_token_ids=[sample_spans[0] for sample_spans in multi_spans],
+                    span_start_positions=[sample_starts[0] for sample_starts in multi_span_starts],
+                    batch_size=batch_size,
+                    show_progress=show_progress,
+                    lengths=lengths,
+                )
+            else:
+                _, sampled_smiles = sampler.sample_batch_with_multiple_fixed_spans(
+                    n_requested,
+                    seq_length=int(tokenizer.max_length),
+                    span_token_ids=multi_spans,
+                    span_start_positions=multi_span_starts,
+                    batch_size=batch_size,
+                    show_progress=show_progress,
+                    lengths=lengths,
+                )
             return sampled_smiles
 
         replace = n_requested > len(train_df)
-        sampled = train_df['p_smiles'].sample(
-            n=n_requested,
-            replace=replace,
-            random_state=np.random.randint(0, 2**31 - 1)
-        )
-        lengths = [
-            min(len(tokenizer.tokenize(s)) + 2, tokenizer.max_length)
-            for s in sampled.tolist()
-        ]
+        if decode_constraint_enabled and decode_constraint_length_prior_lengths:
+            lengths = _sample_decode_constraint_lengths(int(n_requested))
+        else:
+            sampled = train_df['p_smiles'].sample(
+                n=n_requested,
+                replace=replace,
+                random_state=np.random.randint(0, 2**31 - 1)
+            )
+            lengths = [
+                min(len(tokenizer.tokenize(s)) + 2, tokenizer.max_length)
+                for s in sampled.tolist()
+            ]
         if decode_constraint_enabled:
             lengths = [max(int(length), length_buffer) for length in lengths]
         if show_progress:
-            print(f"   Using training length distribution (min={min(lengths)}, max={max(lengths)})")
+            if decode_constraint_enabled and decode_constraint_length_prior_lengths:
+                print(
+                    "   Using class length prior "
+                    f"(min={min(lengths)}, max={max(lengths)}, n_prior={len(decode_constraint_length_prior_lengths)})"
+                )
+            else:
+                print(f"   Using training length distribution (min={min(lengths)}, max={max(lengths)})")
         if not decode_constraint_enabled:
             _, sampled_smiles = sampler.sample_batch(
                 n_requested,
@@ -827,22 +1091,34 @@ def main(args):
             )
             return sampled_smiles
 
-        spans, span_starts, lengths = _build_decode_constraint_spans(
+        multi_spans, multi_span_starts, lengths = _build_decode_constraint_multi_spans(
             motif_token_ids=decode_constraint_token_ids,
             lengths=lengths,
             center_min_frac=decode_constraint_center_min_frac,
             center_max_frac=decode_constraint_center_max_frac,
             seq_length=int(tokenizer.max_length),
+            spans_per_sample=effective_spans_per_sample,
         )
-        _, sampled_smiles = sampler.sample_batch_with_fixed_spans(
-            n_requested,
-            seq_length=tokenizer.max_length,
-            span_token_ids=spans,
-            span_start_positions=span_starts,
-            batch_size=batch_size,
-            show_progress=show_progress,
-            lengths=lengths
-        )
+        if effective_spans_per_sample == 1:
+            _, sampled_smiles = sampler.sample_batch_with_fixed_spans(
+                n_requested,
+                seq_length=tokenizer.max_length,
+                span_token_ids=[sample_spans[0] for sample_spans in multi_spans],
+                span_start_positions=[sample_starts[0] for sample_starts in multi_span_starts],
+                batch_size=batch_size,
+                show_progress=show_progress,
+                lengths=lengths
+            )
+        else:
+            _, sampled_smiles = sampler.sample_batch_with_multiple_fixed_spans(
+                n_requested,
+                seq_length=tokenizer.max_length,
+                span_token_ids=multi_spans,
+                span_start_positions=multi_span_starts,
+                batch_size=batch_size,
+                show_progress=show_progress,
+                lengths=lengths
+            )
         return sampled_smiles
 
     valid_only_stats = {
@@ -868,6 +1144,13 @@ def main(args):
         total_raw_generated = 0
         round_rows = []
 
+        # Adaptive spans escalation for rare polymer classes:
+        # After consecutive zero-acceptance rounds, increase spans_per_sample.
+        adaptive_consecutive_zero = 0
+        adaptive_escalation_after = 5  # escalate after this many consecutive 0% rounds
+        adaptive_current_spans = int(decode_constraint_spans_per_sample)
+        adaptive_spans_max = max(int(decode_constraint_spans_per_sample) + 3, 6)
+
         for round_idx in range(1, valid_only_max_rounds + 1):
             remaining = generation_goal - len(generated_smiles)
             if remaining <= 0:
@@ -881,7 +1164,12 @@ def main(args):
                 f"   Valid-only round {round_idx}/{valid_only_max_rounds}: "
                 f"request={n_requested}, remaining_target={remaining}"
             )
-            batch_smiles = sample_candidates(n_requested=n_requested, show_progress=True)
+            spans_override = adaptive_current_spans if decode_constraint_enabled else None
+            batch_smiles = sample_candidates(
+                n_requested=n_requested,
+                show_progress=True,
+                spans_per_sample_override=spans_override,
+            )
             total_raw_generated += len(batch_smiles)
 
             batch_accepted = _filter_step2_target_candidates(
@@ -897,6 +1185,7 @@ def main(args):
                 enforce_novelty=not valid_only_skip_novelty_filter,
                 enforce_unique=True,
                 enforce_sa=not valid_only_skip_sa_filter,
+                enforce_backbone_class_match=decode_constraint_enforce_backbone_class_match,
             )
             accepted = min(remaining, len(batch_accepted))
             if accepted > 0:
@@ -912,6 +1201,7 @@ def main(args):
                     "accepted_this_round": int(accepted),
                     "accepted_cumulative": int(len(generated_smiles)),
                     "round_acceptance_rate": float(round_acceptance),
+                    "adaptive_spans_per_sample": adaptive_current_spans if decode_constraint_enabled else None,
                 }
             )
             print(
@@ -919,6 +1209,22 @@ def main(args):
                 f"({100.0 * round_acceptance:.2f}%), accepted={accepted}, "
                 f"cumulative={len(generated_smiles)}/{generation_goal}"
             )
+
+            # Adaptive spans escalation: increase motif density on persistent failure
+            if decode_constraint_enabled and round_acceptance == 0.0:
+                adaptive_consecutive_zero += 1
+                if (
+                    adaptive_consecutive_zero >= adaptive_escalation_after
+                    and adaptive_current_spans < adaptive_spans_max
+                ):
+                    adaptive_current_spans += 1
+                    adaptive_consecutive_zero = 0
+                    print(
+                        f"   Adaptive escalation: spans_per_sample increased to "
+                        f"{adaptive_current_spans} (max={adaptive_spans_max})"
+                    )
+            else:
+                adaptive_consecutive_zero = 0
 
         shortfall_count = int(max(generation_goal - len(generated_smiles), 0))
         if shortfall_count > 0:
@@ -956,6 +1262,7 @@ def main(args):
             target_stars=target_stars,
             required_polymer_class=decode_constraint_class if decode_constraint_enforce_class_match else None,
             polymer_classifier=decode_constraint_classifier,
+            enforce_backbone_class_match=decode_constraint_enforce_backbone_class_match,
         )
         generated_smiles = filtered[:generation_goal]
         valid_only_stats.update(
@@ -1147,6 +1454,8 @@ def main(args):
         "decode_constraint_enabled": bool(decode_constraint_enabled),
         "decode_constraint_class": decode_constraint_class,
         "decode_constraint_motif_count": int(len(decode_constraint_token_ids)),
+        "decode_constraint_spans_per_sample": int(decode_constraint_spans_per_sample),
+        "decode_constraint_length_prior_count": int(len(decode_constraint_length_prior_lengths)),
         "decode_constraint_center_min_frac": float(decode_constraint_center_min_frac),
         "decode_constraint_center_max_frac": float(decode_constraint_center_max_frac),
         "decode_constraint_enforce_class_match": bool(decode_constraint_enforce_class_match),
@@ -1256,12 +1565,20 @@ if __name__ == '__main__':
                         help='Optional decode-time polymer class constraint (used by Step 6 only)')
     parser.add_argument('--decode_constraint_motif_bank_json', type=str, default=None,
                         help='JSON file containing decode-time motif fragments for the target class')
+    parser.add_argument('--decode_constraint_length_prior_json', type=str, default=None,
+                        help='Optional JSON file containing class-specific token lengths for decode-time sampling')
+    parser.add_argument('--decode_constraint_spans_per_sample', type=int, default=None,
+                        help='Number of fixed decode-time motifs to inject per sampled polymer')
     parser.add_argument('--decode_constraint_center_min_frac', type=float, default=None,
                         help='Lower bound for motif center placement as a fraction of sequence length')
     parser.add_argument('--decode_constraint_center_max_frac', type=float, default=None,
                         help='Upper bound for motif center placement as a fraction of sequence length')
     parser.add_argument('--decode_constraint_enforce_class_match', action='store_true',
                         help='Filter accepted samples to exact target polymer-class SMARTS matches')
+    parser.add_argument('--decode_constraint_enforce_backbone_class_match', action='store_true',
+                        help='Require class-defining functional group to be on the backbone path between * atoms')
+    parser.add_argument('--decode_constraint_class_token_bias_json', type=str, default=None,
+                        help='Path to JSON with per-token logit bias for class-steered sampling')
     parser.add_argument("--evaluate_ood", action="store_true",
                         help="Compute OOD metrics if embeddings are available")
     parser.add_argument("--foundation_results_dir", type=str,

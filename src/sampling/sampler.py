@@ -48,6 +48,7 @@ class ConstrainedSampler:
         self.target_stars = int(target_stars)
         self.use_constraints = use_constraints
         self.device = device
+        self.class_token_logit_bias: Optional[torch.Tensor] = None
 
         # Get special token IDs
         self.mask_id = tokenizer.mask_token_id
@@ -77,6 +78,20 @@ class ConstrainedSampler:
         } - {-1}
         self.atom_ids.update(self.bracket_token_ids)  # Bracket tokens are also atoms
         self.fallback_non_star_id = self._resolve_fallback_non_star_id()
+
+    def set_class_token_logit_bias(self, bias: Optional[List[float]]) -> None:
+        """Set per-token logit bias to steer sampling toward a target class.
+
+        Args:
+            bias: List of length vocab_size with additive logit biases,
+                  or None to disable.
+        """
+        if bias is None:
+            self.class_token_logit_bias = None
+        else:
+            self.class_token_logit_bias = torch.tensor(
+                bias, dtype=torch.float32, device=self.device
+            )
 
     def _resolve_fallback_non_star_id(self) -> int:
         """Choose a stable fallback token ID that is not special and not '*'."""
@@ -542,7 +557,8 @@ class ConstrainedSampler:
         self,
         ids: torch.Tensor,
         logits: torch.Tensor,
-        target_stars: int = 2
+        target_stars: int = 2,
+        fixed_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Fix the number of '*' tokens in final sequences.
 
@@ -550,6 +566,7 @@ class ConstrainedSampler:
             ids: Token IDs of shape [batch, seq_len].
             logits: Final logits of shape [batch, seq_len, vocab_size].
             target_stars: Target number of '*' tokens.
+            fixed_mask: Boolean mask of fixed (protected) positions to skip.
 
         Returns:
             Fixed token IDs.
@@ -564,16 +581,21 @@ class ConstrainedSampler:
             if num_stars > target_stars:
                 # Keep only the top-k most probable star positions
                 star_positions = torch.where(star_mask)[0]
+                # Only remove stars from non-fixed positions
+                if fixed_mask is not None:
+                    removable = star_positions[~fixed_mask[i, star_positions]]
+                else:
+                    removable = star_positions
                 star_probs = logits[i, star_positions, self.star_id]
 
                 # Get indices of stars to keep (highest probability)
-                _, keep_indices = torch.topk(star_probs, target_stars)
+                _, keep_indices = torch.topk(star_probs, min(target_stars, len(star_positions)))
                 keep_positions = {
                     int(p.item()) for p in star_positions[keep_indices]
                 }
 
-                # Replace extra stars with second-best token
-                for pos in star_positions:
+                # Replace extra stars with second-best token (only non-fixed)
+                for pos in removable:
                     pos_idx = int(pos.item())
                     if pos_idx not in keep_positions:
                         best_token = self._best_replacement_token(
@@ -599,13 +621,15 @@ class ConstrainedSampler:
                 # Find best positions to add stars
                 needed = target_stars - num_stars
 
-                # Get star probabilities at all non-special positions
+                # Get star probabilities at all non-special, non-fixed positions
                 valid_mask = (
                     (fixed_ids[i] != self.bos_id) &
                     (fixed_ids[i] != self.eos_id) &
                     (fixed_ids[i] != self.pad_id) &
                     (fixed_ids[i] != self.star_id)
                 )
+                if fixed_mask is not None:
+                    valid_mask = valid_mask & ~fixed_mask[i]
                 valid_positions = torch.where(valid_mask)[0]
 
                 if len(valid_positions) >= needed:
@@ -621,6 +645,8 @@ class ConstrainedSampler:
                         (fixed_ids[i] != self.eos_id) &
                         (fixed_ids[i] != self.pad_id)
                     )
+                    if fixed_mask is not None:
+                        eligible_mask = eligible_mask & ~fixed_mask[i]
                     eligible_positions = torch.where(eligible_mask)[0]
                     if len(eligible_positions) > 0:
                         k = min(needed, len(eligible_positions))
@@ -635,7 +661,8 @@ class ConstrainedSampler:
     def _fix_paren_balance(
         self,
         ids: torch.Tensor,
-        logits: torch.Tensor
+        logits: torch.Tensor,
+        fixed_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Fix unbalanced parentheses in final sequences.
 
@@ -643,9 +670,12 @@ class ConstrainedSampler:
         1. Left-to-right: Replace any ')' that has no matching '(' to its left
         2. Right-to-left: Replace any '(' that has no matching ')' to its right
 
+        Positions marked in fixed_mask are never modified.
+
         Args:
             ids: Token IDs of shape [batch, seq_len].
             logits: Final logits of shape [batch, seq_len, vocab_size].
+            fixed_mask: Boolean mask of fixed (protected) positions to skip.
 
         Returns:
             Fixed token IDs with balanced parentheses.
@@ -663,6 +693,8 @@ class ConstrainedSampler:
                 elif token_id == self.close_paren_id:
                     if depth > 0:
                         depth -= 1
+                    elif fixed_mask is not None and fixed_mask[i, j]:
+                        pass  # Cannot modify fixed position
                     else:
                         # No matching '(' to the left - replace with best alternative
                         best_token = self._best_replacement_token(
@@ -689,6 +721,8 @@ class ConstrainedSampler:
                 elif token_id == self.open_paren_id:
                     if depth > 0:
                         depth -= 1
+                    elif fixed_mask is not None and fixed_mask[i, j]:
+                        pass  # Cannot modify fixed position
                     else:
                         # No matching ')' to the right - replace with best alternative
                         best_token = self._best_replacement_token(
@@ -711,16 +745,19 @@ class ConstrainedSampler:
     def _fix_ring_closures(
         self,
         ids: torch.Tensor,
-        logits: torch.Tensor
+        logits: torch.Tensor,
+        fixed_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Fix unpaired ring closures in final sequences.
 
         Scans each sequence and replaces ring digits that appear an odd number
         of times (unpaired) with the next-best non-ring token.
+        Positions marked in fixed_mask are never modified.
 
         Args:
             ids: Token IDs of shape [batch, seq_len].
             logits: Final logits of shape [batch, seq_len, vocab_size].
+            fixed_mask: Boolean mask of fixed (protected) positions to skip.
 
         Returns:
             Fixed token IDs with paired ring closures.
@@ -741,11 +778,18 @@ class ConstrainedSampler:
                         ring_positions[token_id] = []
                     ring_positions[token_id].append(j)
 
-            # Fix rings with odd counts (replace last occurrence)
+            # Fix rings with odd counts (replace last non-fixed occurrence)
             for ring_id, positions in ring_positions.items():
                 if len(positions) % 2 != 0:  # Odd count - unpaired
-                    # Replace last occurrence with best non-ring alternative
-                    last_pos = positions[-1]
+                    # Find the last non-fixed position to replace
+                    target_pos = None
+                    for candidate_pos in reversed(positions):
+                        if fixed_mask is None or not fixed_mask[i, candidate_pos]:
+                            target_pos = candidate_pos
+                            break
+                    if target_pos is None:
+                        continue  # All positions are fixed, skip
+
                     forbidden = set(all_ring_ids)
                     forbidden.update(
                         {
@@ -759,20 +803,24 @@ class ConstrainedSampler:
                         }
                     )
                     best_token = self._best_replacement_token(
-                        pos_logits=logits[i, last_pos],
+                        pos_logits=logits[i, target_pos],
                         forbidden_tokens=forbidden,
                     )
                     if best_token is not None:
-                        fixed_ids[i, last_pos] = best_token
+                        fixed_ids[i, target_pos] = best_token
 
         return fixed_ids
 
     def _fix_bond_placement(
         self,
         ids: torch.Tensor,
-        logits: torch.Tensor
+        logits: torch.Tensor,
+        fixed_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Repair obvious invalid bond placements in final sequences."""
+        """Repair obvious invalid bond placements in final sequences.
+
+        Positions marked in fixed_mask are never modified.
+        """
         if not self.bond_ids:
             return ids
 
@@ -784,6 +832,9 @@ class ConstrainedSampler:
             for j in range(seq_len):
                 token_id = int(fixed_ids[i, j].item())
                 if token_id not in bond_ids:
+                    continue
+                # Never modify fixed positions (e.g. decode-constraint motif spans)
+                if fixed_mask is not None and fixed_mask[i, j]:
                     continue
 
                 prev_id = int(fixed_ids[i, j - 1].item()) if j > 0 else -1
@@ -866,6 +917,10 @@ class ConstrainedSampler:
                 logits = self._apply_position_aware_paren_constraints(logits, ids)
                 logits = self._apply_ring_constraints(logits, ids)
                 logits = self._apply_bond_placement_constraints(logits, ids)
+            # Apply class-enriched token bias at non-fixed positions
+            if self.class_token_logit_bias is not None:
+                bias_mask = (~fixed_mask).unsqueeze(-1).float()
+                logits = logits + self.class_token_logit_bias.unsqueeze(0).unsqueeze(0) * bias_mask
             logits = self._apply_sampling_filters(logits)
             logits = self._apply_special_token_constraints(logits, ids)
 
@@ -916,13 +971,13 @@ class ConstrainedSampler:
                 final_logits = logits
 
         if self.use_constraints:
-            ids = self._fix_ring_closures(ids, final_logits)
-            ids = self._fix_bond_placement(ids, final_logits)
-            ids = self._fix_paren_balance(ids, final_logits)
-            ids = self._fix_star_count(ids, final_logits, target_stars=self.target_stars)
+            ids = self._fix_ring_closures(ids, final_logits, fixed_mask=fixed_mask)
+            ids = self._fix_bond_placement(ids, final_logits, fixed_mask=fixed_mask)
+            ids = self._fix_paren_balance(ids, final_logits, fixed_mask=fixed_mask)
+            ids = self._fix_star_count(ids, final_logits, target_stars=self.target_stars, fixed_mask=fixed_mask)
             # Final cleanup after token replacements.
-            ids = self._fix_ring_closures(ids, final_logits)
-            ids = self._fix_paren_balance(ids, final_logits)
+            ids = self._fix_ring_closures(ids, final_logits, fixed_mask=fixed_mask)
+            ids = self._fix_paren_balance(ids, final_logits, fixed_mask=fixed_mask)
         smiles_list = self.tokenizer.batch_decode(ids.cpu().tolist(), skip_special_tokens=True)
 
         return ids, smiles_list
@@ -1137,6 +1192,122 @@ class ConstrainedSampler:
             fixed_mask[i, int(start_pos):end_pos] = True
 
         return self._sample_from_ids(ids, attention_mask, fixed_mask, show_progress)
+
+    def sample_with_multiple_fixed_spans(
+        self,
+        span_token_ids: Sequence[Sequence[Sequence[int]]],
+        span_start_positions: Sequence[Sequence[int]],
+        seq_length: int,
+        lengths: Optional[Sequence[int]] = None,
+        show_progress: bool = True
+    ) -> Tuple[torch.Tensor, List[str]]:
+        """Sample by fixing multiple interior token spans per sequence."""
+        batch_size = len(span_token_ids)
+        if len(span_start_positions) != batch_size:
+            raise ValueError("span_start_positions must match span_token_ids")
+        if lengths is not None and len(lengths) != batch_size:
+            raise ValueError("lengths must match span_token_ids")
+
+        ids = torch.full(
+            (batch_size, seq_length),
+            self.mask_id,
+            dtype=torch.long,
+            device=self.device
+        )
+        attention_mask = torch.ones_like(ids)
+        fixed_mask = torch.zeros_like(ids, dtype=torch.bool)
+
+        ids[:, 0] = self.bos_id
+        fixed_mask[:, 0] = True
+
+        effective_lengths: List[int] = []
+        if lengths is None:
+            ids[:, -1] = self.eos_id
+            fixed_mask[:, -1] = True
+            effective_lengths = [int(seq_length)] * batch_size
+        else:
+            attention_mask = torch.zeros_like(ids)
+            for i, raw_length in enumerate(lengths):
+                length = max(2, int(raw_length))
+                if length > seq_length:
+                    raise ValueError(f"length {length} exceeds seq_length={seq_length}")
+                effective_lengths.append(length)
+                eos_pos = length - 1
+                ids[i, eos_pos] = self.eos_id
+                fixed_mask[i, eos_pos] = True
+                attention_mask[i, :length] = 1
+                if length < seq_length:
+                    ids[i, length:] = self.pad_id
+                    fixed_mask[i, length:] = True
+
+        for i, (sample_spans, sample_starts) in enumerate(zip(span_token_ids, span_start_positions)):
+            if len(sample_spans) != len(sample_starts):
+                raise ValueError("Each sample's span list must match its start-position list")
+            effective_length = effective_lengths[i]
+            prev_end = 1
+            for span_ids, start_pos in zip(sample_spans, sample_starts):
+                span = list(int(token_id) for token_id in span_ids)
+                if not span:
+                    continue
+                if effective_length < 2:
+                    raise ValueError(f"effective length must be >= 2, got {effective_length}")
+                end_pos = int(start_pos) + len(span)
+                if int(start_pos) < 1 or end_pos > (effective_length - 1):
+                    raise ValueError(
+                        f"Fixed span [{start_pos}, {end_pos}) does not fit sequence length {effective_length}"
+                    )
+                if int(start_pos) < prev_end:
+                    raise ValueError(
+                        f"Overlapping fixed spans detected for sample {i}: "
+                        f"start={start_pos}, previous_end={prev_end}"
+                    )
+                ids[i, int(start_pos):end_pos] = torch.tensor(span, dtype=torch.long, device=self.device)
+                fixed_mask[i, int(start_pos):end_pos] = True
+                prev_end = end_pos
+
+        return self._sample_from_ids(ids, attention_mask, fixed_mask, show_progress)
+
+    def sample_batch_with_multiple_fixed_spans(
+        self,
+        num_samples: int,
+        seq_length: int,
+        span_token_ids: Sequence[Sequence[Sequence[int]]],
+        span_start_positions: Sequence[Sequence[int]],
+        batch_size: int = 256,
+        show_progress: bool = True,
+        lengths: Optional[Sequence[int]] = None
+    ) -> Tuple[List[torch.Tensor], List[str]]:
+        """Batch wrapper for multi-span fixed constrained sampling."""
+        if len(span_token_ids) != num_samples:
+            raise ValueError("span_token_ids must match num_samples")
+        if len(span_start_positions) != num_samples:
+            raise ValueError("span_start_positions must match num_samples")
+        if lengths is not None and len(lengths) != num_samples:
+            raise ValueError("lengths must match num_samples")
+
+        all_ids = []
+        all_smiles = []
+        num_batches = (num_samples + batch_size - 1) // batch_size
+        sample_idx = 0
+
+        for _ in tqdm(range(num_batches), desc="Batch sampling", disable=not show_progress):
+            current_batch_size = min(batch_size, num_samples - sample_idx)
+            batch_span_ids = span_token_ids[sample_idx:sample_idx + current_batch_size]
+            batch_span_starts = span_start_positions[sample_idx:sample_idx + current_batch_size]
+            batch_lengths = None if lengths is None else lengths[sample_idx:sample_idx + current_batch_size]
+
+            ids, smiles = self.sample_with_multiple_fixed_spans(
+                span_token_ids=batch_span_ids,
+                span_start_positions=batch_span_starts,
+                seq_length=seq_length,
+                lengths=batch_lengths,
+                show_progress=False,
+            )
+            all_ids.append(ids)
+            all_smiles.extend(smiles)
+            sample_idx += current_batch_size
+
+        return all_ids, all_smiles
 
     def sample_batch_with_fixed_spans(
         self,

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -14,17 +15,93 @@ from src.evaluation.polymer_class import PolymerClassifier
 
 
 # Short, token-safe motif fragments used when automatic mining is unavailable.
+# Longer motifs with aromatic context are listed first to better survive
+# diffusion infilling while preserving SMARTS-matchable imide/ester/amide bonds.
 DEFAULT_CLASS_MOTIFS: Dict[str, List[str]] = {
-    "polyimide": ["CC(=O)NC(=O)C", "C(=O)NC(=O)", "NC(=O)C(=O)"],
-    "polyester": ["CC(=O)OC", "C(=O)OC", "OC(=O)C"],
-    "polyamide": ["CC(=O)NC", "C(=O)NC", "NC(=O)C"],
-    "polyurethane": ["OC(=O)NC", "NC(=O)OC", "C(=O)NCO"],
-    "polyether": ["COCCOC", "COC", "CCOCC"],
-    "polysiloxane": ["SiOSi", "OSiO", "SiOCCOSi"],
-    "polycarbonate": ["OC(=O)OC", "COC(=O)OC", "OC(=O)O"],
-    "polysulfone": ["CS(=O)(=O)C", "S(=O)(=O)", "CS(=O)(=O)CC"],
-    "polyacrylate": ["CC(=O)OC", "CC(C)C(=O)O", "C(C)C(=O)O"],
-    "polystyrene": ["Cc1ccccc1", "c1ccccc1C", "CC(c1ccccc1)"],
+    "polyimide": [
+        # SMARTS: [#6][CX3](=[OX1])[NX3][CX3](=[OX1])[#6]
+        "c(C(=O))NC(=O)c",     # aromatic-context imide linkage
+        "c(C(=O)NC(=O))c",     # aromatic-sandwich imide
+        "CC(=O)NC(=O)CC",       # longer aliphatic imide
+        "CC(=O)NC(=O)C",        # classic imide motif
+        "NC(=O)C(=O)C",         # partial imide with trailing context
+        "cC(=O)NC(=O)c",       # aromatic-edge imide core
+    ],
+    "polyester": [
+        # SMARTS: [#6][CX3](=[OX1])[OX2][#6]
+        "c(C(=O)O)c",          # aromatic-context ester
+        "c(OC(=O))c",          # reversed aromatic ester
+        "CC(=O)OCC",            # longer aliphatic ester
+        "CC(=O)OC",             # classic ester motif
+        "C(=O)OC",              # minimal ester core
+        "OC(=O)C",              # reversed ester
+    ],
+    "polyamide": [
+        # SMARTS: [#6][CX3](=[OX1])[NX3;!$([N]([C](=O))[C](=O))][#6;!$([CX3](=[OX1]))]
+        "c(C(=O)NC)c",         # aromatic-context amide with continuation
+        "c(C(=O)N)c",          # aromatic-context amide
+        "CC(=O)NCC",            # longer aliphatic amide
+        "CC(=O)NC",             # classic amide motif
+        "C(=O)NC",              # minimal amide core
+        "NC(=O)C",              # reversed amide
+    ],
+    "polyurethane": [
+        # SMARTS: [#6][OX2][CX3](=[OX1])[NX3][#6]
+        "c(OC(=O)N)c",         # aromatic-context urethane
+        "COC(=O)NCC",           # longer urethane linkage
+        "CCOC(=O)NC",           # aliphatic urethane with extra context
+        "OC(=O)NC",             # classic urethane
+        "NC(=O)OC",             # reversed urethane
+        "C(=O)NCO",             # partial urethane
+    ],
+    "polyether": [
+        # SMARTS: [#6;!$([CX3](=[OX1]))][OX2][#6;!$([CX3](=[OX1]))]
+        "CCOCCOC",              # long ether chain
+        "cOCCOc",               # aromatic-context ether
+        "CCOCCOCC",             # extended ether
+        "COCCOC",               # classic ether chain
+        "CCCOCC",               # short ether with context
+    ],
+    "polysiloxane": [
+        # SMARTS: [Si][OX2][Si]
+        "SiOSiOSi",            # extended siloxane chain
+        "CSiOSiC",              # Si with carbon context
+        "CSiOSiOC",             # longer siloxane with C context
+        "SiOCCOSi",             # siloxane with carbon spacer
+    ],
+    "polycarbonate": [
+        # SMARTS: [#6][OX2][CX3](=[OX1])[OX2][#6]
+        "c(OC(=O)O)c",         # aromatic-context carbonate
+        "COC(=O)OCC",           # longer carbonate
+        "CCOC(=O)OC",           # aliphatic carbonate with extra context
+        "COC(=O)OC",            # extended carbonate
+        "OC(=O)OC",             # classic carbonate
+    ],
+    "polysulfone": [
+        # SMARTS: [#6][SX4](=[OX1])(=[OX1])[#6]
+        "c(S(=O)(=O))c",       # aromatic-context sulfone
+        "CCS(=O)(=O)CC",       # longer sulfone
+        "CS(=O)(=O)CC",         # extended sulfone
+        "CS(=O)(=O)C",          # classic sulfone motif
+    ],
+    "polyacrylate": [
+        # SMARTS: [#6]-[#6](=O)-[#8]
+        "c(C(=O)OC)c",         # aromatic-context acrylate
+        "CC(C)C(=O)OC",        # methacrylate-like with ester
+        "CC(=O)OCC",            # longer acrylate
+        "CC(=O)OC",             # classic acrylate
+        "CC(C)C(=O)O",          # partial methacrylate
+        "C(C)C(=O)O",           # minimal acrylate
+    ],
+    "polystyrene": [
+        # SMARTS: [#6]-[#6](c1ccccc1)-[#6]
+        # Ring digits are forbidden in motifs, so we provide aromatic-C chains
+        # that the diffusion model can complete into phenyl rings.
+        "CC(cccccc)C",          # backbone with 6 aromatic C (full ring hint)
+        "CC(ccccc)C",           # backbone with 5 aromatic C
+        "CC(cccc)C",            # backbone with 4 aromatic C
+        "CC(ccc)C",             # backbone with 3 aromatic C
+    ],
 }
 
 _BOND_TOKENS = {"-", "=", "#", "/", "\\"}
@@ -302,3 +379,114 @@ def resolve_class_decode_motifs(
         f"Could not resolve any decode-time motifs for class '{target_key}'. "
         "Provide decode_constraint_motif_bank_json or add defaults for this class."
     )
+
+
+def resolve_class_decode_length_prior(
+    *,
+    target_class: str,
+    tokenizer: PSmilesTokenizer,
+    source_smiles: Sequence[str],
+    patterns: Dict[str, str],
+    max_length: int,
+) -> Tuple[List[int], str]:
+    """Resolve a lightweight class-specific token-length prior from local source polymers."""
+    if not source_smiles:
+        return [], "unavailable"
+
+    classifier = PolymerClassifier(patterns=patterns)
+    target_key = str(target_class).strip().lower()
+    lengths: List[int] = []
+    for smiles in source_smiles:
+        try:
+            is_positive = bool(classifier.classify(str(smiles)).get(target_key, False))
+        except Exception:
+            is_positive = False
+        if not is_positive:
+            continue
+        token_len = len(tokenizer.tokenize(str(smiles))) + 2
+        token_len = max(2, min(int(max_length), int(token_len)))
+        lengths.append(token_len)
+
+    if not lengths:
+        return [], "unavailable"
+    return lengths, "local_class_corpus"
+
+
+def compute_class_token_logit_bias(
+    *,
+    target_class: str,
+    tokenizer: PSmilesTokenizer,
+    source_smiles: Sequence[str],
+    patterns: Dict[str, str],
+    bias_strength: float = 1.5,
+    min_class_count: int = 10,
+) -> Optional[List[float]]:
+    """Compute per-token logit bias to steer diffusion sampling toward target class.
+
+    Computes log frequency ratio of tokens in the target class vs the rest of the
+    corpus, then scales by ``bias_strength``.  Tokens enriched in the target class
+    receive positive bias; depleted tokens receive negative bias.
+
+    Returns:
+        List of length ``tokenizer.vocab_size`` with additive logit biases,
+        or ``None`` if the class corpus is too small.
+    """
+    if not source_smiles:
+        return None
+
+    classifier = PolymerClassifier(patterns=patterns)
+    target_key = str(target_class).strip().lower()
+    positive_smiles: List[str] = []
+    negative_smiles: List[str] = []
+    for smi in source_smiles:
+        try:
+            is_pos = bool(classifier.classify(str(smi)).get(target_key, False))
+        except Exception:
+            is_pos = False
+        if is_pos:
+            positive_smiles.append(str(smi))
+        else:
+            negative_smiles.append(str(smi))
+
+    if len(positive_smiles) < int(min_class_count):
+        return None
+
+    vocab_size = tokenizer.vocab_size
+    pos_counts = [0] * vocab_size
+    neg_counts = [0] * vocab_size
+    pos_total = 0
+    neg_total = 0
+
+    for smi in positive_smiles:
+        tokens = tokenizer.tokenize(smi)
+        for tok in tokens:
+            tid = tokenizer.vocab.get(tok, tokenizer.unk_token_id)
+            pos_counts[tid] += 1
+            pos_total += 1
+    for smi in negative_smiles:
+        tokens = tokenizer.tokenize(smi)
+        for tok in tokens:
+            tid = tokenizer.vocab.get(tok, tokenizer.unk_token_id)
+            neg_counts[tid] += 1
+            neg_total += 1
+
+    if pos_total == 0 or neg_total == 0:
+        return None
+
+    smoothing = 1.0
+    bias = [0.0] * vocab_size
+    for tid in range(vocab_size):
+        pos_freq = (pos_counts[tid] + smoothing) / (pos_total + smoothing * vocab_size)
+        neg_freq = (neg_counts[tid] + smoothing) / (neg_total + smoothing * vocab_size)
+        bias[tid] = float(bias_strength) * math.log(pos_freq / neg_freq)
+
+    # Zero out special tokens
+    for special in tokenizer.SPECIAL_TOKENS:
+        if special in tokenizer.vocab:
+            bias[tokenizer.vocab[special]] = 0.0
+    # Zero out star token (star placement is handled by constraints, not bias)
+    star_id = tokenizer.get_star_token_id()
+    if 0 <= star_id < vocab_size:
+        bias[star_id] = 0.0
+
+    return bias

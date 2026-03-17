@@ -34,7 +34,9 @@ from src.chi.model import predict_chi_mean_std_from_coefficients
 from src.chi.constants import COEFF_NAMES
 from src.data.tokenizer import PSmilesTokenizer
 from src.evaluation.class_decode_constraints import (
+    compute_class_token_logit_bias,
     load_decode_constraint_source_smiles,
+    resolve_class_decode_length_prior,
     resolve_class_decode_motifs,
 )
 from src.evaluation.polymer_class import PolymerClassifier
@@ -1364,6 +1366,11 @@ def main(args):
         if args.decode_constraint_max_motifs is not None
         else chi_cfg.get("decode_constraint_max_motifs", 6)
     )
+    decode_constraint_spans_per_sample = int(
+        args.decode_constraint_spans_per_sample
+        if getattr(args, "decode_constraint_spans_per_sample", None) is not None
+        else chi_cfg.get("decode_constraint_spans_per_sample", 2)
+    )
     decode_constraint_center_min_frac = float(
         args.decode_constraint_center_min_frac
         if args.decode_constraint_center_min_frac is not None
@@ -1384,6 +1391,9 @@ def main(args):
     )
     if args.decode_constraint_disable_class_match_filter:
         decode_constraint_enforce_class_match = False
+    decode_constraint_enforce_backbone_class_match = bool(
+        chi_cfg.get("decode_constraint_enforce_backbone_class_match", True)
+    )
     if args.resampling_skip_novelty_filter and args.resampling_keep_novelty_filter:
         raise ValueError("Use only one of --resampling_skip_novelty_filter or --resampling_keep_novelty_filter")
     if args.resampling_skip_sa_filter and args.resampling_keep_sa_filter:
@@ -1398,6 +1408,9 @@ def main(args):
         resampling_skip_sa_filter = True
     elif args.resampling_keep_sa_filter:
         resampling_skip_sa_filter = False
+    decode_constraint_use_class_length_prior = bool(chi_cfg.get("decode_constraint_use_class_length_prior", True))
+    if args.no_decode_constraint_class_length_prior:
+        decode_constraint_use_class_length_prior = False
     if epsilon < 0:
         raise ValueError("epsilon must be >= 0")
     if legacy_class_weight is not None and legacy_class_weight < 0:
@@ -1430,6 +1443,8 @@ def main(args):
         raise ValueError("sampling_attempts_max must be >= 1")
     if decode_constraint_max_motifs < 1:
         raise ValueError("decode_constraint_max_motifs must be >= 1")
+    if decode_constraint_spans_per_sample < 1:
+        raise ValueError("decode_constraint_spans_per_sample must be >= 1")
     if not (0.0 <= decode_constraint_center_min_frac <= decode_constraint_center_max_frac <= 1.0):
         raise ValueError(
             "decode_constraint_center_min_frac and decode_constraint_center_max_frac must satisfy 0 <= min <= max <= 1"
@@ -1521,11 +1536,17 @@ def main(args):
     resolved_decode_motifs: List[str] = []
     resolved_decode_source = None
     resolved_decode_motif_bank_json = None
+    resolved_decode_length_prior_json = None
+    resolved_decode_length_prior_count = 0
+    resolved_decode_length_prior_source = None
     args.decode_constraint_class = None
     args.decode_constraint_motif_bank_json = None
+    args.decode_constraint_length_prior_json = None
+    args.decode_constraint_spans_per_sample = None
     args.decode_constraint_center_min_frac = None
     args.decode_constraint_center_max_frac = None
     args.decode_constraint_enforce_class_match = False
+    args.decode_constraint_enforce_backbone_class_match = False
     args.resampling_skip_novelty_filter = bool(resampling_skip_novelty_filter)
     args.resampling_skip_sa_filter = bool(resampling_skip_sa_filter)
     if decode_constraint_enabled:
@@ -1542,13 +1563,15 @@ def main(args):
             if decode_constraint_motif_bank_json is not None
             else None
         )
-        motif_source_smiles: List[str] = []
+        motif_source_smiles = load_decode_constraint_source_smiles(Path(config["paths"]["data_dir"]))
         if decode_constraint_resolution_strategy == "configured_or_local_mined_or_defaults":
-            motif_source_smiles = load_decode_constraint_source_smiles(Path(config["paths"]["data_dir"]))
+            resolve_source_smiles = motif_source_smiles
+        else:
+            resolve_source_smiles = []
         resolved_decode_motifs, resolved_decode_source = resolve_class_decode_motifs(
             target_class=selected_classes[0],
             tokenizer=tokenizer,
-            source_smiles=motif_source_smiles,
+            source_smiles=resolve_source_smiles,
             patterns={str(k).strip().lower(): v for k, v in polymer_patterns.items()},
             configured_bank_path=configured_bank_path,
             max_motifs=decode_constraint_max_motifs,
@@ -1567,9 +1590,59 @@ def main(args):
             )
         args.decode_constraint_class = selected_classes[0]
         args.decode_constraint_motif_bank_json = str(resolved_decode_motif_bank_json)
+        args.decode_constraint_spans_per_sample = int(decode_constraint_spans_per_sample)
         args.decode_constraint_center_min_frac = float(decode_constraint_center_min_frac)
         args.decode_constraint_center_max_frac = float(decode_constraint_center_max_frac)
         args.decode_constraint_enforce_class_match = bool(decode_constraint_enforce_class_match)
+        args.decode_constraint_enforce_backbone_class_match = bool(decode_constraint_enforce_backbone_class_match)
+        if decode_constraint_use_class_length_prior:
+            resolved_lengths, resolved_decode_length_prior_source = resolve_class_decode_length_prior(
+                target_class=selected_classes[0],
+                tokenizer=tokenizer,
+                source_smiles=motif_source_smiles,
+                patterns={str(k).strip().lower(): v for k, v in polymer_patterns.items()},
+                max_length=int(tokenizer.max_length),
+            )
+            if resolved_lengths:
+                resolved_decode_length_prior_json = metrics_dir / "decode_constraint_length_prior_resolved.json"
+                with open(resolved_decode_length_prior_json, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "target_class": selected_classes[0],
+                            "lengths": resolved_lengths,
+                            "source": resolved_decode_length_prior_source,
+                        },
+                        f,
+                        indent=2,
+                    )
+                resolved_decode_length_prior_count = int(len(resolved_lengths))
+                args.decode_constraint_length_prior_json = str(resolved_decode_length_prior_json)
+
+        # Compute class-enriched token logit bias for steering diffusion sampling
+        class_token_bias = compute_class_token_logit_bias(
+            target_class=selected_classes[0],
+            tokenizer=tokenizer,
+            source_smiles=motif_source_smiles,
+            patterns={str(k).strip().lower(): v for k, v in polymer_patterns.items()},
+            bias_strength=float(chi_cfg.get("decode_constraint_class_token_bias_strength", 1.5)),
+        )
+        if class_token_bias is not None:
+            resolved_class_token_bias_json = metrics_dir / "decode_constraint_class_token_bias.json"
+            with open(resolved_class_token_bias_json, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "target_class": selected_classes[0],
+                        "bias": class_token_bias,
+                    },
+                    f,
+                )
+            args.decode_constraint_class_token_bias_json = str(resolved_class_token_bias_json)
+            print(
+                f"decode_constraint_class_token_bias: computed for {selected_classes[0]}, "
+                f"n_nonzero={sum(1 for b in class_token_bias if abs(b) > 0.01)}"
+            )
+        else:
+            args.decode_constraint_class_token_bias_json = None
 
     seed_info = seed_everything(int(config["data"]["random_seed"]))
     save_config(config, step_dir / "config_used.yaml")
@@ -1610,9 +1683,15 @@ def main(args):
             "decode_constraint_motif_count": int(len(resolved_decode_motifs)),
             "decode_constraint_source": resolved_decode_source,
             "decode_constraint_resolution_strategy": decode_constraint_resolution_strategy,
+            "decode_constraint_spans_per_sample": int(decode_constraint_spans_per_sample),
+            "decode_constraint_use_class_length_prior": bool(decode_constraint_use_class_length_prior),
+            "decode_constraint_length_prior_json": None if resolved_decode_length_prior_json is None else str(resolved_decode_length_prior_json),
+            "decode_constraint_length_prior_count": int(resolved_decode_length_prior_count),
+            "decode_constraint_length_prior_source": resolved_decode_length_prior_source,
             "decode_constraint_center_min_frac": decode_constraint_center_min_frac,
             "decode_constraint_center_max_frac": decode_constraint_center_max_frac,
             "decode_constraint_enforce_class_match": bool(decode_constraint_enforce_class_match),
+            "decode_constraint_enforce_backbone_class_match": bool(decode_constraint_enforce_backbone_class_match),
             "resampling_skip_novelty_filter": bool(resampling_skip_novelty_filter),
             "resampling_skip_sa_filter": bool(resampling_skip_sa_filter),
             "step2_resampling_root": str(step_dir),
@@ -1636,9 +1715,17 @@ def main(args):
             "decode_constraint: "
             f"class={args.decode_constraint_class}, motifs={len(resolved_decode_motifs)}, "
             f"source={resolved_decode_source}, center={decode_constraint_center_min_frac:.2f}-{decode_constraint_center_max_frac:.2f}, "
+            f"spans_per_sample={decode_constraint_spans_per_sample}, "
             f"enforce_class_match={decode_constraint_enforce_class_match}, "
+            f"enforce_backbone_class_match={decode_constraint_enforce_backbone_class_match}, "
             f"resolution_strategy={decode_constraint_resolution_strategy}"
         )
+        if resolved_decode_length_prior_count > 0:
+            print(
+                "decode_constraint_length_prior: "
+                f"count={resolved_decode_length_prior_count}, "
+                f"source={resolved_decode_length_prior_source}"
+            )
     print(
         "step2_resampling_filters: "
         f"skip_novelty={resampling_skip_novelty_filter}, "
@@ -1842,6 +1929,10 @@ def main(args):
         "decode_constraint_source": resolved_decode_source,
         "decode_constraint_resolution_strategy": decode_constraint_resolution_strategy,
         "decode_constraint_motif_bank_json": None if resolved_decode_motif_bank_json is None else str(resolved_decode_motif_bank_json),
+        "decode_constraint_spans_per_sample": int(decode_constraint_spans_per_sample),
+        "decode_constraint_length_prior_json": None if resolved_decode_length_prior_json is None else str(resolved_decode_length_prior_json),
+        "decode_constraint_length_prior_count": int(resolved_decode_length_prior_count),
+        "decode_constraint_length_prior_source": resolved_decode_length_prior_source,
         "resampling_skip_novelty_filter": bool(resampling_skip_novelty_filter),
         "resampling_skip_sa_filter": bool(resampling_skip_sa_filter),
         "step2_resampling_step_dirs": [m.get("step2_resampling_step_dir", "") for m in attempt_manifests],
@@ -1913,9 +2004,14 @@ def main(args):
         "decode_constraint_source": resolved_decode_source,
         "decode_constraint_resolution_strategy": decode_constraint_resolution_strategy,
         "decode_constraint_motif_bank_json": None if resolved_decode_motif_bank_json is None else str(resolved_decode_motif_bank_json),
+        "decode_constraint_spans_per_sample": int(decode_constraint_spans_per_sample),
+        "decode_constraint_length_prior_json": None if resolved_decode_length_prior_json is None else str(resolved_decode_length_prior_json),
+        "decode_constraint_length_prior_count": int(resolved_decode_length_prior_count),
+        "decode_constraint_length_prior_source": resolved_decode_length_prior_source,
         "decode_constraint_center_min_frac": float(decode_constraint_center_min_frac),
         "decode_constraint_center_max_frac": float(decode_constraint_center_max_frac),
         "decode_constraint_enforce_class_match": bool(decode_constraint_enforce_class_match),
+        "decode_constraint_enforce_backbone_class_match": bool(decode_constraint_enforce_backbone_class_match),
         "resampling_skip_novelty_filter": bool(resampling_skip_novelty_filter),
         "resampling_skip_sa_filter": bool(resampling_skip_sa_filter),
         "target_polymer_count_requested": int(target_poly_summary["target_count_requested"]),
@@ -2103,6 +2199,12 @@ if __name__ == "__main__":
         help="Maximum number of decode-time motif fragments to keep for the target class",
     )
     parser.add_argument(
+        "--decode_constraint_spans_per_sample",
+        type=int,
+        default=None,
+        help="Number of class motifs to fix per sampled polymer during Step 6 resampling",
+    )
+    parser.add_argument(
         "--decode_constraint_center_min_frac",
         type=float,
         default=None,
@@ -2118,6 +2220,11 @@ if __name__ == "__main__":
         "--decode_constraint_disable_class_match_filter",
         action="store_true",
         help="Disable exact class-match filtering during constrained Step 2 resampling",
+    )
+    parser.add_argument(
+        "--no_decode_constraint_class_length_prior",
+        action="store_true",
+        help="Disable the Step 6-only class-specific token-length prior during constrained resampling",
     )
     parser.add_argument(
         "--resampling_skip_novelty_filter",

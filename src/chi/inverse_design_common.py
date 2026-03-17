@@ -452,12 +452,20 @@ def launch_fresh_step2_resampling(
         cmd.extend(["--decode_constraint_class", str(args.decode_constraint_class)])
     if getattr(args, "decode_constraint_motif_bank_json", None):
         cmd.extend(["--decode_constraint_motif_bank_json", str(args.decode_constraint_motif_bank_json)])
+    if getattr(args, "decode_constraint_length_prior_json", None):
+        cmd.extend(["--decode_constraint_length_prior_json", str(args.decode_constraint_length_prior_json)])
+    if getattr(args, "decode_constraint_spans_per_sample", None) is not None:
+        cmd.extend(["--decode_constraint_spans_per_sample", str(int(args.decode_constraint_spans_per_sample))])
     if getattr(args, "decode_constraint_center_min_frac", None) is not None:
         cmd.extend(["--decode_constraint_center_min_frac", str(float(args.decode_constraint_center_min_frac))])
     if getattr(args, "decode_constraint_center_max_frac", None) is not None:
         cmd.extend(["--decode_constraint_center_max_frac", str(float(args.decode_constraint_center_max_frac))])
     if bool(getattr(args, "decode_constraint_enforce_class_match", False)):
         cmd.append("--decode_constraint_enforce_class_match")
+    if bool(getattr(args, "decode_constraint_enforce_backbone_class_match", False)):
+        cmd.append("--decode_constraint_enforce_backbone_class_match")
+    if getattr(args, "decode_constraint_class_token_bias_json", None):
+        cmd.extend(["--decode_constraint_class_token_bias_json", str(args.decode_constraint_class_token_bias_json)])
     if bool(getattr(args, "resampling_skip_novelty_filter", False)):
         cmd.append("--valid_only_skip_novelty_filter")
     if bool(getattr(args, "resampling_skip_sa_filter", False)):
