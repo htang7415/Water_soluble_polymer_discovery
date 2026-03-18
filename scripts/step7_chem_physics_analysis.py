@@ -47,6 +47,8 @@ from src.utils.reporting import save_artifact_manifest, save_step_summary, write
 
 
 CLASS_COL = "water_miscible"
+DESCRIPTOR_Z_SHIFT_STD_FLOOR = 0.05
+DESCRIPTOR_Z_SHIFT_MAX_ABS = 10.0
 COEFF_COLUMNS = ["a0", "a1", "a2", "a3", "b1", "b2"]
 DESCRIPTOR_COLUMNS = [
     "mol_wt",
@@ -139,6 +141,41 @@ def _safe_mannwhitney(x: np.ndarray, y: np.ndarray) -> float:
         return float(mannwhitneyu(x, y, alternative="two-sided").pvalue)
     except Exception:
         return np.nan
+
+
+def _safe_pearsonr(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if int(mask.sum()) < 2:
+        return np.nan, np.nan
+    x_valid = x_arr[mask]
+    y_valid = y_arr[mask]
+    if np.isclose(np.nanstd(x_valid), 0.0) or np.isclose(np.nanstd(y_valid), 0.0):
+        return np.nan, np.nan
+    try:
+        r, p = pearsonr(x_valid, y_valid)
+    except Exception:
+        return np.nan, np.nan
+    return float(r), float(p)
+
+
+def _safe_standardized_shift(mean_x: float, mean_ref: float, ref_std: float) -> float:
+    if not (np.isfinite(mean_x) and np.isfinite(mean_ref) and np.isfinite(ref_std)):
+        return np.nan
+    # Keep near-zero reference variance from dominating descriptor rankings.
+    denom = max(float(ref_std), float(DESCRIPTOR_Z_SHIFT_STD_FLOOR))
+    if denom <= 0.0:
+        return np.nan
+    shift = (float(mean_x) - float(mean_ref)) / denom
+    return float(np.clip(shift, -DESCRIPTOR_Z_SHIFT_MAX_ABS, DESCRIPTOR_Z_SHIFT_MAX_ABS))
+
+
+def _majority_class_label(values, default=np.nan) -> float:
+    numeric = pd.to_numeric(pd.Series(values), errors="coerce").dropna().to_numpy(dtype=float)
+    if len(numeric) == 0:
+        return float(default)
+    return float(np.mean(numeric) >= 0.5)
 
 
 def _cleanup_previous_figures(figures_dir: Path) -> None:
@@ -370,7 +407,7 @@ def _plot_gradient_scatter(df: pd.DataFrame, axis_label: str, out_png: Path, dpi
         lo -= 1.0
         hi += 1.0
     sign_agree = float(np.mean(np.sign(x) == np.sign(y)))
-    corr = float(pearsonr(x, y)[0]) if len(x) >= 2 else np.nan
+    corr = _safe_pearsonr(x, y)[0]
 
     fig, ax = plt.subplots(figsize=(6.2, 5.2))
     ax.scatter(x, y, s=26, alpha=0.75, color="#4c78a8")
@@ -455,7 +492,7 @@ def _compare_descriptor_shift(selected_df: pd.DataFrame, baseline_df: pd.DataFra
             )
             continue
         b_std = float(np.std(b, ddof=0))
-        z_shift = (float(np.mean(s)) - float(np.mean(b))) / b_std if not np.isclose(b_std, 0.0) else np.nan
+        z_shift = _safe_standardized_shift(float(np.mean(s)), float(np.mean(b)), b_std)
         rows.append(
             {
                 "descriptor": col,
@@ -1253,7 +1290,7 @@ def _chi_formula_for_fit(Xdata: np.ndarray, a0: float, a1: float, a2: float, a3:
     return base * modifier
 
 
-def _fit_polymer_coefficients_from_data(chi_df: pd.DataFrame) -> pd.DataFrame:
+def _fit_polymer_coefficients_from_data(chi_df: pd.DataFrame, random_seed: int | None = None) -> pd.DataFrame:
     df = _normalize_columns(chi_df).copy()
     smiles_col = _resolve_smiles_column(df)
     if smiles_col is None:
@@ -1312,7 +1349,8 @@ def _fit_polymer_coefficients_from_data(chi_df: pd.DataFrame) -> pd.DataFrame:
         for trial in range(3):
             p0 = p0_base.copy()
             if trial > 0:
-                rng = np.random.default_rng(2026 + trial)
+                base_seed = 0 if random_seed is None else int(random_seed)
+                rng = np.random.default_rng(base_seed + trial)
                 p0 += rng.normal(loc=0.0, scale=[0.2, 50.0, 0.2, 0.02, 0.2, 0.2], size=6)
                 p0 = np.clip(p0, lower_bounds + 1e-6, upper_bounds - 1e-6)
             try:
@@ -1363,7 +1401,11 @@ def _fit_polymer_coefficients_from_data(chi_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _load_or_fit_coefficients(coeff_path: Optional[Path], chi_df: pd.DataFrame) -> pd.DataFrame:
+def _load_or_fit_coefficients(
+    coeff_path: Optional[Path],
+    chi_df: pd.DataFrame,
+    random_seed: int | None = None,
+) -> pd.DataFrame:
     if coeff_path is not None and coeff_path.exists():
         coeff_df = _normalize_columns(pd.read_csv(coeff_path))
         missing_coeff = [c for c in COEFF_COLUMNS if c not in coeff_df.columns]
@@ -1394,7 +1436,7 @@ def _load_or_fit_coefficients(coeff_path: Optional[Path], chi_df: pd.DataFrame) 
                 tmp = (
                     tmp.dropna(subset=["canonical_smiles"])
                     .groupby("canonical_smiles", as_index=False)[CLASS_COL]
-                    .agg(lambda s: int(round(float(np.mean(pd.to_numeric(s, errors="coerce").fillna(0))))))
+                    .agg(lambda s: _majority_class_label(s, default=np.nan))
                 )
                 coeff_df = coeff_df.merge(tmp, on="canonical_smiles", how="left")
         if "Polymer" not in coeff_df.columns:
@@ -1402,7 +1444,7 @@ def _load_or_fit_coefficients(coeff_path: Optional[Path], chi_df: pd.DataFrame) 
         if "polymer_id" not in coeff_df.columns:
             coeff_df["polymer_id"] = np.arange(len(coeff_df), dtype=int)
         return coeff_df
-    return _fit_polymer_coefficients_from_data(chi_df)
+    return _fit_polymer_coefficients_from_data(chi_df, random_seed=random_seed)
 
 
 def _compute_dchi_dT(row: pd.Series, T: float, phi: float) -> float:
@@ -1532,8 +1574,10 @@ def _plot_dchi_dT_distribution(coeff_df: pd.DataFrame, figures_dir: Path, dpi: i
 
 def _chi_spinodal(phi: float) -> float:
     phi_val = float(phi)
-    if phi_val <= 0.0 or phi_val >= 1.0:
+    if not np.isfinite(phi_val) or phi_val < 0.0 or phi_val > 1.0:
         return float(np.nan)
+    if np.isclose(phi_val, 0.0) or np.isclose(phi_val, 1.0):
+        return float(np.inf)
     return float(1.0 / (2.0 * phi_val * (1.0 - phi_val)))
 
 
@@ -1601,7 +1645,7 @@ def _compute_spinodal_analysis(
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     T_vals = sorted(pd.to_numeric(chi_df["temperature"], errors="coerce").dropna().unique().tolist())
     phi_vals = sorted(pd.to_numeric(chi_df["phi"], errors="coerce").dropna().unique().tolist())
-    phi_vals = [float(p) for p in phi_vals if (p > 0.0 and p < 1.0)]
+    phi_vals = [float(p) for p in phi_vals if (p >= 0.0 and p <= 1.0)]
 
     if len(T_vals) == 0 or len(phi_vals) == 0:
         return pd.DataFrame(), pd.DataFrame()
@@ -1627,7 +1671,7 @@ def _compute_spinodal_analysis(
                 spin = _chi_spinodal(p)
                 chi_vals.append(chi_val)
                 spin_vals.append(spin)
-                cond_hits.append(float(chi_val < spin) if np.isfinite(spin) else np.nan)
+                cond_hits.append(float(chi_val < spin) if np.isfinite(chi_val) and np.isfinite(spin) else np.nan)
         cond_hits_arr = np.asarray(cond_hits, dtype=float)
 
         target_hit_flags = []
@@ -1635,10 +1679,18 @@ def _compute_spinodal_analysis(
             t = float(tr["temperature"])
             p = float(tr["phi"])
             chi_pred = float(predict_chi_from_coefficients(coeff, np.array(t), np.array(p)))
-            target_hit = int(chi_pred <= float(tr["target_chi"]))
+            target_hit = (
+                float(chi_pred <= float(tr["target_chi"]))
+                if np.isfinite(chi_pred) and np.isfinite(float(tr["target_chi"]))
+                else np.nan
+            )
             target_hit_flags.append(target_hit)
             p_clip = float(np.clip(p, 1e-6, 1 - 1e-6))
-            delta_g = float((1.0 - p_clip) * np.log(1.0 - p_clip) + chi_pred * p_clip * (1.0 - p_clip))
+            delta_g = (
+                float((1.0 - p_clip) * np.log(1.0 - p_clip) + chi_pred * p_clip * (1.0 - p_clip))
+                if np.isfinite(chi_pred)
+                else np.nan
+            )
             freeE_rows.append(
                 {
                     "polymer_id": row.get("polymer_id", np.nan),
@@ -1655,7 +1707,10 @@ def _compute_spinodal_analysis(
                     "chi_target_condition_hit": target_hit,
                 }
             )
+        target_hit_flags_arr = np.asarray(target_hit_flags, dtype=float)
 
+        spin_vals_arr = np.asarray(spin_vals, dtype=float)
+        finite_spin_mask = np.isfinite(spin_vals_arr)
         spinodal_rows.append(
             {
                 "polymer_id": row.get("polymer_id", np.nan),
@@ -1667,10 +1722,14 @@ def _compute_spinodal_analysis(
                 "n_conditions": int(np.isfinite(cond_hits_arr).sum()),
                 "fraction_below_spinodal": float(np.nanmean(cond_hits_arr)) if np.isfinite(cond_hits_arr).any() else np.nan,
                 "mean_pred_chi_over_grid": float(np.nanmean(np.asarray(chi_vals, dtype=float))),
-                "mean_spinodal_over_grid": float(np.nanmean(np.asarray(spin_vals, dtype=float))),
-                "chi_target_condition_flag": int(np.all(np.asarray(target_hit_flags, dtype=int) == 1))
-                if target_hit_flags
-                else np.nan,
+                # Endpoint spinodals are infinite; keep them in the hit fraction, but
+                # summarize the interior grid with a finite mean for downstream tables.
+                "mean_spinodal_over_grid": float(np.nanmean(spin_vals_arr[finite_spin_mask])) if finite_spin_mask.any() else np.nan,
+                "chi_target_condition_flag": (
+                    float(np.all(target_hit_flags_arr == 1.0))
+                    if target_hit_flags and np.isfinite(target_hit_flags_arr).all()
+                    else np.nan
+                ),
             }
         )
     return pd.DataFrame(spinodal_rows), pd.DataFrame(freeE_rows)
@@ -1831,7 +1890,7 @@ def _build_chi_dataset_descriptor_df(chi_df: pd.DataFrame) -> pd.DataFrame:
         smiles = str(sub[smiles_col].iloc[0])
         polymer_name = str(sub["Polymer"].iloc[0]) if "Polymer" in sub.columns else canon
         mean_chi = float(pd.to_numeric(sub["chi"], errors="coerce").mean())
-        class_label = int(round(float(pd.to_numeric(sub[CLASS_COL], errors="coerce").mean())))
+        class_label = _majority_class_label(sub[CLASS_COL], default=np.nan)
         desc = _calc_descriptor_row(smiles)
         mol = _mol_from_polymer_smiles(smiles)
         fgs = _detect_functional_groups(mol)
@@ -1841,7 +1900,7 @@ def _build_chi_dataset_descriptor_df(chi_df: pd.DataFrame) -> pd.DataFrame:
                 "SMILES": smiles,
                 "canonical_smiles": canon,
                 "chi_mean": mean_chi,
-                CLASS_COL: class_label,
+                CLASS_COL: int(class_label) if np.isfinite(class_label) else np.nan,
                 **desc,
                 **fgs,
             }
@@ -2205,7 +2264,9 @@ def _load_classification_dataset_from_config(config: Dict) -> pd.DataFrame:
                 "Polymer": str(sub["Polymer"].iloc[0]),
                 "SMILES": str(sub["SMILES"].iloc[0]),
                 "canonical_smiles": str(can),
-                CLASS_COL: int(float(np.mean(y)) >= 0.5) if len(y) else int(pd.to_numeric(sub[CLASS_COL], errors="coerce").fillna(0).iloc[0]),
+                CLASS_COL: int(_majority_class_label(y, default=0.0))
+                if len(y)
+                else int(pd.to_numeric(sub[CLASS_COL], errors="coerce").fillna(0).iloc[0]),
                 "source_file": ";".join(sorted(set(sub["source_file"].astype(str).tolist()))),
             }
         )
@@ -2274,7 +2335,7 @@ def _compute_classification_context(
             y_std = float(np.std(y, ddof=0)) if len(y) else np.nan
             mean_x = float(np.mean(x)) if len(x) else np.nan
             mean_y = float(np.mean(y)) if len(y) else np.nan
-            z_shift = (mean_x - mean_y) / y_std if (np.isfinite(y_std) and not np.isclose(y_std, 0.0)) else np.nan
+            z_shift = _safe_standardized_shift(mean_x, mean_y, y_std)
             desc_rows.append(
                 {
                     "descriptor": dcol,
@@ -2562,7 +2623,7 @@ def _compute_embedding_pinn_correlations(
             y = pd.to_numeric(merged[var], errors="coerce").to_numpy(dtype=float)
             mask = np.isfinite(x) & np.isfinite(y)
             if int(mask.sum()) >= 3:
-                r, p = pearsonr(x[mask], y[mask])
+                r, p = _safe_pearsonr(x[mask], y[mask])
                 rows.append({"variable": var, "pc_axis": pc, "pearson_r": float(r), "pvalue": float(p), "n": int(mask.sum())})
             else:
                 rows.append({"variable": var, "pc_axis": pc, "pearson_r": np.nan, "pvalue": np.nan, "n": int(mask.sum())})
@@ -3862,7 +3923,7 @@ def main(args: argparse.Namespace) -> None:
         ).to_csv(metrics_dir / "candidate_analysis_skipped_reason.csv", index=False)
 
     # D) Physical interpretation of Step4 χ(T,φ) coefficients.
-    coeff_df = _load_or_fit_coefficients(step4_coeff_path, chi_df)
+    coeff_df = _load_or_fit_coefficients(step4_coeff_path, chi_df, random_seed=seed_value)
     if not coeff_df.empty:
         for c in COEFF_COLUMNS:
             coeff_df[c] = pd.to_numeric(coeff_df[c], errors="coerce")
@@ -3998,11 +4059,11 @@ def main(args: argparse.Namespace) -> None:
             mask_chi = np.isfinite(x) & np.isfinite(y_chi)
             mask_cls = np.isfinite(x) & np.isfinite(y_cls)
             if int(mask_chi.sum()) >= 3:
-                r_chi = float(pearsonr(x[mask_chi], y_chi[mask_chi])[0])
+                r_chi = _safe_pearsonr(x[mask_chi], y_chi[mask_chi])[0]
             else:
                 r_chi = np.nan
             if int(mask_cls.sum()) >= 3:
-                r_cls = float(pearsonr(x[mask_cls], y_cls[mask_cls])[0])
+                r_cls = _safe_pearsonr(x[mask_cls], y_cls[mask_cls])[0]
             else:
                 r_cls = np.nan
             corr_rows.append(

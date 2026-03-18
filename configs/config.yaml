@@ -275,12 +275,12 @@ chi_training:
   step7_chem_physics:
     baseline_max_samples: 500000  # max training polymers sampled for descriptor/novelty baseline
     novelty_similarity_threshold: 0.40  # novelty cutoff on max Tanimoto to baseline
-    descriptor_top_k: 8  # number of top-shift descriptors shown in figure
+    descriptor_top_k: 6  # number of top-shift descriptors shown in figure
 
   # Step 8 manuscript + supporting information package
   step8_paper_package:
     split_mode: "polymer"  # fixed split mode for paper package curation
-    manuscript_main_figures: 7  # target number of main-text figures
+    manuscript_main_figures: 6  # target number of main-text figures
     only_png_outputs: true  # Step 8 writes PNG only
 
 checkpointing:

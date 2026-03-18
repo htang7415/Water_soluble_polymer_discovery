@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import argparse
 import ast
+import hashlib
 import json
 import math
 import re
@@ -118,6 +119,66 @@ def _safe_first_row(path: Optional[Path]) -> Dict[str, object]:
     if df.empty:
         return {}
     return df.iloc[0].to_dict()
+
+
+def _file_signature(path: Optional[Path]) -> Optional[Dict[str, object]]:
+    if path is None or not path.exists():
+        return None
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _hash_series(values: pd.Series) -> str:
+    normalized = values.fillna("").astype(str).tolist()
+    return _hash_text("\n".join(normalized))
+
+
+def _cache_metadata_path(cache_csv: Path) -> Path:
+    return cache_csv.with_suffix(f"{cache_csv.suffix}.meta.json")
+
+
+def _load_cache_metadata(cache_csv: Path) -> Optional[Dict[str, object]]:
+    meta_path = _cache_metadata_path(cache_csv)
+    if not meta_path.exists():
+        return None
+    try:
+        with meta_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_cache_metadata(cache_csv: Path, metadata: Dict[str, object]) -> None:
+    meta_path = _cache_metadata_path(cache_csv)
+    with meta_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True)
+
+
+def _write_table_notes(table_dir: Path, scope_label: str) -> Path:
+    note_path = table_dir / "README.md"
+    note_path.write_text(
+        "\n".join(
+            [
+                f"# {scope_label} Tables",
+                "",
+                "- Blank numeric cells in CSV tables indicate an unavailable or not-computed upstream metric.",
+                "- Blank cells should not be interpreted as zero unless the table itself states otherwise.",
+                "- Placeholder tables use an explicit `note` column when the source artifact is missing.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return note_path
 
 
 def _pick(row: Dict[str, object], keys: List[str], default=np.nan):
@@ -450,7 +511,11 @@ def _compose_figure(
                 ax.set_axis_off()
                 status = "ok"
                 src_str = str(src)
-            except Exception:
+            except Exception as exc:
+                print(
+                    f"[WARN] Failed to load panel for {spec.figure_id} "
+                    f"({panel.caption}) from {src}: {exc}"
+                )
                 _draw_missing_panel(ax, panel.caption, font_size=font_size)
         else:
             _draw_missing_panel(ax, panel.caption, font_size=font_size)
@@ -1236,11 +1301,24 @@ def _resolve_step6_target_plot_csv(
     )
     novel_df["Polymer"] = novel_df.get("Polymer", novel_df["canonical_smiles"]).astype(str)
     novel_df["polymer_id"] = np.arange(1, len(novel_df) + 1, dtype=int)
+    cache_metadata = {
+        "cache_version": 2,
+        "config_sha256": _hash_text(json.dumps(config, sort_keys=True, default=str)),
+        "target_csv": _file_signature(target_csv),
+        "inverse_targets_csv": _file_signature(inverse_targets_csv),
+        "reg_checkpoint": _file_signature(reg_checkpoint),
+        "cls_checkpoint": _file_signature(cls_checkpoint),
+        "model_size": str(model_size),
+        "split_mode": str(split_mode),
+        "canonical_smiles_sha256": _hash_series(novel_df["canonical_smiles"]),
+        "canonical_smiles_count": int(len(novel_df)),
+    }
 
     if cache_csv.exists():
         cache_df = _safe_read_csv(cache_csv)
         required_cols = {"polymer_id", "canonical_smiles", "chi_pred_target", "class_prob", "target_chi", *COEFF_NAMES}
-        if required_cols.issubset(cache_df.columns) and len(cache_df) == len(novel_df):
+        cache_meta = _load_cache_metadata(cache_csv)
+        if required_cols.issubset(cache_df.columns) and cache_meta == cache_metadata:
             cached_canonical = cache_df["canonical_smiles"].astype(str).fillna("").tolist()
             source_canonical = novel_df["canonical_smiles"].astype(str).fillna("").tolist()
             if cached_canonical == source_canonical:
@@ -1285,11 +1363,16 @@ def _resolve_step6_target_plot_csv(
     if inferred_df.empty or not {"polymer_id", "class_prob", *COEFF_NAMES}.issubset(inferred_df.columns):
         return target_csv
 
+    merge_cols = ["polymer_id", "class_prob", *COEFF_NAMES]
+    if "class_prob_std" in inferred_df.columns:
+        merge_cols.insert(2, "class_prob_std")
     merged_df = novel_df.merge(
-        inferred_df[["polymer_id", "class_prob", "class_prob_std", *COEFF_NAMES]],
+        inferred_df[merge_cols],
         on="polymer_id",
         how="left",
     )
+    if "class_prob_std" not in merged_df.columns:
+        merged_df["class_prob_std"] = np.nan
     merged_df["temperature"] = pd.to_numeric(merged_df.get("temperature", temperature), errors="coerce")
     merged_df["phi"] = pd.to_numeric(merged_df.get("phi", phi), errors="coerce")
     merged_df["target_chi"] = pd.to_numeric(merged_df.get("target_chi", target_chi), errors="coerce")
@@ -1301,14 +1384,25 @@ def _resolve_step6_target_plot_csv(
     if "target_polymer_class" not in merged_df.columns or merged_df["target_polymer_class"].isna().all():
         merged_df["target_polymer_class"] = target_class
 
-    coeff_matrix = merged_df[COEFF_NAMES].to_numpy(dtype=float)
-    merged_df["chi_pred_target"] = predict_chi_from_coefficients(
-        coefficients=coeff_matrix,
-        temperature=merged_df["temperature"].to_numpy(dtype=float),
-        phi=merged_df["phi"].to_numpy(dtype=float),
+    coeff_matrix = merged_df[COEFF_NAMES].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    temperature_values = merged_df["temperature"].to_numpy(dtype=float)
+    phi_values = merged_df["phi"].to_numpy(dtype=float)
+    valid_rows = (
+        np.isfinite(temperature_values)
+        & np.isfinite(phi_values)
+        & np.all(np.isfinite(coeff_matrix), axis=1)
     )
+    chi_pred = np.full(len(merged_df), np.nan, dtype=float)
+    if np.any(valid_rows):
+        chi_pred[valid_rows] = predict_chi_from_coefficients(
+            coefficients=coeff_matrix[valid_rows],
+            temperature=temperature_values[valid_rows],
+            phi=phi_values[valid_rows],
+        )
+    merged_df["chi_pred_target"] = chi_pred
     cache_csv.parent.mkdir(parents=True, exist_ok=True)
     merged_df.to_csv(cache_csv, index=False)
+    _write_cache_metadata(cache_csv, cache_metadata)
     return cache_csv
 
 
@@ -3605,6 +3699,7 @@ def _write_status_report(
             "",
             "## Notes",
             "- Verification phrasing in external docs should use SI=8 and full-title PNG filenames.",
+            f"- Blank table cells mean unavailable/not-computed metrics; see `{manuscript_tables_dir / 'README.md'}` and `{si_tables_dir / 'README.md'}`.",
         ]
     )
 
@@ -3620,6 +3715,8 @@ def _build_manuscript_tables(
 ) -> Dict[str, Path]:
     manuscript_tables_dir.mkdir(parents=True, exist_ok=True)
     si_tables_dir.mkdir(parents=True, exist_ok=True)
+    _write_table_notes(manuscript_tables_dir, "Manuscript")
+    _write_table_notes(si_tables_dir, "Supporting Information")
 
     s0 = _safe_first_row(paths.get("step0_summary"))
     if not s0:
@@ -4172,29 +4269,24 @@ def main(args: argparse.Namespace) -> None:
         paths=paths,
         metadata_dir=metadata_dir,
     )
-    step5_target_csv = (
-        paths["step5_dir"] / "metrics" / "target_polymers.csv"
-        if paths.get("step5_dir") is not None
-        else None
+    step5_target_csv = _first_existing(
+        [
+            paths.get("step5_selected_target_candidate_ranked"),
+            paths["step5_dir"] / "metrics" / "target_polymers.csv"
+            if paths.get("step5_dir") is not None
+            else None,
+        ]
     )
-    step5_selection_summary_csv = (
-        paths["step5_dir"] / "metrics" / "target_polymer_selection_summary.csv"
-        if paths.get("step5_dir") is not None
-        else None
-    )
+    step5_selection_summary_csv = _selection_summary_csv_from_target_csv(step5_target_csv)
     step6_target_csv = _first_existing(
         [
+            paths.get("step6_selected_target_candidate_ranked"),
             paths["step6_dir"] / "metrics" / "target_polymers.csv"
             if paths.get("step6_dir") is not None
             else None,
-            _latest_resampling_attempt_csv(paths.get("step6_dir"), "target_polymers.csv"),
         ]
     )
-    step6_selection_summary_csv = (
-        step6_target_csv.parent / "target_polymer_selection_summary.csv"
-        if isinstance(step6_target_csv, Path)
-        else None
-    )
+    step6_selection_summary_csv = _selection_summary_csv_from_target_csv(step6_target_csv)
     step6_inverse_targets_csv = (
         paths.get("step6_dir") / "metrics" / "inverse_targets.csv"
         if paths.get("step6_dir") is not None

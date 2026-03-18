@@ -92,7 +92,7 @@ def _compute_target_candidates(
     out = coeff_df[copy_cols].copy()
     for col in ["class_prob_std", "class_logit_std", *coeff_std_cols]:
         if col not in out.columns:
-            out[col] = 0.0
+            out[col] = np.nan
 
     coeff_mean = out[COEFF_NAMES].to_numpy(dtype=float)
     coeff_std = out[coeff_std_cols].to_numpy(dtype=float)
@@ -117,7 +117,7 @@ def _compute_target_candidates(
         property_rule = default_property_rule
     out["property_rule"] = property_rule
 
-    out["class_prob_std"] = out["class_prob_std"].astype(float).fillna(0.0)
+    out["class_prob_std"] = pd.to_numeric(out["class_prob_std"], errors="coerce")
     if uncertainty_enabled:
         out["class_prob_lcb"] = np.clip(
             out["class_prob"].astype(float) - float(uncertainty_class_z) * out["class_prob_std"],
@@ -177,7 +177,7 @@ def _target_metrics(cand: pd.DataFrame) -> Dict[str, float]:
         "top1_polymer": cand["Polymer"].iloc[0],
         "top1_candidate_source": cand["candidate_source"].iloc[0] if "candidate_source" in cand.columns else "unknown",
         "top1_class_prob": float(cand["class_prob"].iloc[0]),
-        "top1_class_prob_std": float(cand["class_prob_std"].iloc[0]) if "class_prob_std" in cand.columns else 0.0,
+        "top1_class_prob_std": float(cand["class_prob_std"].iloc[0]) if "class_prob_std" in cand.columns else np.nan,
         "top1_class_prob_lcb": float(cand["class_prob_lcb"].iloc[0]) if "class_prob_lcb" in cand.columns else float(cand["class_prob"].iloc[0]),
         "top1_soluble_hit": int(cand["soluble_hit"].iloc[0]),
         "top1_property_hit": int(cand["property_hit"].iloc[0]),
@@ -185,7 +185,7 @@ def _target_metrics(cand: pd.DataFrame) -> Dict[str, float]:
         "top1_property_error": float(cand["property_error"].iloc[0]),
         "top1_abs_error": float(cand["abs_error"].iloc[0]),
         "top1_pred_chi": float(cand["chi_pred_target"].iloc[0]),
-        "top1_pred_chi_std": float(cand["chi_pred_std_target"].iloc[0]) if "chi_pred_std_target" in cand.columns else 0.0,
+        "top1_pred_chi_std": float(cand["chi_pred_std_target"].iloc[0]) if "chi_pred_std_target" in cand.columns else np.nan,
         "top1_is_novel_vs_train": int(cand["is_novel_vs_train"].iloc[0]) if "is_novel_vs_train" in cand.columns else np.nan,
     }
 
@@ -206,6 +206,10 @@ def _target_metrics(cand: pd.DataFrame) -> Dict[str, float]:
 
 
 def _aggregate_metrics(target_metrics_df: pd.DataFrame) -> pd.DataFrame:
+    def _nanmean_or_nan(series: pd.Series) -> float:
+        values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+        return float(np.nanmean(values)) if np.isfinite(values).any() else np.nan
+
     def summarize(scope: str, sub: pd.DataFrame) -> Dict[str, float]:
         out = {
             "scope": scope,
@@ -219,9 +223,9 @@ def _aggregate_metrics(target_metrics_df: pd.DataFrame) -> pd.DataFrame:
             "mean_property_hit_rate": float(np.mean(sub["property_hit_rate"])),
         }
         if "top1_pred_chi_std" in sub.columns:
-            out["mean_top1_pred_chi_std"] = float(np.mean(sub["top1_pred_chi_std"]))
+            out["mean_top1_pred_chi_std"] = _nanmean_or_nan(sub["top1_pred_chi_std"])
         if "top1_class_prob_std" in sub.columns:
-            out["mean_top1_class_prob_std"] = float(np.mean(sub["top1_class_prob_std"]))
+            out["mean_top1_class_prob_std"] = _nanmean_or_nan(sub["top1_class_prob_std"])
         for k in K_LIST:
             out[f"target_success_top{k}"] = float(np.mean(sub[f"top{k}_joint_hit"] > 0))
             if f"top{k}_novel_rate" in sub.columns:
@@ -256,7 +260,7 @@ def _postprocess_metrics(candidate_df: pd.DataFrame, target_metrics_df: pd.DataF
         if "class_prob_lcb" not in topk.columns:
             topk["class_prob_lcb"] = topk["class_prob"]
         if "chi_pred_std_target" not in topk.columns:
-            topk["chi_pred_std_target"] = 0.0
+            topk["chi_pred_std_target"] = np.nan
         per_target = topk.groupby("target_id", as_index=False).agg(
             novel_rate=("is_novel_vs_train", "mean"),
             mean_class_prob=("class_prob", "mean"),
@@ -310,9 +314,10 @@ def _accumulate_candidate_pools(pool_frames: List[pd.DataFrame]) -> pd.DataFrame
         coeff_df["SMILES"].astype(str),
     )
     if "source_polymer_id" not in coeff_df.columns:
-        coeff_df["source_polymer_id"] = coeff_df.get("polymer_id", pd.Series([-1] * len(coeff_df))).astype(int)
+        polymer_ids = coeff_df.get("polymer_id", pd.Series([-1] * len(coeff_df), index=coeff_df.index))
+        coeff_df["source_polymer_id"] = pd.to_numeric(polymer_ids, errors="coerce").fillna(-1).astype(int)
     else:
-        coeff_df["source_polymer_id"] = coeff_df["source_polymer_id"].fillna(-1).astype(int)
+        coeff_df["source_polymer_id"] = pd.to_numeric(coeff_df["source_polymer_id"], errors="coerce").fillna(-1).astype(int)
     coeff_df = coeff_df.drop_duplicates(subset=["canonical_smiles"], keep="first").reset_index(drop=True)
     coeff_df["polymer_id"] = np.arange(len(coeff_df), dtype=int)
     return coeff_df
@@ -335,7 +340,7 @@ def _empty_target_metrics(target_row: pd.Series) -> Dict[str, float]:
         "top1_polymer": "",
         "top1_candidate_source": "unknown",
         "top1_class_prob": np.nan,
-        "top1_class_prob_std": 0.0,
+        "top1_class_prob_std": np.nan,
         "top1_class_prob_lcb": np.nan,
         "top1_soluble_hit": 0,
         "top1_property_hit": 0,
@@ -343,7 +348,7 @@ def _empty_target_metrics(target_row: pd.Series) -> Dict[str, float]:
         "top1_property_error": np.nan,
         "top1_abs_error": np.nan,
         "top1_pred_chi": np.nan,
-        "top1_pred_chi_std": 0.0,
+        "top1_pred_chi_std": np.nan,
         "top1_is_novel_vs_train": np.nan,
         "best_joint_abs_error": np.nan,
         "first_joint_rank": np.nan,
@@ -399,7 +404,7 @@ def _score_candidate_pool(
     if "class_prob_lcb" not in topk.columns:
         topk["class_prob_lcb"] = topk["class_prob"]
     if "chi_pred_std_target" not in topk.columns:
-        topk["chi_pred_std_target"] = 0.0
+        topk["chi_pred_std_target"] = np.nan
     coverage = (
         topk.groupby(["candidate_source", "polymer_id", "Polymer"], as_index=False)
         .agg(
@@ -523,7 +528,7 @@ def _select_final_target_polymers(
                 "property_error": float(row["property_error"]),
                 "abs_error": float(row["abs_error"]),
                 "class_prob": float(row["class_prob"]),
-                "class_prob_std": float(row["class_prob_std"]) if not pd.isna(row.get("class_prob_std", np.nan)) else 0.0,
+                "class_prob_std": float(row["class_prob_std"]) if not pd.isna(row.get("class_prob_std", np.nan)) else np.nan,
                 "class_prob_lcb": float(row["class_prob_lcb"]) if not pd.isna(row.get("class_prob_lcb", np.nan)) else float(row["class_prob"]),
                 "soluble_hit": int(row["soluble_hit"]),
                 "property_hit": int(row["property_hit"]),
@@ -531,7 +536,7 @@ def _select_final_target_polymers(
                 "requirement_miss_count": int(row.get("requirement_miss_count", 2 - (row["soluble_hit"] + row["property_hit"]))),
                 "score": float(row["score"]),
                 "rank_in_target": int(row["rank"]),
-                "chi_pred_std_target": float(row["chi_pred_std_target"]) if not pd.isna(row.get("chi_pred_std_target", np.nan)) else 0.0,
+                "chi_pred_std_target": float(row["chi_pred_std_target"]) if not pd.isna(row.get("chi_pred_std_target", np.nan)) else np.nan,
                 "chi_pred_conservative": float(row["chi_pred_conservative"]) if not pd.isna(row.get("chi_pred_conservative", np.nan)) else float(row["chi_pred_target"]),
                 "is_valid": int(is_valid),
                 "star_count": int(star_count),
@@ -711,6 +716,8 @@ def _compute_property_requirement_margin(df: pd.DataFrame, epsilon: float) -> pd
     lower_mask = rule == "lower_bound"
     band_mask = ~(upper_mask | lower_mask)
 
+    # Positive margin means the candidate satisfies the requirement with slack;
+    # negative margin means the requirement is violated by that magnitude.
     if {"target_chi", "chi_pred_conservative"}.issubset(df.columns):
         margin.loc[upper_mask] = (
             df.loc[upper_mask, "target_chi"].to_numpy(dtype=float)
@@ -889,14 +896,15 @@ def _save_figures(
 
     if not candidate_df.empty and not target_poly_df.empty:
         joint_selected = ((target_poly_df["soluble_hit"] == 1) & (target_poly_df["property_hit"] == 1)).astype(int)
+        selected_group = f"Selected {len(target_poly_df)}"
         rate_df = pd.DataFrame(
             [
                 {"group": "Screened", "requirement": "Solubility", "pass_rate": float(candidate_df["soluble_hit"].mean())},
                 {"group": "Screened", "requirement": "Property", "pass_rate": float(candidate_df["property_hit"].mean())},
                 {"group": "Screened", "requirement": "Joint target", "pass_rate": float(candidate_df["joint_hit"].mean())},
-                {"group": "Selected 100", "requirement": "Solubility", "pass_rate": float(target_poly_df["soluble_hit"].mean())},
-                {"group": "Selected 100", "requirement": "Property", "pass_rate": float(target_poly_df["property_hit"].mean())},
-                {"group": "Selected 100", "requirement": "Joint target", "pass_rate": float(joint_selected.mean())},
+                {"group": selected_group, "requirement": "Solubility", "pass_rate": float(target_poly_df["soluble_hit"].mean())},
+                {"group": selected_group, "requirement": "Property", "pass_rate": float(target_poly_df["property_hit"].mean())},
+                {"group": selected_group, "requirement": "Joint target", "pass_rate": float(joint_selected.mean())},
             ]
         )
         fig, ax = plt.subplots(figsize=(7.5, 4.8))
@@ -1018,22 +1026,14 @@ def _save_figures(
         fig.savefig(out_dir / "selected_target_chi_parity.png", dpi=dpi)
         plt.close(fig)
 
+        margin_vals = _compute_property_requirement_margin(sel, epsilon)
         fig, ax = plt.subplots(figsize=(6.2, 4.8))
-        sns.histplot(sel["chi_pred_target"].dropna(), bins=min(20, max(8, len(sel) // 6)), color="#e45756", ax=ax)
-        target_vals = pd.to_numeric(sel["target_chi"], errors="coerce").dropna().to_numpy(dtype=float)
-        for idx, value in enumerate(np.unique(np.round(target_vals, 6))):
-            ax.axvline(
-                float(value),
-                color="#474747",
-                linewidth=1.0,
-                linestyle=":",
-                label="Target χ" if idx == 0 else None,
-            )
-        ax.set_xlabel("Predicted χ at target condition")
+        sns.histplot(margin_vals.dropna(), bins=min(20, max(8, len(sel) // 6)), color="#e45756", ax=ax)
+        ax.axvline(0.0, color="#474747", linewidth=1.0, linestyle=":", label="Requirement boundary")
+        ax.set_xlabel("Signed property margin")
         ax.set_ylabel("Count")
-        ax.set_title("Step 5 selected polymers: predicted χ distribution")
-        if target_vals.size > 0:
-            ax.legend(frameon=False)
+        ax.set_title("Step 5 selected polymers: property margin distribution")
+        ax.legend(frameon=False)
         fig.tight_layout()
         fig.savefig(out_dir / "selected_target_chi_margin_distribution.png", dpi=dpi)
         plt.close(fig)
@@ -1535,9 +1535,11 @@ def main(args):
         **pool_summary,
     }
     if "chi_pred_std_target" in candidate_df.columns:
-        summary["mean_candidate_pred_chi_std"] = float(np.nanmean(candidate_df["chi_pred_std_target"]))
+        cand_pred_std = pd.to_numeric(candidate_df["chi_pred_std_target"], errors="coerce").to_numpy(dtype=float)
+        summary["mean_candidate_pred_chi_std"] = float(np.nanmean(cand_pred_std)) if np.isfinite(cand_pred_std).any() else np.nan
     if "class_prob_std" in coeff_df.columns:
-        summary["mean_candidate_class_prob_std"] = float(np.nanmean(coeff_df["class_prob_std"]))
+        cand_cls_std = pd.to_numeric(coeff_df["class_prob_std"], errors="coerce").to_numpy(dtype=float)
+        summary["mean_candidate_class_prob_std"] = float(np.nanmean(cand_cls_std)) if np.isfinite(cand_cls_std).any() else np.nan
     for key, value in overall_row.items():
         if isinstance(value, (np.floating, np.integer)):
             summary[key] = float(value)
