@@ -38,6 +38,7 @@ from src.utils.chemistry import (
     check_validity,
     count_stars,
     canonicalize_smiles,
+    has_terminal_connection_stars,
     batch_compute_fingerprints,
     compute_pairwise_diversity,
 )
@@ -498,6 +499,9 @@ def _select_final_target_polymers(
         if not canonical or pd.isna(canonical):
             canonical = canonicalize_smiles(smiles) if is_valid else None
         star_count = count_stars(smiles)
+        terminal_star_ok = bool(is_valid) and (
+            has_terminal_connection_stars(smiles, expected_stars=2) if int(target_stars) == 2 else True
+        )
         is_novel = bool(canonical) and canonical not in training_canonical
         if "is_novel_vs_train" in row and not pd.isna(row["is_novel_vs_train"]):
             is_novel = bool(int(row["is_novel_vs_train"]))
@@ -540,6 +544,7 @@ def _select_final_target_polymers(
                 "chi_pred_conservative": float(row["chi_pred_conservative"]) if not pd.isna(row.get("chi_pred_conservative", np.nan)) else float(row["chi_pred_target"]),
                 "is_valid": int(is_valid),
                 "star_count": int(star_count),
+                "terminal_star_ok": int(terminal_star_ok),
                 "is_novel_vs_train": int(is_novel),
                 "sa_score": float(sa_score) if sa_score is not None else np.nan,
                 "sa_ok": int(sa_ok),
@@ -579,6 +584,8 @@ def _select_final_target_polymers(
 
     valid_mask = all_df["is_valid"] == 1
     star_mask = valid_mask & (all_df["star_count"] == int(target_stars))
+    if int(target_stars) == 2:
+        star_mask = star_mask & (all_df["terminal_star_ok"] == 1)
     novel_mask = star_mask & (all_df["is_novel_vs_train"] == 1)
     sa_mask = novel_mask & (all_df["sa_ok"] == 1)
     filter_mask = sa_mask & (all_df["passes_all_target_conditions"] == 1)
@@ -857,7 +864,7 @@ def _save_figures(
         stage_labels = [
             "Screened polymers",
             "Valid SMILES",
-            f"{target_stars} stars",
+            (f"{target_stars} terminal stars" if int(target_stars) == 2 else f"{target_stars} stars"),
             "Novel vs train",
             f"SA < {target_sa_max:.1f}",
             "Pass target requirements",
@@ -1443,6 +1450,7 @@ def main(args):
         "n_generated_input_total": int(sum(int(m.get("n_generated_input", 0)) for m in attempt_manifests)),
         "n_valid_total": int(sum(int(m.get("n_valid", 0)) for m in attempt_manifests)),
         "n_valid_two_stars_total": int(sum(int(m.get("n_valid_two_stars", 0)) for m in attempt_manifests)),
+        "n_valid_two_terminal_stars_total": int(sum(int(m.get("n_valid_two_terminal_stars", 0)) for m in attempt_manifests)),
         "novel_candidate_count_total_pre_dedup": int(sum(int(m.get("novel_candidate_count", 0)) for m in attempt_manifests)),
         "candidate_count_total_before_cross_attempt_dedup": int(
             sum(int(m.get("candidate_count_after_dedup", 0)) for m in attempt_manifests)

@@ -67,6 +67,33 @@ def count_stars(smiles: str) -> int:
     return smiles.count('*')
 
 
+def has_terminal_connection_stars(smiles: str, expected_stars: Optional[int] = None) -> bool:
+    """Check that all '*' atoms are terminal attachment points in the molecular graph.
+
+    This is the graph-based version of the p-SMILES rule that connection points
+    should be repeat-unit termini, not internal bridge atoms such as ``C*C``.
+
+    Args:
+        smiles: Input SMILES / p-SMILES string.
+        expected_stars: Optional exact number of '*' atoms required.
+
+    Returns:
+        True if the molecule parses and every '*' atom has graph degree 1.
+    """
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return False
+        star_atoms = [atom for atom in mol.GetAtoms() if atom.GetAtomicNum() == 0]
+        if expected_stars is not None and len(star_atoms) != int(expected_stars):
+            return False
+        if not star_atoms:
+            return expected_stars in (None, 0)
+        return all(int(atom.GetDegree()) == 1 for atom in star_atoms)
+    except Exception:
+        return False
+
+
 def is_valid_psmiles(smiles: str) -> bool:
     """Check if a p-SMILES is valid (parseable and has exactly 2 stars).
 

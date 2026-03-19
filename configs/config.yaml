@@ -166,7 +166,7 @@ chi_training:
     finetune_last_layers: 0  # integer in [0, num_layers(model_size)]; 0=freeze backbone
 
     tune: true
-    n_trials: 120
+    n_trials: 300
     tuning_epochs: 60
     tuning_patience: 10
     tuning_objective: "val_poly_nrmse"  # val_r2 | val_poly_nrmse

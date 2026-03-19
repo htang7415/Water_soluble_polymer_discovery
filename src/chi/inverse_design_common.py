@@ -20,7 +20,7 @@ from src.chi.model import (
     SolubilityClassifier,
 )
 from src.chi.constants import COEFF_NAMES
-from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars
+from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars, has_terminal_connection_stars
 from src.utils.figure_style import apply_publication_figure_style
 from src.utils.numerics import stable_sigmoid
 
@@ -369,6 +369,7 @@ def prepare_novel_candidates(
     rows = []
     n_valid = 0
     n_valid_two_star = 0
+    n_valid_two_terminal_star = 0
     for smi in input_smiles:
         if not check_validity(smi):
             continue
@@ -376,6 +377,10 @@ def prepare_novel_candidates(
         if require_two_stars and count_stars(smi) != 2:
             continue
         n_valid_two_star += 1
+        if require_two_stars and not has_terminal_connection_stars(smi, expected_stars=2):
+            continue
+        if require_two_stars:
+            n_valid_two_terminal_star += 1
         canon = canonicalize_smiles(smi)
         if canon is None:
             continue
@@ -389,6 +394,7 @@ def prepare_novel_candidates(
             "n_generated_input": int(len(input_smiles)),
             "n_valid": int(n_valid),
             "n_valid_two_stars": int(n_valid_two_star),
+            "n_valid_two_terminal_stars": int(n_valid_two_terminal_star),
             "n_valid_unique": int(n_valid_unique),
             "n_novel_unique": 0,
             "novel_fraction_among_valid_unique": 0.0,
@@ -411,6 +417,7 @@ def prepare_novel_candidates(
         "n_generated_input": int(len(input_smiles)),
         "n_valid": int(n_valid),
         "n_valid_two_stars": int(n_valid_two_star),
+        "n_valid_two_terminal_stars": int(n_valid_two_terminal_star),
         "n_valid_unique": int(n_valid_unique),
         "n_novel_unique": int(n_novel_unique),
         "novel_fraction_among_valid_unique": float(n_novel_unique / n_valid_unique) if n_valid_unique > 0 else 0.0,

@@ -29,6 +29,7 @@ from src.utils.chemistry import (
     count_stars,
     check_validity,
     canonicalize_smiles,
+    has_terminal_connection_stars,
     batch_compute_fingerprints,
     compute_pairwise_diversity,
 )
@@ -48,6 +49,15 @@ from src.utils.reporting import save_step_summary, save_artifact_manifest, write
 BOND_CHARS = set(['-', '=', '#', '/', '\\'])
 
 
+def _passes_target_star_rule(smiles: str, target_stars: int) -> bool:
+    """Require the requested star count, plus terminal '*' atoms for 2-star p-SMILES."""
+    if count_stars(smiles) != int(target_stars):
+        return False
+    if int(target_stars) == 2:
+        return has_terminal_connection_stars(smiles, expected_stars=2)
+    return True
+
+
 def _sa_score_cached(smiles: str, cache: dict[str, float | None]) -> float | None:
     key = str(smiles)
     if key not in cache:
@@ -59,6 +69,7 @@ def _smiles_constraint_violations(smiles: str) -> dict:
     if not smiles:
         return {
             "star_count": True,
+            "terminal_star_atoms": True,
             "bond_placement": True,
             "paren_balance": True,
             "empty_parens": True,
@@ -66,6 +77,7 @@ def _smiles_constraint_violations(smiles: str) -> dict:
         }
 
     star_violation = count_stars(smiles) != 2
+    terminal_star_violation = (not star_violation) and (not has_terminal_connection_stars(smiles, expected_stars=2))
     empty_parens = "()" in smiles
 
     # Parenthesis balance
@@ -105,6 +117,7 @@ def _smiles_constraint_violations(smiles: str) -> dict:
 
     return {
         "star_count": star_violation,
+        "terminal_star_atoms": terminal_star_violation,
         "bond_placement": bond_violation,
         "paren_balance": paren_violation,
         "empty_parens": empty_parens,
@@ -116,6 +129,7 @@ def compute_smiles_constraint_metrics(smiles_list, method, representation, model
     total = len(smiles_list)
     violations = {
         "star_count": 0,
+        "terminal_star_atoms": 0,
         "bond_placement": 0,
         "paren_balance": 0,
         "empty_parens": 0,
@@ -155,7 +169,7 @@ def _filter_valid_samples(
     for smiles in smiles_list:
         if not check_validity(smiles):
             continue
-        if require_target_stars and count_stars(smiles) != target_stars:
+        if require_target_stars and not _passes_target_star_rule(smiles, target_stars):
             continue
         if required_polymer_class is not None and polymer_classifier is not None:
             if enforce_backbone_class_match:
@@ -187,7 +201,7 @@ def _filter_step2_target_candidates(
     for smiles in smiles_list:
         if not check_validity(smiles):
             continue
-        if require_target_stars and count_stars(smiles) != target_stars:
+        if require_target_stars and not _passes_target_star_rule(smiles, target_stars):
             continue
         canonical = canonicalize_smiles(smiles)
         if canonical is None:
@@ -498,6 +512,9 @@ def _select_target_polymers(
     for idx, smiles in enumerate(generated_smiles, start=1):
         is_valid = check_validity(smiles)
         star_count = count_stars(smiles)
+        terminal_star_ok = bool(is_valid) and (
+            has_terminal_connection_stars(smiles, expected_stars=2) if int(target_stars) == 2 else True
+        )
         canonical = canonicalize_smiles(smiles) if is_valid else None
         is_novel = bool(canonical) and canonical not in training_canonical
         sa = _sa_score_cached(smiles, sa_cache) if is_valid else None
@@ -509,6 +526,7 @@ def _select_target_polymers(
                 "canonical_smiles": canonical,
                 "is_valid": int(is_valid),
                 "star_count": int(star_count),
+                "terminal_star_ok": int(terminal_star_ok),
                 "is_novel": int(is_novel),
                 "sa_score": float(sa) if sa is not None else np.nan,
                 "sa_ok": int(sa_ok),
@@ -538,6 +556,7 @@ def _select_target_polymers(
     filter_mask = (
         (all_df["is_valid"] == 1)
         & (all_df["star_count"] == int(target_stars))
+        & ((all_df["terminal_star_ok"] == 1) if int(target_stars) == 2 else True)
         & (all_df["is_novel"] == 1)
         & (all_df["sa_ok"] == 1)
     )
