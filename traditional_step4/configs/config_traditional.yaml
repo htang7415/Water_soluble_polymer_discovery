@@ -35,7 +35,7 @@ traditional_step4:
     tune: true
     n_trials: 120
     tuning_cv_folds: 5
-    tuning_objective: "val_r2"  # "val_r2" | "val_poly_nrmse"
+    tuning_objective: "val_poly_nrmse"  # "val_r2" | "val_poly_nrmse"
     nrmse_std_floor: 0.02
     nrmse_clip: 10.0
     models:

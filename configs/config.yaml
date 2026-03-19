@@ -166,15 +166,15 @@ chi_training:
     finetune_last_layers: 0  # integer in [0, num_layers(model_size)]; 0=freeze backbone
 
     tune: true
-    n_trials: 200
+    n_trials: 120
     tuning_epochs: 60
     tuning_patience: 10
-    tuning_objective: "val_r2"  # val_r2 | val_poly_nrmse
+    tuning_objective: "val_poly_nrmse"  # val_r2 | val_poly_nrmse
     tuning_cv_folds: 5
-    budget_search_epochs: 120  # capped post-Optuna CV used to derive final-fit epochs
+    budget_search_epochs: 250  # capped post-Optuna CV used to derive final-fit epochs
     budget_search_patience: 20
-    epoch_selection_metric: "val_rmse"  # val_rmse | val_poly_nrmse
-    loss_weighting: "uniform"  # uniform | polymer_balanced
+    epoch_selection_metric: "val_poly_nrmse"  # val_rmse | val_poly_nrmse
+    loss_weighting: "polymer_balanced"  # uniform | polymer_balanced
     loss_weight_clip_ratio: 10.0
     scheduler_t_max: null  # null => use num_epochs; final fit overrides to preserve LR schedule shape
     nrmse_std_floor: 0.02
