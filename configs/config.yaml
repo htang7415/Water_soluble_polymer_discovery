@@ -168,8 +168,16 @@ chi_training:
     n_trials: 200
     tuning_epochs: 60
     tuning_patience: 10
-    tuning_objective: "val_r2"  # regression objective uses mean CV val_r2
+    tuning_objective: "val_r2"  # val_r2 | val_poly_nrmse
     tuning_cv_folds: 5
+    budget_search_epochs: 120  # capped post-Optuna CV used to derive final-fit epochs
+    budget_search_patience: 20
+    epoch_selection_metric: "val_rmse"  # val_rmse | val_poly_nrmse
+    loss_weighting: "uniform"  # uniform | polymer_balanced
+    loss_weight_clip_ratio: 10.0
+    scheduler_t_max: null  # null => use num_epochs; final fit overrides to preserve LR schedule shape
+    nrmse_std_floor: 0.02
+    nrmse_clip: 10.0
     optuna_search_space:
       # If list has exactly 2 values, it is treated as a continuous range [min, max].
       # If list has >2 values, it is treated as categorical choices.

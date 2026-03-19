@@ -30,7 +30,14 @@ from src.chi.embeddings import (
     embedding_table_from_cache,
     load_backbone_from_step1,
 )
-from src.chi.metrics import classification_metrics, hit_metrics, metrics_by_group, regression_metrics
+from src.chi.metrics import (
+    classification_metrics,
+    hit_metrics,
+    metrics_by_group,
+    polymer_balanced_nrmse,
+    polymer_r2_distribution,
+    regression_metrics,
+)
 from src.chi.model import PhysicsGuidedChiModel, SolubilityClassifier
 from src.utils.config import load_config, save_config
 from src.utils.figure_style import apply_publication_figure_style
@@ -81,6 +88,14 @@ class TrainConfig:
     tuning_patience: int
     tuning_objective: str
     tuning_cv_folds: int
+    budget_search_epochs: int
+    budget_search_patience: int
+    epoch_selection_metric: str
+    loss_weighting: str
+    loss_weight_clip_ratio: float
+    scheduler_t_max: Optional[int]
+    nrmse_std_floor: float
+    nrmse_clip: float
     timestep_for_embedding: int
     finetune_last_layers: int
     optuna_search_space: Dict[str, object]
@@ -89,7 +104,7 @@ class TrainConfig:
 class ChiDataset(Dataset):
     """Row-level chi dataset with cached polymer embeddings."""
 
-    def __init__(self, df: pd.DataFrame, embedding_table: np.ndarray):
+    def __init__(self, df: pd.DataFrame, embedding_table: np.ndarray, weights: Optional[np.ndarray] = None):
         self.df = df.reset_index(drop=True).copy()
         self.embedding_table = embedding_table.astype(np.float32)
 
@@ -99,6 +114,13 @@ class ChiDataset(Dataset):
         self.phi = torch.tensor(self.df["phi"].to_numpy(dtype=np.float32), dtype=torch.float32)
         self.chi = torch.tensor(self.df["chi"].to_numpy(dtype=np.float32), dtype=torch.float32)
         self.label = torch.tensor(self.df["water_miscible"].to_numpy(dtype=np.float32), dtype=torch.float32)
+        if weights is None:
+            weight_array = np.ones(len(self.df), dtype=np.float32)
+        else:
+            weight_array = np.asarray(weights, dtype=np.float32).reshape(-1)
+            if len(weight_array) != len(self.df):
+                raise ValueError(f"ChiDataset weights length mismatch: expected {len(self.df)}, got {len(weight_array)}")
+        self.weight = torch.tensor(weight_array, dtype=torch.float32)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -110,13 +132,14 @@ class ChiDataset(Dataset):
             "phi": self.phi[idx],
             "chi": self.chi[idx],
             "label": self.label[idx],
+            "weight": self.weight[idx],
         }
 
 
 class ChiTokenDataset(Dataset):
     """Row-level chi dataset with tokenized polymer SMILES for backbone finetuning."""
 
-    def __init__(self, df: pd.DataFrame, tokenizer):
+    def __init__(self, df: pd.DataFrame, tokenizer, weights: Optional[np.ndarray] = None):
         self.df = df.reset_index(drop=True).copy()
         encoded = tokenizer.batch_encode(self.df["SMILES"].astype(str).tolist())
         self.input_ids = torch.tensor(np.asarray(encoded["input_ids"], dtype=np.int64), dtype=torch.long)
@@ -125,6 +148,15 @@ class ChiTokenDataset(Dataset):
         self.phi = torch.tensor(self.df["phi"].to_numpy(dtype=np.float32), dtype=torch.float32)
         self.chi = torch.tensor(self.df["chi"].to_numpy(dtype=np.float32), dtype=torch.float32)
         self.label = torch.tensor(self.df["water_miscible"].to_numpy(dtype=np.float32), dtype=torch.float32)
+        if weights is None:
+            weight_array = np.ones(len(self.df), dtype=np.float32)
+        else:
+            weight_array = np.asarray(weights, dtype=np.float32).reshape(-1)
+            if len(weight_array) != len(self.df):
+                raise ValueError(
+                    f"ChiTokenDataset weights length mismatch: expected {len(self.df)}, got {len(weight_array)}"
+                )
+        self.weight = torch.tensor(weight_array, dtype=torch.float32)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -137,6 +169,7 @@ class ChiTokenDataset(Dataset):
             "phi": self.phi[idx],
             "chi": self.chi[idx],
             "label": self.label[idx],
+            "weight": self.weight[idx],
         }
 
 
@@ -285,12 +318,46 @@ def _normalize_tuning_objective(value: str) -> str:
     v = str(value).strip().lower()
     if v in {"val_r2", "r2", "maximize_val_r2"}:
         return "val_r2"
-    raise ValueError("chi_training.step4_1_regression.tuning_objective must be 'val_r2'")
+    if v in {"val_poly_nrmse", "poly_nrmse", "minimize_val_poly_nrmse"}:
+        return "val_poly_nrmse"
+    raise ValueError("chi_training.step4_1_regression.tuning_objective must be one of {'val_r2','val_poly_nrmse'}")
+
+
+def _normalize_epoch_selection_metric(value: str) -> str:
+    v = str(value).strip().lower()
+    if v in {"val_rmse", "rmse"}:
+        return "val_rmse"
+    if v in {"val_poly_nrmse", "poly_nrmse"}:
+        return "val_poly_nrmse"
+    raise ValueError(
+        "chi_training.step4_1_regression.epoch_selection_metric must be one of {'val_rmse','val_poly_nrmse'}"
+    )
+
+
+def _tuning_objective_direction(name: str) -> str:
+    normalized = _normalize_tuning_objective(name)
+    if normalized == "val_r2":
+        return "maximize"
+    if normalized == "val_poly_nrmse":
+        return "minimize"
+    raise ValueError(f"Unsupported tuning objective: {name}")
+
+
+def _metric_is_lower_better(name: str) -> bool:
+    normalized = str(name).strip().lower()
+    if normalized in {"val_rmse", "rmse", "val_poly_nrmse", "poly_nrmse"}:
+        return True
+    if normalized in {"val_r2", "r2"}:
+        return False
+    raise ValueError(f"Unsupported metric comparator for Step4_1: {name}")
 
 
 def _describe_tuning_objective(train_cfg: TrainConfig) -> str:
-    _ = train_cfg
-    return "maximize_val_r2"
+    if train_cfg.tuning_objective == "val_r2":
+        return "maximize_val_r2"
+    if train_cfg.tuning_objective == "val_poly_nrmse":
+        return "minimize_val_poly_nrmse"
+    return str(train_cfg.tuning_objective)
 
 
 def _normalize_water_soluble_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -458,6 +525,14 @@ def _default_chi_config(config: Dict) -> Dict:
         "tuning_patience": 20,
         "tuning_objective": "val_r2",
         "tuning_cv_folds": 6,
+        "budget_search_epochs": 120,
+        "budget_search_patience": 20,
+        "epoch_selection_metric": "val_rmse",
+        "loss_weighting": "uniform",
+        "loss_weight_clip_ratio": 10.0,
+        "scheduler_t_max": None,
+        "nrmse_std_floor": 0.02,
+        "nrmse_clip": 10.0,
         "embedding_batch_size": 128,
         "embedding_timestep": int(config.get("training_property", {}).get("default_timestep", 1)),
         "finetune_last_layers": int(config.get("training_property", {}).get("finetune_last_layers", 0)),
@@ -512,6 +587,14 @@ def _default_chi_config(config: Dict) -> Dict:
         "tuning_patience",
         "tuning_objective",
         "tuning_cv_folds",
+        "budget_search_epochs",
+        "budget_search_patience",
+        "epoch_selection_metric",
+        "loss_weighting",
+        "loss_weight_clip_ratio",
+        "scheduler_t_max",
+        "nrmse_std_floor",
+        "nrmse_clip",
         "finetune_last_layers",
     ]:
         out[key] = step41_cfg.get(key, chi_cfg.get(key, defaults[key]))
@@ -559,6 +642,7 @@ def build_train_config(args, config: Dict) -> TrainConfig:
     tuning_cv_folds = int(args.tuning_cv_folds if args.tuning_cv_folds is not None else chi_cfg.get("tuning_cv_folds", 6))
     if tuning_cv_folds < 2:
         raise ValueError("chi_training.tuning_cv_folds must be >= 2")
+    epoch_selection_metric = _normalize_epoch_selection_metric(chi_cfg.get("epoch_selection_metric", "val_rmse"))
     # CV-driven defaults. Users can still override holdout via:
     # chi_training.shared.split.holdout_test_ratio.
     holdout_test_ratio_raw = chi_cfg.get("holdout_test_ratio", None)
@@ -578,6 +662,30 @@ def build_train_config(args, config: Dict) -> TrainConfig:
     scheduler_min_lr = float(chi_cfg.get("scheduler_min_lr", 1.0e-6))
     if scheduler_min_lr < 0:
         raise ValueError("chi_training.scheduler_min_lr must be >= 0")
+    loss_weighting = str(chi_cfg.get("loss_weighting", "uniform")).strip().lower()
+    if loss_weighting not in {"uniform", "polymer_balanced"}:
+        raise ValueError("chi_training.step4_1_regression.loss_weighting must be one of {'uniform','polymer_balanced'}")
+    loss_weight_clip_ratio = float(chi_cfg.get("loss_weight_clip_ratio", 10.0))
+    if loss_weight_clip_ratio <= 0:
+        raise ValueError("chi_training.step4_1_regression.loss_weight_clip_ratio must be > 0")
+    budget_search_epochs = int(chi_cfg.get("budget_search_epochs", 120))
+    budget_search_patience = int(chi_cfg.get("budget_search_patience", 20))
+    if budget_search_epochs < 1:
+        raise ValueError("chi_training.step4_1_regression.budget_search_epochs must be >= 1")
+    if budget_search_patience < 0:
+        raise ValueError("chi_training.step4_1_regression.budget_search_patience must be >= 0")
+    if budget_search_patience > budget_search_epochs:
+        raise ValueError("chi_training.step4_1_regression.budget_search_patience must be <= budget_search_epochs")
+    nrmse_std_floor = float(chi_cfg.get("nrmse_std_floor", 0.02))
+    if nrmse_std_floor <= 0:
+        raise ValueError("chi_training.step4_1_regression.nrmse_std_floor must be > 0")
+    nrmse_clip = float(chi_cfg.get("nrmse_clip", 10.0))
+    if nrmse_clip <= 0:
+        raise ValueError("chi_training.step4_1_regression.nrmse_clip must be > 0")
+    scheduler_t_max_raw = chi_cfg.get("scheduler_t_max", None)
+    scheduler_t_max = int(scheduler_t_max_raw) if scheduler_t_max_raw is not None else None
+    if scheduler_t_max is not None and scheduler_t_max < 1:
+        raise ValueError("chi_training.step4_1_regression.scheduler_t_max must be >= 1 when provided")
 
     return TrainConfig(
         split_mode=split_mode,
@@ -599,6 +707,14 @@ def build_train_config(args, config: Dict) -> TrainConfig:
         tuning_patience=int(chi_cfg.get("tuning_patience", 15)),
         tuning_objective=tuning_objective,
         tuning_cv_folds=tuning_cv_folds,
+        budget_search_epochs=budget_search_epochs,
+        budget_search_patience=budget_search_patience,
+        epoch_selection_metric=epoch_selection_metric,
+        loss_weighting=loss_weighting,
+        loss_weight_clip_ratio=loss_weight_clip_ratio,
+        scheduler_t_max=scheduler_t_max,
+        nrmse_std_floor=nrmse_std_floor,
+        nrmse_clip=nrmse_clip,
         timestep_for_embedding=int(chi_cfg.get("embedding_timestep", 1)),
         finetune_last_layers=int(chi_cfg.get("finetune_last_layers", 0)),
         optuna_search_space=dict(chi_cfg.get("optuna_search_space", {})),
@@ -633,15 +749,49 @@ def _build_final_fit_split_df(split_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _compute_polymer_weights(split_df: pd.DataFrame, eps: float = 1.0e-4, clip_ratio: float = 10.0) -> np.ndarray:
+    weights = np.ones(len(split_df), dtype=np.float32)
+    train_mask = split_df["split"].to_numpy() == "train"
+    if not np.any(train_mask):
+        return weights
+
+    train_df = split_df.loc[train_mask, ["polymer_id", "chi"]].copy()
+    stats = train_df.groupby("polymer_id")["chi"].agg(["count", "var"]).reset_index()
+    stats["var"] = pd.to_numeric(stats["var"], errors="coerce").fillna(0.0)
+    stats["raw_weight"] = 1.0 / (stats["count"].astype(float) * np.sqrt(stats["var"].astype(float) + float(eps)))
+    median_weight = float(np.nanmedian(stats["raw_weight"].to_numpy(dtype=float))) if not stats.empty else np.nan
+    clip_ceiling = float(clip_ratio) * median_weight if np.isfinite(median_weight) else np.nan
+    if np.isfinite(clip_ceiling):
+        stats["clipped_weight"] = np.minimum(stats["raw_weight"].astype(float), clip_ceiling)
+    else:
+        stats["clipped_weight"] = stats["raw_weight"].astype(float)
+    mean_weight = float(np.nanmean(stats["clipped_weight"].to_numpy(dtype=float))) if not stats.empty else np.nan
+    if np.isfinite(mean_weight) and mean_weight > 0:
+        stats["final_weight"] = stats["clipped_weight"].astype(float) / mean_weight
+    else:
+        stats["final_weight"] = 1.0
+
+    train_weights = split_df.loc[train_mask, ["polymer_id"]].merge(
+        stats[["polymer_id", "final_weight"]],
+        on="polymer_id",
+        how="left",
+    )
+    weights[train_mask] = train_weights["final_weight"].fillna(1.0).to_numpy(dtype=np.float32)
+    return weights
+
+
 def make_dataloaders(
     split_df: pd.DataFrame,
     embedding_table: np.ndarray,
     batch_size: int,
+    weights: Optional[np.ndarray] = None,
     shuffle_train: bool = True,
 ) -> Dict[str, DataLoader]:
     loaders = {}
     for split in ["train", "val", "test"]:
-        ds = ChiDataset(split_df[split_df["split"] == split], embedding_table)
+        split_mask = split_df["split"] == split
+        split_weights = None if weights is None else np.asarray(weights)[split_mask.to_numpy()]
+        ds = ChiDataset(split_df[split_mask], embedding_table, weights=split_weights)
         loaders[split] = DataLoader(
             ds,
             batch_size=batch_size,
@@ -656,11 +806,14 @@ def make_token_dataloaders(
     split_df: pd.DataFrame,
     tokenizer,
     batch_size: int,
+    weights: Optional[np.ndarray] = None,
     shuffle_train: bool = True,
 ) -> Dict[str, DataLoader]:
     loaders = {}
     for split in ["train", "val", "test"]:
-        ds = ChiTokenDataset(split_df[split_df["split"] == split], tokenizer)
+        split_mask = split_df["split"] == split
+        split_weights = None if weights is None else np.asarray(weights)[split_mask.to_numpy()]
+        ds = ChiTokenDataset(split_df[split_mask], tokenizer, weights=split_weights)
         loaders[split] = DataLoader(
             ds,
             batch_size=batch_size,
@@ -690,6 +843,7 @@ def run_epoch(
         temperature = batch["temperature"].to(device)
         phi = batch["phi"].to(device)
         chi_true = batch["chi"].to(device)
+        weight = batch["weight"].to(device)
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
@@ -711,7 +865,11 @@ def run_epoch(
                 phi=phi,
             )
 
-        loss_mse = torch.nn.functional.mse_loss(out["chi_pred"], chi_true)
+        sq_error = (out["chi_pred"] - chi_true) ** 2
+        if train_mode:
+            loss_mse = torch.mean(weight * sq_error)
+        else:
+            loss_mse = torch.mean(sq_error)
         loss = loss_mse
         if train_mode:
             loss.backward()
@@ -796,6 +954,13 @@ def train_one_model(
     finetune_last_layers: int = 0,
     timestep_for_embedding: int = 1,
 ) -> Tuple[nn.Module, Dict[str, List[float]], Dict[str, Dict[str, np.ndarray]]]:
+    loss_weights = None
+    if train_cfg.loss_weighting == "polymer_balanced":
+        loss_weights = _compute_polymer_weights(
+            split_df=split_df,
+            eps=1.0e-4,
+            clip_ratio=float(train_cfg.loss_weight_clip_ratio),
+        )
     if finetune_last_layers > 0:
         if config is None:
             raise ValueError("config is required when finetune_last_layers > 0")
@@ -805,6 +970,7 @@ def train_one_model(
             split_df,
             tokenizer,
             batch_size=batch_size,
+            weights=loss_weights,
             shuffle_train=True,
         )
         _, backbone, _ = load_backbone_from_step1(
@@ -833,6 +999,7 @@ def train_one_model(
             split_df,
             embedding_table,
             batch_size=batch_size,
+            weights=loss_weights,
             shuffle_train=True,
         )
         model = PhysicsGuidedChiModel(
@@ -850,7 +1017,7 @@ def train_one_model(
     if train_cfg.use_scheduler:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=max(1, int(num_epochs)),
+            T_max=max(1, int(train_cfg.scheduler_t_max or num_epochs)),
             eta_min=float(train_cfg.scheduler_min_lr),
         )
 
@@ -864,12 +1031,22 @@ def train_one_model(
         "val_loss_mse": [],
         "val_loss_bce": [],
         "val_rmse": [],
+        "val_poly_nrmse": [],
+        "steps_per_epoch_train": [],
     }
 
     best_state = None
-    best_rmse = np.inf
+    selection_metric_name = str(train_cfg.epoch_selection_metric)
+    lower_is_better = _metric_is_lower_better(selection_metric_name)
+    best_metric = np.inf if lower_is_better else -np.inf
     wait = 0
     has_val = len(dataloaders["val"].dataset) > 0
+    val_polymer_ids = (
+        split_df.loc[split_df["split"] == "val", "polymer_id"].to_numpy()
+        if has_val
+        else np.asarray([], dtype=np.int64)
+    )
+    steps_per_epoch_train = int(len(dataloaders["train"]))
 
     for epoch in range(1, num_epochs + 1):
         train_stats = run_epoch(
@@ -890,9 +1067,17 @@ def train_one_model(
             val_pred = predict_split(model, dataloaders["val"], device)
             val_reg = regression_metrics(val_pred["chi_true"], val_pred["chi_pred"])
             val_rmse = float(val_reg["rmse"])
+            val_poly_nrmse = polymer_balanced_nrmse(
+                val_pred["chi_true"],
+                val_pred["chi_pred"],
+                val_polymer_ids,
+                std_floor=float(train_cfg.nrmse_std_floor),
+                nrmse_clip=float(train_cfg.nrmse_clip),
+            )
         else:
             val_stats = {"loss": np.nan, "loss_mse": np.nan, "loss_bce": np.nan}
             val_rmse = np.nan
+            val_poly_nrmse = np.nan
 
         history["epoch"].append(epoch)
         history["learning_rate"].append(float(optimizer.param_groups[0]["lr"]))
@@ -903,10 +1088,21 @@ def train_one_model(
         history["val_loss_mse"].append(val_stats["loss_mse"])
         history["val_loss_bce"].append(val_stats["loss_bce"])
         history["val_rmse"].append(val_rmse)
+        history["val_poly_nrmse"].append(float(val_poly_nrmse) if np.isfinite(val_poly_nrmse) else np.nan)
+        history["steps_per_epoch_train"].append(steps_per_epoch_train)
 
         if has_val:
-            if val_rmse < best_rmse:
-                best_rmse = val_rmse
+            selection_metric_value = val_rmse if selection_metric_name == "val_rmse" else val_poly_nrmse
+            improved = (
+                np.isfinite(selection_metric_value)
+                and (
+                    (lower_is_better and selection_metric_value < best_metric)
+                    or ((not lower_is_better) and selection_metric_value > best_metric)
+                )
+            )
+            if improved or best_state is None:
+                if np.isfinite(selection_metric_value):
+                    best_metric = float(selection_metric_value)
                 best_state = copy.deepcopy(model.state_dict())
                 wait = 0
             else:
@@ -1072,12 +1268,21 @@ def _evaluate_trial_with_cv(
         )
         val_pred = preds["val"]
         val_reg = regression_metrics(val_pred["chi_true"], val_pred["chi_pred"])
+        val_polymer_ids = fold_df.loc[fold_df["split"] == "val", "polymer_id"].to_numpy()
+        val_poly_nrmse = polymer_balanced_nrmse(
+            val_pred["chi_true"],
+            val_pred["chi_pred"],
+            val_polymer_ids,
+            std_floor=float(train_cfg.nrmse_std_floor),
+            nrmse_clip=float(train_cfg.nrmse_clip),
+        )
         fold_rows.append(
             {
                 "fold": fold_id,
                 "val_n": int(len(val_pred["chi_true"])),
                 "val_r2": float(val_reg["r2"]),
                 "val_rmse": float(val_reg["rmse"]),
+                "val_poly_nrmse": float(val_poly_nrmse) if np.isfinite(val_poly_nrmse) else np.nan,
             }
         )
         if collect_val_predictions:
@@ -1096,10 +1301,12 @@ def _evaluate_trial_with_cv(
     fold_metrics_df = pd.DataFrame(fold_rows)
     mean_r2 = float(np.nanmean(fold_metrics_df["val_r2"])) if not fold_metrics_df.empty else np.nan
     mean_rmse = float(np.nanmean(fold_metrics_df["val_rmse"])) if not fold_metrics_df.empty else np.nan
+    mean_poly_nrmse = float(np.nanmean(fold_metrics_df["val_poly_nrmse"])) if not fold_metrics_df.empty else np.nan
     cv_val_df = pd.concat(cv_val_frames, ignore_index=True) if cv_val_frames else pd.DataFrame()
     return {
         "cv_val_r2": mean_r2,
         "cv_val_rmse": mean_rmse,
+        "cv_val_poly_nrmse": mean_poly_nrmse,
         "fold_metrics": fold_metrics_df,
         "cv_val_predictions": cv_val_df,
     }
@@ -1370,8 +1577,8 @@ def run_regression_cv_with_best_hyperparameters(
             learning_rate=learning_rate,
             weight_decay=weight_decay,
             batch_size=batch_size,
-            num_epochs=train_cfg.num_epochs,
-            patience=train_cfg.patience,
+            num_epochs=train_cfg.budget_search_epochs,
+            patience=train_cfg.budget_search_patience,
             config=config,
             model_size=model_size,
             backbone_checkpoint=backbone_checkpoint,
@@ -1428,6 +1635,15 @@ def run_regression_cv_with_best_hyperparameters(
                 "n_rows": int(len(sub)),
             }
             row.update(regression_metrics(chi_true, chi_pred))
+            poly_nrmse = polymer_balanced_nrmse(
+                chi_true,
+                chi_pred,
+                sub["polymer_id"].to_numpy(),
+                std_floor=float(train_cfg.nrmse_std_floor),
+                nrmse_clip=float(train_cfg.nrmse_clip),
+            )
+            row["poly_nrmse"] = float(poly_nrmse) if np.isfinite(poly_nrmse) else np.nan
+            row["val_poly_nrmse"] = row["poly_nrmse"] if raw_split == "val" else np.nan
             row.update(hit_metrics(chi_pred - chi_true, epsilons=[0.02, 0.05, 0.1, 0.2]))
             fold_metric_rows.append(row)
 
@@ -1435,7 +1651,7 @@ def run_regression_cv_with_best_hyperparameters(
     fold_metrics_df.to_csv(metrics_dir / "cv_fold_metrics.csv", index=False)
     cv_summary_df = _summarize_cv_fold_metrics(
         fold_metrics_df=fold_metrics_df,
-        metric_cols=["mae", "rmse", "r2"],
+        metric_cols=["mae", "rmse", "nrmse", "r2", "poly_nrmse", "val_poly_nrmse"],
     )
     cv_summary_df.to_csv(metrics_dir / "cv_metrics_summary.csv", index=False)
 
@@ -1451,14 +1667,14 @@ def run_regression_cv_with_best_hyperparameters(
     cv_pred_df.to_csv(metrics_dir / "cv_predictions_all.csv", index=False)
     for split in ["train", "test"]:
         if cv_pred_df.empty or "cv_split" not in cv_pred_df.columns:
-            split_df = pd.DataFrame()
+            split_pred_df = pd.DataFrame()
         else:
-            split_df = cv_pred_df[cv_pred_df["cv_split"] == split].copy()
-        split_df.to_csv(metrics_dir / f"cv_predictions_{split}.csv", index=False)
-        if not split_df.empty:
+            split_pred_df = cv_pred_df[cv_pred_df["cv_split"] == split].copy()
+        split_pred_df.to_csv(metrics_dir / f"cv_predictions_{split}.csv", index=False)
+        if not split_pred_df.empty:
             if split == "train":
                 _save_cv_parity_by_fold_figure(
-                    cv_val_df=split_df,
+                    cv_val_df=split_pred_df,
                     out_png=figures_dir / "cv_parity_train_by_fold.png",
                     dpi=dpi,
                     font_size=font_size,
@@ -1466,12 +1682,66 @@ def run_regression_cv_with_best_hyperparameters(
                 )
             else:
                 _save_cv_parity_by_fold_figure(
-                    cv_val_df=split_df,
+                    cv_val_df=split_pred_df,
                     out_png=figures_dir / "cv_parity_test_by_fold.png",
                     dpi=dpi,
                     font_size=font_size,
                     split_label="test",
                 )
+
+    best_epoch_rows: List[Dict[str, object]] = []
+    selection_metric = str(train_cfg.epoch_selection_metric)
+    lower_is_better = _metric_is_lower_better(selection_metric)
+    best_steps: List[int] = []
+    for fold_id, fold_hist in enumerate(fold_history_frames, start=1):
+        metric_series = pd.to_numeric(fold_hist.get(selection_metric, pd.Series(dtype=float)), errors="coerce")
+        finite_mask = np.isfinite(metric_series.to_numpy(dtype=float))
+        if finite_mask.any():
+            metric_subset = metric_series[finite_mask]
+            best_idx = metric_subset.idxmin() if lower_is_better else metric_subset.idxmax()
+        else:
+            best_idx = fold_hist.index[-1]
+        best_row = fold_hist.loc[best_idx]
+        best_epoch = int(best_row["epoch"])
+        steps_per_epoch_train = int(best_row.get("steps_per_epoch_train", 0))
+        if steps_per_epoch_train <= 0:
+            steps_per_epoch_train = 1
+        best_step = max(1, int(best_epoch * steps_per_epoch_train))
+        best_steps.append(best_step)
+        best_epoch_rows.append(
+            {
+                "fold": int(fold_id),
+                "best_epoch": best_epoch,
+                "steps_per_epoch_train": steps_per_epoch_train,
+                "best_step": best_step,
+                "n_train_rows": int((cv_folds[fold_id - 1]["split"] == "train").sum()),
+                "batch_size": int(batch_size),
+                "metric_used": selection_metric,
+                "metric_value": float(best_row.get(selection_metric, np.nan)),
+            }
+        )
+    best_epoch_df = pd.DataFrame(best_epoch_rows)
+    best_epoch_df.to_csv(metrics_dir / "cv_best_epochs_by_fold.csv", index=False)
+
+    final_fit_df = _build_final_fit_split_df(split_df)
+    if finetune_last_layers > 0:
+        final_train_loaders = make_token_dataloaders(
+            final_fit_df,
+            tokenizer,
+            batch_size=batch_size,
+            shuffle_train=False,
+        )
+    else:
+        final_train_loaders = make_dataloaders(
+            final_fit_df,
+            embedding_table,
+            batch_size=batch_size,
+            shuffle_train=False,
+        )
+    steps_per_epoch_final = max(1, int(len(final_train_loaders["train"])))
+    target_steps = max(1, int(np.median(best_steps))) if best_steps else 1
+    derived_final_epochs = int(np.ceil(target_steps / float(steps_per_epoch_final)))
+    derived_final_epochs = int(np.clip(derived_final_epochs, 1, int(train_cfg.num_epochs)))
 
     summary_by_split = _cv_summary_table_to_dict(cv_summary_df)
     run_summary = {
@@ -1480,8 +1750,12 @@ def run_regression_cv_with_best_hyperparameters(
         "strategy": str(cv_info.get("strategy", "unknown")),
         "dev_rows": int(cv_info.get("dev_rows", 0)),
         "dev_units": int(cv_info.get("dev_units", 0)),
-        "num_epochs": int(train_cfg.num_epochs),
-        "patience": int(train_cfg.patience),
+        "budget_search_epochs": int(train_cfg.budget_search_epochs),
+        "budget_search_patience": int(train_cfg.budget_search_patience),
+        "epoch_selection_metric": selection_metric,
+        "final_training_derived_steps": int(target_steps),
+        "final_training_derived_epochs": int(derived_final_epochs),
+        "steps_per_epoch_final": int(steps_per_epoch_final),
         "summary_by_split": summary_by_split,
     }
     with open(metrics_dir / "cv_run_summary.json", "w") as f:
@@ -1736,7 +2010,7 @@ def tune_hyperparameters(
     _summarize_tuning_cv_folds(cv_folds).to_csv(tuning_dir / "optuna_tuning_cv_folds.csv", index=False)
 
     objective_name = train_cfg.tuning_objective
-    objective_direction = "maximize"
+    objective_direction = _tuning_objective_direction(objective_name)
 
     def objective(trial: optuna.Trial) -> float:
         if len(num_layers_space) == 2:
@@ -1783,17 +2057,24 @@ def tune_hyperparameters(
         )
         val_r2 = float(cv_eval["cv_val_r2"])
         val_rmse = float(cv_eval["cv_val_rmse"])
-        invalid_metrics = int((not np.isfinite(val_r2)) or (not np.isfinite(val_rmse)))
+        val_poly_nrmse = float(cv_eval["cv_val_poly_nrmse"])
+        if objective_name == "val_poly_nrmse":
+            objective_value = val_poly_nrmse
+        else:
+            objective_value = val_r2
+        invalid_metrics = int(not np.isfinite(objective_value))
         trial.set_user_attr("val_r2", val_r2)
         trial.set_user_attr("val_rmse", val_rmse)
+        trial.set_user_attr("val_poly_nrmse", val_poly_nrmse)
         trial.set_user_attr("cv_val_r2", val_r2)
         trial.set_user_attr("cv_val_rmse", val_rmse)
+        trial.set_user_attr("cv_val_poly_nrmse", val_poly_nrmse)
         trial.set_user_attr("cv_n_folds", int(len(cv_folds)))
         trial.set_user_attr("tuning_objective", objective_name)
         trial.set_user_attr("invalid_metrics", invalid_metrics)
         if invalid_metrics:
-            return -1.0e12
-        return val_r2
+            return 1.0e12 if objective_direction == "minimize" else -1.0e12
+        return float(objective_value)
 
     study = optuna.create_study(direction=objective_direction)
     study.optimize(objective, n_trials=train_cfg.n_trials, show_progress_bar=True)
@@ -1802,6 +2083,7 @@ def tune_hyperparameters(
     for t in study.trials:
         val_r2 = t.user_attrs.get("cv_val_r2", t.user_attrs.get("val_r2", np.nan))
         val_rmse = t.user_attrs.get("cv_val_rmse", t.user_attrs.get("val_rmse", np.nan))
+        val_poly_nrmse = t.user_attrs.get("cv_val_poly_nrmse", t.user_attrs.get("val_poly_nrmse", np.nan))
         row = {
             "trial": t.number,
             "state": str(t.state),
@@ -1811,6 +2093,7 @@ def tune_hyperparameters(
             "value_val_r2": val_r2,
             "val_r2": val_r2,
             "val_rmse": val_rmse,
+            "val_poly_nrmse": val_poly_nrmse,
             "invalid_metrics": int(t.user_attrs.get("invalid_metrics", 0)),
             "cv_n_folds": int(t.user_attrs.get("cv_n_folds", len(cv_folds))),
         }
@@ -1827,6 +2110,10 @@ def tune_hyperparameters(
         trial_df["chi_val_rmse"] = trial_df["val_rmse"]
     else:
         trial_df["chi_val_rmse"] = np.nan
+    if "val_poly_nrmse" in trial_df.columns:
+        trial_df["chi_val_poly_nrmse"] = trial_df["val_poly_nrmse"]
+    else:
+        trial_df["chi_val_poly_nrmse"] = np.nan
 
     # Running best R2 over completed trials (higher is better).
     chi_r2_numeric = pd.to_numeric(trial_df["chi_val_r2"], errors="coerce")
@@ -1892,20 +2179,30 @@ def tune_hyperparameters(
     best_chi_val_r2_values = pd.to_numeric(trial_df["best_chi_val_r2_so_far"], errors="coerce").to_numpy()
     objective_values = pd.to_numeric(trial_df["objective_value"], errors="coerce").to_numpy()
     best_objective_values = pd.to_numeric(trial_df["best_objective_so_far"], errors="coerce").to_numpy()
+    if objective_name == "val_r2":
+        chi_r2_plot_label = "Trial chi R2"
+        best_chi_r2_plot_label = "Best chi R2 so far"
+        chi_r2_ylabel = "Validation chi R2"
+        chi_r2_title = "Optuna optimization process based on chi R2"
+    else:
+        chi_r2_plot_label = "Trial chi R2 (auxiliary)"
+        best_chi_r2_plot_label = "Best chi R2 so far (auxiliary)"
+        chi_r2_ylabel = "Validation chi R2 (auxiliary)"
+        chi_r2_title = "Auxiliary validation chi R2 during Optuna"
 
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(trial_numbers, chi_val_r2_values, "o", color="#1f77b4", label="Trial chi R2", alpha=0.85)
+    ax.plot(trial_numbers, chi_val_r2_values, "o", color="#1f77b4", label=chi_r2_plot_label, alpha=0.85)
     ax.plot(
         trial_numbers,
         best_chi_val_r2_values,
         "-",
         color="#d62728",
         linewidth=2,
-        label="Best chi R2 so far",
+        label=best_chi_r2_plot_label,
     )
     ax.set_xlabel("Optuna trial")
-    ax.set_ylabel("Validation chi R2")
-    ax.set_title("Optuna optimization process based on chi R2")
+    ax.set_ylabel(chi_r2_ylabel)
+    ax.set_title(chi_r2_title)
     ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(tuning_dir / "optuna_optimization_chi_r2.png", dpi=dpi)
@@ -1940,6 +2237,7 @@ def tune_hyperparameters(
                 "objective_direction": objective_direction,
                 "objective_value_at_best_trial": float(study.best_value),
                 "best_value_r2": float(study.best_trial.user_attrs.get("cv_val_r2", np.nan)),
+                "best_value_poly_nrmse_at_best_trial": float(study.best_trial.user_attrs.get("cv_val_poly_nrmse", np.nan)),
                 "best_value_rmse_at_best_trial": float(study.best_trial.user_attrs.get("cv_val_rmse", np.nan)),
                 "tuning_cv_folds_requested": int(train_cfg.tuning_cv_folds),
                 "tuning_cv_folds_resolved": int(cv_info.get("resolved_folds", len(cv_folds))),
@@ -2187,6 +2485,8 @@ def _collect_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
     rows = []
     class_rows = []
     polymer_rows = []
+    polymer_r2_rows = []
+    low_chi_rows = []
 
     for split, sub in pred_df.groupby("split"):
         reg = regression_metrics(sub["chi"], sub["chi_pred"])
@@ -2218,9 +2518,44 @@ def _collect_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
         poly_row.update(poly_metric)
         polymer_rows.append(poly_row)
 
+        for class_value, class_sub in sub.groupby("water_miscible", sort=True):
+            dist_row = {
+                "split": split,
+                "water_miscible": int(class_value),
+                "class_label": _class_display_label(class_value),
+            }
+            dist_row.update(
+                polymer_r2_distribution(
+                    y_true=class_sub["chi"],
+                    y_pred=class_sub["chi_pred"],
+                    polymer_ids=class_sub["polymer_id"],
+                )
+            )
+            polymer_r2_rows.append(dist_row)
+
+    test_df = pred_df[pred_df["split"] == "test"].copy()
+    if not test_df.empty:
+        for quantile in [0.10, 0.25, 0.50, 0.75]:
+            chi_cutoff = float(test_df["chi"].quantile(quantile))
+            sub = test_df[test_df["chi"] <= chi_cutoff].copy()
+            if sub.empty:
+                continue
+            reg = regression_metrics(sub["chi"], sub["chi_pred"])
+            low_row = {
+                "split": "test",
+                "subset": f"bottom_{int(round(quantile * 100)):02d}pct",
+                "quantile": float(quantile),
+                "chi_threshold": chi_cutoff,
+                "rank_correlation": reg.get("spearman_r", np.nan),
+            }
+            low_row.update(reg)
+            low_chi_rows.append(low_row)
+
     pd.DataFrame(rows).to_csv(out_dir / "chi_metrics_overall.csv", index=False)
     pd.concat(class_rows, ignore_index=True).to_csv(out_dir / "chi_metrics_by_class.csv", index=False)
     pd.DataFrame(polymer_rows).to_csv(out_dir / "chi_metrics_polymer_level.csv", index=False)
+    pd.DataFrame(polymer_r2_rows).to_csv(out_dir / "chi_metrics_polymer_r2_distribution.csv", index=False)
+    pd.DataFrame(low_chi_rows).to_csv(out_dir / "chi_metrics_low_chi_quantiles.csv", index=False)
 
 
 
@@ -3140,6 +3475,8 @@ def _collect_regression_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
     rows = []
     class_rows = []
     polymer_rows = []
+    polymer_r2_rows = []
+    low_chi_rows = []
     for split, sub in pred_df.groupby("split"):
         reg = regression_metrics(sub["chi"], sub["chi_pred"])
         hit = hit_metrics(sub["chi_error"], epsilons=[0.02, 0.05, 0.1, 0.2])
@@ -3167,9 +3504,44 @@ def _collect_regression_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
         poly_row.update(poly_metric)
         polymer_rows.append(poly_row)
 
+        for class_value, class_sub in sub.groupby("water_miscible", sort=True):
+            dist_row = {
+                "split": split,
+                "water_miscible": int(class_value),
+                "class_label": _class_display_label(class_value),
+            }
+            dist_row.update(
+                polymer_r2_distribution(
+                    y_true=class_sub["chi"],
+                    y_pred=class_sub["chi_pred"],
+                    polymer_ids=class_sub["polymer_id"],
+                )
+            )
+            polymer_r2_rows.append(dist_row)
+
+    test_df = pred_df[pred_df["split"] == "test"].copy()
+    if not test_df.empty:
+        for quantile in [0.10, 0.25, 0.50, 0.75]:
+            chi_cutoff = float(test_df["chi"].quantile(quantile))
+            sub = test_df[test_df["chi"] <= chi_cutoff].copy()
+            if sub.empty:
+                continue
+            reg = regression_metrics(sub["chi"], sub["chi_pred"])
+            low_row = {
+                "split": "test",
+                "subset": f"bottom_{int(round(quantile * 100)):02d}pct",
+                "quantile": float(quantile),
+                "chi_threshold": chi_cutoff,
+                "rank_correlation": reg.get("spearman_r", np.nan),
+            }
+            low_row.update(reg)
+            low_chi_rows.append(low_row)
+
     pd.DataFrame(rows).to_csv(out_dir / "chi_metrics_overall.csv", index=False)
     pd.concat(class_rows, ignore_index=True).to_csv(out_dir / "chi_metrics_by_class.csv", index=False)
     pd.DataFrame(polymer_rows).to_csv(out_dir / "chi_metrics_polymer_level.csv", index=False)
+    pd.DataFrame(polymer_r2_rows).to_csv(out_dir / "chi_metrics_polymer_r2_distribution.csv", index=False)
+    pd.DataFrame(low_chi_rows).to_csv(out_dir / "chi_metrics_low_chi_quantiles.csv", index=False)
 
 
 def _make_regression_figures(
@@ -3565,6 +3937,13 @@ def main(args):
             "n_trials": train_cfg.n_trials,
             "tuning_objective": train_cfg.tuning_objective,
             "tuning_cv_folds": train_cfg.tuning_cv_folds,
+            "budget_search_epochs": train_cfg.budget_search_epochs,
+            "budget_search_patience": train_cfg.budget_search_patience,
+            "epoch_selection_metric": train_cfg.epoch_selection_metric,
+            "loss_weighting": train_cfg.loss_weighting,
+            "loss_weight_clip_ratio": train_cfg.loss_weight_clip_ratio,
+            "nrmse_std_floor": train_cfg.nrmse_std_floor,
+            "nrmse_clip": train_cfg.nrmse_clip,
             "gradient_clip_norm": train_cfg.gradient_clip_norm,
             "use_scheduler": train_cfg.use_scheduler,
             "scheduler_min_lr": train_cfg.scheduler_min_lr,
@@ -3710,14 +4089,13 @@ def main(args):
         if reg_embedding_table is None:
             raise RuntimeError("Regression embedding table was not prepared.")
         reg_cfg = copy.deepcopy(train_cfg)
-        reg_cfg.tuning_objective = "val_r2"
         reg_cfg.tune = bool(args.tune or (bool(reg_cfg.tune) and not args.no_tune))
         if args.n_trials is not None:
             reg_cfg.n_trials = int(args.n_trials)
         if args.tuning_cv_folds is not None:
             reg_cfg.tuning_cv_folds = int(args.tuning_cv_folds)
         if args.tuning_objective is not None:
-            reg_cfg.tuning_objective = str(args.tuning_objective)
+            reg_cfg.tuning_objective = _normalize_tuning_objective(args.tuning_objective)
 
         reg_finetune_last_layers = int(reg_cfg.finetune_last_layers)
         reg_use_backbone_finetune = bool(reg_finetune_last_layers > 0)
@@ -3729,6 +4107,46 @@ def main(args):
                 checkpoint_path=args.backbone_checkpoint,
                 device="cpu",
             )
+        write_initial_log(
+            step_dir=reg_dir,
+            step_name="step4_1_regression",
+            context={
+                "config_path": args.config,
+                "model_size": args.model_size,
+                "stage": args.stage,
+                "results_dir": str(results_dir),
+                "stage_output_dir": str(reg_dir),
+                "split_mode": reg_split_mode,
+                "regression_split_mode": reg_split_mode,
+                "backbone_artifact_split_mode": backbone_split_mode,
+                "holdout_test_ratio": float(reg_cfg.holdout_test_ratio),
+                "resolved_train_ratio": float(split_ratios["train_ratio"]),
+                "resolved_val_ratio": float(split_ratios["val_ratio"]),
+                "resolved_test_ratio": float(split_ratios["test_ratio"]),
+                "final_fit_uses_train_plus_val": True,
+                "dataset_path": str(reg_csv),
+                "step4_1_dataset_path": str(reg_csv),
+                "tune": bool(reg_cfg.tune),
+                "n_trials": int(reg_cfg.n_trials),
+                "tuning_objective": reg_cfg.tuning_objective,
+                "tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
+                "budget_search_epochs": int(reg_cfg.budget_search_epochs),
+                "budget_search_patience": int(reg_cfg.budget_search_patience),
+                "epoch_selection_metric": reg_cfg.epoch_selection_metric,
+                "loss_weighting": reg_cfg.loss_weighting,
+                "loss_weight_clip_ratio": float(reg_cfg.loss_weight_clip_ratio),
+                "nrmse_std_floor": float(reg_cfg.nrmse_std_floor),
+                "nrmse_clip": float(reg_cfg.nrmse_clip),
+                "gradient_clip_norm": float(reg_cfg.gradient_clip_norm),
+                "use_scheduler": bool(reg_cfg.use_scheduler),
+                "scheduler_min_lr": float(reg_cfg.scheduler_min_lr),
+                "scheduler_t_max": reg_cfg.scheduler_t_max,
+                "backbone_num_layers": int(backbone_num_layers),
+                "finetune_last_layers": int(reg_cfg.finetune_last_layers),
+                "step4_1_dir": str(reg_dir),
+                "random_seed": int(reg_cfg.seed),
+            },
+        )
 
         if reg_cfg.tune:
             print("Running Optuna for Step4_1 (regression)...")
@@ -3775,31 +4193,36 @@ def main(args):
                 f"chosen regression finetune_last_layers must be in [0, {backbone_num_layers}], got {reg_finetune_last_layers}"
             )
         reg_use_backbone_finetune = bool(reg_finetune_last_layers > 0)
-        if reg_cfg.tune:
-            print("Running Step4_1 CV retraining with selected hyperparameters...")
-            reg_post_optuna_cv_summary = run_regression_cv_with_best_hyperparameters(
-                split_df=reg_split_df,
-                embedding_table=reg_embedding_table,
-                train_cfg=reg_cfg,
-                config=config,
-                model_size=args.model_size,
-                backbone_checkpoint=args.backbone_checkpoint,
-                tokenizer=tokenizer_for_training,
-                device=device,
-                hidden_sizes=reg_chosen["hidden_sizes"],
-                dropout=reg_chosen["dropout"],
-                learning_rate=reg_chosen["learning_rate"],
-                weight_decay=reg_chosen["weight_decay"],
-                batch_size=reg_chosen["batch_size"],
-                finetune_last_layers=reg_finetune_last_layers,
-                metrics_dir=reg_metrics_dir / "cv_best_params",
-                figures_dir=reg_figures_dir / "cv_best_params",
-                dpi=dpi,
-                font_size=font_size,
-            )
+        print("Running Step4_1 CV budget search with selected hyperparameters...")
+        reg_post_optuna_cv_summary = run_regression_cv_with_best_hyperparameters(
+            split_df=reg_split_df,
+            embedding_table=reg_embedding_table,
+            train_cfg=reg_cfg,
+            config=config,
+            model_size=args.model_size,
+            backbone_checkpoint=args.backbone_checkpoint,
+            tokenizer=tokenizer_for_training,
+            device=device,
+            hidden_sizes=reg_chosen["hidden_sizes"],
+            dropout=reg_chosen["dropout"],
+            learning_rate=reg_chosen["learning_rate"],
+            weight_decay=reg_chosen["weight_decay"],
+            batch_size=reg_chosen["batch_size"],
+            finetune_last_layers=reg_finetune_last_layers,
+            metrics_dir=reg_metrics_dir / "cv_best_params",
+            figures_dir=reg_figures_dir / "cv_best_params",
+            dpi=dpi,
+            font_size=font_size,
+        )
         reg_final_fit_df = _build_final_fit_split_df(reg_split_df)
         reg_final_train_rows = int((reg_final_fit_df["split"] == "train").sum())
         reg_final_test_rows = int((reg_final_fit_df["split"] == "test").sum())
+        reg_final_num_epochs = int(reg_cfg.num_epochs)
+        if isinstance(reg_post_optuna_cv_summary, dict):
+            reg_final_num_epochs = int(reg_post_optuna_cv_summary.get("final_training_derived_epochs", reg_final_num_epochs))
+        reg_final_num_epochs = int(np.clip(reg_final_num_epochs, 1, int(reg_cfg.num_epochs)))
+        reg_final_cfg = copy.deepcopy(reg_cfg)
+        reg_final_cfg.scheduler_t_max = int(reg_cfg.num_epochs)
 
         with open(reg_metrics_dir / "chosen_hyperparameters.json", "w") as f:
             json.dump(reg_chosen, f, indent=2)
@@ -3808,15 +4231,35 @@ def main(args):
                 {
                     "used_optuna": bool(reg_cfg.tune),
                     "optuna_objective": _describe_tuning_objective(reg_cfg),
-                    "tuning_objective": "val_r2",
+                    "tuning_objective": reg_cfg.tuning_objective,
                     "tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
+                    "epoch_selection_metric": reg_cfg.epoch_selection_metric,
                     "optuna_best_params": reg_best_params,
                     "backbone_num_layers": int(backbone_num_layers),
                     "finetune_last_layers": int(reg_finetune_last_layers),
                     "backbone_finetune_enabled": bool(reg_use_backbone_finetune),
                     "final_training_hyperparameters": reg_chosen,
-                    "final_training_num_epochs": int(reg_cfg.num_epochs),
+                    "loss_weighting": reg_cfg.loss_weighting,
+                    "loss_weight_clip_ratio": float(reg_cfg.loss_weight_clip_ratio),
+                    "nrmse_std_floor": float(reg_cfg.nrmse_std_floor),
+                    "nrmse_clip": float(reg_cfg.nrmse_clip),
+                    "budget_search_epochs": int(reg_cfg.budget_search_epochs),
+                    "budget_search_patience": int(reg_cfg.budget_search_patience),
+                    "final_training_num_epochs": int(reg_final_num_epochs),
                     "final_training_patience": int(reg_cfg.patience),
+                    "final_training_scheduler_t_max": int(reg_final_cfg.scheduler_t_max),
+                    "final_training_derived_steps": (
+                        int(reg_post_optuna_cv_summary.get("final_training_derived_steps"))
+                        if isinstance(reg_post_optuna_cv_summary, dict)
+                        and reg_post_optuna_cv_summary.get("final_training_derived_steps") is not None
+                        else None
+                    ),
+                    "final_training_derived_epochs": (
+                        int(reg_post_optuna_cv_summary.get("final_training_derived_epochs"))
+                        if isinstance(reg_post_optuna_cv_summary, dict)
+                        and reg_post_optuna_cv_summary.get("final_training_derived_epochs") is not None
+                        else None
+                    ),
                     "final_fit_uses_train_plus_val": True,
                     "final_fit_train_rows": reg_final_train_rows,
                     "final_fit_test_rows": reg_final_test_rows,
@@ -3829,21 +4272,21 @@ def main(args):
         reg_model, reg_history, reg_predictions = train_one_model(
             split_df=reg_final_fit_df,
             embedding_table=reg_embedding_table,
-            train_cfg=reg_cfg,
+            train_cfg=reg_final_cfg,
             device=device,
             hidden_sizes=reg_chosen["hidden_sizes"],
             dropout=reg_chosen["dropout"],
             learning_rate=reg_chosen["learning_rate"],
             weight_decay=reg_chosen["weight_decay"],
             batch_size=reg_chosen["batch_size"],
-            num_epochs=reg_cfg.num_epochs,
+            num_epochs=reg_final_num_epochs,
             patience=reg_cfg.patience,
             config=config,
             model_size=args.model_size,
             backbone_checkpoint=args.backbone_checkpoint,
             tokenizer=tokenizer_for_training,
             finetune_last_layers=reg_finetune_last_layers,
-            timestep_for_embedding=reg_cfg.timestep_for_embedding,
+            timestep_for_embedding=reg_final_cfg.timestep_for_embedding,
         )
 
         reg_checkpoint = {
@@ -3858,6 +4301,14 @@ def main(args):
             "optuna_best_params": reg_best_params,
             "split_mode": reg_cfg.split_mode,
             "timestep_for_embedding": reg_cfg.timestep_for_embedding,
+            "loss_weighting": reg_cfg.loss_weighting,
+            "loss_weight_clip_ratio": float(reg_cfg.loss_weight_clip_ratio),
+            "tuning_objective": reg_cfg.tuning_objective,
+            "epoch_selection_metric": reg_cfg.epoch_selection_metric,
+            "scheduler_t_max": reg_final_cfg.scheduler_t_max,
+            "nrmse_std_floor": float(reg_cfg.nrmse_std_floor),
+            "nrmse_clip": float(reg_cfg.nrmse_clip),
+            "num_epochs_trained": int(reg_final_num_epochs),
             "backbone_num_layers": int(backbone_num_layers),
             "finetune_last_layers": int(reg_finetune_last_layers),
             "backbone_finetune_enabled": bool(reg_use_backbone_finetune),
@@ -4099,8 +4550,8 @@ def main(args):
 
     hp_summary: Dict[str, object] = {
         "stage": args.stage,
-        "used_optuna": bool(train_cfg.tune),
-        "tuning_cv_folds": int(train_cfg.tuning_cv_folds),
+        "used_optuna": bool(reg_cfg.tune) if reg_chosen is not None else bool(train_cfg.tune),
+        "tuning_cv_folds": int(reg_cfg.tuning_cv_folds) if reg_chosen is not None else int(train_cfg.tuning_cv_folds),
         "holdout_test_ratio": float(train_cfg.holdout_test_ratio),
         "resolved_train_ratio": float(split_ratios["train_ratio"]),
         "resolved_val_ratio": float(split_ratios["val_ratio"]),
@@ -4109,9 +4560,16 @@ def main(args):
     }
     if reg_chosen is not None:
         hp_summary["step4_1_regression"] = {
-            "objective": "maximize_val_r2",
+            "objective": _describe_tuning_objective(reg_cfg),
             "optuna_best_params": reg_best_params,
             "final_training_hyperparameters": reg_chosen,
+            "loss_weighting": reg_cfg.loss_weighting,
+            "loss_weight_clip_ratio": float(reg_cfg.loss_weight_clip_ratio),
+            "budget_search_epochs": int(reg_cfg.budget_search_epochs),
+            "budget_search_patience": int(reg_cfg.budget_search_patience),
+            "epoch_selection_metric": reg_cfg.epoch_selection_metric,
+            "nrmse_std_floor": float(reg_cfg.nrmse_std_floor),
+            "nrmse_clip": float(reg_cfg.nrmse_clip),
             "post_optuna_cv_retrain": reg_post_optuna_cv_summary,
         }
     if cls_chosen is not None:
@@ -4280,7 +4738,7 @@ if __name__ == "__main__":
         "--tuning_objective",
         type=str,
         default=None,
-        choices=["val_r2"],
+        choices=["val_r2", "val_poly_nrmse"],
         help="Regression Optuna objective for Step4_1 (Step4_2 always tunes balanced_accuracy)",
     )
     parser.add_argument(

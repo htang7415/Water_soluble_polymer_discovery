@@ -56,6 +56,7 @@ def regression_metrics(y_true: Iterable[float], y_pred: Iterable[float], prefix:
             f"{prefix}n": 0,
             f"{prefix}mae": np.nan,
             f"{prefix}rmse": np.nan,
+            f"{prefix}nrmse": np.nan,
             f"{prefix}mse": np.nan,
             f"{prefix}r2": np.nan,
             f"{prefix}mape_pct": np.nan,
@@ -74,6 +75,8 @@ def regression_metrics(y_true: Iterable[float], y_pred: Iterable[float], prefix:
 
     mse = mean_squared_error(y_true, y_pred)
     rmse = np.sqrt(mse)
+    std_true = float(np.std(y_true))
+    nrmse = (rmse / std_true) if std_true > 0 else np.nan
     mae = mean_absolute_error(y_true, y_pred)
     r2 = r2_score(y_true, y_pred) if len(y_true) > 1 else np.nan
 
@@ -100,6 +103,7 @@ def regression_metrics(y_true: Iterable[float], y_pred: Iterable[float], prefix:
         f"{prefix}n": int(len(y_true)),
         f"{prefix}mae": _safe_float(mae),
         f"{prefix}rmse": _safe_float(rmse),
+        f"{prefix}nrmse": _safe_float(nrmse),
         f"{prefix}mse": _safe_float(mse),
         f"{prefix}r2": _safe_float(r2),
         f"{prefix}mape_pct": _safe_float(mape_pct),
@@ -113,6 +117,111 @@ def regression_metrics(y_true: Iterable[float], y_pred: Iterable[float], prefix:
         f"{prefix}calib_intercept": _safe_float(intercept),
     }
 
+
+
+def polymer_balanced_nrmse(
+    y_true: Iterable[float],
+    y_pred: Iterable[float],
+    polymer_ids: Iterable[object],
+    std_floor: float = 0.02,
+    nrmse_clip: float = 10.0,
+) -> float:
+    y_true_arr = np.asarray(list(y_true), dtype=float)
+    y_pred_arr = np.asarray(list(y_pred), dtype=float)
+    polymer_arr = np.asarray(list(polymer_ids))
+
+    if not (len(y_true_arr) == len(y_pred_arr) == len(polymer_arr)):
+        raise ValueError("polymer_balanced_nrmse expects y_true, y_pred, and polymer_ids to have matching lengths")
+    if len(y_true_arr) == 0:
+        return np.nan
+
+    finite_mask = np.isfinite(y_true_arr) & np.isfinite(y_pred_arr) & ~pd.isna(polymer_arr)
+    if not np.any(finite_mask):
+        return np.nan
+
+    df = pd.DataFrame(
+        {
+            "polymer_id": polymer_arr[finite_mask],
+            "y_true": y_true_arr[finite_mask],
+            "y_pred": y_pred_arr[finite_mask],
+        }
+    )
+
+    per_polymer_scores: List[float] = []
+    std_floor = float(std_floor)
+    nrmse_clip = float(nrmse_clip)
+    for _, sub in df.groupby("polymer_id", sort=False):
+        y_true_poly = sub["y_true"].to_numpy(dtype=float)
+        y_pred_poly = sub["y_pred"].to_numpy(dtype=float)
+        rmse_poly = float(np.sqrt(mean_squared_error(y_true_poly, y_pred_poly)))
+        std_poly = float(np.std(y_true_poly)) if len(y_true_poly) >= 2 else 0.0
+        denom = max(std_poly, std_floor)
+        score = rmse_poly / denom if denom > 0 else np.nan
+        if np.isfinite(score):
+            per_polymer_scores.append(float(np.clip(score, 0.0, nrmse_clip)))
+
+    if not per_polymer_scores:
+        return np.nan
+    return _safe_float(np.mean(per_polymer_scores))
+
+
+def polymer_r2_distribution(
+    y_true: Iterable[float],
+    y_pred: Iterable[float],
+    polymer_ids: Iterable[object],
+    prefix: str = "",
+) -> Dict[str, float]:
+    y_true_arr = np.asarray(list(y_true), dtype=float)
+    y_pred_arr = np.asarray(list(y_pred), dtype=float)
+    polymer_arr = np.asarray(list(polymer_ids))
+
+    if not (len(y_true_arr) == len(y_pred_arr) == len(polymer_arr)):
+        raise ValueError("polymer_r2_distribution expects y_true, y_pred, and polymer_ids to have matching lengths")
+
+    empty_result = {
+        f"{prefix}n_polymers": 0,
+        f"{prefix}n_valid_polymer_r2": 0,
+        f"{prefix}poly_r2_mean": np.nan,
+        f"{prefix}poly_r2_median": np.nan,
+        f"{prefix}poly_r2_p25": np.nan,
+        f"{prefix}poly_r2_p75": np.nan,
+        f"{prefix}pct_poly_r2_gt_0": np.nan,
+    }
+    if len(y_true_arr) == 0:
+        return empty_result
+
+    finite_mask = np.isfinite(y_true_arr) & np.isfinite(y_pred_arr) & ~pd.isna(polymer_arr)
+    if not np.any(finite_mask):
+        return empty_result
+
+    df = pd.DataFrame(
+        {
+            "polymer_id": polymer_arr[finite_mask],
+            "y_true": y_true_arr[finite_mask],
+            "y_pred": y_pred_arr[finite_mask],
+        }
+    )
+
+    poly_r2_values: List[float] = []
+    n_polymers = 0
+    for _, sub in df.groupby("polymer_id", sort=False):
+        n_polymers += 1
+        y_true_poly = sub["y_true"].to_numpy(dtype=float)
+        y_pred_poly = sub["y_pred"].to_numpy(dtype=float)
+        poly_r2 = r2_score(y_true_poly, y_pred_poly) if len(y_true_poly) > 1 else np.nan
+        poly_r2_values.append(_safe_float(poly_r2))
+
+    values = np.asarray(poly_r2_values, dtype=float)
+    finite_values = values[np.isfinite(values)]
+    return {
+        f"{prefix}n_polymers": int(n_polymers),
+        f"{prefix}n_valid_polymer_r2": int(finite_values.size),
+        f"{prefix}poly_r2_mean": _safe_float(np.mean(finite_values)) if finite_values.size > 0 else np.nan,
+        f"{prefix}poly_r2_median": _safe_float(np.median(finite_values)) if finite_values.size > 0 else np.nan,
+        f"{prefix}poly_r2_p25": _safe_float(np.percentile(finite_values, 25)) if finite_values.size > 0 else np.nan,
+        f"{prefix}poly_r2_p75": _safe_float(np.percentile(finite_values, 75)) if finite_values.size > 0 else np.nan,
+        f"{prefix}pct_poly_r2_gt_0": _safe_float(np.mean(finite_values > 0) * 100.0) if finite_values.size > 0 else np.nan,
+    }
 
 
 def classification_metrics(
