@@ -150,6 +150,7 @@ chi_training:
     target_bootstrap_repeats: 800  # bootstrap repeats for chi_target stability estimation
 
   # Step4_1: chi(T,phi) regression
+  # Main pipeline uses one random_seed per run; optional multi-seed evaluation is handled by scripts/step4_1_multiseed_eval.py.
   step4_1_regression:
     dataset_path: "Data/chi/_250_polymers_T_phi.csv"
     batch_size: 128

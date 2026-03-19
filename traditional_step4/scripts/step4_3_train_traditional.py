@@ -21,7 +21,14 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from src.chi.constants import COEFF_NAMES  # noqa: E402
-from src.chi.metrics import classification_metrics, hit_metrics, metrics_by_group, regression_metrics  # noqa: E402
+from src.chi.metrics import (  # noqa: E402
+    classification_metrics,
+    hit_metrics,
+    metrics_by_group,
+    polymer_balanced_nrmse,
+    polymer_r2_distribution,
+    regression_metrics,
+)
 from src.chi.model import predict_chi_from_coefficients  # noqa: E402
 from common import (  # noqa: E402
     FingerprintConfig,
@@ -63,6 +70,13 @@ warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 WATER_SOLUBLE_PALETTE = {0: "#d62728", 1: "#1f77b4"}
 
 
+def _class_display_label(value: object) -> str:
+    try:
+        return "miscible" if int(value) == 1 else "immiscible"
+    except Exception:
+        return str(value)
+
+
 @dataclass
 class StageConfig:
     split_mode: str
@@ -74,6 +88,8 @@ class StageConfig:
     tuning_objective: str
     models: List[str]
     optuna_search_space: Dict[str, object]
+    nrmse_std_floor: float = 0.02
+    nrmse_clip: float = 10.0
 
 
 def _seed_everything_simple(seed: int) -> Dict[str, object]:
@@ -351,7 +367,12 @@ def _normalize_tuning_objective(value: object, default_tuning_objective: str) ->
     if default_norm == "val_r2":
         if raw in {"val_r2", "r2", "maximize_val_r2"}:
             return "val_r2"
-        raise ValueError("step4_3_1_regression.tuning_objective must be one of {'val_r2', 'r2', 'maximize_val_r2'}")
+        if raw in {"val_poly_nrmse", "poly_nrmse", "minimize_val_poly_nrmse"}:
+            return "val_poly_nrmse"
+        raise ValueError(
+            "step4_3_1_regression.tuning_objective must be one of "
+            "{'val_r2', 'r2', 'maximize_val_r2', 'val_poly_nrmse', 'poly_nrmse', 'minimize_val_poly_nrmse'}"
+        )
 
     if default_norm == "val_balanced_accuracy":
         if raw in {"val_balanced_accuracy", "balanced_accuracy", "maximize_val_balanced_accuracy"}:
@@ -364,13 +385,28 @@ def _normalize_tuning_objective(value: object, default_tuning_objective: str) ->
     raise ValueError(f"Unsupported default tuning objective: {default_tuning_objective}")
 
 
+def _tuning_objective_direction(tuning_objective: str) -> str:
+    name = str(tuning_objective).strip().lower()
+    if name in {"val_r2", "val_balanced_accuracy"}:
+        return "maximize"
+    if name == "val_poly_nrmse":
+        return "minimize"
+    raise ValueError(f"Unsupported tuning objective: {tuning_objective}")
+
+
 def _objective_summary_name(tuning_objective: str) -> str:
     name = str(tuning_objective).strip().lower()
     if name == "val_r2":
         return "maximize_val_r2"
+    if name == "val_poly_nrmse":
+        return "minimize_val_poly_nrmse"
     if name == "val_balanced_accuracy":
         return "maximize_val_balanced_accuracy"
     return name
+
+
+def _objective_failure_value(tuning_objective: str) -> float:
+    return -1.0e12 if _tuning_objective_direction(tuning_objective) == "maximize" else 1.0e12
 
 
 def _suggest_int(trial, name: str, search_space: Dict[str, object], default_lo: int, default_hi: int) -> int:
@@ -1498,6 +1534,8 @@ def _evaluate_regression_cv(
     model_name: str,
     model_params: Dict[str, object],
     seed: int,
+    nrmse_std_floor: float = 0.02,
+    nrmse_clip: float = 10.0,
     collect_val_predictions: bool = False,
 ) -> Dict[str, object]:
     fold_rows: List[Dict[str, object]] = []
@@ -1532,6 +1570,13 @@ def _evaluate_regression_cv(
         ).reshape(-1)
 
         reg = regression_metrics(y_val, y_pred)
+        val_poly_nrmse = polymer_balanced_nrmse(
+            y_true=y_val,
+            y_pred=y_pred,
+            polymer_ids=val_df["polymer_id"],
+            std_floor=float(nrmse_std_floor),
+            nrmse_clip=float(nrmse_clip),
+        )
         fold_rows.append(
             {
                 "fold": int(fold_id),
@@ -1540,6 +1585,7 @@ def _evaluate_regression_cv(
                 "val_r2": _safe_float(reg["r2"]),
                 "val_rmse": _safe_float(reg["rmse"]),
                 "val_mae": _safe_float(reg["mae"]),
+                "val_poly_nrmse": _safe_float(val_poly_nrmse),
             }
         )
         if collect_val_predictions:
@@ -1571,6 +1617,7 @@ def _evaluate_regression_cv(
         "cv_val_r2": float(np.nanmean(fold_metrics_df["val_r2"])) if not fold_metrics_df.empty else np.nan,
         "cv_val_rmse": float(np.nanmean(fold_metrics_df["val_rmse"])) if not fold_metrics_df.empty else np.nan,
         "cv_val_mae": float(np.nanmean(fold_metrics_df["val_mae"])) if not fold_metrics_df.empty else np.nan,
+        "cv_val_poly_nrmse": float(np.nanmean(fold_metrics_df["val_poly_nrmse"])) if not fold_metrics_df.empty else np.nan,
         "fold_metrics": fold_metrics_df,
         "cv_val_predictions": pd.concat(val_frames, ignore_index=True) if val_frames else pd.DataFrame(),
     }
@@ -1788,6 +1835,9 @@ def _tune_regression(
     summarize_cv_folds(cv_folds).to_csv(tuning_dir / "optuna_tuning_cv_folds.csv", index=False)
 
     objective_name = str(stage_cfg.tuning_objective).strip().lower()
+    objective_direction = _tuning_objective_direction(objective_name)
+    maximize = objective_direction == "maximize"
+    failure_value = _objective_failure_value(objective_name)
     trial_rows: List[Dict[str, object]] = []
 
     def objective(trial: optuna.Trial) -> float:
@@ -1800,34 +1850,43 @@ def _tune_regression(
                 model_name=model_name,
                 model_params=params,
                 seed=stage_cfg.seed,
+                nrmse_std_floor=stage_cfg.nrmse_std_floor,
+                nrmse_clip=stage_cfg.nrmse_clip,
             )
             if objective_name == "val_r2":
-                score = float(cv_eval["cv_val_r2"])
+                objective_value = float(cv_eval["cv_val_r2"])
+            elif objective_name == "val_poly_nrmse":
+                objective_value = float(cv_eval["cv_val_poly_nrmse"])
             else:
                 raise ValueError(f"Unsupported regression tuning objective: {objective_name}")
+            val_r2 = float(cv_eval["cv_val_r2"])
             rmse = float(cv_eval["cv_val_rmse"])
-            invalid = int((not np.isfinite(score)) or (not np.isfinite(rmse)))
+            val_poly_nrmse = float(cv_eval.get("cv_val_poly_nrmse", np.nan))
+            invalid = int(not np.isfinite(objective_value))
             fold_metrics_attr = _to_serializable(cv_eval.get("fold_metrics", pd.DataFrame()).to_dict(orient="records"))
         except Exception as exc:
-            score = -1.0e12
+            objective_value = failure_value
+            val_r2 = np.nan
             rmse = np.nan
+            val_poly_nrmse = np.nan
             invalid = 1
             fold_metrics_attr = []
             trial.set_user_attr("error", str(exc))
 
         trial.set_user_attr("model_name", model_name)
         trial.set_user_attr("model_params", _to_serializable(params))
-        trial.set_user_attr("cv_val_r2", score)
+        trial.set_user_attr("cv_val_r2", val_r2)
         trial.set_user_attr("cv_val_rmse", rmse)
+        trial.set_user_attr("cv_val_poly_nrmse", val_poly_nrmse)
         trial.set_user_attr("cv_fold_metrics", fold_metrics_attr)
         trial.set_user_attr("cv_n_folds", int(len(cv_folds)))
         trial.set_user_attr("tuning_objective", objective_name)
         trial.set_user_attr("invalid_metrics", invalid)
         if invalid:
-            return -1.0e12
-        return score
+            return failure_value
+        return objective_value
 
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(direction=objective_direction)
     study.optimize(objective, n_trials=int(stage_cfg.n_trials), show_progress_bar=True)
 
     for t in study.trials:
@@ -1835,11 +1894,12 @@ def _tune_regression(
             "trial": int(t.number),
             "state": str(t.state),
             "objective_name": objective_name,
-            "objective_direction": "maximize",
+            "objective_direction": objective_direction,
             "objective_value": _safe_float(t.value),
             "model_name": str(t.user_attrs.get("model_name", t.params.get("model_name", ""))),
             "val_r2": _safe_float(t.user_attrs.get("cv_val_r2", np.nan)),
             "val_rmse": _safe_float(t.user_attrs.get("cv_val_rmse", np.nan)),
+            "val_poly_nrmse": _safe_float(t.user_attrs.get("cv_val_poly_nrmse", np.nan)),
             "invalid_metrics": int(t.user_attrs.get("invalid_metrics", 0)),
             "cv_n_folds": int(t.user_attrs.get("cv_n_folds", len(cv_folds))),
         }
@@ -1858,12 +1918,14 @@ def _tune_regression(
                 "model_name",
                 "val_r2",
                 "val_rmse",
+                "val_poly_nrmse",
                 "invalid_metrics",
                 "cv_n_folds",
             ]
         )
     trial_df.to_csv(tuning_dir / "optuna_trials.csv", index=False)
-    trial_df["best_objective_so_far"] = pd.to_numeric(trial_df["objective_value"], errors="coerce").cummax()
+    objective_series = pd.to_numeric(trial_df["objective_value"], errors="coerce")
+    trial_df["best_objective_so_far"] = objective_series.cummax() if maximize else objective_series.cummin()
     trial_df.to_csv(tuning_dir / "optuna_optimization_objective.csv", index=False)
     _plot_optuna_objective(
         trial_df=trial_df,
@@ -1871,7 +1933,7 @@ def _tune_regression(
         objective_name=objective_name,
         dpi=dpi,
         font_size=font_size,
-        maximize=True,
+        maximize=maximize,
     )
     _save_optuna_best_metric_figures(
         trial_df=trial_df,
@@ -1879,7 +1941,7 @@ def _tune_regression(
         objective_name=objective_name,
         dpi=dpi,
         font_size=font_size,
-        maximize=True,
+        maximize=maximize,
     )
 
     valid_trials = []
@@ -1892,7 +1954,7 @@ def _tune_regression(
         if invalid == 0 and np.isfinite(value):
             valid_trials.append(t)
 
-    best_trial = max(valid_trials, key=lambda t: float(t.value)) if valid_trials else None
+    best_trial = (max(valid_trials, key=lambda t: float(t.value)) if maximize else min(valid_trials, key=lambda t: float(t.value))) if valid_trials else None
     fallback_reason = ""
     if best_trial is None:
         best_model_name = str(stage_cfg.models[0])
@@ -1910,12 +1972,39 @@ def _tune_regression(
             best_params = _default_regression_params(best_model_name)
         objective_at_best = float(best_trial.value)
 
-    best_params_by_model = _collect_best_params_by_model(study=study, model_names=stage_cfg.models)
+    best_params_by_model = _collect_best_params_by_model(study=study, model_names=stage_cfg.models, maximize=maximize)
     best_fold_metrics_df = pd.DataFrame()
+    best_cv_metric_source = "best_trial_user_attrs"
+    best_cv_eval_error = "skipped_recompute_same_cv_folds"
     if best_trial is not None:
-        fold_metrics_attr = best_trial.user_attrs.get("cv_fold_metrics", [])
-        if isinstance(fold_metrics_attr, list):
-            best_fold_metrics_df = pd.DataFrame(fold_metrics_attr)
+        try:
+            best_cv_eval = _evaluate_regression_cv(
+                cv_folds=cv_folds,
+                fingerprint_table=fingerprint_table,
+                model_name=best_model_name,
+                model_params=best_params,
+                seed=stage_cfg.seed,
+                nrmse_std_floor=stage_cfg.nrmse_std_floor,
+                nrmse_clip=stage_cfg.nrmse_clip,
+                collect_val_predictions=True,
+            )
+            best_fold_metrics_df = best_cv_eval.get("fold_metrics", pd.DataFrame()).copy()
+            best_cv_val_df = best_cv_eval.get("cv_val_predictions", pd.DataFrame())
+            if isinstance(best_cv_val_df, pd.DataFrame) and not best_cv_val_df.empty:
+                best_cv_val_df.to_csv(tuning_dir / "best_trial_cv_val_predictions.csv", index=False)
+                _save_cv_parity_by_fold_figure(
+                    cv_val_df=best_cv_val_df,
+                    out_png=tuning_dir / "cv_parity_by_fold.png",
+                    dpi=dpi,
+                    font_size=font_size,
+                )
+            best_cv_metric_source = "recomputed_best_trial_cv"
+            best_cv_eval_error = ""
+        except Exception as exc:
+            best_cv_eval_error = str(exc)
+            fold_metrics_attr = best_trial.user_attrs.get("cv_fold_metrics", [])
+            if isinstance(fold_metrics_attr, list):
+                best_fold_metrics_df = pd.DataFrame(fold_metrics_attr)
     best_fold_metrics_df.to_csv(tuning_dir / "best_trial_cv_fold_metrics.csv", index=False)
 
     with open(tuning_dir / "optuna_best.json", "w") as f:
@@ -1924,20 +2013,23 @@ def _tune_regression(
                 "best_trial": int(best_trial.number) if best_trial is not None else None,
                 "objective": _objective_summary_name(objective_name),
                 "objective_name": objective_name,
-                "objective_direction": "maximize",
+                "objective_direction": objective_direction,
                 "objective_value_at_best_trial": _safe_float(objective_at_best),
                 "best_model_name": best_model_name,
                 "best_params": best_params,
                 "best_value_r2": _safe_float(best_trial.user_attrs.get("cv_val_r2", np.nan)) if best_trial is not None else np.nan,
                 "best_value_rmse": _safe_float(best_trial.user_attrs.get("cv_val_rmse", np.nan)) if best_trial is not None else np.nan,
+                "best_value_poly_nrmse": _safe_float(best_trial.user_attrs.get("cv_val_poly_nrmse", np.nan))
+                if best_trial is not None
+                else np.nan,
                 "tuning_cv_folds_requested": int(stage_cfg.tuning_cv_folds),
                 "tuning_cv_folds_resolved": int(cv_info.get("resolved_folds", len(cv_folds))),
                 "tuning_cv_strategy": str(cv_info.get("strategy", "unknown")),
                 "invalid_trial_count": int(trial_df["invalid_metrics"].sum()) if "invalid_metrics" in trial_df.columns else 0,
                 "best_trial_number": int(best_trial.number) if best_trial is not None else None,
                 "fallback_reason": fallback_reason,
-                "best_cv_metric_source": "best_trial_user_attrs",
-                "best_cv_eval_error": "skipped_recompute_same_cv_folds",
+                "best_cv_metric_source": best_cv_metric_source,
+                "best_cv_eval_error": best_cv_eval_error,
                 "selection_bias_note": (
                     "Tuning CV metrics come from folds used during hyperparameter selection; "
                     "use holdout test metrics for unbiased reporting."
@@ -2224,6 +2316,8 @@ def _collect_regression_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
     rows = []
     class_rows = []
     polymer_rows = []
+    polymer_r2_rows = []
+    low_chi_rows = []
     for split, sub in pred_df.groupby("split"):
         reg = regression_metrics(sub["chi"], sub["chi_pred"])
         hit = hit_metrics(sub["chi_error"], epsilons=[0.02, 0.05, 0.1, 0.2])
@@ -2265,12 +2359,47 @@ def _collect_regression_metrics(pred_df: pd.DataFrame, out_dir: Path) -> None:
         poly_row["poly_r2"] = poly_row["poly_r2_mean"]
         polymer_rows.append(poly_row)
 
+        for class_value, class_sub in sub.groupby("water_miscible", sort=True):
+            dist_row = {
+                "split": split,
+                "water_miscible": int(class_value),
+                "class_label": _class_display_label(class_value),
+            }
+            dist_row.update(
+                polymer_r2_distribution(
+                    y_true=class_sub["chi"],
+                    y_pred=class_sub["chi_pred"],
+                    polymer_ids=class_sub["polymer_id"],
+                )
+            )
+            polymer_r2_rows.append(dist_row)
+
+    test_df = pred_df[pred_df["split"] == "test"].copy()
+    if not test_df.empty:
+        for quantile in [0.10, 0.25, 0.50, 0.75]:
+            chi_cutoff = float(test_df["chi"].quantile(quantile))
+            sub = test_df[test_df["chi"] <= chi_cutoff].copy()
+            if sub.empty:
+                continue
+            reg = regression_metrics(sub["chi"], sub["chi_pred"])
+            low_row = {
+                "split": "test",
+                "subset": f"bottom_{int(round(quantile * 100)):02d}pct",
+                "quantile": float(quantile),
+                "chi_threshold": chi_cutoff,
+                "rank_correlation": reg.get("spearman_r", np.nan),
+            }
+            low_row.update(reg)
+            low_chi_rows.append(low_row)
+
     pd.DataFrame(rows).to_csv(out_dir / "chi_metrics_overall.csv", index=False)
     if class_rows:
         pd.concat(class_rows, ignore_index=True).to_csv(out_dir / "chi_metrics_by_class.csv", index=False)
     else:
         pd.DataFrame(columns=["split", "group"]).to_csv(out_dir / "chi_metrics_by_class.csv", index=False)
     pd.DataFrame(polymer_rows).to_csv(out_dir / "chi_metrics_polymer_level.csv", index=False)
+    pd.DataFrame(polymer_r2_rows).to_csv(out_dir / "chi_metrics_polymer_r2_distribution.csv", index=False)
+    pd.DataFrame(low_chi_rows).to_csv(out_dir / "chi_metrics_low_chi_quantiles.csv", index=False)
 
 
 def _plot_regression_parity_panel(ax, sub: pd.DataFrame, split: str) -> None:
@@ -2509,6 +2638,12 @@ def _resolve_stage_config(
     n_trials = int(n_trials_override if n_trials_override is not None else stage_section.get("n_trials", 100))
     objective_raw = stage_section.get("tuning_objective", default_tuning_objective)
     tuning_objective = _normalize_tuning_objective(objective_raw, default_tuning_objective=default_tuning_objective)
+    nrmse_std_floor = float(stage_section.get("nrmse_std_floor", 0.02))
+    if nrmse_std_floor <= 0:
+        raise ValueError("nrmse_std_floor must be > 0")
+    nrmse_clip = float(stage_section.get("nrmse_clip", 10.0))
+    if nrmse_clip <= 0:
+        raise ValueError("nrmse_clip must be > 0")
 
     models = stage_section.get("models", [])
     if not isinstance(models, list) or len(models) == 0:
@@ -2533,6 +2668,8 @@ def _resolve_stage_config(
         tuning_objective=str(tuning_objective),
         models=models,
         optuna_search_space=dict(optuna_search_space),
+        nrmse_std_floor=float(nrmse_std_floor),
+        nrmse_clip=float(nrmse_clip),
     )
 
 
@@ -2548,12 +2685,12 @@ def _to_serializable(obj):
     return obj
 
 
-def _collect_best_params_by_model(study, model_names: List[str]) -> Dict[str, Dict[str, object]]:
+def _collect_best_params_by_model(study, model_names: List[str], maximize: bool = True) -> Dict[str, Dict[str, object]]:
     out: Dict[str, Dict[str, object]] = {}
     normalized = [str(m).strip().lower() for m in model_names]
     for model_name in normalized:
         best_trial = None
-        best_value = -np.inf
+        best_value = -np.inf if maximize else np.inf
         for t in study.trials:
             trial_model = str(t.user_attrs.get("model_name", "")).strip().lower()
             if trial_model != model_name:
@@ -2570,7 +2707,8 @@ def _collect_best_params_by_model(study, model_names: List[str]) -> Dict[str, Di
                 continue
             if not np.isfinite(score):
                 continue
-            if (best_trial is None) or (score > best_value):
+            is_better = score > best_value if maximize else score < best_value
+            if (best_trial is None) or is_better:
                 best_trial = t
                 best_value = score
         if best_trial is None:
@@ -3061,7 +3199,10 @@ def _run_regression_stage(
             {
                 "selection_mode": "per_model_optuna" if stage_cfg.tune else "default_no_tuning",
                 "objective_name": stage_cfg.tuning_objective,
+                "objective_direction": _tuning_objective_direction(stage_cfg.tuning_objective),
                 "tuning_cv_folds": int(stage_cfg.tuning_cv_folds),
+                "nrmse_std_floor": float(stage_cfg.nrmse_std_floor),
+                "nrmse_clip": float(stage_cfg.nrmse_clip),
                 "model_names": [str(m) for m in stage_cfg.models],
                 "cross_model_best_selected_in_step4_3": False,
                 "selection_note": "Step4_3 trains each model independently; cross-model selection is deferred to Step4_4.",
@@ -3405,6 +3546,8 @@ def main() -> None:
             effective_reg_cfg["n_trials"] = int(reg_cfg.n_trials)
             effective_reg_cfg["tuning_cv_folds"] = int(reg_cfg.tuning_cv_folds)
             effective_reg_cfg["tuning_objective"] = str(reg_cfg.tuning_objective)
+            effective_reg_cfg["nrmse_std_floor"] = float(reg_cfg.nrmse_std_floor)
+            effective_reg_cfg["nrmse_clip"] = float(reg_cfg.nrmse_clip)
             effective_reg_cfg["models"] = list(reg_cfg.models)
     if cls_cfg is not None:
         effective_cls_cfg = effective_trad_cfg.setdefault("step4_3_2_classification", {})
@@ -3436,6 +3579,8 @@ def main() -> None:
                 "regression_holdout_test_ratio": float(reg_cfg.holdout_test_ratio),
                 "regression_tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
                 "regression_tuning_objective": str(reg_cfg.tuning_objective),
+                "regression_nrmse_std_floor": float(reg_cfg.nrmse_std_floor),
+                "regression_nrmse_clip": float(reg_cfg.nrmse_clip),
                 "regression_tune": bool(reg_cfg.tune),
                 "regression_n_trials": int(reg_cfg.n_trials),
             }
@@ -3497,6 +3642,8 @@ def main() -> None:
                 "regression_n_trials": int(reg_cfg.n_trials),
                 "regression_tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
                 "regression_tuning_objective": str(reg_cfg.tuning_objective),
+                "regression_nrmse_std_floor": float(reg_cfg.nrmse_std_floor),
+                "regression_nrmse_clip": float(reg_cfg.nrmse_clip),
             }
         )
     if cls_cfg is not None:
@@ -3522,6 +3669,8 @@ def main() -> None:
                 "holdout_test_ratio": float(reg_cfg.holdout_test_ratio),
                 "tuning_cv_folds": int(reg_cfg.tuning_cv_folds),
                 "tuning_objective": str(reg_cfg.tuning_objective),
+                "nrmse_std_floor": float(reg_cfg.nrmse_std_floor),
+                "nrmse_clip": float(reg_cfg.nrmse_clip),
                 "tune": bool(reg_cfg.tune),
                 "n_trials": int(reg_cfg.n_trials),
                 "random_seed": int(seed),
