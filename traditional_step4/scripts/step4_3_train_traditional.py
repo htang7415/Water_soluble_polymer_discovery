@@ -244,6 +244,25 @@ def _clean_numeric_array(values) -> np.ndarray:
     return arr[np.isfinite(arr)]
 
 
+def _regression_features_from_table(split_df: pd.DataFrame, fingerprint_table: np.ndarray) -> np.ndarray:
+    fp = features_from_table(split_df, fingerprint_table)
+    if len(split_df) == 0:
+        return np.zeros((0, int(fp.shape[1]) + 2), dtype=np.float32)
+    temperature = (
+        pd.to_numeric(split_df["temperature"], errors="coerce")
+        .fillna(0.0)
+        .to_numpy(dtype=np.float32)
+        .reshape(-1, 1)
+    )
+    phi = (
+        pd.to_numeric(split_df["phi"], errors="coerce")
+        .fillna(0.0)
+        .to_numpy(dtype=np.float32)
+        .reshape(-1, 1)
+    )
+    return np.concatenate([fp, temperature, phi], axis=1).astype(np.float32, copy=False)
+
+
 def _plot_kde_safe_1d(
     ax,
     values,
@@ -1053,10 +1072,6 @@ def _build_regression_estimator(model_name: str, params: Dict[str, object], seed
     else:
         raise ValueError(f"Unsupported regression model: {model_name}")
 
-    # Step4_3_1 regression predicts 6 physics coefficients (a0,a1,a2,a3,b1,b2).
-    # Some estimators require explicit multi-output wrapping.
-    if model_name in {"xgboost", "gpr"}:
-        return MultiOutputRegressor(base_estimator)
     return base_estimator
 
 
@@ -1518,13 +1533,10 @@ def _fit_coeff_regression_model_from_split(
     model_params: Dict[str, object],
     seed: int,
 ):
-    coeff_by_polymer = _build_polymer_coefficient_targets(train_df)
-    polymer_ids = np.array(sorted(coeff_by_polymer.keys()), dtype=np.int64)
-    X_train = fingerprint_table[polymer_ids].astype(np.float32, copy=False)
-    y_train_coeff = np.stack([coeff_by_polymer[int(pid)] for pid in polymer_ids], axis=0).astype(float, copy=False)
-
+    X_train = _regression_features_from_table(train_df, fingerprint_table)
+    y_train = train_df["chi"].to_numpy(dtype=float)
     model = _build_regression_estimator(model_name=model_name, params=model_params, seed=seed)
-    model.fit(X_train, y_train_coeff)
+    model.fit(X_train, y_train)
     return model
 
 
@@ -1553,21 +1565,9 @@ def _evaluate_regression_cv(
             model_params=model_params,
             seed=seed,
         )
-        X_val = features_from_table(val_df, fingerprint_table)
-        coeff_pred = _coerce_coeff_matrix(
-            model.predict(X_val),
-            expected_rows=int(len(val_df)),
-            context=f"cv_fold={fold_id}, model={model_name}",
-        )
+        X_val = _regression_features_from_table(val_df, fingerprint_table)
         y_val = val_df["chi"].to_numpy(dtype=float)
-        y_pred = np.asarray(
-            predict_chi_from_coefficients(
-                coeff_pred,
-                val_df["temperature"].to_numpy(dtype=float),
-                val_df["phi"].to_numpy(dtype=float),
-            ),
-            dtype=float,
-        ).reshape(-1)
+        y_pred = np.asarray(model.predict(X_val), dtype=float).reshape(-1)
 
         reg = regression_metrics(y_val, y_pred)
         val_poly_nrmse = polymer_balanced_nrmse(
@@ -1592,8 +1592,6 @@ def _evaluate_regression_cv(
             out = val_df.copy()
             out["chi_true"] = y_val
             out["chi_pred"] = y_pred
-            for idx, coeff_name in enumerate(COEFF_NAMES):
-                out[coeff_name] = coeff_pred[:, idx]
             out["fold"] = int(fold_id)
             val_frames.append(
                 out[
@@ -1607,7 +1605,6 @@ def _evaluate_regression_cv(
                         "phi",
                         "chi_true",
                         "chi_pred",
-                        *COEFF_NAMES,
                     ]
                 ].copy()
             )
@@ -2283,27 +2280,12 @@ def _save_regression_predictions(split_df: pd.DataFrame, fingerprint_table: np.n
     for split in ["train", "val", "test"]:
         sub = split_df[split_df["split"] == split].copy().reset_index(drop=True)
         if len(sub) > 0:
-            X = features_from_table(sub, fingerprint_table)
-            coeff_pred = _coerce_coeff_matrix(
-                model.predict(X),
-                expected_rows=int(len(sub)),
-                context=f"prediction_split={split}",
-            )
-            y_pred = np.asarray(
-                predict_chi_from_coefficients(
-                    coeff_pred,
-                    sub["temperature"].to_numpy(dtype=float),
-                    sub["phi"].to_numpy(dtype=float),
-                ),
-                dtype=float,
-            ).reshape(-1)
+            X = _regression_features_from_table(sub, fingerprint_table)
+            y_pred = np.asarray(model.predict(X), dtype=float).reshape(-1)
         else:
-            coeff_pred = np.zeros((0, len(COEFF_NAMES)), dtype=float)
             y_pred = np.zeros((0,), dtype=float)
         sub["chi_pred"] = y_pred
         sub["chi_error"] = sub["chi_pred"] - sub["chi"]
-        for idx, coeff_name in enumerate(COEFF_NAMES):
-            sub[coeff_name] = coeff_pred[:, idx]
         sub.to_csv(out_dir / f"chi_predictions_{split}.csv", index=False)
         frames.append(sub)
     all_df = pd.concat(frames, ignore_index=True)

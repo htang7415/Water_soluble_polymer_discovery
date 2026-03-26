@@ -30,8 +30,6 @@ from src.chi.inverse_design_common import (
     set_plot_style,
     unique_preserving_order,
 )
-from src.chi.model import predict_chi_mean_std_from_coefficients
-from src.chi.constants import COEFF_NAMES
 from src.data.tokenizer import PSmilesTokenizer
 from src.evaluation.class_decode_constraints import (
     compute_class_token_logit_bias,
@@ -56,6 +54,16 @@ from src.utils.reporting import save_step_summary, save_artifact_manifest, write
 
 
 K_LIST = [1, 3, 5, 10]
+
+
+def _count_candidate_polymers(coeff_df: pd.DataFrame) -> int:
+    if coeff_df.empty:
+        return 0
+    if "canonical_smiles" in coeff_df.columns:
+        return int(coeff_df["canonical_smiles"].astype(str).nunique())
+    if "polymer_id" in coeff_df.columns:
+        return int(pd.to_numeric(coeff_df["polymer_id"], errors="coerce").nunique())
+    return int(coeff_df["SMILES"].astype(str).nunique()) if "SMILES" in coeff_df.columns else int(len(coeff_df))
 
 
 def _parse_target_polymer_classes(value: str, available: List[str]) -> List[str]:
@@ -131,58 +139,42 @@ def _compute_target_candidates(
     uncertainty_property_z: float,
     uncertainty_score_weight: float,
 ) -> pd.DataFrame:
+    target_id = int(target_row["target_id"])
     target_chi = float(target_row["target_chi"])
-    t = float(target_row["temperature"])
-    phi = float(target_row["phi"])
     target_polymer_class = str(target_row["target_polymer_class"]).strip().lower()
 
     class_col = f"polymer_class_{target_polymer_class}"
-    required_cols = ["polymer_id", "Polymer", "SMILES", "class_prob", *COEFF_NAMES, class_col]
+    required_cols = [
+        "polymer_id",
+        "Polymer",
+        "SMILES",
+        "class_prob",
+        "target_id",
+        "temperature",
+        "phi",
+        "target_chi",
+        "chi_pred_target",
+        class_col,
+    ]
     missing = [c for c in required_cols if c not in coeff_df.columns]
     if missing:
         raise ValueError(f"Candidate pool missing required columns: {missing}")
 
-    coeff_std_cols = [f"{name}_std" for name in COEFF_NAMES]
-    copy_cols = unique_preserving_order(
-        required_cols
-        + [
-            c
-            for c in [
-                CLASS_LABEL_INTERNAL,
-                CLASS_LABEL_PUBLIC,
-                "candidate_source",
-                "sampling_attempt",
-                "canonical_smiles",
-                "class_logit",
-                "class_logit_std",
-                "class_prob_std",
-                "is_novel_vs_train",
-                *coeff_std_cols,
-            ]
-            if c in coeff_df.columns
-        ]
-    )
-    out = coeff_df[copy_cols].copy()
-    for col in ["class_prob_std", "class_logit_std", *coeff_std_cols]:
-        if col not in out.columns:
-            out[col] = np.nan
+    target_mask = pd.to_numeric(coeff_df["target_id"], errors="coerce").eq(target_id)
+    out = coeff_df.loc[target_mask].copy()
+    if "class_prob_std" not in out.columns:
+        out["class_prob_std"] = 0.0
+    if "class_logit_std" not in out.columns:
+        out["class_logit_std"] = 0.0
+    if "chi_pred_std_target" not in out.columns:
+        out["chi_pred_std_target"] = 0.0
 
-    coeff_mean = out[COEFF_NAMES].to_numpy(dtype=float)
-    coeff_std = out[coeff_std_cols].to_numpy(dtype=float)
-    pred_mean, pred_std = predict_chi_mean_std_from_coefficients(
-        coeff_mean=coeff_mean,
-        coeff_std=coeff_std,
-        temperature=np.full(len(out), t, dtype=float),
-        phi=np.full(len(out), phi, dtype=float),
-    )
-
-    out["target_id"] = int(target_row["target_id"])
-    out["temperature"] = t
-    out["phi"] = phi
+    out["temperature"] = float(target_row["temperature"])
+    out["phi"] = float(target_row["phi"])
     out["target_chi"] = target_chi
     out["target_polymer_class"] = target_polymer_class
-    out["chi_pred_target"] = pred_mean
-    out["chi_pred_std_target"] = pred_std
+    out["chi_pred_target"] = pd.to_numeric(out["chi_pred_target"], errors="coerce")
+    out["chi_pred_std_target"] = pd.to_numeric(out["chi_pred_std_target"], errors="coerce").fillna(0.0)
     out["chi_error"] = out["chi_pred_target"] - target_chi
     out["abs_error"] = np.abs(out["chi_error"])
 
@@ -407,8 +399,11 @@ def _accumulate_candidate_pools(pool_frames: List[pd.DataFrame]) -> pd.DataFrame
         coeff_df["source_polymer_id"] = pd.to_numeric(polymer_ids, errors="coerce").fillna(-1).astype(int)
     else:
         coeff_df["source_polymer_id"] = pd.to_numeric(coeff_df["source_polymer_id"], errors="coerce").fillna(-1).astype(int)
-    coeff_df = coeff_df.drop_duplicates(subset=["canonical_smiles"], keep="first").reset_index(drop=True)
-    coeff_df["polymer_id"] = np.arange(len(coeff_df), dtype=int)
+    dedup_subset = ["canonical_smiles", "target_id"] if "target_id" in coeff_df.columns else ["canonical_smiles"]
+    coeff_df = coeff_df.drop_duplicates(subset=dedup_subset, keep="first").reset_index(drop=True)
+    polymer_keys = pd.Index(pd.unique(coeff_df["canonical_smiles"].astype(str)))
+    polymer_id_map = {key: idx for idx, key in enumerate(polymer_keys)}
+    coeff_df["polymer_id"] = coeff_df["canonical_smiles"].astype(str).map(polymer_id_map).astype(int)
     return coeff_df
 
 
@@ -526,7 +521,7 @@ def _score_candidate_pool(
         target_count=target_polymer_count,
         target_stars=target_stars,
         sa_max=target_sa_max,
-        total_sampling_points=int(len(coeff_df)),
+        total_sampling_points=_count_candidate_polymers(coeff_df),
     )
 
     return {
@@ -1787,6 +1782,7 @@ def main(args):
             args=args,
             config=config,
             chi_cfg=chi_cfg,
+            target_df=target_df,
             results_dir=results_dir,
             base_results_dir=base_results_dir,
             step4_reg_metrics_dir=step4_reg_metrics_dir,
@@ -1848,14 +1844,14 @@ def main(args):
             }
 
         attempt_pool_summary["candidate_polymer_class_hits"] = class_coverage
-        attempt_pool_summary["accumulated_candidate_count"] = int(len(coeff_df))
+        attempt_pool_summary["accumulated_candidate_count"] = int(_count_candidate_polymers(coeff_df))
         attempt_pool_summary["target_count_selected"] = int(target_poly_summary["target_count_selected"])
         attempt_manifests.append(attempt_pool_summary)
 
         row = {
             "sampling_attempt": int(attempt_idx),
-            "attempt_candidate_count_after_dedup": int(len(attempt_coeff_df)),
-            "accumulated_candidate_count": int(len(coeff_df)),
+            "attempt_candidate_count_after_dedup": int(_count_candidate_polymers(attempt_coeff_df)),
+            "accumulated_candidate_count": int(_count_candidate_polymers(coeff_df)),
             "target_count_selected": int(target_poly_summary["target_count_selected"]),
             "n_polymers_pass_all_targets": int(target_poly_summary.get("n_polymers_pass_all_targets", 0)),
             "n_polymers_pass_any_target_class": int(target_poly_summary.get("n_polymers_pass_any_target_class", 0)),
@@ -1877,7 +1873,7 @@ def main(args):
         class_msg = ", ".join(f"{cls}={class_coverage.get(cls, 0)}" for cls in selected_classes)
         print(
             "  accumulated candidates="
-            f"{len(coeff_df)}, selected={target_poly_summary['target_count_selected']}/{target_polymer_count}, "
+            f"{_count_candidate_polymers(coeff_df)}, selected={target_poly_summary['target_count_selected']}/{target_polymer_count}, "
             f"class_hits[{class_msg}]"
         )
         if int(target_poly_summary["target_count_selected"]) >= int(target_polymer_count):
@@ -1921,7 +1917,7 @@ def main(args):
         "candidate_count_total_before_cross_attempt_dedup": int(
             sum(int(m.get("candidate_count_after_dedup", 0)) for m in attempt_manifests)
         ),
-        "candidate_count_after_dedup": int(len(coeff_df)),
+        "candidate_count_after_dedup": int(_count_candidate_polymers(coeff_df)),
         "selected_polymer_classes": selected_classes,
         "candidate_polymer_class_hits": class_coverage,
         "decode_constraint_enabled": bool(decode_constraint_enabled),

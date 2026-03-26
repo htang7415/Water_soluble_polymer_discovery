@@ -3181,6 +3181,8 @@ def main(args: argparse.Namespace) -> None:
         "step4_summary_path": str(step4_summary_path) if step4_summary_path is not None else "",
         "step4_predictions_path": str(step4_path) if step4_path is not None else "",
         "step4_coeff_path": str(step4_coeff_path) if step4_coeff_path is not None else "",
+        "step4_coefficients_available": int(step4_coeff_path is not None and step4_coeff_path.exists()),
+        "step4_coefficient_source_mode": "step4_coefficients" if step4_coeff_path is not None and step4_coeff_path.exists() else "fit_from_data",
         "step4_reg_overall_path": str(step4_reg_overall_path) if step4_reg_overall_path is not None else "",
         "step4_cls_overall_path": str(step4_cls_overall_path) if step4_cls_overall_path is not None else "",
         "step5_summary_path": str(step5_summary_path) if step5_summary_path is not None else "",
@@ -3925,6 +3927,21 @@ def main(args: argparse.Namespace) -> None:
     # D) Physical interpretation of Step4 χ(T,φ) coefficients.
     coeff_df = _load_or_fit_coefficients(step4_coeff_path, chi_df, random_seed=seed_value)
     if not coeff_df.empty:
+        if "coeff_source" in coeff_df.columns:
+            coeff_sources = coeff_df["coeff_source"].dropna().astype(str).unique().tolist()
+            if coeff_sources:
+                summary["step4_coefficient_source_mode"] = "|".join(sorted(coeff_sources))
+                if all(source != "step4_coefficients" for source in coeff_sources):
+                    pd.DataFrame(
+                        [
+                            {
+                                "note": (
+                                    "Step4 coefficient artifact was not available. "
+                                    "Coefficient-based Block D/E analyses use coefficients refit from the labeled chi dataset."
+                                )
+                            }
+                        ]
+                    ).to_csv(metrics_dir / "step4_coefficient_fallback_note.csv", index=False)
         for c in COEFF_COLUMNS:
             coeff_df[c] = pd.to_numeric(coeff_df[c], errors="coerce")
         coeff_df[CLASS_COL] = pd.to_numeric(coeff_df[CLASS_COL], errors="coerce")

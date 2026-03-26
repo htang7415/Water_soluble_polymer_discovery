@@ -254,9 +254,9 @@ chi_training:
     epsilon: 0.05
     # ranking uses independent hard filters (soluble_hit, property_hit, polymer_class_hit) first
     target_polymer_count: 100  # final total number of exported target polymers across all Step 6 resampling attempts
-    target_sa_max: 3.8
+    target_sa_max: 4.0
     candidate_source: "novel"  # fresh Step 2 resampling only
-    resampling_target_polymer_count: 100  # accepted Step 2 candidates requested per fresh attempt before Step 6 scoring
+    resampling_target_polymer_count: 512  # accepted Step 2 candidates requested per fresh attempt before Step 6 scoring
     sampling_attempts_max: 5000  # stop early once 100 final Step 6 targets are found; otherwise keep resampling until the max is reached
     property_rule: "upper_bound"
     coverage_topk: 5

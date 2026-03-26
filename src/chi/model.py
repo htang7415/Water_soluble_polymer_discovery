@@ -198,6 +198,56 @@ class PhysicsGuidedChiModel(nn.Module):
         return out
 
 
+class DirectChiRegressor(nn.Module):
+    """Map polymer embedding plus (temperature, phi) directly to chi."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_sizes: List[int] | Tuple[int, ...] = (256, 128),
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        self.hidden_sizes = list(hidden_sizes)
+        self.dropout = float(dropout)
+
+        self.input_dim = self.embedding_dim + 2
+        self.encoder = _build_mlp(self.input_dim, self.hidden_sizes, self.dropout)
+        head_dim = self.input_dim if not self.hidden_sizes else self.hidden_sizes[-1]
+        self.chi_head = nn.Linear(head_dim, 1)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, embedding: torch.Tensor, temperature: torch.Tensor, phi: torch.Tensor) -> Dict[str, torch.Tensor]:
+        _validate_formula_inputs_torch(temperature, phi=phi)
+        cond = torch.stack([temperature, phi], dim=-1)
+        features = self.encoder(torch.cat([embedding, cond], dim=-1))
+        chi_pred = self.chi_head(features).squeeze(-1)
+        return {
+            "chi_pred": chi_pred,
+        }
+
+    def compute_loss(
+        self,
+        embedding: torch.Tensor,
+        temperature: torch.Tensor,
+        phi: torch.Tensor,
+        chi_true: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        out = self.forward(embedding=embedding, temperature=temperature, phi=phi)
+        mse = F.mse_loss(out["chi_pred"], chi_true)
+        out.update({"loss": mse, "loss_mse": mse})
+        return out
+
+
 class SolubilityClassifier(nn.Module):
     """Map polymer embedding to soluble/insoluble class logit."""
 
@@ -245,6 +295,43 @@ class BackbonePhysicsGuidedChiModel(nn.Module):
         self,
         backbone: nn.Module,
         chi_head: PhysicsGuidedChiModel,
+        timestep: int,
+        pooling: str = "mean",
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.chi_head = chi_head
+        self.timestep = int(timestep)
+        self.pooling = pooling
+
+    def _encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        batch_size = int(input_ids.shape[0])
+        timesteps = torch.full((batch_size,), self.timestep, device=input_ids.device, dtype=torch.long)
+        return self.backbone.get_pooled_output(
+            input_ids=input_ids,
+            timesteps=timesteps,
+            attention_mask=attention_mask,
+            pooling=self.pooling,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        temperature: torch.Tensor,
+        phi: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        embedding = self._encode(input_ids=input_ids, attention_mask=attention_mask)
+        return self.chi_head(embedding=embedding, temperature=temperature, phi=phi)
+
+
+class BackboneDirectChiModel(nn.Module):
+    """Backbone encoder + direct chi head used by Step 4 finetuning."""
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        chi_head: DirectChiRegressor,
         timestep: int,
         pooling: str = "mean",
     ):

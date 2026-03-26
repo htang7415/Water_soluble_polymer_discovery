@@ -38,7 +38,7 @@ from src.chi.metrics import (
     polymer_r2_distribution,
     regression_metrics,
 )
-from src.chi.model import PhysicsGuidedChiModel, SolubilityClassifier
+from src.chi.model import DirectChiRegressor, SolubilityClassifier
 from src.utils.config import load_config, save_config
 from src.utils.figure_style import apply_publication_figure_style
 from src.utils.model_scales import get_model_config, get_results_dir
@@ -173,13 +173,13 @@ class ChiTokenDataset(Dataset):
         }
 
 
-class BackbonePhysicsGuidedChiModel(nn.Module):
-    """End-to-end Step 4 model: backbone encoder + physics-guided chi head."""
+class BackboneDirectChiModel(nn.Module):
+    """End-to-end Step 4 model: backbone encoder + direct chi regression head."""
 
     def __init__(
         self,
         backbone: nn.Module,
-        chi_head: PhysicsGuidedChiModel,
+        chi_head: DirectChiRegressor,
         timestep: int,
         pooling: str = "mean",
     ):
@@ -893,16 +893,11 @@ def predict_split(model: nn.Module, loader: DataLoader, device: str) -> Dict[str
     model.eval()
     pred_chi: List[np.ndarray] = []
     true_chi: List[np.ndarray] = []
-    logits: List[np.ndarray] = []
-    probs: List[np.ndarray] = []
-    labels: List[np.ndarray] = []
-    coeffs: List[np.ndarray] = []
 
     for batch in loader:
         temperature = batch["temperature"].to(device)
         phi = batch["phi"].to(device)
         chi_true = batch["chi"].to(device)
-        label = batch["label"].to(device)
 
         if "embedding" in batch:
             embedding = batch["embedding"].to(device)
@@ -919,18 +914,10 @@ def predict_split(model: nn.Module, loader: DataLoader, device: str) -> Dict[str
 
         pred_chi.append(out["chi_pred"].cpu().numpy())
         true_chi.append(chi_true.cpu().numpy())
-        logits.append(out["class_logit"].cpu().numpy())
-        probs.append(torch.sigmoid(out["class_logit"]).cpu().numpy())
-        labels.append(label.cpu().numpy())
-        coeffs.append(out["coefficients"].cpu().numpy())
 
     return {
         "chi_true": np.concatenate(true_chi, axis=0) if true_chi else np.array([]),
         "chi_pred": np.concatenate(pred_chi, axis=0) if pred_chi else np.array([]),
-        "label": np.concatenate(labels, axis=0) if labels else np.array([]),
-        "logit": np.concatenate(logits, axis=0) if logits else np.array([]),
-        "prob": np.concatenate(probs, axis=0) if probs else np.array([]),
-        "coefficients": np.concatenate(coeffs, axis=0) if coeffs else np.array([]),
     }
 
 
@@ -981,12 +968,12 @@ def train_one_model(
             device=device,
         )
         _set_finetune_last_layers(backbone, finetune_last_layers=finetune_last_layers)
-        chi_head = PhysicsGuidedChiModel(
+        chi_head = DirectChiRegressor(
             embedding_dim=int(backbone.hidden_size),
             hidden_sizes=hidden_sizes,
             dropout=dropout,
         )
-        model = BackbonePhysicsGuidedChiModel(
+        model = BackboneDirectChiModel(
             backbone=backbone,
             chi_head=chi_head,
             timestep=int(timestep_for_embedding),
@@ -1002,7 +989,7 @@ def train_one_model(
             weights=loss_weights,
             shuffle_train=True,
         )
-        model = PhysicsGuidedChiModel(
+        model = DirectChiRegressor(
             embedding_dim=int(embedding_table.shape[1]),
             hidden_sizes=hidden_sizes,
             dropout=dropout,
@@ -1603,15 +1590,12 @@ def run_regression_cv_with_best_hyperparameters(
 
             chi_true = np.asarray(pred["chi_true"], dtype=float)
             chi_pred = np.asarray(pred["chi_pred"], dtype=float)
-            coeff = _coerce_coeff_matrix(pred["coefficients"], expected_rows=len(sub), split=f"cv_{raw_split}")
             sub["chi_true"] = chi_true
             sub["chi_pred"] = chi_pred
             sub["chi_error"] = chi_pred - chi_true
             sub["fold"] = int(fold_id)
             sub["cv_split"] = cv_split
             sub["raw_split"] = raw_split
-            for i, name in enumerate(COEFF_NAMES):
-                sub[name] = coeff[:, i] if i < coeff.shape[1] else np.nan
 
             use_cols = [
                 "fold",
@@ -1625,7 +1609,7 @@ def run_regression_cv_with_best_hyperparameters(
                 "chi_true",
                 "chi_pred",
                 "chi_error",
-            ] + COEFF_NAMES
+            ]
             fold_pred_frames.append(sub[[c for c in use_cols if c in sub.columns]].copy())
 
             row: Dict[str, object] = {
@@ -2462,13 +2446,11 @@ def _save_prediction_csvs(
         pred = predictions[split]
         sub["chi_pred"] = pred["chi_pred"]
         sub["chi_error"] = sub["chi_pred"] - sub["chi"]
-        sub["class_logit"] = pred["logit"]
-        sub["class_prob"] = pred["prob"]
-        sub["class_pred"] = (sub["class_prob"] >= 0.5).astype(int)
-
-        coeff = _coerce_coeff_matrix(pred["coefficients"], expected_rows=len(sub), split=split)
-        for i, name in enumerate(COEFF_NAMES):
-            sub[name] = coeff[:, i] if i < coeff.shape[1] else np.nan
+        if "logit" in pred:
+            sub["class_logit"] = pred["logit"]
+        if "prob" in pred:
+            sub["class_prob"] = pred["prob"]
+            sub["class_pred"] = (sub["class_prob"] >= 0.5).astype(int)
 
         sub.to_csv(out_dir / f"chi_predictions_{split}.csv", index=False)
         frames.append(sub)
@@ -2850,42 +2832,9 @@ def _save_coefficient_summary(
     tokenizer=None,
     timestep: int = 1,
 ) -> None:
-    model.eval()
-    if isinstance(model, BackbonePhysicsGuidedChiModel):
-        if tokenizer is None:
-            raise ValueError("tokenizer is required to save coefficients for backbone-finetuned model")
-        rec = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_miscible"]].copy().reset_index(drop=True)
-        encoded = tokenizer.batch_encode(rec["SMILES"].astype(str).tolist())
-        input_ids = torch.tensor(np.asarray(encoded["input_ids"], dtype=np.int64), dtype=torch.long, device=device)
-        attention_mask = torch.tensor(np.asarray(encoded["attention_mask"], dtype=np.int64), dtype=torch.long, device=device)
-        timesteps = torch.full((int(input_ids.shape[0]),), int(timestep), device=device, dtype=torch.long)
-        with torch.no_grad():
-            emb_t = model.backbone.get_pooled_output(
-                input_ids=input_ids,
-                timesteps=timesteps,
-                attention_mask=attention_mask,
-                pooling="mean",
-            )
-            features = model.chi_head.encoder(emb_t)
-            coeff = model.chi_head.coeff_head(features).cpu().numpy()
-            logit = model.chi_head.class_head(features).squeeze(-1).cpu().numpy()
-            prob = stable_sigmoid(logit)
-        df = rec
-    else:
-        emb = np.stack(embedding_cache_df["embedding"].to_list(), axis=0)
-        emb_t = torch.tensor(emb, dtype=torch.float32, device=device)
-        with torch.no_grad():
-            features = model.encoder(emb_t)
-            coeff = model.coeff_head(features).cpu().numpy()
-            logit = model.class_head(features).squeeze(-1).cpu().numpy()
-            prob = stable_sigmoid(logit)
-        df = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_miscible"]].copy()
-
-    for i, name in enumerate(COEFF_NAMES):
-        df[name] = coeff[:, i]
-    df["class_logit"] = logit
-    df["class_prob"] = prob
-    df.to_csv(out_csv, index=False)
+    raise RuntimeError(
+        "Coefficient export is not available after switching Step4_1 regression to direct chi prediction."
+    )
 
 
 def run_classifier_epoch(
@@ -3460,9 +3409,6 @@ def _save_regression_prediction_csvs(
         pred = predictions[split]
         sub["chi_pred"] = pred["chi_pred"]
         sub["chi_error"] = sub["chi_pred"] - sub["chi"]
-        coeff = _coerce_coeff_matrix(pred["coefficients"], expected_rows=len(sub), split=split)
-        for i, name in enumerate(COEFF_NAMES):
-            sub[name] = coeff[:, i] if i < coeff.shape[1] else np.nan
         sub.to_csv(out_dir / f"chi_predictions_{split}.csv", index=False)
         frames.append(sub)
     all_df = _concat_non_empty_frames(frames)
@@ -3759,7 +3705,6 @@ def _merge_predictions(
             "label": cls["label"],
             "logit": cls["logit"],
             "prob": cls["prob"],
-            "coefficients": reg["coefficients"],
         }
     return merged
 
@@ -3773,47 +3718,9 @@ def _save_combined_polymer_coefficients(
     tokenizer=None,
     timestep: int = 1,
 ) -> None:
-    reg_model.eval()
-    cls_model.eval()
-
-    if isinstance(reg_model, BackbonePhysicsGuidedChiModel):
-        if tokenizer is None:
-            raise ValueError("tokenizer is required to save coefficients for backbone-finetuned model")
-        rec = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_miscible"]].copy().reset_index(drop=True)
-        encoded = tokenizer.batch_encode(rec["SMILES"].astype(str).tolist())
-        input_ids = torch.tensor(np.asarray(encoded["input_ids"], dtype=np.int64), dtype=torch.long, device=device)
-        attention_mask = torch.tensor(np.asarray(encoded["attention_mask"], dtype=np.int64), dtype=torch.long, device=device)
-        timesteps = torch.full((int(input_ids.shape[0]),), int(timestep), device=device, dtype=torch.long)
-        with torch.no_grad():
-            emb_t = reg_model.backbone.get_pooled_output(
-                input_ids=input_ids,
-                timesteps=timesteps,
-                attention_mask=attention_mask,
-                pooling="mean",
-            )
-            features = reg_model.chi_head.encoder(emb_t)
-            coeff = reg_model.chi_head.coeff_head(features).cpu().numpy()
-        df = rec
-    else:
-        emb = np.stack(embedding_cache_df["embedding"].to_list(), axis=0)
-        emb_t = torch.tensor(emb, dtype=torch.float32, device=device)
-        with torch.no_grad():
-            features = reg_model.encoder(emb_t)
-            coeff = reg_model.coeff_head(features).cpu().numpy()
-        df = embedding_cache_df[["polymer_id", "Polymer", "SMILES", "water_miscible"]].copy()
-
-    emb_for_cls = np.stack(embedding_cache_df["embedding"].to_list(), axis=0)
-    emb_cls_t = torch.tensor(emb_for_cls, dtype=torch.float32, device=device)
-    with torch.no_grad():
-        cls_out = cls_model(embedding=emb_cls_t)
-        class_logit = cls_out["class_logit"].detach().cpu().numpy()
-        class_prob = torch.sigmoid(cls_out["class_logit"]).detach().cpu().numpy()
-
-    for i, name in enumerate(COEFF_NAMES):
-        df[name] = coeff[:, i]
-    df["class_logit"] = class_logit
-    df["class_prob"] = class_prob
-    df.to_csv(out_csv, index=False)
+    raise RuntimeError(
+        "Combined coefficient export is not available after switching Step4_1 regression to direct chi prediction."
+    )
 
 
 def main(args):
@@ -4312,6 +4219,7 @@ def main(args):
             "backbone_num_layers": int(backbone_num_layers),
             "finetune_last_layers": int(reg_finetune_last_layers),
             "backbone_finetune_enabled": bool(reg_use_backbone_finetune),
+            "regression_mode": "direct_chi",
             "dataset_path": str(reg_csv),
             "config": config,
         }
@@ -4333,8 +4241,6 @@ def main(args):
             dpi=dpi,
             font_size=font_size,
         )
-        reg_poly = reg_pred_df[["polymer_id", "Polymer", "SMILES", "water_miscible"] + COEFF_NAMES].drop_duplicates("polymer_id")
-        reg_poly.to_csv(reg_metrics_dir / "polymer_coefficients_regression_only.csv", index=False)
 
     # -------------------------
     # Step 4_2: Classification

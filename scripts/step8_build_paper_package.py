@@ -43,9 +43,7 @@ from matplotlib.patches import FancyBboxPatch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.chi.constants import COEFF_NAMES
 from src.chi.inverse_design_common import infer_coefficients_for_novel_candidates
-from src.chi.model import predict_chi_from_coefficients
 from src.utils.config import load_config, save_config
 from src.utils.chemistry import canonicalize_smiles
 from src.utils.figure_style import apply_publication_figure_style
@@ -1257,6 +1255,18 @@ def _selection_summary_csv_from_target_csv(target_csv: Optional[Path]) -> Option
     return candidate if candidate.exists() else None
 
 
+def _prefer_full_target_csv(
+    *,
+    step_dir: Optional[Path],
+    ranked_csv: Optional[Path],
+) -> Optional[Path]:
+    candidates = [
+        step_dir / "metrics" / "target_polymers.csv" if step_dir is not None else None,
+        ranked_csv,
+    ]
+    return _first_existing(candidates)
+
+
 def _resolve_step6_target_plot_csv(
     *,
     target_csv: Optional[Path],
@@ -1302,7 +1312,7 @@ def _resolve_step6_target_plot_csv(
     novel_df["Polymer"] = novel_df.get("Polymer", novel_df["canonical_smiles"]).astype(str)
     novel_df["polymer_id"] = np.arange(1, len(novel_df) + 1, dtype=int)
     cache_metadata = {
-        "cache_version": 2,
+        "cache_version": 3,
         "config_sha256": _hash_text(json.dumps(config, sort_keys=True, default=str)),
         "target_csv": _file_signature(target_csv),
         "inverse_targets_csv": _file_signature(inverse_targets_csv),
@@ -1316,7 +1326,7 @@ def _resolve_step6_target_plot_csv(
 
     if cache_csv.exists():
         cache_df = _safe_read_csv(cache_csv)
-        required_cols = {"polymer_id", "canonical_smiles", "chi_pred_target", "class_prob", "target_chi", *COEFF_NAMES}
+        required_cols = {"polymer_id", "canonical_smiles", "chi_pred_target", "class_prob", "target_chi"}
         cache_meta = _load_cache_metadata(cache_csv)
         if required_cols.issubset(cache_df.columns) and cache_meta == cache_metadata:
             cached_canonical = cache_df["canonical_smiles"].astype(str).fillna("").tolist()
@@ -1324,15 +1334,67 @@ def _resolve_step6_target_plot_csv(
             if cached_canonical == source_canonical:
                 return cache_csv
 
+    source_target_cols = {"temperature", "phi", "target_chi"}
+    source_has_target_info = source_target_cols.issubset(source_df.columns)
     inverse_df = _safe_read_csv(inverse_targets_csv)
-    inverse_row = inverse_df.iloc[0].to_dict() if not inverse_df.empty else {}
-    temperature = _pick(inverse_row, ["temperature"], default=np.nan)
-    phi = _pick(inverse_row, ["phi"], default=np.nan)
-    target_chi = _pick(inverse_row, ["target_chi"], default=np.nan)
-    property_rule = _pick(inverse_row, ["property_rule"], default="")
-    target_class = _pick(inverse_row, ["target_polymer_class"], default="")
-    if any(not np.isfinite(float(v)) for v in [temperature, phi, target_chi]):
-        return target_csv
+    if source_has_target_info:
+        condition_cols = ["temperature", "phi", "target_chi"]
+        target_cols = ["target_id", *condition_cols]
+        if "target_id" not in source_df.columns:
+            key_df = source_df[condition_cols].copy()
+            for optional_col in ["property_rule", "target_polymer_class"]:
+                if optional_col in source_df.columns:
+                    key_df[optional_col] = source_df[optional_col]
+                    condition_cols.append(optional_col)
+            key_df = key_df.drop_duplicates().reset_index(drop=True)
+            key_df.insert(0, "target_id", np.arange(1, len(key_df) + 1, dtype=int))
+            source_df = source_df.merge(key_df, on=condition_cols, how="left")
+            novel_df["target_id"] = source_df["target_id"].to_numpy()
+        for optional_col in ["property_rule", "target_polymer_class"]:
+            if optional_col in source_df.columns:
+                target_cols.append(optional_col)
+        target_df = (
+            source_df[target_cols]
+            .copy()
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+        for col in ["temperature", "phi", "target_chi"]:
+            target_df[col] = pd.to_numeric(target_df[col], errors="coerce")
+        if target_df[["temperature", "phi", "target_chi"]].isna().any().any():
+            return target_csv
+        temperature = float(pd.to_numeric(target_df["temperature"], errors="coerce").iloc[0])
+        phi = float(pd.to_numeric(target_df["phi"], errors="coerce").iloc[0])
+        target_chi = float(pd.to_numeric(target_df["target_chi"], errors="coerce").iloc[0])
+        property_rule = str(target_df.get("property_rule", pd.Series([""])).iloc[0] or "")
+        target_class = str(target_df.get("target_polymer_class", pd.Series([""])).iloc[0] or "")
+    else:
+        inverse_row = inverse_df.iloc[0].to_dict() if not inverse_df.empty else {}
+        temperature = _pick(inverse_row, ["temperature"], default=np.nan)
+        phi = _pick(inverse_row, ["phi"], default=np.nan)
+        target_chi = _pick(inverse_row, ["target_chi"], default=np.nan)
+        property_rule = _pick(inverse_row, ["property_rule"], default="")
+        target_class = _pick(inverse_row, ["target_polymer_class"], default="")
+        if inverse_df.empty or len(inverse_df) != 1:
+            print(
+                "[WARN] Step 6 target rescoring skipped because the source table lacks per-target condition columns "
+                "and inverse_targets.csv contains multiple target rows."
+            )
+            return target_csv
+        if any(not np.isfinite(float(v)) for v in [temperature, phi, target_chi]):
+            return target_csv
+        target_df = pd.DataFrame(
+            [
+                {
+                    "target_id": 1,
+                    "temperature": float(temperature),
+                    "phi": float(phi),
+                    "target_chi": float(target_chi),
+                    "property_rule": property_rule or "upper_bound",
+                    "target_polymer_class": target_class,
+                }
+            ]
+        )
 
     chi_cfg = config.get("chi_training", {})
     shared_cfg = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared", {}), dict) else {}
@@ -1344,6 +1406,7 @@ def _resolve_step6_target_plot_csv(
     try:
         inferred_df = infer_coefficients_for_novel_candidates(
             novel_df=novel_df[["polymer_id", "Polymer", "SMILES", "canonical_smiles"]].copy(),
+            target_df=target_df,
             config=config,
             model_size=model_size,
             split_mode=split_mode,
@@ -1360,15 +1423,24 @@ def _resolve_step6_target_plot_csv(
         print(f"[WARN] Step 6 target rescoring failed; Figure 5 chi/probability panels may be unavailable: {exc}")
         return target_csv
 
-    if inferred_df.empty or not {"polymer_id", "class_prob", *COEFF_NAMES}.issubset(inferred_df.columns):
+    if inferred_df.empty or not {"polymer_id", "class_prob", "chi_pred_target"}.issubset(inferred_df.columns):
         return target_csv
 
-    merge_cols = ["polymer_id", "class_prob", *COEFF_NAMES]
+    merge_cols = ["polymer_id", "class_prob", "chi_pred_target"]
+    merge_keys = ["polymer_id"]
+    if "target_id" in source_df.columns and "target_id" in inferred_df.columns:
+        source_df["target_id"] = pd.to_numeric(source_df["target_id"], errors="coerce").astype("Int64")
+        inferred_df = inferred_df.copy()
+        inferred_df["target_id"] = pd.to_numeric(inferred_df["target_id"], errors="coerce").astype("Int64")
+        merge_keys.append("target_id")
     if "class_prob_std" in inferred_df.columns:
         merge_cols.insert(2, "class_prob_std")
+    if "chi_pred_std_target" in inferred_df.columns:
+        merge_cols.append("chi_pred_std_target")
+    inferred_keep_cols = list(dict.fromkeys(merge_keys + merge_cols))
     merged_df = novel_df.merge(
-        inferred_df[merge_cols],
-        on="polymer_id",
+        inferred_df[inferred_keep_cols],
+        on=merge_keys,
         how="left",
     )
     if "class_prob_std" not in merged_df.columns:
@@ -1383,23 +1455,6 @@ def _resolve_step6_target_plot_csv(
         merged_df["property_rule"] = property_rule
     if "target_polymer_class" not in merged_df.columns or merged_df["target_polymer_class"].isna().all():
         merged_df["target_polymer_class"] = target_class
-
-    coeff_matrix = merged_df[COEFF_NAMES].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-    temperature_values = merged_df["temperature"].to_numpy(dtype=float)
-    phi_values = merged_df["phi"].to_numpy(dtype=float)
-    valid_rows = (
-        np.isfinite(temperature_values)
-        & np.isfinite(phi_values)
-        & np.all(np.isfinite(coeff_matrix), axis=1)
-    )
-    chi_pred = np.full(len(merged_df), np.nan, dtype=float)
-    if np.any(valid_rows):
-        chi_pred[valid_rows] = predict_chi_from_coefficients(
-            coefficients=coeff_matrix[valid_rows],
-            temperature=temperature_values[valid_rows],
-            phi=phi_values[valid_rows],
-        )
-    merged_df["chi_pred_target"] = chi_pred
     cache_csv.parent.mkdir(parents=True, exist_ok=True)
     merged_df.to_csv(cache_csv, index=False)
     _write_cache_metadata(cache_csv, cache_metadata)
@@ -3401,15 +3456,16 @@ def _write_storyline(
         "We present a physics-guided diffusion model framework for discovering water-miscible polymers.",
         "A transformer-based diffusion backbone trained on >100k polymer SMILES generates structurally",
         "diverse candidates. Condition-aware Flory-Huggins χ_target thresholds, learned from labeled",
-        "thermodynamic data, define design criteria across (T, φ) space. A PINN-augmented regression",
-        "model predicts χ(T, φ) coefficients and a binary classifier screens for water-miscibility.",
+        "thermodynamic data, define design criteria across (T, φ) space. A condition-aware regression",
+        "model predicts χ directly from polymer representation, temperature, and φ, while a binary",
+        "classifier screens for water-miscibility.",
         "Two inverse-design workflows - unconstrained and polymer-family-conditioned - identify",
         "novel water-miscible candidates whose novelty and thermodynamic profiles are validated",
         "by mechanistic chemistry-physics analysis.",
         "",
         "## Key Innovations",
         "1. Condition-aware χ_target learning: thresholds vary by (T, φ) and are bootstrap-validated",
-        "2. PINN regression: physically constrained χ(T, φ) = (a0 + a1/T + a2lnT + a3T)(1 + b1(1-φ) + b2(1-φ)^2)",
+        "2. Direct χ regression: χ is predicted from polymer representation together with temperature and φ",
         "3. Two-stage inverse design with class conditioning and multi-constraint scoring",
         "",
         "## Figure Narrative",
@@ -3864,17 +3920,13 @@ def _build_manuscript_tables(
     si_table1_path = si_tables_dir / "tableS1_input_artifact_status.csv"
     artifact_df.to_csv(si_table1_path, index=False)
 
-    step5_targets = _first_existing(
-        [
-            paths.get("step5_selected_target_candidate_ranked"),
-            paths["step5_dir"] / "metrics" / "target_polymers.csv" if paths.get("step5_dir") is not None else None,
-        ]
+    step5_targets = _prefer_full_target_csv(
+        step_dir=paths.get("step5_dir"),
+        ranked_csv=paths.get("step5_selected_target_candidate_ranked"),
     )
-    step6_targets = _first_existing(
-        [
-            paths.get("step6_selected_target_candidate_ranked"),
-            paths["step6_dir"] / "metrics" / "target_polymers.csv" if paths.get("step6_dir") is not None else None,
-        ]
+    step6_targets = _prefer_full_target_csv(
+        step_dir=paths.get("step6_dir"),
+        ranked_csv=paths.get("step6_selected_target_candidate_ranked"),
     )
     step5_df = _safe_read_csv(step5_targets)
     step6_df = _safe_read_csv(step6_targets)
@@ -3905,7 +3957,7 @@ def _build_manuscript_tables(
     coeff_df = _safe_read_csv(coeff_path)
     if coeff_df.empty:
         pd.DataFrame(
-            [{"note": "Step4 chi_coefficients.csv not found for this run."}]
+            [{"note": "Step4 direct chi regression does not provide coefficient tables for this run."}]
         ).to_csv(table_s4_path, index=False)
     else:
         coeff_df.to_csv(table_s4_path, index=False)
@@ -4269,22 +4321,14 @@ def main(args: argparse.Namespace) -> None:
         paths=paths,
         metadata_dir=metadata_dir,
     )
-    step5_target_csv = _first_existing(
-        [
-            paths.get("step5_selected_target_candidate_ranked"),
-            paths["step5_dir"] / "metrics" / "target_polymers.csv"
-            if paths.get("step5_dir") is not None
-            else None,
-        ]
+    step5_target_csv = _prefer_full_target_csv(
+        step_dir=paths.get("step5_dir"),
+        ranked_csv=paths.get("step5_selected_target_candidate_ranked"),
     )
     step5_selection_summary_csv = _selection_summary_csv_from_target_csv(step5_target_csv)
-    step6_target_csv = _first_existing(
-        [
-            paths.get("step6_selected_target_candidate_ranked"),
-            paths["step6_dir"] / "metrics" / "target_polymers.csv"
-            if paths.get("step6_dir") is not None
-            else None,
-        ]
+    step6_target_csv = _prefer_full_target_csv(
+        step_dir=paths.get("step6_dir"),
+        ranked_csv=paths.get("step6_selected_target_candidate_ranked"),
     )
     step6_selection_summary_csv = _selection_summary_csv_from_target_csv(step6_target_csv)
     step6_inverse_targets_csv = (
