@@ -14,6 +14,17 @@ RUNS=${2:-}
 STEP62_CONFIG=${STEP62_CONFIG:-configs/config6_2.yaml}
 BASE_CONFIG=${BASE_CONFIG:-configs/config.yaml}
 
+if command -v conda >/dev/null 2>&1; then
+  eval "$(conda shell.bash hook)"
+elif [ -x "/srv/home/htang228/anaconda3/bin/conda" ]; then
+  eval "$(/srv/home/htang228/anaconda3/bin/conda shell.bash hook)"
+else
+  echo "Conda not found on the login node. Please load conda and rerun."
+  exit 2
+fi
+
+conda activate euler_active_learning
+
 SIZE_TAG="m"
 case "$MODEL_SIZE" in
   small|s) SIZE_TAG="s" ;;
