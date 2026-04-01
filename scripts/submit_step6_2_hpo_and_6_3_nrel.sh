@@ -31,7 +31,7 @@ import sys
 
 sys.path.insert(0, str(Path(".").resolve()))
 from src.step6_2.config import load_step6_2_config
-from src.step6_2.hpo import STUDY_BASE_RUNS
+from src.step6_2.study_families import STUDY_BASE_RUNS
 
 resolved = load_step6_2_config(
     config_path=os.environ["STEP62_CONFIG"],
@@ -67,6 +67,15 @@ for line in "${META_LINES[@]}"; do
     FAMILY=*) FAMILIES+=("${line#FAMILY=}") ;;
   esac
 done
+
+if [ -z "$BENCHMARK_ROOT" ] || [ -z "$COMPARE_ROOT" ] || [ -z "$COMPARE_RUNS" ]; then
+  echo "Failed to resolve Step 6_2/6_3 metadata on the login node."
+  exit 2
+fi
+if [ -n "$STUDY_FAMILIES" ] && [ ${#FAMILIES[@]} -eq 0 ]; then
+  echo "Failed to resolve Step 6_2 HPO study families on the login node."
+  exit 2
+fi
 
 submitted_job_ids=()
 
@@ -112,7 +121,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(".").resolve()))
-from src.step6_2.hpo import STUDY_BASE_RUNS
+from src.step6_2.study_families import STUDY_BASE_RUNS
 print(STUDY_BASE_RUNS[os.environ["STUDY_FAMILY"]])
 PY
 )

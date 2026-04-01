@@ -14,21 +14,13 @@ import yaml
 
 from .config import build_run_config
 from .run_core import execute_step62_run
+from .study_families import STUDY_BASE_RUNS
 from src.utils.model_scales import get_model_config
 
 try:
     import optuna
 except ImportError:  # pragma: no cover - dependency is optional at import time
     optuna = None
-
-
-STUDY_BASE_RUNS = {
-    "S1": "S1_guided_frozen",
-    "S2": "S2_conditional",
-    "S3": "S3_conditional_guided",
-    "S4_rl": "S4_rl_finetuned",
-    "S4_dpo": "S4_dpo",
-}
 
 
 def _require_optuna():

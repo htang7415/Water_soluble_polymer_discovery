@@ -22,7 +22,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(".").resolve()))
-from src.step6_2.hpo import STUDY_BASE_RUNS
+from src.step6_2.study_families import STUDY_BASE_RUNS
 
 runs = []
 if os.environ.get("INCLUDE_S0", "1") == "1":

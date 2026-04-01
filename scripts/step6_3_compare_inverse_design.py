@@ -15,7 +15,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.step6_2.config import load_step6_2_config
-from src.step6_2.hpo import STUDY_BASE_RUNS
+from src.step6_2.study_families import STUDY_BASE_RUNS
 from src.step6_2.plotting import (
     plot_overall_success_all_runs,
     plot_overall_success_by_family,
