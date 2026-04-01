@@ -5,6 +5,8 @@ __pycache__/
 results/
 results_small
 results_1
+.cache/
+.mplconfig/
 traditional_step4/results*/
 Bi_Diffusion_SMILES
 Data/
@@ -17,6 +19,7 @@ Experiments*/
 
 *.md
 !README.md
+!command.md
 
 *.txt
 *.csv
@@ -33,4 +36,18 @@ Experiments*/
 *.ipynb
 *.pptx
 *.sh
+!scripts/run_step6_2.sh
+!scripts/run_step6_2_hpo.sh
+!scripts/run_step6_2_hpo_euler.sh
+!scripts/run_step6_2_hpo_nrel.sh
+!scripts/run_step6_2_hpo_and_6_3.sh
+!scripts/run_step6_3.sh
+!scripts/run_step6_2_euler.sh
+!scripts/run_step6_2_nrel.sh
+!scripts/run_step6_3_euler.sh
+!scripts/run_step6_3_nrel.sh
+!scripts/submit_step6_2_and_6_3_euler.sh
+!scripts/submit_step6_2_and_6_3_nrel.sh
+!scripts/submit_step6_2_hpo_and_6_3_euler.sh
+!scripts/submit_step6_2_hpo_and_6_3_nrel.sh
 *.gz

@@ -1,0 +1,175 @@
+step6_2:
+  split_mode: polymer
+  classification_split_mode: polymer
+  random_seed: 42
+  num_sampling_rounds: 5
+  sampling_seeds: [42, 43, 44, 45, 46]
+  canonical_families: [S0, S1, S2, S3, S4]
+  enabled_runs:
+    - S0_raw_unconditional
+    - S1_guided_frozen
+    - S2_conditional
+    - S2_cfg_2p0
+    - S3_conditional_guided
+    - S3_cfg_2p0
+    - S4_rl_finetuned
+    - S4_dpo
+  generation_budget: 512
+  sampling_temperature: 1.0
+  inference_batch_size: 128
+  raw_generation_valid_only: false
+  class_decode_prior_mode: "on"
+  class_token_bias_start_frac: 0.7
+  class_token_bias_strength: 1.5
+  target_sa_max: 4.0
+  figure_font_size: 16
+  available_target_classes: [polyimide, polyamide, polyester, polyether, polyacrylate, polystyrene, polysulfone]
+  c_target: polyimide
+
+  s1:
+    best_of_k: 4
+    guidance_start_frac: 0.5
+    class_guidance_start_frac: 0.7
+    class_guidance_min_valid_frac: 0.25
+    class_surrogate_mode: binary_exact
+    sol_log_prob_floor: -5.0
+    w_sol: 1.0
+    w_chi: 2.0
+    w_class: 0.5
+    embedding_timestep: 1
+
+  s2:
+    variant: pure
+    finetune_last_layers: null
+    optimizer: adamw
+    learning_rate: 3.0e-4
+    weight_decay: 0.01
+    batch_size: 128
+    warmup_steps: 1000
+    warmup_schedule: linear
+    lr_schedule: constant_after_warmup
+    max_steps: 50000
+    val_check_interval_steps: 500
+    early_stopping_patience_checks: 10
+    early_stopping_min_delta: 1.0e-4
+    max_grad_norm: 1.0
+    condition_dropout_rate: 0.1
+    condition_dropout_mode: joint_all_conditions
+    chi_target_augmentation_rate: 0.15
+    train_batch_mix:
+      d_chi: 0.8
+      d_water: 0.2
+    mt_aux:
+      head_type: linear
+      soluble_loss_weight: 0.1
+      chi_loss_weight: 0.1
+    cfg_scale: 1.0
+
+  s3:
+    supervised_train_config_source: s2
+    best_of_k: 4
+    guidance_start_frac: 0.5
+    class_guidance_start_frac: 0.7
+    class_guidance_min_valid_frac: 0.25
+    class_surrogate_mode: binary_exact
+    sol_log_prob_floor: -5.0
+    w_sol: 1.0
+    w_chi: 2.0
+    w_class: 0.25
+    embedding_timestep: 1
+    cfg_scale: 1.0
+
+  s4:
+    alignment_mode: rl
+    supervised_train_config_source: s2
+    warm_start_policy: shared_family_producer
+    warm_start_producer_name: S4_supervised_warm_start
+    optimizer: adamw
+    cfg_scale: 1.0
+    count_training_oracle_calls_separately: true
+    rl_checkpoint_selection_mode: proxy_success_hit_rate
+    rl_prompt_source: benchmark_target_rows
+    sol_log_prob_floor: -5.0
+    reward_weights:
+      w_success: 2.0
+      w_valid: 1.0
+      w_novel: 0.0
+      w_star: 1.0
+      w_sa: 1.0
+      w_class: 1.0
+      w_sol: 1.0
+      w_chi: 2.0
+    learning_rate: 1.0e-5
+    weight_decay: 0.01
+    warmup_steps: 0
+    warmup_schedule: linear
+    lr_schedule: constant_after_warmup
+    kl_weight: 0.01
+    gradient_checkpointing: true
+    rl_num_steps: 5000
+    rl_proxy_eval_interval_steps: 1000
+    rl_proxy_num_targets: 5
+    rl_proxy_generation_budget: 64
+    trajectories_per_batch: 128
+    dpo:
+      offline_pair_budget: 10000
+      val_pair_fraction: 0.2
+      beta: 0.1
+      optimizer: adamw
+      batch_size: 128
+      learning_rate: 3.0e-5
+      weight_decay: 0.01
+      warmup_steps: 0
+      warmup_schedule: linear
+      lr_schedule: constant_after_warmup
+      pair_source: label_water_miscibility
+      pair_refresh_mode: offline_fixed
+      logprob_mode: single_step_t1
+      checkpoint_selection_mode: val_dpo_loss
+      num_epochs: 3
+      synthetic_candidates_per_target: 16
+
+  run_overrides:
+    S2_mt:
+      canonical_family: S2
+      s2:
+        variant: mt
+    S2_cfg_0p0:
+      canonical_family: S2
+      s2:
+        cfg_scale: 0.0
+    S2_cfg_2p0:
+      canonical_family: S2
+      s2:
+        cfg_scale: 2.0
+    S3_cfg_2p0:
+      canonical_family: S3
+      s3:
+        cfg_scale: 2.0
+    S4_dpo:
+      canonical_family: S4
+      s4:
+        alignment_mode: dpo
+
+step6_3:
+  compare_all_enabled_runs: true
+  summarize_by_canonical_family: true
+
+step6_2_hpo:
+  enabled: true
+  sampler: tpe
+  sampler_seed: 42
+  n_startup_trials: 20
+  pruner: median
+  storage_uri: sqlite:///results_<model_size>/step6_2_hpo/<split_mode>/<c_target>/<study_family>/optuna.db
+  hpo_num_targets: 8
+  hpo_generation_budget: 128
+  hpo_num_rounds: 2
+  hpo_sampling_seeds: [101, 102]
+  tie_epsilon: 1.0e-4
+  method_budgets:
+    S1: {n_trials: 120, timeout_hours_medium: null}
+    S2: {n_trials: 120, timeout_hours_medium: null}
+    S3: {n_trials: 120, timeout_hours_medium: null}
+    S4_rl: {n_trials: 120, timeout_hours_medium: null}
+    S4_dpo: {n_trials: 120, timeout_hours_medium: null}

@@ -49,6 +49,7 @@ class ConstrainedSampler:
         self.use_constraints = use_constraints
         self.device = device
         self.class_token_logit_bias: Optional[torch.Tensor] = None
+        self.class_token_bias_start_frac: float = 0.0
 
         # Get special token IDs
         self.mask_id = tokenizer.mask_token_id
@@ -92,6 +93,19 @@ class ConstrainedSampler:
             self.class_token_logit_bias = torch.tensor(
                 bias, dtype=torch.float32, device=self.device
             )
+
+    def set_class_token_bias_start_frac(self, start_frac: float) -> None:
+        """Set late-activation threshold for class-token logit bias."""
+        start_frac = float(start_frac)
+        if not (0.0 <= start_frac <= 1.0):
+            raise ValueError(f"class_token_bias_start_frac must be in [0, 1], got {start_frac}")
+        self.class_token_bias_start_frac = start_frac
+
+    def _step_progress_frac(self, t: int) -> float:
+        """Map reverse-diffusion step ``t`` to progress fraction in [0, 1]."""
+        if self.num_steps <= 1:
+            return 1.0
+        return 1.0 - (float(t) - 1.0) / float(self.num_steps - 1)
 
     def _resolve_fallback_non_star_id(self) -> int:
         """Choose a stable fallback token ID that is not special and not '*'."""
@@ -553,6 +567,23 @@ class ConstrainedSampler:
         normalized = probs / sums.clamp(min=1e-12)
         return torch.where(valid_rows, normalized, row_fallback)
 
+    def _ensure_valid_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Guarantee at least one finite token logit at every position.
+
+        Constraint stacks can occasionally prune an entire token row to ``-inf``.
+        Sampling tolerates that through probability fallbacks, but log-softmax-
+        based objectives such as RL KL and replay diagnostics need finite logits.
+        """
+        finite = torch.isfinite(logits)
+        valid_rows = finite.any(dim=-1, keepdim=True)
+        if bool(valid_rows.all()):
+            return logits
+
+        repaired = logits.clone()
+        fallback = torch.full_like(repaired, float("-inf"))
+        fallback[..., self.fallback_non_star_id] = 0.0
+        return torch.where(valid_rows, repaired, fallback)
+
     def _fix_star_count(
         self,
         ids: torch.Tensor,
@@ -906,6 +937,7 @@ class ConstrainedSampler:
 
         for t in steps:
             timesteps = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
+            step_progress = self._step_progress_frac(int(t))
 
             with torch.no_grad():
                 logits = backbone(ids, timesteps, attention_mask)
@@ -918,7 +950,10 @@ class ConstrainedSampler:
                 logits = self._apply_ring_constraints(logits, ids)
                 logits = self._apply_bond_placement_constraints(logits, ids)
             # Apply class-enriched token bias at non-fixed positions
-            if self.class_token_logit_bias is not None:
+            if (
+                self.class_token_logit_bias is not None
+                and step_progress >= float(self.class_token_bias_start_frac)
+            ):
                 bias_mask = (~fixed_mask).unsqueeze(-1).float()
                 logits = logits + self.class_token_logit_bias.unsqueeze(0).unsqueeze(0) * bias_mask
             logits = self._apply_sampling_filters(logits)
