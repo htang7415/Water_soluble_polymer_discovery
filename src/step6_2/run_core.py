@@ -165,7 +165,7 @@ def run_single_target_sampling(
         )
         return smiles, {"training_soluble_oracle_calls": 0, "training_chi_oracle_calls": 0}, sample_meta
 
-    if run_cfg["run_name"] == "S1_guided_frozen":
+    if str(run_cfg["canonical_family"]) == "S1":
         if evaluator is None:
             raise ValueError("S1 guided frozen sampling requires a loaded Step 6_2 evaluator.")
         s1_cfg = run_cfg["s1"]

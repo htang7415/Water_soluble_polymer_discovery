@@ -160,8 +160,18 @@ class ConditionalDiffusionBackbone(nn.Module):
 
         cond = self._compute_condition_embedding(condition_bundle, condition_drop_mask)
         for layer_idx, layer in enumerate(self.layers):
-            def _layer_forward(hidden: torch.Tensor, cond_embed: torch.Tensor) -> torch.Tensor:
-                shift1, shift2 = self.condition_shift_projections[layer_idx](cond_embed).chunk(2, dim=-1)
+            projection = self.condition_shift_projections[layer_idx]
+
+            def _layer_forward(
+                hidden: torch.Tensor,
+                cond_embed: torch.Tensor,
+                *,
+                layer: nn.Module = layer,
+                projection: nn.Module = projection,
+            ) -> torch.Tensor:
+                # Bind the per-layer modules into the checkpointed closure so backward
+                # recomputation uses the same layer/projection pair as the forward pass.
+                shift1, shift2 = projection(cond_embed).chunk(2, dim=-1)
                 h1 = layer.norm1(hidden) + shift1.unsqueeze(1)
                 hidden = hidden + layer.attn(h1, attention_mask)
                 h2 = layer.norm2(hidden) + shift2.unsqueeze(1)
