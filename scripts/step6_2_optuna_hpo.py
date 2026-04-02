@@ -32,6 +32,11 @@ def main() -> None:
         action="store_true",
         help="Force-enable step6_2_hpo for this invocation without editing configs/config6_2.yaml.",
     )
+    parser.add_argument(
+        "--fresh_study",
+        action="store_true",
+        help="Delete existing per-family Step 6_2 HPO study artifacts before rerunning.",
+    )
     args = parser.parse_args()
 
     resolved = load_step6_2_config(
@@ -55,6 +60,7 @@ def main() -> None:
             model_size=args.model_size,
             device=device,
             refit_best=not args.skip_refit,
+            fresh_study=bool(args.fresh_study),
         )
         print(
             f"[step6_2_hpo] {study_family} best_trial={int(result['best_trial'].number)} "

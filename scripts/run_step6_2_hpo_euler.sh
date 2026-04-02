@@ -12,6 +12,7 @@ cd "$PROJECT_ROOT"
 STEP62_CONFIG=${STEP62_CONFIG:-configs/config6_2.yaml}
 BASE_CONFIG=${BASE_CONFIG:-configs/config.yaml}
 SKIP_REFIT=${SKIP_REFIT:-0}
+FRESH_STUDY=${FRESH_STUDY:-1}
 
 if command -v conda >/dev/null 2>&1; then
   eval "$(conda shell.bash hook)"
@@ -39,12 +40,16 @@ CMD=(
 if [ "$SKIP_REFIT" = "1" ]; then
   CMD+=(--skip_refit)
 fi
+if [ "$FRESH_STUDY" = "1" ]; then
+  CMD+=(--fresh_study)
+fi
 
 echo "Step 6_2 HPO (Euler): Optuna study + best-trial refit"
 echo "  Model size:     $MODEL_SIZE"
 echo "  Study families: $STUDY_FAMILIES"
 echo "  Conda env:      euler_active_learning"
 echo "  Config:         $STEP62_CONFIG"
+echo "  Fresh study:    $FRESH_STUDY"
 echo "  XDG_CACHE_HOME: $XDG_CACHE_HOME"
 echo "  MPLCONFIGDIR:   $MPLCONFIGDIR"
 

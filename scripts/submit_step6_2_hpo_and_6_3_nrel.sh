@@ -14,6 +14,8 @@ STUDY_FAMILIES=${2:-S1,S2,S3,S4_rl,S4_dpo}
 INCLUDE_S0=${INCLUDE_S0:-1}
 STEP62_CONFIG=${STEP62_CONFIG:-configs/config6_2.yaml}
 BASE_CONFIG=${BASE_CONFIG:-configs/config.yaml}
+FRESH_STUDY=${FRESH_STUDY:-1}
+FORCE_RERUN_HPO=${FORCE_RERUN_HPO:-1}
 
 if command -v conda >/dev/null 2>&1; then
   eval "$(conda shell.bash hook)"
@@ -149,9 +151,12 @@ PY
       break
     fi
   done
-  if [ "$tuned_complete" -eq 1 ]; then
+  if [ "$tuned_complete" -eq 1 ] && [ "$FORCE_RERUN_HPO" != "1" ]; then
     echo "Skipping completed HPO refit run: ${tuned_run}"
     continue
+  fi
+  if [ "$tuned_complete" -eq 1 ] && [ "$FORCE_RERUN_HPO" = "1" ]; then
+    echo "Re-running completed HPO refit run: ${tuned_run}"
   fi
   family_tag=$(echo "$family" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '_')
   jid=$(sbatch \
@@ -167,7 +172,7 @@ PY
     --cpus-per-task=16 \
     --gres=gpu:1 \
     --chdir "$PROJECT_ROOT" \
-    --wrap "bash scripts/run_step6_2_hpo_nrel.sh \"$MODEL_SIZE\" \"$family\"")
+    --wrap "FRESH_STUDY=\"$FRESH_STUDY\" bash scripts/run_step6_2_hpo_nrel.sh \"$MODEL_SIZE\" \"$family\"")
   submitted_job_ids+=("$jid")
   echo "Submitted Step 6_2 HPO family ${family}: ${jid}"
 done
@@ -186,13 +191,13 @@ STEP63_ARGS=(
   --chdir "$PROJECT_ROOT"
 )
 if [ ${#submitted_job_ids[@]} -gt 0 ]; then
-  dependency="afterok:$(IFS=:; echo "${submitted_job_ids[*]}")"
+  dependency="afterany:$(IFS=:; echo "${submitted_job_ids[*]}")"
   STEP63_ARGS+=(--dependency "$dependency")
 fi
 
 jid63=$(sbatch \
   "${STEP63_ARGS[@]}" \
-  --wrap "bash scripts/run_step6_3_nrel.sh \"$MODEL_SIZE\" \"$COMPARE_RUNS\"")
+  --wrap "ALLOW_PARTIAL=\"1\" bash scripts/run_step6_3_nrel.sh \"$MODEL_SIZE\" \"$COMPARE_RUNS\"")
 
 echo "Submitted Step 6_2 HPO + Step 6_3 chain on NREL:"
 if [ ${#submitted_job_ids[@]} -gt 0 ]; then

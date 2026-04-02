@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import time
 from copy import deepcopy
 from dataclasses import replace
@@ -71,6 +72,44 @@ def _finetune_last_layer_choices(resolved) -> list[object]:
     return ordered + ["full"]
 
 
+def _update_s2_training_params(run_cfg: Dict[str, object], params: Dict[str, Any], *, prefix: str = "") -> None:
+    lr_key = f"{prefix}learning_rate"
+    dropout_key = f"{prefix}condition_dropout_rate"
+    augmentation_key = f"{prefix}chi_target_augmentation_rate"
+    mix_key = f"{prefix}train_batch_mix_d_chi"
+
+    updates: Dict[str, Any] = {}
+    if lr_key in params:
+        updates["learning_rate"] = float(params[lr_key])
+    if dropout_key in params:
+        updates["condition_dropout_rate"] = float(params[dropout_key])
+    if augmentation_key in params:
+        updates["chi_target_augmentation_rate"] = float(params[augmentation_key])
+    if mix_key in params:
+        d_chi = float(params[mix_key])
+        updates["train_batch_mix"] = {
+            "d_chi": d_chi,
+            "d_water": float(1.0 - d_chi),
+        }
+    if updates:
+        run_cfg["s2"].update(updates)
+
+
+def _suggest_s2_training_params(trial, params: Dict[str, Any], *, prefix: str = "") -> None:
+    params[f"{prefix}learning_rate"] = trial.suggest_float(
+        f"{prefix}learning_rate", 1.0e-4, 6.0e-4, log=True
+    )
+    params[f"{prefix}condition_dropout_rate"] = trial.suggest_float(
+        f"{prefix}condition_dropout_rate", 0.05, 0.20
+    )
+    params[f"{prefix}chi_target_augmentation_rate"] = trial.suggest_float(
+        f"{prefix}chi_target_augmentation_rate", 0.0, 0.25
+    )
+    params[f"{prefix}train_batch_mix_d_chi"] = trial.suggest_float(
+        f"{prefix}train_batch_mix_d_chi", 0.60, 0.90
+    )
+
+
 def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, Any]):
     resolved_trial = resolved
     if "class_token_bias_start_frac" in params:
@@ -97,19 +136,14 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
             }
         )
     elif family == "S2":
+        _update_s2_training_params(run_cfg, params)
         run_cfg["s2"].update(
             {
-                "learning_rate": float(params["learning_rate"]),
-                "condition_dropout_rate": float(params["condition_dropout_rate"]),
-                "chi_target_augmentation_rate": float(params["chi_target_augmentation_rate"]),
                 "cfg_scale": float(params["cfg_scale"]),
-                "train_batch_mix": {
-                    "d_chi": float(params["train_batch_mix_d_chi"]),
-                    "d_water": float(1.0 - float(params["train_batch_mix_d_chi"])),
-                },
             }
         )
     elif family == "S3":
+        _update_s2_training_params(run_cfg, params, prefix="s2_")
         run_cfg["s3"].update(
             {
                 "cfg_scale": float(params["cfg_scale"]),
@@ -123,6 +157,7 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
             }
         )
     elif family == "S4":
+        _update_s2_training_params(run_cfg, params, prefix="s2_")
         alignment_mode = str(run_cfg["s4"]["alignment_mode"]).strip().lower()
         run_cfg["s4"]["cfg_scale"] = float(params["cfg_scale"])
         if alignment_mode == "rl":
@@ -138,6 +173,7 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
             )
             run_cfg["s4"]["reward_weights"] = reward_weights
             run_cfg["s4"]["kl_weight"] = float(params["kl_weight"])
+            run_cfg["s4"]["learning_rate"] = float(params["rl_learning_rate"])
         elif alignment_mode == "dpo":
             dpo_cfg = deepcopy(run_cfg["s4"]["dpo"])
             dpo_cfg.update(
@@ -174,15 +210,13 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["finetune_last_layers"] = trial.suggest_categorical(
             "finetune_last_layers", _finetune_last_layer_choices(resolved)
         )
-        params["learning_rate"] = trial.suggest_float("learning_rate", 1.0e-4, 6.0e-4, log=True)
-        params["condition_dropout_rate"] = trial.suggest_float("condition_dropout_rate", 0.05, 0.20)
-        params["chi_target_augmentation_rate"] = trial.suggest_float("chi_target_augmentation_rate", 0.0, 0.25)
-        params["train_batch_mix_d_chi"] = trial.suggest_float("train_batch_mix_d_chi", 0.60, 0.90)
+        _suggest_s2_training_params(trial, params)
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 3.0)
     elif study_family == "S3":
         params["finetune_last_layers"] = trial.suggest_categorical(
             "finetune_last_layers", _finetune_last_layer_choices(resolved)
         )
+        _suggest_s2_training_params(trial, params, prefix="s2_")
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 3.0)
         params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 8])
         params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.40, 0.65)
@@ -196,17 +230,20 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["finetune_last_layers"] = trial.suggest_categorical(
             "finetune_last_layers", _finetune_last_layer_choices(resolved)
         )
+        _suggest_s2_training_params(trial, params, prefix="s2_")
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
         params["w_class"] = trial.suggest_float("w_class", 0.25, 2.0, log=True)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
         params["w_sa"] = trial.suggest_float("w_sa", 0.0, 1.5)
         params["kl_weight"] = trial.suggest_float("kl_weight", 1.0e-3, 5.0e-2, log=True)
+        params["rl_learning_rate"] = trial.suggest_float("rl_learning_rate", 1.0e-6, 1.0e-4, log=True)
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
     elif study_family == "S4_dpo":
         params["finetune_last_layers"] = trial.suggest_categorical(
             "finetune_last_layers", _finetune_last_layer_choices(resolved)
         )
+        _suggest_s2_training_params(trial, params, prefix="s2_")
         params["offline_pair_budget"] = trial.suggest_categorical("offline_pair_budget", [5000, 10000, 20000])
         params["beta"] = trial.suggest_float("beta", 0.03, 0.3, log=True)
         params["learning_rate"] = trial.suggest_float("learning_rate", 1.0e-5, 1.0e-4, log=True)
@@ -263,41 +300,6 @@ def _write_search_space(path: Path, *, study_family: str, token_bias_active: boo
         yaml.safe_dump(payload, handle, sort_keys=False)
 
 
-def _apply_inherited_s2_warm_start_params(resolved, run_cfg: Dict[str, object]) -> Dict[str, object]:
-    """Optionally seed S3/S4 warm starts from the best completed S2 HPO recipe."""
-
-    canonical_family = str(run_cfg.get("canonical_family", "")).strip()
-    if canonical_family not in {"S3", "S4"}:
-        return run_cfg
-
-    best_params_path = _hpo_root(resolved) / "S2" / "best_params.yaml"
-    if not best_params_path.exists():
-        return run_cfg
-
-    with open(best_params_path, "r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle) or {}
-    best_params = payload.get("best_params", {}) if isinstance(payload, dict) else {}
-    if not isinstance(best_params, dict) or not best_params:
-        return run_cfg
-
-    if "finetune_last_layers" in best_params:
-        finetune_value = best_params["finetune_last_layers"]
-        run_cfg["s2"]["finetune_last_layers"] = None if finetune_value == "full" else int(finetune_value)
-    if "learning_rate" in best_params:
-        run_cfg["s2"]["learning_rate"] = float(best_params["learning_rate"])
-    if "condition_dropout_rate" in best_params:
-        run_cfg["s2"]["condition_dropout_rate"] = float(best_params["condition_dropout_rate"])
-    if "chi_target_augmentation_rate" in best_params:
-        run_cfg["s2"]["chi_target_augmentation_rate"] = float(best_params["chi_target_augmentation_rate"])
-    if "train_batch_mix_d_chi" in best_params:
-        d_chi = float(best_params["train_batch_mix_d_chi"])
-        run_cfg["s2"]["train_batch_mix"] = {
-            "d_chi": d_chi,
-            "d_water": float(1.0 - d_chi),
-        }
-    return run_cfg
-
-
 def run_optuna_study(
     *,
     resolved,
@@ -307,6 +309,7 @@ def run_optuna_study(
     model_size: str | None,
     device: str,
     refit_best: bool = True,
+    fresh_study: bool = False,
 ) -> Dict[str, Any]:
     _require_optuna()
     if not bool(resolved.step6_2_hpo.get("enabled", False)):
@@ -318,8 +321,9 @@ def run_optuna_study(
 
     base_run_name = STUDY_BASE_RUNS[study_family]
     base_run_cfg = build_run_config(resolved, base_run_name)
-    base_run_cfg = _apply_inherited_s2_warm_start_params(resolved, base_run_cfg)
     study_root = _hpo_root(resolved) / study_family
+    if fresh_study and study_root.exists():
+        shutil.rmtree(study_root)
     study_root.mkdir(parents=True, exist_ok=True)
     _write_search_space(
         study_root / "search_space.yaml",
@@ -342,13 +346,15 @@ def run_optuna_study(
         n_startup_trials=int(resolved.step6_2_hpo.get("n_startup_trials", 20)),
     )
     pruner = optuna.pruners.MedianPruner()
+    study_name = f"step6_2_{study_family}_{resolved.c_target}_{resolved.model_size}"
+    storage_uri = _storage_uri(resolved, study_family=study_family)
     study = optuna.create_study(
-        study_name=f"step6_2_{study_family}_{resolved.c_target}_{resolved.model_size}",
+        study_name=study_name,
         direction="maximize",
         sampler=sampler,
         pruner=pruner,
-        storage=_storage_uri(resolved, study_family=study_family),
-        load_if_exists=True,
+        storage=storage_uri,
+        load_if_exists=not fresh_study,
     )
 
     budgets = dict(resolved.step6_2_hpo.get("method_budgets", {}).get(study_family, {}))
@@ -449,13 +455,16 @@ def run_optuna_study(
         tuned_run_cfg = deepcopy(base_run_cfg)
         resolved_refit, tuned_run_cfg = _apply_trial_params(resolved, tuned_run_cfg, dict(best_trial.params))
         tuned_run_cfg["run_name"] = f"{base_run_cfg['run_name']}_optuna"
+        refit_run_dir = resolved_refit.benchmark_root / tuned_run_cfg["run_name"]
+        if fresh_study and refit_run_dir.exists():
+            shutil.rmtree(refit_run_dir)
         refit_result = execute_step62_run(
             resolved=resolved_refit,
             run_name=tuned_run_cfg["run_name"],
             run_cfg=tuned_run_cfg,
             device=device,
             config_path=config_path,
-            run_dir=resolved_refit.benchmark_root / tuned_run_cfg["run_name"],
+            run_dir=refit_run_dir,
             shared_evaluator=None,
             target_rows_df=None,
             generation_budget=None,
