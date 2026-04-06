@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import shutil
+import tempfile
 import time
 from copy import deepcopy
 from dataclasses import replace
@@ -286,8 +287,32 @@ def _select_best_completed_trial(study, *, tie_epsilon: float):
     return contenders[0]
 
 
-def _trial_run_dir(study_root: Path, trial_number: int) -> Path:
-    return study_root / "trials" / f"trial_{int(trial_number):04d}"
+def _trial_summary_path(study_root: Path, trial_number: int) -> Path:
+    return study_root / "trials" / f"trial_{int(trial_number):04d}.json"
+
+
+def _write_trial_summary(
+    study_root: Path,
+    *,
+    trial_number: int,
+    study_family: str,
+    run_name: str,
+    params: Dict[str, Any],
+    mean_success_hit_rate: float | None,
+    state: str,
+) -> None:
+    payload = {
+        "trial_number": int(trial_number),
+        "study_family": str(study_family),
+        "run_name": str(run_name),
+        "state": str(state),
+        "mean_success_hit_rate": (float(mean_success_hit_rate) if mean_success_hit_rate is not None else None),
+        "hyperparameters": dict(params),
+    }
+    trial_path = _trial_summary_path(study_root, int(trial_number))
+    trial_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(trial_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
 
 
 def _write_search_space(path: Path, *, study_family: str, token_bias_active: bool, pair_source: str) -> None:
@@ -386,35 +411,50 @@ def run_optuna_study(
         params = suggest_trial_params(trial, study_family=study_family, resolved=resolved, run_cfg=run_cfg)
         resolved_trial, run_cfg = _apply_trial_params(resolved, run_cfg, params)
         run_cfg["run_name"] = f"{base_run_cfg['run_name']}__trial_{int(trial.number):04d}"
-        trial_dir = _trial_run_dir(study_root, int(trial.number))
         start = time.time()
-        result = execute_step62_run(
-            resolved=resolved_trial,
-            run_name=run_cfg["run_name"],
-            run_cfg=run_cfg,
-            device=device,
-            config_path=config_path,
-            run_dir=trial_dir,
-            shared_evaluator=None,
-            target_rows_df=resolved_trial.hpo_target_df,
-            generation_budget=hpo_generation_budget,
-            sampling_seeds=hpo_sampling_seeds,
-            num_rounds=hpo_num_rounds,
-            save_figures=False,
-            pruning_callback=pruning_callback,
-            extra_context={
-                "base_config_path": base_config_path,
-                "model_size": model_size,
-                "study_family": study_family,
-                "trial_number": int(trial.number),
-                "hpo_mode": True,
-                "trial_params": params,
-            },
-        )
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=f"step6_2_hpo_{study_family}_trial_{int(trial.number):04d}_"
+            ) as tmp_dir:
+                result = execute_step62_run(
+                    resolved=resolved_trial,
+                    run_name=run_cfg["run_name"],
+                    run_cfg=run_cfg,
+                    device=device,
+                    config_path=config_path,
+                    run_dir=Path(tmp_dir),
+                    shared_evaluator=None,
+                    target_rows_df=resolved_trial.hpo_target_df,
+                    generation_budget=hpo_generation_budget,
+                    sampling_seeds=hpo_sampling_seeds,
+                    num_rounds=hpo_num_rounds,
+                    save_figures=False,
+                    pruning_callback=pruning_callback,
+                    extra_context={
+                        "base_config_path": base_config_path,
+                        "model_size": model_size,
+                        "study_family": study_family,
+                        "trial_number": int(trial.number),
+                        "hpo_mode": True,
+                        "trial_params": params,
+                    },
+                )
+        except optuna.TrialPruned:
+            _write_trial_summary(
+                study_root,
+                trial_number=int(trial.number),
+                study_family=study_family,
+                run_name=str(run_cfg["run_name"]),
+                params=params,
+                mean_success_hit_rate=None,
+                state="PRUNED",
+            )
+            raise
         wall_time = time.time() - start
         metrics = result["method_metrics"]
         eval_df = result["evaluation_results_df"]
-        trial.report(float(metrics["mean_success_hit_rate"]), step=9_999_999)
+        mean_success_hit_rate = float(metrics["mean_success_hit_rate"])
+        trial.report(mean_success_hit_rate, step=9_999_999)
         trial.set_user_attr("mean_class_ok", float(eval_df["class_ok"].astype(float).mean()) if not eval_df.empty else float("nan"))
         trial.set_user_attr("mean_chi_ok", float(eval_df["chi_ok"].astype(float).mean()) if not eval_df.empty else float("nan"))
         trial.set_user_attr("mean_soluble_ok", float(eval_df["soluble_ok"].astype(float).mean()) if not eval_df.empty else float("nan"))
@@ -424,16 +464,35 @@ def run_optuna_study(
         )
         trial.set_user_attr("wall_time_sec", float(wall_time))
         trial.set_user_attr("run_name", str(run_cfg["run_name"]))
-        return float(metrics["mean_success_hit_rate"])
+        _write_trial_summary(
+            study_root,
+            trial_number=int(trial.number),
+            study_family=study_family,
+            run_name=str(run_cfg["run_name"]),
+            params=params,
+            mean_success_hit_rate=mean_success_hit_rate,
+            state="COMPLETE",
+        )
+        return mean_success_hit_rate
 
     if remaining_trials > 0:
         study.optimize(objective, n_trials=remaining_trials, timeout=None)
     best_trial = _select_best_completed_trial(study, tie_epsilon=tie_epsilon)
 
-    trials_df = study.trials_dataframe(attrs=("number", "value", "state", "params", "user_attrs"))
+    trials_df = study.trials_dataframe(attrs=("number", "value", "state", "params"))
+    trials_df = trials_df.rename(columns={"number": "trial_number", "value": "mean_success_hit_rate"})
     trials_df.to_csv(study_root / "trials.csv", index=False)
+    trial_records = [
+        {
+            "trial_number": int(trial.number),
+            "state": str(trial.state.name),
+            "mean_success_hit_rate": (float(trial.value) if trial.value is not None else None),
+            "hyperparameters": dict(trial.params),
+        }
+        for trial in study.trials
+    ]
     with open(study_root / "trials.json", "w", encoding="utf-8") as handle:
-        json.dump([trial.__dict__ for trial in study.trials], handle, indent=2, default=str)
+        json.dump(trial_records, handle, indent=2)
     with open(study_root / "best_params.yaml", "w", encoding="utf-8") as handle:
         yaml.safe_dump(
             {
@@ -442,9 +501,8 @@ def run_optuna_study(
                 "existing_trial_count_at_start": int(existing_trial_count),
                 "remaining_trials_executed": int(remaining_trials),
                 "best_trial_number": int(best_trial.number),
-                "best_value": float(best_trial.value),
+                "best_mean_success_hit_rate": float(best_trial.value),
                 "best_params": dict(best_trial.params),
-                "best_user_attrs": dict(best_trial.user_attrs),
             },
             handle,
             sort_keys=False,
