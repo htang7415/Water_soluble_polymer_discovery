@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from src.data.tokenizer import PSmilesTokenizer
-from src.utils.chemistry import canonicalize_smiles
+from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars, has_terminal_connection_stars
 from src.utils.reproducibility import seed_everything
 
 from .conditional_sampling import create_conditional_sampler, sample_conditional_with_class_prior
@@ -103,6 +103,24 @@ def _bundle_to_row(bundle: np.ndarray) -> Dict[str, float]:
     return {column: float(bundle[idx]) for idx, column in enumerate(COND_COLS)}
 
 
+def _compute_star_ok(smiles: str) -> int:
+    smiles = str(smiles)
+    return int(
+        check_validity(smiles)
+        and count_stars(smiles) == 2
+        and has_terminal_connection_stars(smiles, expected_stars=2)
+    )
+
+
+def _filter_star_ok_rows(df: pd.DataFrame, *, smiles_col: str = "SMILES") -> Tuple[pd.DataFrame, Dict[str, int]]:
+    if df.empty:
+        return df.copy(), {"input_rows": 0, "star_ok_rows": 0}
+    work = df.copy()
+    work["_star_ok"] = work[smiles_col].astype(str).map(_compute_star_ok).astype(int)
+    filtered = work.loc[work["_star_ok"] == 1].drop(columns=["_star_ok"]).reset_index(drop=True)
+    return filtered, {"input_rows": int(len(df)), "star_ok_rows": int(len(filtered))}
+
+
 def _base_pair_record(
     *,
     source_name: str,
@@ -147,11 +165,12 @@ def _base_pair_record(
 
 def _build_d_water_pairs(
     train_d_water: pd.DataFrame,
-) -> pd.DataFrame:
-    positives = train_d_water.loc[train_d_water["water_miscible"].astype(int) == 1].copy()
-    negatives = train_d_water.loc[train_d_water["water_miscible"].astype(int) == 0].copy()
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    filtered, star_stats = _filter_star_ok_rows(train_d_water)
+    positives = filtered.loc[filtered["water_miscible"].astype(int) == 1].copy()
+    negatives = filtered.loc[filtered["water_miscible"].astype(int) == 0].copy()
     if positives.empty or negatives.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), star_stats
 
     positives["canonical_smiles"] = positives["SMILES"].astype(str).map(_canonical_sort_key)
     negatives["canonical_smiles"] = negatives["SMILES"].astype(str).map(_canonical_sort_key)
@@ -175,10 +194,11 @@ def _build_d_water_pairs(
                 )
             )
     if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(
+        return pd.DataFrame(), star_stats
+    pair_df = pd.DataFrame(rows).sort_values(
         ["source_name", "bucket_key", "chosen_canonical_smiles", "rejected_canonical_smiles", "chosen_row_id", "rejected_row_id"]
     ).reset_index(drop=True)
+    return pair_df, star_stats
 
 
 def _build_d_chi_pairs(
@@ -187,8 +207,8 @@ def _build_d_chi_pairs(
     scaler: ConditionScaler,
     chi_lookup,
     pair_source: str,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    work = train_d_chi.copy()
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
+    work, star_stats = _filter_star_ok_rows(train_d_chi)
     work["canonical_smiles"] = work["SMILES"].astype(str).map(_canonical_sort_key)
     rows: List[Dict[str, Any]] = []
     gap_rows: List[Dict[str, Any]] = []
@@ -265,7 +285,7 @@ def _build_d_chi_pairs(
             ]
         ).reset_index(drop=True)
     gap_df = pd.DataFrame(gap_rows)
-    return pair_df, gap_df
+    return pair_df, gap_df, star_stats
 
 
 def _synthetic_pair_record(
@@ -446,6 +466,7 @@ def _take_budgeted_pairs(
     d_water_pairs: pd.DataFrame,
     d_chi_pairs: pd.DataFrame,
     offline_pair_budget: int,
+    d_water_budget_fraction: float,
 ) -> pd.DataFrame:
     budget = max(0, int(offline_pair_budget))
     if budget == 0:
@@ -455,9 +476,11 @@ def _take_budgeted_pairs(
     remaining_parts: List[pd.DataFrame] = []
     water_available = int(len(d_water_pairs))
     chi_available = int(len(d_chi_pairs))
+    water_fraction = float(np.clip(float(d_water_budget_fraction), 0.0, 1.0))
 
     if water_available > 0 and chi_available > 0:
-        water_target = budget // 2
+        water_target = int(np.floor(float(budget) * water_fraction))
+        water_target = max(0, min(int(budget), water_target))
         chi_target = budget - water_target
     elif chi_available > 0:
         water_target = 0
@@ -616,9 +639,9 @@ def build_dpo_pair_splits(
         )
     else:
         frames = build_step62_supervised_frames(resolved)
-        d_water_pairs = _build_d_water_pairs(frames["train_d_water"])
+        d_water_pairs, d_water_star_stats = _build_d_water_pairs(frames["train_d_water"])
         d_chi_pair_source = pair_source if pair_source == "chi_aware_label_bucketed" else "label_water_miscibility"
-        d_chi_pairs, chi_prompt_gap_df = _build_d_chi_pairs(
+        d_chi_pairs, chi_prompt_gap_df, d_chi_star_stats = _build_d_chi_pairs(
             frames["train_d_chi"],
             scaler=scaler,
             chi_lookup=resolved.chi_lookup,
@@ -628,6 +651,7 @@ def build_dpo_pair_splits(
             d_water_pairs=d_water_pairs,
             d_chi_pairs=d_chi_pairs,
             offline_pair_budget=int(dpo_cfg["offline_pair_budget"]),
+            d_water_budget_fraction=float(dpo_cfg.get("d_water_budget_fraction", 0.5)),
         )
     if selected_pairs.empty:
         raise ValueError("No Step 6_2 DPO pairs could be constructed from the current training split.")
@@ -665,6 +689,7 @@ def build_dpo_pair_splits(
     diagnostics = {
         "pair_source": pair_source,
         "offline_pair_budget": int(dpo_cfg["offline_pair_budget"]),
+        "d_water_budget_fraction": float(dpo_cfg.get("d_water_budget_fraction", 0.5)),
         "realized_total_pairs": realized_total,
         "realized_train_pairs": int(len(train_pairs)),
         "realized_val_pairs": int(len(val_pairs)),
@@ -674,6 +699,11 @@ def build_dpo_pair_splits(
         "realized_d_chi_pairs": int((selected_pairs["source_name"] == "d_chi").sum()),
         "realized_target_row_synthetic_pairs": int((selected_pairs["source_name"] == "target_row_synthetic").sum()),
         "synthetic_candidate_count": int(len(candidate_df)),
+        "star_ok_pair_filter_enabled": bool(pair_source != "target_row_synthetic"),
+        "d_water_input_rows": int(d_water_star_stats["input_rows"]) if pair_source != "target_row_synthetic" else 0,
+        "d_water_star_ok_rows": int(d_water_star_stats["star_ok_rows"]) if pair_source != "target_row_synthetic" else 0,
+        "d_chi_input_rows": int(d_chi_star_stats["input_rows"]) if pair_source != "target_row_synthetic" else 0,
+        "d_chi_star_ok_rows": int(d_chi_star_stats["star_ok_rows"]) if pair_source != "target_row_synthetic" else 0,
     }
     if diagnostics["shortfall_pairs"] > 0:
         LOGGER.warning(
@@ -855,6 +885,13 @@ def _save_dpo_checkpoint(
     torch.save(payload, checkpoint_path)
 
 
+def _clone_policy_state_dict(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in module.state_dict().items()
+    }
+
+
 def train_s4_dpo_alignment(
     *,
     resolved: ResolvedStep62Config,
@@ -865,6 +902,7 @@ def train_s4_dpo_alignment(
     evaluator=None,
     device: str,
     pruning_callback=None,
+    skip_disk_checkpoints: bool = False,
 ) -> DpoTrainingArtifacts:
     """Train the Step 6_2 offline DPO branch from a supervised warm start."""
 
@@ -917,12 +955,13 @@ def train_s4_dpo_alignment(
             collate_fn=step62_dpo_collate_fn,
         )
 
+    configured_num_epochs = int(dpo_cfg["num_epochs"])
     optimizer, scheduler = build_optimizer_and_scheduler(
         modules={"policy_model": policy_model},
         learning_rate=float(dpo_cfg["learning_rate"]),
         weight_decay=float(dpo_cfg["weight_decay"]),
         warmup_steps=int(dpo_cfg["warmup_steps"]),
-        max_steps=max(1, int(len(train_loader) * int(dpo_cfg["num_epochs"]))),
+        max_steps=max(1, int(len(train_loader) * configured_num_epochs)),
         warmup_schedule=str(dpo_cfg["warmup_schedule"]),
         lr_schedule=str(dpo_cfg["lr_schedule"]),
     )
@@ -931,14 +970,20 @@ def train_s4_dpo_alignment(
     last_checkpoint_path = run_dirs["checkpoints_dir"] / "aligned_dpo_last.pt"
     history_rows: List[Dict[str, Any]] = []
     best_val_dpo_loss = float("inf")
+    beta_value = float(dpo_cfg["beta"])
+    effective_num_epochs = configured_num_epochs
+    saturation_guard_triggered = False
+    best_policy_state: Optional[Dict[str, torch.Tensor]] = None
 
     epoch_counter = 0
-    for epoch_idx in range(1, int(dpo_cfg["num_epochs"]) + 1):
+    epoch_idx = 1
+    while epoch_idx <= effective_num_epochs:
         policy_model.train()
         train_loss_sum = 0.0
         train_margin_sum = 0.0
         train_acc_sum = 0.0
         train_count = 0
+        current_beta = float(beta_value)
 
         for batch in train_loader:
             batch = _move_batch_to_device(batch, device)
@@ -948,7 +993,7 @@ def train_s4_dpo_alignment(
                 reference_model=reference_model,
                 batch=batch,
                 cfg_scale=float(run_cfg["s4"]["cfg_scale"]),
-                beta=float(dpo_cfg["beta"]),
+                beta=current_beta,
             )
             metrics["loss"].backward()
             torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
@@ -967,7 +1012,7 @@ def train_s4_dpo_alignment(
             val_loader=val_loader,
             device=device,
             cfg_scale=float(run_cfg["s4"]["cfg_scale"]),
-            beta=float(dpo_cfg["beta"]),
+            beta=current_beta,
         )
         denom = max(1, train_count)
         history_row = {
@@ -975,10 +1020,12 @@ def train_s4_dpo_alignment(
             "train_dpo_loss": train_loss_sum / denom,
             "train_margin_mean": train_margin_sum / denom,
             "train_preference_accuracy": train_acc_sum / denom,
+            "dpo_beta": current_beta,
+            "effective_num_epochs": int(effective_num_epochs),
+            "saturation_guard_triggered": 0,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             **val_metrics,
         }
-        history_rows.append(history_row)
         epoch_counter = epoch_idx
         current_val = float(val_metrics["val_dpo_loss"]) if np.isfinite(val_metrics["val_dpo_loss"]) else float(
             history_row["train_dpo_loss"]
@@ -992,30 +1039,62 @@ def train_s4_dpo_alignment(
             )
         if current_val < best_val_dpo_loss:
             best_val_dpo_loss = current_val
-            _save_dpo_checkpoint(
-                checkpoint_path=best_checkpoint_path,
-                policy_model=policy_model,
-                reference_checkpoint_path=warm_start.checkpoint_path,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch_idx=epoch_idx,
-                best_val_dpo_loss=best_val_dpo_loss,
-                run_cfg=run_cfg,
-                warm_start=warm_start,
-            )
+            if skip_disk_checkpoints:
+                best_policy_state = _clone_policy_state_dict(policy_model)
+            else:
+                _save_dpo_checkpoint(
+                    checkpoint_path=best_checkpoint_path,
+                    policy_model=policy_model,
+                    reference_checkpoint_path=warm_start.checkpoint_path,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch_idx=epoch_idx,
+                    best_val_dpo_loss=best_val_dpo_loss,
+                    run_cfg=run_cfg,
+                    warm_start=warm_start,
+                )
+        if (not saturation_guard_triggered) and epoch_idx == 1:
+            train_loss_value = float(history_row["train_dpo_loss"])
+            val_acc_value = float(history_row["val_preference_accuracy"])
+            if (
+                (np.isfinite(val_acc_value) and val_acc_value > 0.95)
+                or (np.isfinite(train_loss_value) and train_loss_value < 1.0e-4)
+            ):
+                saturation_guard_triggered = True
+                beta_value = max(current_beta * 0.5, 1.0e-4)
+                effective_num_epochs = max(effective_num_epochs, configured_num_epochs * 2)
+                history_row["saturation_guard_triggered"] = 1
+                LOGGER.warning(
+                    "Step 6_2 DPO saturation guard triggered for run=%s: val_accuracy=%.4f train_loss=%.6g beta %.6g -> %.6g epochs %d -> %d",
+                    str(run_cfg["run_name"]),
+                    val_acc_value,
+                    train_loss_value,
+                    current_beta,
+                    beta_value,
+                    configured_num_epochs,
+                    effective_num_epochs,
+                )
+        history_row["next_epoch_dpo_beta"] = float(beta_value)
+        history_row["effective_num_epochs"] = int(effective_num_epochs)
+        history_rows.append(history_row)
+        epoch_idx += 1
 
-    _save_dpo_checkpoint(
-        checkpoint_path=last_checkpoint_path,
-        policy_model=policy_model,
-        reference_checkpoint_path=warm_start.checkpoint_path,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        epoch_idx=epoch_counter,
-        best_val_dpo_loss=best_val_dpo_loss,
-        run_cfg=run_cfg,
-        warm_start=warm_start,
-    )
-    if best_checkpoint_path.exists():
+    if not skip_disk_checkpoints:
+        _save_dpo_checkpoint(
+            checkpoint_path=last_checkpoint_path,
+            policy_model=policy_model,
+            reference_checkpoint_path=warm_start.checkpoint_path,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch_idx=epoch_counter,
+            best_val_dpo_loss=best_val_dpo_loss,
+            run_cfg=run_cfg,
+            warm_start=warm_start,
+        )
+    if skip_disk_checkpoints:
+        if best_policy_state is not None:
+            policy_model.load_state_dict(best_policy_state)
+    elif best_checkpoint_path.exists():
         load_step62_checkpoint_into_modules(
             checkpoint_path=best_checkpoint_path,
             diffusion_model=policy_model,
@@ -1031,11 +1110,16 @@ def train_s4_dpo_alignment(
                 "run_name": str(run_cfg["run_name"]),
                 "pair_source": diagnostics["pair_source"],
                 "best_val_dpo_loss": float(best_val_dpo_loss),
-                "num_epochs": int(dpo_cfg["num_epochs"]),
+                "num_epochs": int(effective_num_epochs),
+                "configured_num_epochs": int(configured_num_epochs),
+                "configured_beta": float(dpo_cfg["beta"]),
+                "final_beta": float(beta_value),
+                "saturation_guard_triggered": bool(saturation_guard_triggered),
                 "train_pairs": int(len(train_pairs_df)),
                 "val_pairs": int(len(val_pairs_df)),
-                "best_checkpoint_path": str(best_checkpoint_path),
-                "last_checkpoint_path": str(last_checkpoint_path),
+                "best_checkpoint_path": (None if skip_disk_checkpoints else str(best_checkpoint_path)),
+                "last_checkpoint_path": (None if skip_disk_checkpoints else str(last_checkpoint_path)),
+                "disk_checkpoints_saved": bool(not skip_disk_checkpoints),
             },
             handle,
             indent=2,
@@ -1045,7 +1129,7 @@ def train_s4_dpo_alignment(
         tokenizer=warm_start.tokenizer,
         policy_model=policy_model,
         reference_model=reference_model,
-        checkpoint_path=best_checkpoint_path,
+        checkpoint_path=(best_checkpoint_path if not skip_disk_checkpoints else last_checkpoint_path),
         last_checkpoint_path=last_checkpoint_path,
         scaler=warm_start.scaler,
         train_pairs_df=train_pairs_df,

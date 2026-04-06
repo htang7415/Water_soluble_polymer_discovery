@@ -13,9 +13,11 @@ from src.chi.embeddings import load_backbone_from_step1
 from src.evaluation.class_decode_constraints import (
     compute_class_token_logit_bias,
     load_decode_constraint_source_smiles,
+    resolve_class_backbone_template_cores,
     resolve_class_decode_length_prior,
     resolve_class_decode_motifs,
 )
+from src.evaluation.polymer_class import BACKBONE_CLASS_MATCH_CLASSES, PolymerClassifier
 from src.model.diffusion import DiscreteMaskingDiffusion
 from src.sampling.sampler import ConstrainedSampler
 from src.step6_2.config import ResolvedStep62Config
@@ -39,6 +41,15 @@ class ResolvedClassSamplingPrior:
     fallback_source_lengths: List[int]
     class_token_logit_bias: Optional[List[float]]
     class_token_bias_strength: float
+    backbone_template_enabled: bool
+    backbone_template_cores: List[str]
+    backbone_template_source: Optional[str]
+    backbone_template_token_ids: List[List[int]]
+    backbone_template_min_gap_tokens: int
+    enforce_class_match: bool
+    enforce_backbone_class_match: bool
+    class_match_sampling_attempts_max: int
+    class_match_oversample_factor: float
 
 
 def _prepare_decode_constraint_token_ids(
@@ -252,6 +263,69 @@ def _build_decode_constraint_multi_spans(
     return chosen_spans, start_positions, adjusted_lengths
 
 
+def _build_backbone_template_multi_spans(
+    *,
+    backbone_template_token_ids: List[List[int]],
+    lengths: List[int],
+    center_min_frac: float,
+    center_max_frac: float,
+    seq_length: int,
+    star_token_id: int,
+    backbone_gap_token_id: int,
+    min_gap_tokens: int,
+) -> tuple[List[List[List[int]]], List[List[int]], List[int]]:
+    if not backbone_template_token_ids:
+        raise ValueError("backbone_template_token_ids is empty")
+    if star_token_id < 0:
+        raise ValueError("Tokenizer does not define a '*' token for backbone-template sampling")
+    if backbone_gap_token_id < 0:
+        raise ValueError("Tokenizer does not define a valid backbone spacer token for backbone-template sampling")
+    if not lengths:
+        return [], [], []
+
+    max_core_len = max(len(ids) for ids in backbone_template_token_ids)
+    min_required_length = max_core_len + 4 + (2 * int(min_gap_tokens))
+    adjusted_lengths = [
+        min(seq_length, max(int(raw_length), int(min_required_length)))
+        for raw_length in lengths
+    ]
+
+    chosen_spans: List[List[List[int]]] = []
+    start_positions: List[List[int]] = []
+    star_span = [int(star_token_id)]
+    gap_span = [int(backbone_gap_token_id)] * max(0, int(min_gap_tokens))
+
+    for effective_length in adjusted_lengths:
+        fitting = [
+            ids
+            for ids in backbone_template_token_ids
+            if len(ids) <= max(1, int(effective_length) - 4 - (2 * int(min_gap_tokens)))
+        ]
+        if not fitting:
+            raise ValueError(
+                f"No backbone-template core fits effective sequence length {effective_length}. "
+                "Increase allowed lengths or shorten the template core."
+            )
+        core_ids = list(fitting[np.random.randint(0, len(fitting))])
+        scaffold_ids = star_span + gap_span + core_ids + gap_span + star_span
+        max_start = int(effective_length) - 1 - len(scaffold_ids)
+        if max_start < 1:
+            raise ValueError(
+                f"Backbone-template scaffold length {len(scaffold_ids)} does not fit sequence length {effective_length}"
+            )
+        center_frac = (
+            center_min_frac
+            if center_min_frac == center_max_frac
+            else float(np.random.uniform(center_min_frac, center_max_frac))
+        )
+        candidate_start = int(round(center_frac * float(max(1, effective_length - 1)) - (0.5 * len(scaffold_ids))))
+        scaffold_start = max(1, min(max_start, candidate_start))
+        chosen_spans.append([scaffold_ids])
+        start_positions.append([scaffold_start])
+
+    return chosen_spans, start_positions, adjusted_lengths
+
+
 def load_step1_diffusion(
     resolved: ResolvedStep62Config,
     *,
@@ -350,6 +424,10 @@ def resolve_class_sampling_prior(
         )
     fallback_source_lengths = _token_lengths_from_smiles(tokenizer, source_smiles)
     class_token_bias_strength = float(run_cfg.get("class_token_bias_strength", 1.5))
+    enforce_class_match = bool(step6_cfg.get("decode_constraint_enforce_class_match", False))
+    enforce_backbone_class_match = bool(step6_cfg.get("decode_constraint_enforce_backbone_class_match", False))
+    class_match_sampling_attempts_max = int(step6_cfg.get("decode_constraint_class_match_sampling_attempts_max", 12))
+    class_match_oversample_factor = float(step6_cfg.get("decode_constraint_class_match_oversample_factor", 2.0))
     class_token_logit_bias = compute_class_token_logit_bias(
         target_class=target_class,
         tokenizer=tokenizer,
@@ -357,6 +435,35 @@ def resolve_class_sampling_prior(
         patterns=resolved.polymer_patterns,
         bias_strength=class_token_bias_strength,
     )
+    configured_template_classes_raw = step6_cfg.get("decode_constraint_backbone_template_classes", [])
+    if isinstance(configured_template_classes_raw, str):
+        configured_template_classes = {
+            token.strip().lower()
+            for token in configured_template_classes_raw.split(",")
+            if token.strip()
+        }
+    else:
+        configured_template_classes = {
+            str(token).strip().lower()
+            for token in list(configured_template_classes_raw)
+            if str(token).strip()
+        }
+    template_enabled = (
+        target_class in BACKBONE_CLASS_MATCH_CLASSES
+        and target_class in configured_template_classes
+    )
+    backbone_template_cores: List[str] = []
+    backbone_template_source: Optional[str] = None
+    backbone_template_token_ids: List[List[int]] = []
+    if template_enabled:
+        backbone_template_cores, backbone_template_source = resolve_class_backbone_template_cores(
+            target_class=target_class,
+            tokenizer=tokenizer,
+            max_templates=int(step6_cfg.get("decode_constraint_backbone_template_max_templates", 3)),
+        )
+        backbone_template_token_ids = _prepare_decode_constraint_token_ids(tokenizer, backbone_template_cores)
+        template_enabled = bool(backbone_template_token_ids)
+    backbone_template_min_gap_tokens = int(step6_cfg.get("decode_constraint_backbone_template_min_gap_tokens", 1))
 
     prior = ResolvedClassSamplingPrior(
         target_class=target_class,
@@ -372,6 +479,15 @@ def resolve_class_sampling_prior(
         fallback_source_lengths=fallback_source_lengths,
         class_token_logit_bias=class_token_logit_bias,
         class_token_bias_strength=class_token_bias_strength,
+        backbone_template_enabled=bool(template_enabled),
+        backbone_template_cores=backbone_template_cores,
+        backbone_template_source=backbone_template_source,
+        backbone_template_token_ids=backbone_template_token_ids,
+        backbone_template_min_gap_tokens=backbone_template_min_gap_tokens,
+        enforce_class_match=bool(enforce_class_match),
+        enforce_backbone_class_match=bool(enforce_backbone_class_match),
+        class_match_sampling_attempts_max=int(class_match_sampling_attempts_max),
+        class_match_oversample_factor=float(class_match_oversample_factor),
     )
 
     if metrics_dir is not None:
@@ -407,6 +523,22 @@ def resolve_class_sampling_prior(
                     },
                     handle,
                 )
+        with open(metrics_dir / "decode_constraint_backbone_template_resolved.json", "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "target_class": target_class,
+                    "enabled": bool(prior.backbone_template_enabled),
+                    "source": prior.backbone_template_source,
+                    "min_gap_tokens": int(prior.backbone_template_min_gap_tokens),
+                    "cores": prior.backbone_template_cores,
+                    "enforce_class_match": bool(prior.enforce_class_match),
+                    "enforce_backbone_class_match": bool(prior.enforce_backbone_class_match),
+                    "class_match_sampling_attempts_max": int(prior.class_match_sampling_attempts_max),
+                    "class_match_oversample_factor": float(prior.class_match_oversample_factor),
+                },
+                handle,
+                indent=2,
+            )
 
     return prior
 
@@ -440,6 +572,13 @@ def _sample_lengths(
         lengths = [int(tokenizer.max_length)] * int(num_samples)
 
     motif_buffer = max((len(ids) for ids in prior.motif_token_ids), default=0) + 4
+    if prior.backbone_template_enabled and prior.backbone_template_token_ids:
+        motif_buffer = max(
+            motif_buffer,
+            max((len(ids) for ids in prior.backbone_template_token_ids), default=0)
+            + 4
+            + (2 * int(prior.backbone_template_min_gap_tokens)),
+        )
     if motif_buffer > 0:
         lengths = [max(int(length), int(motif_buffer)) for length in lengths]
     return [min(int(tokenizer.max_length), int(length)) for length in lengths]
@@ -473,17 +612,15 @@ def create_constrained_sampler(
     return sampler
 
 
-def sample_with_class_prior(
+def _sample_raw_smiles_with_prior(
     *,
     sampler: ConstrainedSampler,
     tokenizer: PSmilesTokenizer,
     prior: ResolvedClassSamplingPrior,
     resolved: ResolvedStep62Config,
     num_samples: int,
-    show_progress: bool = True,
+    show_progress: bool,
 ) -> Tuple[List[str], Dict[str, object]]:
-    """Sample polymers with Step 6 class priors using a sampler-compatible backend."""
-
     sampling_cfg = resolved.base_config.get("sampling", {})
     lengths = _sample_lengths(
         prior=prior,
@@ -492,7 +629,30 @@ def sample_with_class_prior(
         sampling_cfg=sampling_cfg,
     )
 
-    if prior.motif_token_ids:
+    if prior.backbone_template_enabled and prior.backbone_template_token_ids:
+        backbone_gap_token_id = int(tokenizer.vocab.get("C", tokenizer.unk_token_id))
+        if backbone_gap_token_id == int(tokenizer.unk_token_id):
+            raise ValueError("Tokenizer vocabulary must define token 'C' for backbone-template sampling")
+        multi_spans, multi_span_starts, lengths = _build_backbone_template_multi_spans(
+            backbone_template_token_ids=prior.backbone_template_token_ids,
+            lengths=lengths,
+            center_min_frac=prior.center_min_frac,
+            center_max_frac=prior.center_max_frac,
+            seq_length=int(tokenizer.max_length),
+            star_token_id=int(tokenizer.get_star_token_id()),
+            backbone_gap_token_id=backbone_gap_token_id,
+            min_gap_tokens=int(prior.backbone_template_min_gap_tokens),
+        )
+        _, smiles = sampler.sample_batch_with_multiple_fixed_spans(
+            num_samples=num_samples,
+            seq_length=int(tokenizer.max_length),
+            span_token_ids=multi_spans,
+            span_start_positions=multi_span_starts,
+            batch_size=int(sampling_cfg.get("batch_size", 128)),
+            show_progress=show_progress,
+            lengths=lengths,
+        )
+    elif prior.motif_token_ids:
         multi_spans, multi_span_starts, lengths = _build_decode_constraint_multi_spans(
             motif_token_ids=prior.motif_token_ids,
             lengths=lengths,
@@ -530,15 +690,111 @@ def sample_with_class_prior(
             lengths=lengths,
         )
 
+    return smiles, {
+        "length_prior_count": int(len(prior.length_prior_lengths)),
+        "length_prior_source": prior.length_prior_source,
+    }
+
+
+def _accepted_target_class_indices(
+    smiles_list: List[str],
+    *,
+    prior: ResolvedClassSamplingPrior,
+    classifier: PolymerClassifier,
+) -> List[int]:
+    use_backbone = bool(prior.target_class in BACKBONE_CLASS_MATCH_CLASSES and prior.enforce_backbone_class_match)
+    accepted: List[int] = []
+    for idx, smiles in enumerate(smiles_list):
+        try:
+            matches = classifier.classify_backbone(str(smiles)) if use_backbone else classifier.classify(str(smiles))
+        except Exception:
+            matches = {}
+        if bool(matches.get(prior.target_class, False)):
+            accepted.append(int(idx))
+    return accepted
+
+
+def sample_with_class_prior(
+    *,
+    sampler: ConstrainedSampler,
+    tokenizer: PSmilesTokenizer,
+    prior: ResolvedClassSamplingPrior,
+    resolved: ResolvedStep62Config,
+    num_samples: int,
+    show_progress: bool = True,
+) -> Tuple[List[str], Dict[str, object]]:
+    """Sample polymers with Step 6 class priors using a sampler-compatible backend."""
+    accepted_smiles: List[str] = []
+    accepted_raw_count = 0
+    total_drawn = 0
+    attempts = 0
+    classifier = PolymerClassifier(patterns=resolved.polymer_patterns) if prior.enforce_class_match else None
+    last_raw_meta: Dict[str, object] = {}
+
+    while len(accepted_smiles) < int(num_samples):
+        attempts += 1
+        if attempts > int(prior.class_match_sampling_attempts_max):
+            raise RuntimeError(
+                "Step 6_2 class-constrained sampling could not satisfy the target-class quota. "
+                f"target_class={prior.target_class!r} accepted={len(accepted_smiles)} requested={int(num_samples)} "
+                f"after {int(prior.class_match_sampling_attempts_max)} attempts."
+            )
+        remaining = int(num_samples) - len(accepted_smiles)
+        request_size = remaining
+        if prior.enforce_class_match:
+            request_size = max(
+                remaining,
+                int(np.ceil(float(remaining) * float(prior.class_match_oversample_factor))),
+            )
+        raw_smiles, raw_meta = _sample_raw_smiles_with_prior(
+            sampler=sampler,
+            tokenizer=tokenizer,
+            prior=prior,
+            resolved=resolved,
+            num_samples=int(request_size),
+            show_progress=show_progress and attempts == 1,
+        )
+        last_raw_meta = raw_meta
+        total_drawn += int(len(raw_smiles))
+        if prior.enforce_class_match and classifier is not None:
+            accepted_idx = _accepted_target_class_indices(raw_smiles, prior=prior, classifier=classifier)
+            accepted_raw_count += int(len(accepted_idx))
+            accepted_smiles.extend([raw_smiles[idx] for idx in accepted_idx])
+        else:
+            accepted_raw_count += int(len(raw_smiles))
+            accepted_smiles.extend(raw_smiles)
+
+    smiles = accepted_smiles[: int(num_samples)]
+
     metadata = {
         "num_samples": int(num_samples),
+        "total_raw_samples_drawn": int(total_drawn),
+        "accepted_raw_target_class_samples": int(accepted_raw_count),
+        "class_match_sampling_attempts": int(attempts),
+        "class_match_acceptance_rate": (
+            float(accepted_raw_count) / float(total_drawn) if total_drawn > 0 else 0.0
+        ),
+        "class_match_oversampling_ratio": (
+            float(total_drawn) / float(num_samples) if int(num_samples) > 0 else 0.0
+        ),
         "spans_per_sample": int(prior.spans_per_sample),
         "motif_count": int(len(prior.motifs)),
         "motif_source": prior.motif_source,
-        "length_prior_count": int(len(prior.length_prior_lengths)),
-        "length_prior_source": prior.length_prior_source,
+        "backbone_template_enabled": bool(prior.backbone_template_enabled),
+        "backbone_template_core_count": int(len(prior.backbone_template_cores)),
+        "backbone_template_source": prior.backbone_template_source,
+        "backbone_template_layout": "contiguous_scaffold" if prior.backbone_template_enabled else "disabled",
+        "length_prior_count": int(last_raw_meta.get("length_prior_count", len(prior.length_prior_lengths))),
+        "length_prior_source": last_raw_meta.get("length_prior_source", prior.length_prior_source),
         "class_token_bias_enabled": bool(prior.class_token_logit_bias is not None),
         "class_token_bias_strength": float(prior.class_token_bias_strength),
+        "enforce_class_match": bool(prior.enforce_class_match),
+        "enforce_backbone_class_match": bool(prior.enforce_backbone_class_match),
+        "class_match_mode": (
+            "strict_backbone"
+            if prior.target_class in BACKBONE_CLASS_MATCH_CLASSES and prior.enforce_backbone_class_match
+            else "loose"
+        ),
     }
     return smiles, metadata
 

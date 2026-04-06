@@ -196,12 +196,31 @@ def compute_success_shaped_rewards(
             chi_term_values.append(-max(0.0, float(chi_pred_value) - float(chi_target_value)))
     chi_term = torch.tensor(np.asarray(chi_term_values, dtype=np.float32), dtype=torch.float32)
 
+    success_col = "success_hit_discovery" if "success_hit_discovery" in evaluation_df.columns else "success_hit"
+    sa_col = "sa_ok_discovery" if "sa_ok_discovery" in evaluation_df.columns else "sa_ok"
+    if "target_sa_max_discovery" in evaluation_df.columns:
+        sa_threshold = pd.to_numeric(evaluation_df["target_sa_max_discovery"], errors="coerce").to_numpy(dtype=np.float32)
+    elif "target_sa_max_reporting" in evaluation_df.columns:
+        sa_threshold = pd.to_numeric(evaluation_df["target_sa_max_reporting"], errors="coerce").to_numpy(dtype=np.float32)
+    else:
+        sa_threshold = np.full(len(evaluation_df), np.nan, dtype=np.float32)
+    sa_score = pd.to_numeric(evaluation_df.get("sa_score"), errors="coerce").to_numpy(dtype=np.float32)
+    sa_continuous_values: List[float] = []
+    for score_value, threshold_value in zip(sa_score, sa_threshold):
+        if not np.isfinite(score_value) or not np.isfinite(threshold_value) or float(threshold_value) <= 0.0:
+            sa_continuous_values.append(-1.0)
+            continue
+        raw_value = (float(threshold_value) - float(score_value)) / float(threshold_value)
+        sa_continuous_values.append(max(-1.0, min(1.0, raw_value)))
+    sa_continuous = torch.tensor(np.asarray(sa_continuous_values, dtype=np.float32), dtype=torch.float32)
+
     reward = (
-        float(reward_weights.get("w_success", 0.0)) * torch.tensor(evaluation_df["success_hit"].to_numpy(dtype=np.float32))
+        float(reward_weights.get("w_success", 0.0)) * torch.tensor(evaluation_df[success_col].to_numpy(dtype=np.float32))
         + float(reward_weights.get("w_valid", 0.0)) * torch.tensor(evaluation_df["valid_ok"].to_numpy(dtype=np.float32))
         + float(reward_weights.get("w_novel", 0.0)) * torch.tensor(evaluation_df["novel_ok"].to_numpy(dtype=np.float32))
         + float(reward_weights.get("w_star", 0.0)) * torch.tensor(evaluation_df["star_ok"].to_numpy(dtype=np.float32))
-        + float(reward_weights.get("w_sa", 0.0)) * torch.tensor(evaluation_df["sa_ok"].to_numpy(dtype=np.float32))
+        + float(reward_weights.get("w_sa", 0.0)) * torch.tensor(evaluation_df[sa_col].to_numpy(dtype=np.float32))
+        + float(reward_weights.get("w_sa_continuous", 0.0)) * sa_continuous
         + float(reward_weights.get("w_class", 0.0)) * torch.tensor(evaluation_df["class_ok"].to_numpy(dtype=np.float32))
         + float(reward_weights.get("w_sol", 0.0)) * sol_term
         + float(reward_weights.get("w_chi", 0.0)) * chi_term
@@ -211,7 +230,10 @@ def compute_success_shaped_rewards(
     metrics = {
         "reward_mean": float(reward.mean().item()) if len(reward) else float("nan"),
         "reward_std": float(reward.std(unbiased=False).item()) if len(reward) else float("nan"),
-        "success_rate": float(evaluation_df["success_hit"].astype(float).mean()) if len(evaluation_df) else float("nan"),
+        "success_rate": float(evaluation_df[success_col].astype(float).mean()) if len(evaluation_df) else float("nan"),
+        "reward_success_metric": str(success_col),
+        "reward_sa_metric": str(sa_col),
+        "sa_continuous_mean": float(sa_continuous.mean().item()) if len(sa_continuous) else float("nan"),
         "training_soluble_oracle_calls": valid_count,
         "training_chi_oracle_calls": valid_count,
     }

@@ -11,9 +11,9 @@ import pandas as pd
 import torch
 import yaml
 
-from .config import build_run_config
+from .config import build_run_config, resolve_step62_generation_budget
 from .conditional_sampling import create_conditional_sampler, sample_conditional_with_class_prior
-from .dataset import build_inference_condition_bundle
+from .dataset import ConditionScaler, build_inference_condition_bundle
 from .dpo import train_s4_dpo_alignment
 from .evaluation import (
     aggregate_round_metrics,
@@ -33,9 +33,12 @@ from .frozen_sampling import (
 from .guided_sampler import GuidedConditionalSampler, GuidedSampler
 from .plotting import plot_generated_chi_vs_target, plot_per_target_success, plot_success_gate_funnel
 from .rl_trainer import train_s4_rl_alignment
-from .train_s2 import train_s2_supervised_run
+from .supervised import build_s2_components_from_step1, load_step62_checkpoint_into_modules
+from .train_s2 import S2TrainingArtifacts, train_s2_supervised_run
 from src.utils.reproducibility import save_run_metadata, seed_everything
 from src.utils.reporting import save_artifact_manifest, write_initial_log
+
+_HPO_SHARED_S4_WARM_START_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def _write_frame(df: pd.DataFrame, path: Path) -> None:
@@ -59,11 +62,14 @@ def _as_yamlable(value):
     return value
 
 
-def create_run_dirs(run_dir: Path) -> Dict[str, Path]:
+def create_run_dirs(run_dir: Path, *, create_checkpoints_dir: bool = True) -> Dict[str, Path]:
     metrics_dir = run_dir / "metrics"
     figures_dir = run_dir / "figures"
     checkpoints_dir = run_dir / "checkpoints"
-    for path in [run_dir, metrics_dir, figures_dir, checkpoints_dir]:
+    paths = [run_dir, metrics_dir, figures_dir]
+    if create_checkpoints_dir:
+        paths.append(checkpoints_dir)
+    for path in paths:
         path.mkdir(parents=True, exist_ok=True)
     return {
         "run_dir": run_dir,
@@ -132,6 +138,245 @@ def build_s4_warm_start_run_cfg(resolved, run_cfg: Dict[str, object]) -> Dict[st
             warm_cfg["s2"].update(deepcopy(supervised_override))
     warm_cfg["run_name"] = f"{run_cfg['run_name']}__warm_start"
     return warm_cfg
+
+
+def _clone_module_state_dict(module: Optional[torch.nn.Module]) -> Optional[Dict[str, torch.Tensor]]:
+    if module is None:
+        return None
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in module.state_dict().items()
+    }
+
+
+def _shared_s4_warm_start_cache_key(
+    *,
+    resolved,
+    warm_run_cfg: Dict[str, object],
+    warm_run_dir: Path,
+    device: str,
+) -> str:
+    payload = {
+        "benchmark_root": str(resolved.benchmark_root),
+        "warm_run_dir": str(warm_run_dir),
+        "model_size": str(resolved.model_size),
+        "split_mode": str(resolved.split_mode),
+        "c_target": str(resolved.c_target),
+        "device": str(device),
+        "s2_cfg": _as_yamlable(dict(warm_run_cfg.get("s2", {}))),
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def _cache_s4_warm_start_payload(warm_start_artifacts: S2TrainingArtifacts) -> Dict[str, Any]:
+    scaler = warm_start_artifacts.scaler
+    return {
+        "model_state_dict": _clone_module_state_dict(warm_start_artifacts.diffusion_model),
+        "aux_state_dict": _clone_module_state_dict(warm_start_artifacts.aux_heads),
+        "condition_scaler": {
+            "temperature_min": float(scaler.temperature_min),
+            "temperature_max": float(scaler.temperature_max),
+            "phi_min": float(scaler.phi_min),
+            "phi_max": float(scaler.phi_max),
+            "chi_goal_min": float(scaler.chi_goal_min),
+            "chi_goal_max": float(scaler.chi_goal_max),
+        },
+        "history_df": warm_start_artifacts.history_df.copy(),
+        "augmentation_diag_df": warm_start_artifacts.augmentation_diag_df.copy(),
+        "batch_mix_counts": deepcopy(warm_start_artifacts.batch_mix_counts),
+    }
+
+
+def _load_warm_start_artifacts_from_cache(
+    *,
+    resolved,
+    warm_run_cfg: Dict[str, object],
+    warm_dirs: Dict[str, Path],
+    device: str,
+    cache_payload: Dict[str, Any],
+) -> S2TrainingArtifacts:
+    tokenizer, diffusion_model, aux_heads, step1_checkpoint_path, backbone_finetune_info = build_s2_components_from_step1(
+        resolved,
+        device=device,
+        run_cfg=warm_run_cfg,
+    )
+    diffusion_model.load_state_dict(cache_payload["model_state_dict"])
+    if aux_heads is not None and cache_payload.get("aux_state_dict") is not None:
+        aux_heads.load_state_dict(cache_payload["aux_state_dict"])
+    scaler_payload = dict(cache_payload["condition_scaler"])
+    scaler = ConditionScaler(
+        temperature_min=float(scaler_payload["temperature_min"]),
+        temperature_max=float(scaler_payload["temperature_max"]),
+        phi_min=float(scaler_payload["phi_min"]),
+        phi_max=float(scaler_payload["phi_max"]),
+        chi_goal_min=float(scaler_payload["chi_goal_min"]),
+        chi_goal_max=float(scaler_payload["chi_goal_max"]),
+    )
+    return S2TrainingArtifacts(
+        tokenizer=tokenizer,
+        diffusion_model=diffusion_model,
+        aux_heads=aux_heads,
+        checkpoint_path=warm_dirs["checkpoints_dir"] / "conditional_diffusion_best.pt",
+        last_checkpoint_path=warm_dirs["checkpoints_dir"] / "conditional_diffusion_last.pt",
+        step1_checkpoint_path=step1_checkpoint_path,
+        scaler=scaler,
+        history_df=cache_payload["history_df"].copy(),
+        augmentation_diag_df=cache_payload["augmentation_diag_df"].copy(),
+        batch_mix_counts=deepcopy(cache_payload["batch_mix_counts"]),
+        backbone_finetune_info=backbone_finetune_info,
+    )
+
+
+def _use_shared_s4_warm_start(run_cfg: Dict[str, object], *, extra_context: Optional[Dict[str, Any]]) -> bool:
+    policy = str(run_cfg.get("s4", {}).get("warm_start_policy", "")).strip().lower()
+    if policy != "shared_family_producer":
+        return False
+    context = extra_context or {}
+    if bool(context.get("hpo_mode", False)):
+        return bool(context.get("allow_shared_s4_warm_start", False))
+    return True
+
+
+def _resolve_s4_warm_dirs(
+    *,
+    resolved,
+    run_cfg: Dict[str, object],
+    local_run_dir: Path,
+    extra_context: Optional[Dict[str, Any]],
+) -> Dict[str, Path]:
+    create_checkpoints_dir = not bool((extra_context or {}).get("skip_disk_checkpoints", False))
+    if _use_shared_s4_warm_start(run_cfg, extra_context=extra_context):
+        producer_name = str(run_cfg["s4"].get("warm_start_producer_name", "S4_supervised_warm_start")).strip()
+        return create_run_dirs(
+            resolved.benchmark_root / producer_name,
+            create_checkpoints_dir=create_checkpoints_dir,
+        )
+    return create_run_dirs(local_run_dir / "_warm_start", create_checkpoints_dir=create_checkpoints_dir)
+
+
+def _load_warm_start_artifacts_from_checkpoint(
+    *,
+    resolved,
+    warm_run_cfg: Dict[str, object],
+    warm_dirs: Dict[str, Path],
+    device: str,
+) -> S2TrainingArtifacts:
+    checkpoint_path = warm_dirs["checkpoints_dir"] / "conditional_diffusion_best.pt"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Warm-start checkpoint not found: {checkpoint_path}")
+
+    tokenizer, diffusion_model, aux_heads, step1_checkpoint_path, backbone_finetune_info = build_s2_components_from_step1(
+        resolved,
+        device=device,
+        run_cfg=warm_run_cfg,
+    )
+    payload = load_step62_checkpoint_into_modules(
+        checkpoint_path=checkpoint_path,
+        diffusion_model=diffusion_model,
+        aux_heads=aux_heads,
+        device=device,
+    )
+    scaler_payload = dict(payload.get("condition_scaler", {}))
+    scaler = ConditionScaler(
+        temperature_min=float(scaler_payload["temperature_min"]),
+        temperature_max=float(scaler_payload["temperature_max"]),
+        phi_min=float(scaler_payload["phi_min"]),
+        phi_max=float(scaler_payload["phi_max"]),
+        chi_goal_min=float(scaler_payload["chi_goal_min"]),
+        chi_goal_max=float(scaler_payload["chi_goal_max"]),
+    )
+    history_path = warm_dirs["metrics_dir"] / "supervised_training_history.csv"
+    augmentation_path = warm_dirs["metrics_dir"] / "chi_target_augmentation_eligibility.csv"
+    batch_mix_path = warm_dirs["metrics_dir"] / "train_batch_mix_resolved.json"
+    history_df = pd.read_csv(history_path) if history_path.exists() else pd.DataFrame()
+    augmentation_diag_df = pd.read_csv(augmentation_path) if augmentation_path.exists() else pd.DataFrame()
+    if batch_mix_path.exists():
+        with open(batch_mix_path, "r", encoding="utf-8") as handle:
+            batch_mix_counts = json.load(handle)
+    else:
+        batch_mix_counts = {}
+
+    return S2TrainingArtifacts(
+        tokenizer=tokenizer,
+        diffusion_model=diffusion_model,
+        aux_heads=aux_heads,
+        checkpoint_path=checkpoint_path,
+        last_checkpoint_path=warm_dirs["checkpoints_dir"] / "conditional_diffusion_last.pt",
+        step1_checkpoint_path=step1_checkpoint_path,
+        scaler=scaler,
+        history_df=history_df,
+        augmentation_diag_df=augmentation_diag_df,
+        batch_mix_counts=batch_mix_counts,
+        backbone_finetune_info=backbone_finetune_info,
+    )
+
+
+def _prepare_s4_warm_start(
+    *,
+    resolved,
+    run_cfg: Dict[str, object],
+    run_dirs: Dict[str, Path],
+    config_path: str,
+    device: str,
+    extra_context: Optional[Dict[str, Any]],
+    pruning_callback: Optional[Callable[..., None]],
+) -> Tuple[Dict[str, object], Dict[str, Path], S2TrainingArtifacts]:
+    warm_run_cfg = build_s4_warm_start_run_cfg(resolved, run_cfg)
+    using_shared_warm_start = _use_shared_s4_warm_start(run_cfg, extra_context=extra_context)
+    skip_disk_checkpoints = bool((extra_context or {}).get("skip_disk_checkpoints", False))
+    warm_dirs = _resolve_s4_warm_dirs(
+        resolved=resolved,
+        run_cfg=run_cfg,
+        local_run_dir=run_dirs["run_dir"],
+        extra_context=extra_context,
+    )
+    cache_key = None
+    if using_shared_warm_start and skip_disk_checkpoints:
+        cache_key = _shared_s4_warm_start_cache_key(
+            resolved=resolved,
+            warm_run_cfg=warm_run_cfg,
+            warm_run_dir=warm_dirs["run_dir"],
+            device=device,
+        )
+        cache_payload = _HPO_SHARED_S4_WARM_START_CACHE.get(cache_key)
+        if cache_payload is not None:
+            warm_start_artifacts = _load_warm_start_artifacts_from_cache(
+                resolved=resolved,
+                warm_run_cfg=warm_run_cfg,
+                warm_dirs=warm_dirs,
+                device=device,
+                cache_payload=cache_payload,
+            )
+            return warm_run_cfg, warm_dirs, warm_start_artifacts
+    checkpoint_path = warm_dirs["checkpoints_dir"] / "conditional_diffusion_best.pt"
+    if checkpoint_path.exists():
+        warm_start_artifacts = _load_warm_start_artifacts_from_checkpoint(
+            resolved=resolved,
+            warm_run_cfg=warm_run_cfg,
+            warm_dirs=warm_dirs,
+            device=device,
+        )
+        return warm_run_cfg, warm_dirs, warm_start_artifacts
+
+    save_run_config_snapshot(
+        warm_dirs,
+        run_cfg=warm_run_cfg,
+        resolved=resolved,
+        config_path=config_path,
+        extra_context={"parent_run_name": run_cfg["run_name"], **(extra_context or {})},
+    )
+    warm_start_artifacts = train_s2_supervised_run(
+        resolved=resolved,
+        run_cfg=warm_run_cfg,
+        run_dirs=warm_dirs,
+        device=device,
+        skip_disk_checkpoints=bool(skip_disk_checkpoints),
+        pruning_callback=(None if using_shared_warm_start else pruning_callback),
+        pruning_stage="warm_start",
+    )
+    if cache_key is not None:
+        _HPO_SHARED_S4_WARM_START_CACHE[cache_key] = _cache_s4_warm_start_payload(warm_start_artifacts)
+    return warm_run_cfg, warm_dirs, warm_start_artifacts
 
 
 def run_single_target_sampling(
@@ -347,13 +592,18 @@ def execute_step62_run(
     run_cfg = run_cfg or build_run_config(resolved, run_name)
     run_dir = run_dir or (resolved.benchmark_root / str(run_cfg["run_name"]))
     target_rows_df = target_rows_df.copy() if target_rows_df is not None else resolved.target_family_df.copy()
-    generation_budget = int(generation_budget if generation_budget is not None else resolved.step6_2["generation_budget"])
+    generation_budget = int(
+        generation_budget
+        if generation_budget is not None
+        else resolve_step62_generation_budget(resolved.step6_2, resolved.c_target)
+    )
     sampling_seeds = list(sampling_seeds if sampling_seeds is not None else resolved.step6_2["sampling_seeds"])
     num_rounds = int(num_rounds if num_rounds is not None else resolved.step6_2["num_sampling_rounds"])
     if num_rounds > len(sampling_seeds):
         raise ValueError("num_rounds exceeds the number of provided sampling seeds.")
 
-    run_dirs = create_run_dirs(run_dir)
+    skip_disk_checkpoints = bool((extra_context or {}).get("skip_disk_checkpoints", False))
+    run_dirs = create_run_dirs(run_dir, create_checkpoints_dir=not skip_disk_checkpoints)
     save_run_config_snapshot(
         run_dirs,
         run_cfg=run_cfg,
@@ -371,6 +621,7 @@ def execute_step62_run(
             run_cfg=run_cfg,
             run_dirs=run_dirs,
             device=device,
+            skip_disk_checkpoints=skip_disk_checkpoints,
             pruning_callback=pruning_callback,
             pruning_stage="s2",
         )
@@ -379,22 +630,14 @@ def execute_step62_run(
         prior = resolve_class_sampling_prior(resolved, run_cfg, tokenizer, metrics_dir=run_dirs["metrics_dir"])
         s2_scaler = training_artifacts.scaler
     elif canonical_family == "S4" and str(run_cfg["s4"]["alignment_mode"]).strip().lower() == "dpo":
-        warm_run_cfg = build_s4_warm_start_run_cfg(resolved, run_cfg)
-        warm_dirs = create_run_dirs(run_dirs["run_dir"] / "_warm_start")
-        save_run_config_snapshot(
-            warm_dirs,
-            run_cfg=warm_run_cfg,
+        warm_run_cfg, warm_dirs, warm_start_artifacts = _prepare_s4_warm_start(
             resolved=resolved,
+            run_cfg=run_cfg,
+            run_dirs=run_dirs,
             config_path=config_path,
-            extra_context={"parent_run_name": run_cfg["run_name"], **(extra_context or {})},
-        )
-        warm_start_artifacts = train_s2_supervised_run(
-            resolved=resolved,
-            run_cfg=warm_run_cfg,
-            run_dirs=warm_dirs,
             device=device,
+            extra_context=extra_context,
             pruning_callback=pruning_callback,
-            pruning_stage="warm_start",
         )
         prior = resolve_class_sampling_prior(
             resolved,
@@ -413,6 +656,7 @@ def execute_step62_run(
             prior=prior,
             evaluator=evaluator,
             device=device,
+            skip_disk_checkpoints=skip_disk_checkpoints,
             pruning_callback=pruning_callback,
         )
         tokenizer = dpo_artifacts.tokenizer
@@ -422,28 +666,21 @@ def execute_step62_run(
             {
                 "warm_start_run_name": warm_run_cfg["run_name"],
                 "warm_start_dir": str(warm_dirs["run_dir"]),
-                "warm_start_best_checkpoint": str(warm_start_artifacts.checkpoint_path),
-                "aligned_best_checkpoint": str(dpo_artifacts.checkpoint_path),
+                "warm_start_best_checkpoint": (None if skip_disk_checkpoints else str(warm_start_artifacts.checkpoint_path)),
+                "aligned_best_checkpoint": (None if skip_disk_checkpoints else str(dpo_artifacts.checkpoint_path)),
+                "disk_checkpoints_saved": bool(not skip_disk_checkpoints),
             },
             run_dirs["metrics_dir"] / "s4_alignment_summary.json",
         )
-    elif canonical_family == "S4" and str(run_cfg["s4"]["alignment_mode"]).strip().lower() == "rl":
-        warm_run_cfg = build_s4_warm_start_run_cfg(resolved, run_cfg)
-        warm_dirs = create_run_dirs(run_dirs["run_dir"] / "_warm_start")
-        save_run_config_snapshot(
-            warm_dirs,
-            run_cfg=warm_run_cfg,
+    elif canonical_family == "S4" and str(run_cfg["s4"]["alignment_mode"]).strip().lower() in {"rl", "ppo", "grpo"}:
+        warm_run_cfg, warm_dirs, warm_start_artifacts = _prepare_s4_warm_start(
             resolved=resolved,
+            run_cfg=run_cfg,
+            run_dirs=run_dirs,
             config_path=config_path,
-            extra_context={"parent_run_name": run_cfg["run_name"], **(extra_context or {})},
-        )
-        warm_start_artifacts = train_s2_supervised_run(
-            resolved=resolved,
-            run_cfg=warm_run_cfg,
-            run_dirs=warm_dirs,
             device=device,
+            extra_context=extra_context,
             pruning_callback=pruning_callback,
-            pruning_stage="warm_start",
         )
         prior = resolve_class_sampling_prior(
             resolved,
@@ -461,6 +698,7 @@ def execute_step62_run(
             prior=prior,
             evaluator=evaluator,
             device=device,
+            skip_disk_checkpoints=skip_disk_checkpoints,
             pruning_callback=pruning_callback,
         )
         tokenizer = rl_artifacts.tokenizer
@@ -470,8 +708,9 @@ def execute_step62_run(
             {
                 "warm_start_run_name": warm_run_cfg["run_name"],
                 "warm_start_dir": str(warm_dirs["run_dir"]),
-                "warm_start_best_checkpoint": str(warm_start_artifacts.checkpoint_path),
-                "aligned_best_checkpoint": str(rl_artifacts.checkpoint_path),
+                "warm_start_best_checkpoint": (None if skip_disk_checkpoints else str(warm_start_artifacts.checkpoint_path)),
+                "aligned_best_checkpoint": (None if skip_disk_checkpoints else str(rl_artifacts.checkpoint_path)),
+                "disk_checkpoints_saved": bool(not skip_disk_checkpoints),
             },
             run_dirs["metrics_dir"] / "s4_alignment_summary.json",
         )
@@ -483,6 +722,7 @@ def execute_step62_run(
     generated_frames: List[pd.DataFrame] = []
     evaluation_frames: List[pd.DataFrame] = []
     round_oracle_rows: List[Dict[str, int]] = []
+    sampling_meta_rows: List[Dict[str, Any]] = []
     sample_id_start = 1
 
     if canonical_family in {"S1", "S3"} and evaluator is None:
@@ -495,7 +735,7 @@ def execute_step62_run(
         round_class_guidance_suppressed_steps = 0
 
         for _, target_row in target_rows_df.iterrows():
-            smiles, guidance_stats, _sample_meta = run_single_target_sampling(
+            smiles, guidance_stats, sample_meta = run_single_target_sampling(
                 run_cfg=run_cfg,
                 resolved=resolved,
                 target_row=target_row,
@@ -506,6 +746,21 @@ def execute_step62_run(
                 device=device,
                 s2_scaler=s2_scaler,
                 generation_budget=generation_budget,
+            )
+            sampling_meta_rows.append(
+                {
+                    "run_name": str(run_cfg["run_name"]),
+                    "canonical_family": str(run_cfg["canonical_family"]),
+                    "round_id": int(round_id),
+                    "sampling_seed": int(sampling_seed),
+                    "target_row_id": int(target_row["target_row_id"]),
+                    "target_row_key": str(target_row["target_row_key"]),
+                    "c_target": str(target_row["c_target"]),
+                    "temperature": float(target_row["temperature"]),
+                    "phi": float(target_row["phi"]),
+                    "chi_target": float(target_row["chi_target"]),
+                    **sample_meta,
+                }
             )
             generated_df = build_generated_samples_frame(
                 smiles,
@@ -544,6 +799,7 @@ def execute_step62_run(
     target_row_summary_df = summarize_target_rows(target_row_metrics_df)
     round_metrics_df = aggregate_round_metrics(evaluation_results_df, target_row_metrics_df)
     round_oracle_df = pd.DataFrame(round_oracle_rows)
+    sampling_meta_df = pd.DataFrame(sampling_meta_rows)
     if not round_oracle_df.empty:
         round_metrics_df = round_metrics_df.drop(
             columns=["training_soluble_oracle_calls", "training_chi_oracle_calls"],
@@ -574,6 +830,21 @@ def execute_step62_run(
                 if "class_guidance_suppressed_steps" in round_metrics_df.columns and not round_metrics_df.empty
                 else 0.0
             ),
+            "mean_class_match_acceptance_rate": (
+                float(sampling_meta_df["class_match_acceptance_rate"].mean())
+                if "class_match_acceptance_rate" in sampling_meta_df.columns and not sampling_meta_df.empty
+                else 0.0
+            ),
+            "mean_class_match_oversampling_ratio": (
+                float(sampling_meta_df["class_match_oversampling_ratio"].mean())
+                if "class_match_oversampling_ratio" in sampling_meta_df.columns and not sampling_meta_df.empty
+                else 0.0
+            ),
+            "mean_total_raw_samples_drawn": (
+                float(sampling_meta_df["total_raw_samples_drawn"].mean())
+                if "total_raw_samples_drawn" in sampling_meta_df.columns and not sampling_meta_df.empty
+                else 0.0
+            ),
         }
     )
 
@@ -582,7 +853,26 @@ def execute_step62_run(
     _write_frame(round_metrics_df, run_dirs["metrics_dir"] / "round_metrics.csv")
     _write_frame(target_row_metrics_df, run_dirs["metrics_dir"] / "target_row_metrics.csv")
     _write_frame(target_row_summary_df, run_dirs["metrics_dir"] / "target_row_summary.csv")
+    _write_frame(sampling_meta_df, run_dirs["metrics_dir"] / "sampling_metadata.csv")
     _write_json(method_metrics, run_dirs["metrics_dir"] / "method_metrics.json")
+    if not sampling_meta_df.empty:
+        _write_json(
+            {
+                "mean_class_match_acceptance_rate": float(sampling_meta_df["class_match_acceptance_rate"].mean())
+                if "class_match_acceptance_rate" in sampling_meta_df.columns
+                else 0.0,
+                "mean_class_match_oversampling_ratio": float(sampling_meta_df["class_match_oversampling_ratio"].mean())
+                if "class_match_oversampling_ratio" in sampling_meta_df.columns
+                else 0.0,
+                "mean_total_raw_samples_drawn": float(sampling_meta_df["total_raw_samples_drawn"].mean())
+                if "total_raw_samples_drawn" in sampling_meta_df.columns
+                else 0.0,
+                "max_total_raw_samples_drawn": float(sampling_meta_df["total_raw_samples_drawn"].max())
+                if "total_raw_samples_drawn" in sampling_meta_df.columns
+                else 0.0,
+            },
+            run_dirs["metrics_dir"] / "sampling_metadata_summary.json",
+        )
 
     if save_figures and not evaluation_results_df.empty:
         plot_success_gate_funnel(

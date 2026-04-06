@@ -30,6 +30,8 @@ SUPPORTED_RUNS = {
     "S3_cfg_2p0",
     "S4_dpo",
     "S4_rl_finetuned",
+    "S4_ppo",
+    "S4_grpo",
 }
 
 

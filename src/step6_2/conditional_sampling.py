@@ -86,12 +86,7 @@ class ConditionalConstrainedSampler(ConstrainedSampler):
                 logits = self._apply_position_aware_paren_constraints(logits, ids)
                 logits = self._apply_ring_constraints(logits, ids)
                 logits = self._apply_bond_placement_constraints(logits, ids)
-            if (
-                self.class_token_logit_bias is not None
-                and step_progress >= float(self.class_token_bias_start_frac)
-            ):
-                bias_mask = (~fixed_mask).unsqueeze(-1).float()
-                logits = logits + self.class_token_logit_bias.unsqueeze(0).unsqueeze(0) * bias_mask
+            logits = self._apply_class_token_bias(logits, fixed_mask=fixed_mask, step_progress=step_progress)
             logits = self._apply_sampling_filters(logits)
             logits = self._apply_special_token_constraints(logits, ids)
             logits = self._ensure_valid_logits(logits)
@@ -163,12 +158,15 @@ def create_conditional_sampler(
     condition_bundle: torch.Tensor,
     cfg_scale: float,
     device: str,
+    num_steps: int | None = None,
 ) -> ConditionalConstrainedSampler:
     sampling_cfg = resolved.base_config.get("sampling", {})
     sampler = ConditionalConstrainedSampler(
         diffusion_model=diffusion_model,
         tokenizer=tokenizer,
-        num_steps=resolved.base_config["diffusion"]["num_steps"],
+        num_steps=int(
+            resolved.base_config["diffusion"]["num_steps"] if num_steps is None else num_steps
+        ),
         temperature=float(resolved.step6_2["sampling_temperature"]),
         top_k=sampling_cfg.get("top_k"),
         top_p=sampling_cfg.get("top_p"),

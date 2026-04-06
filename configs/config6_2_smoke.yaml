@@ -8,14 +8,41 @@ step6_2:
   enabled_runs:
     - S0_raw_unconditional
     - S1_guided_frozen
+    - S4_ppo
+    - S4_grpo
   generation_budget: 4
+  generation_budget_by_class:
+    polyacrylate: 4
+    polyether: 6
+    polyamide: 6
+    polyester: 8
+    polyimide: 8
+    polysulfone: 8
+    polystyrene: 6
   sampling_temperature: 1.0
   inference_batch_size: 32
   raw_generation_valid_only: false
   class_decode_prior_mode: "on"
-  class_token_bias_start_frac: 0.7
+  class_token_bias_start_frac: 0.5
   class_token_bias_strength: 1.5
+  chi_band_epsilon: 0.25
   target_sa_max: 4.0
+  reporting_target_sa_max_by_class:
+    polyacrylate: 3.5
+    polyether: 4.0
+    polyamide: 4.0
+    polyester: 4.0
+    polyimide: 4.0
+    polysulfone: 4.0
+    polystyrene: 4.0
+  discovery_target_sa_max_by_class:
+    polyacrylate: 4.0
+    polyether: 4.5
+    polyamide: 5.0
+    polyester: 5.0
+    polyimide: 5.5
+    polysulfone: 5.5
+    polystyrene: 5.0
   figure_font_size: 16
   available_target_classes: [polyimide, polyamide, polyester, polyether, polyacrylate, polystyrene, polysulfone]
   c_target: polyimide
@@ -82,7 +109,9 @@ step6_2:
     cfg_scale: 1.0
     count_training_oracle_calls_separately: true
     rl_checkpoint_selection_mode: proxy_success_hit_rate
-    rl_prompt_source: benchmark_target_rows
+    rl_prompt_source: train_exact_step3_distribution
+    rl_use_class_family_sampling: false
+    rl_diffusion_num_steps: 25
     sol_log_prob_floor: -5.0
     reward_weights:
       w_success: 2.0
@@ -90,7 +119,8 @@ step6_2:
       w_novel: 0.0
       w_star: 1.0
       w_sa: 1.0
-      w_class: 1.0
+      w_sa_continuous: 0.5
+      w_class: 0.0
       w_sol: 1.0
       w_chi: 2.0
     learning_rate: 1.0e-5
@@ -101,14 +131,20 @@ step6_2:
     kl_weight: 0.01
     gradient_checkpointing: true
     rl_num_steps: 10
+    policy_update_epochs: 1
+    normalize_advantages: false
+    ppo_clip_eps: 0.2
+    grpo_group_size: 8
+    grpo_advantage_epsilon: 1.0e-6
     rl_proxy_eval_interval_steps: 5
     rl_proxy_num_targets: 2
     rl_proxy_generation_budget: 4
     trajectories_per_batch: 8
     dpo:
       offline_pair_budget: 64
+      d_water_budget_fraction: 0.2
       val_pair_fraction: 0.2
-      beta: 0.1
+      beta: 0.02
       optimizer: adamw
       batch_size: 16
       learning_rate: 3.0e-5
@@ -120,7 +156,7 @@ step6_2:
       pair_refresh_mode: offline_fixed
       logprob_mode: single_step_t1
       checkpoint_selection_mode: val_dpo_loss
-      num_epochs: 1
+      num_epochs: 2
       synthetic_candidates_per_target: 4
 
   run_overrides:
@@ -144,10 +180,26 @@ step6_2:
       canonical_family: S4
       s4:
         alignment_mode: dpo
+    S4_ppo:
+      canonical_family: S4
+      s4:
+        alignment_mode: ppo
+        policy_update_epochs: 2
+        normalize_advantages: true
+        ppo_clip_eps: 0.2
+    S4_grpo:
+      canonical_family: S4
+      s4:
+        alignment_mode: grpo
+        policy_update_epochs: 2
+        normalize_advantages: true
+        ppo_clip_eps: 0.2
+        grpo_group_size: 8
 
 step6_3:
   compare_all_enabled_runs: false
   summarize_by_canonical_family: true
+  compare_metric: discovery_success_hit_rate
 
 step6_2_hpo:
   enabled: true
@@ -156,8 +208,20 @@ step6_2_hpo:
   n_startup_trials: 5
   pruner: median
   storage_uri: sqlite:///results_<model_size>/step6_2_hpo/<split_mode>/<c_target>/<study_family>/optuna_smoke.db
+  reuse_shared_s4_warm_start: true
+  skip_disk_checkpoints: true
+  hpo_s2_max_steps: 50
+  hpo_rl_num_steps: 5
   hpo_num_targets: 2
   hpo_generation_budget: 4
+  hpo_generation_budget_by_class:
+    polyacrylate: 4
+    polyether: 6
+    polyamide: 6
+    polyester: 6
+    polyimide: 8
+    polysulfone: 8
+    polystyrene: 6
   hpo_num_rounds: 1
   hpo_sampling_seeds: [101]
   tie_epsilon: 1.0e-4
@@ -166,4 +230,6 @@ step6_2_hpo:
     S2: {n_trials: 2, timeout_hours_medium: null}
     S3: {n_trials: 2, timeout_hours_medium: null}
     S4_rl: {n_trials: 2, timeout_hours_medium: null}
+    S4_ppo: {n_trials: 2, timeout_hours_medium: null}
+    S4_grpo: {n_trials: 2, timeout_hours_medium: null}
     S4_dpo: {n_trials: 2, timeout_hours_medium: null}

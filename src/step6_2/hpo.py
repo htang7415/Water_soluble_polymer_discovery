@@ -14,7 +14,7 @@ from typing import Any, Dict
 
 import yaml
 
-from .config import build_run_config
+from .config import build_run_config, resolve_step62_hpo_generation_budget
 from .run_core import execute_step62_run
 from .study_families import STUDY_BASE_RUNS
 from src.utils.model_scales import get_model_config
@@ -111,6 +111,31 @@ def _suggest_s2_training_params(trial, params: Dict[str, Any], *, prefix: str = 
     )
 
 
+def _apply_hpo_runtime_overrides(resolved, run_cfg: Dict[str, object], *, study_family: str) -> Dict[str, object]:
+    hpo_cfg = dict(resolved.step6_2_hpo)
+    s2_hpo_max_steps = int(hpo_cfg.get("hpo_s2_max_steps", 0) or 0)
+    rl_hpo_num_steps = int(hpo_cfg.get("hpo_rl_num_steps", 0) or 0)
+
+    if "s2" in run_cfg and s2_hpo_max_steps > 0:
+        capped_steps = min(int(run_cfg["s2"]["max_steps"]), int(s2_hpo_max_steps))
+        run_cfg["s2"]["max_steps"] = int(capped_steps)
+        run_cfg["s2"]["val_check_interval_steps"] = int(
+            min(int(run_cfg["s2"]["val_check_interval_steps"]), max(100, capped_steps // 10))
+        )
+
+    if study_family in {"S4_rl", "S4_ppo", "S4_grpo"} and rl_hpo_num_steps > 0:
+        capped_rl_steps = int(min(int(run_cfg["s4"]["rl_num_steps"]), int(rl_hpo_num_steps)))
+        run_cfg["s4"]["rl_num_steps"] = int(capped_rl_steps)
+        run_cfg["s4"]["rl_proxy_eval_interval_steps"] = int(
+            min(
+                int(run_cfg["s4"]["rl_proxy_eval_interval_steps"]),
+                max(1, capped_rl_steps // 2),
+            )
+        )
+
+    return run_cfg
+
+
 def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, Any]):
     resolved_trial = resolved
     if "class_token_bias_start_frac" in params:
@@ -158,23 +183,30 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
             }
         )
     elif family == "S4":
-        _update_s2_training_params(run_cfg, params, prefix="s2_")
+        if any(str(key).startswith("s2_") for key in params):
+            _update_s2_training_params(run_cfg, params, prefix="s2_")
         alignment_mode = str(run_cfg["s4"]["alignment_mode"]).strip().lower()
         run_cfg["s4"]["cfg_scale"] = float(params["cfg_scale"])
-        if alignment_mode == "rl":
+        if alignment_mode in {"rl", "ppo", "grpo"}:
             reward_weights = deepcopy(run_cfg["s4"]["reward_weights"])
             reward_weights.update(
                 {
                     "w_success": float(params["w_success"]),
-                    "w_class": float(params["w_class"]),
                     "w_sol": float(params["w_sol"]),
                     "w_chi": float(params["w_chi"]),
                     "w_sa": float(params["w_sa"]),
+                    "w_sa_continuous": float(params["w_sa_continuous"]),
                 }
             )
             run_cfg["s4"]["reward_weights"] = reward_weights
             run_cfg["s4"]["kl_weight"] = float(params["kl_weight"])
             run_cfg["s4"]["learning_rate"] = float(params["rl_learning_rate"])
+            if alignment_mode in {"ppo", "grpo"}:
+                run_cfg["s4"]["policy_update_epochs"] = int(params["policy_update_epochs"])
+                run_cfg["s4"]["ppo_clip_eps"] = float(params["ppo_clip_eps"])
+                run_cfg["s4"]["normalize_advantages"] = True
+            if alignment_mode == "grpo":
+                run_cfg["s4"]["grpo_group_size"] = int(params["grpo_group_size"])
         elif alignment_mode == "dpo":
             dpo_cfg = deepcopy(run_cfg["s4"]["dpo"])
             dpo_cfg.update(
@@ -228,28 +260,43 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
         params["w_class"] = trial.suggest_float("w_class", 0.10, 1.0, log=True)
     elif study_family == "S4_rl":
-        params["finetune_last_layers"] = trial.suggest_categorical(
-            "finetune_last_layers", _finetune_last_layer_choices(resolved)
-        )
-        _suggest_s2_training_params(trial, params, prefix="s2_")
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
-        params["w_class"] = trial.suggest_float("w_class", 0.25, 2.0, log=True)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
         params["w_sa"] = trial.suggest_float("w_sa", 0.0, 1.5)
+        params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)
         params["kl_weight"] = trial.suggest_float("kl_weight", 1.0e-3, 5.0e-2, log=True)
         params["rl_learning_rate"] = trial.suggest_float("rl_learning_rate", 1.0e-6, 1.0e-4, log=True)
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
+    elif study_family == "S4_ppo":
+        params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
+        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
+        params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
+        params["w_sa"] = trial.suggest_float("w_sa", 0.0, 1.5)
+        params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)
+        params["kl_weight"] = trial.suggest_float("kl_weight", 1.0e-3, 5.0e-2, log=True)
+        params["rl_learning_rate"] = trial.suggest_float("rl_learning_rate", 1.0e-6, 1.0e-4, log=True)
+        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
+        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2])
+        params["ppo_clip_eps"] = trial.suggest_float("ppo_clip_eps", 0.10, 0.30)
+    elif study_family == "S4_grpo":
+        params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
+        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
+        params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
+        params["w_sa"] = trial.suggest_float("w_sa", 0.0, 1.5)
+        params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)
+        params["kl_weight"] = trial.suggest_float("kl_weight", 1.0e-3, 5.0e-2, log=True)
+        params["rl_learning_rate"] = trial.suggest_float("rl_learning_rate", 1.0e-6, 1.0e-4, log=True)
+        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
+        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2])
+        params["ppo_clip_eps"] = trial.suggest_float("ppo_clip_eps", 0.10, 0.30)
+        params["grpo_group_size"] = trial.suggest_categorical("grpo_group_size", [8, 16])
     elif study_family == "S4_dpo":
-        params["finetune_last_layers"] = trial.suggest_categorical(
-            "finetune_last_layers", _finetune_last_layer_choices(resolved)
-        )
-        _suggest_s2_training_params(trial, params, prefix="s2_")
         params["offline_pair_budget"] = trial.suggest_categorical("offline_pair_budget", [5000, 10000, 20000])
-        params["beta"] = trial.suggest_float("beta", 0.03, 0.3, log=True)
+        params["beta"] = trial.suggest_float("beta", 0.01, 0.2, log=True)
         params["learning_rate"] = trial.suggest_float("learning_rate", 1.0e-5, 1.0e-4, log=True)
-        params["batch_size"] = trial.suggest_categorical("batch_size", [64, 128])
-        params["num_epochs"] = trial.suggest_categorical("num_epochs", [2, 3, 4, 6])
+        params["batch_size"] = trial.suggest_categorical("batch_size", [32, 64])
+        params["num_epochs"] = trial.suggest_categorical("num_epochs", [4, 6, 8, 10])
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
         pair_source = str(run_cfg["s4"]["dpo"]["pair_source"]).strip().lower()
         if pair_source == "target_row_synthetic":
@@ -260,7 +307,7 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         raise ValueError(f"Unsupported Step 6_2 HPO study family: {study_family}")
 
     if token_bias_active:
-        params["class_token_bias_start_frac"] = trial.suggest_float("class_token_bias_start_frac", 0.55, 0.85)
+        params["class_token_bias_start_frac"] = trial.suggest_float("class_token_bias_start_frac", 0.4, 0.75)
         params["class_token_bias_strength"] = trial.suggest_float("class_token_bias_strength", 0.5, 3.0, log=True)
     return params
 
@@ -298,7 +345,10 @@ def _write_trial_summary(
     study_family: str,
     run_name: str,
     params: Dict[str, Any],
+    objective_value: float | None,
+    objective_metric: str,
     mean_success_hit_rate: float | None,
+    mean_success_hit_rate_discovery: float | None,
     state: str,
 ) -> None:
     payload = {
@@ -306,7 +356,12 @@ def _write_trial_summary(
         "study_family": str(study_family),
         "run_name": str(run_name),
         "state": str(state),
+        "objective_metric": str(objective_metric),
+        "objective_value": (float(objective_value) if objective_value is not None else None),
         "mean_success_hit_rate": (float(mean_success_hit_rate) if mean_success_hit_rate is not None else None),
+        "mean_success_hit_rate_discovery": (
+            float(mean_success_hit_rate_discovery) if mean_success_hit_rate_discovery is not None else None
+        ),
         "hyperparameters": dict(params),
     }
     trial_path = _trial_summary_path(study_root, int(trial_number))
@@ -346,6 +401,15 @@ def run_optuna_study(
 
     base_run_name = STUDY_BASE_RUNS[study_family]
     base_run_cfg = build_run_config(resolved, base_run_name)
+    budgets = dict(resolved.step6_2_hpo.get("method_budgets", {}).get(study_family, {}))
+    n_trials = int(budgets.get("n_trials", 120))
+    default_startup_trials = int(resolved.step6_2_hpo.get("n_startup_trials", 20))
+    effective_startup_trials = int(
+        min(
+            int(budgets.get("n_startup_trials", default_startup_trials)),
+            max(1, n_trials - 1) if n_trials > 1 else 1,
+        )
+    )
     study_root = _hpo_root(resolved) / study_family
     if fresh_study and study_root.exists():
         shutil.rmtree(study_root)
@@ -368,7 +432,7 @@ def run_optuna_study(
     sampler = optuna.samplers.TPESampler(
         multivariate=True,
         seed=int(resolved.step6_2_hpo.get("sampler_seed", 42)),
-        n_startup_trials=int(resolved.step6_2_hpo.get("n_startup_trials", 20)),
+        n_startup_trials=int(effective_startup_trials),
     )
     pruner = optuna.pruners.MedianPruner()
     study_name = f"step6_2_{study_family}_{resolved.c_target}_{resolved.model_size}"
@@ -382,14 +446,15 @@ def run_optuna_study(
         load_if_exists=not fresh_study,
     )
 
-    budgets = dict(resolved.step6_2_hpo.get("method_budgets", {}).get(study_family, {}))
-    n_trials = int(budgets.get("n_trials", 120))
     existing_trial_count = int(len(study.trials))
     remaining_trials = max(0, int(n_trials) - existing_trial_count)
-    hpo_generation_budget = int(resolved.step6_2_hpo["hpo_generation_budget"])
+    hpo_generation_budget = int(resolve_step62_hpo_generation_budget(resolved.step6_2_hpo, resolved.c_target))
     hpo_num_rounds = int(resolved.step6_2_hpo["hpo_num_rounds"])
     hpo_sampling_seeds = [int(x) for x in resolved.step6_2_hpo["hpo_sampling_seeds"]]
     tie_epsilon = float(resolved.step6_2_hpo.get("tie_epsilon", 1.0e-4))
+    objective_metric_name = "mean_success_hit_rate_discovery"
+    share_s4_warm_start_in_hpo = bool(resolved.step6_2_hpo.get("reuse_shared_s4_warm_start", True))
+    skip_disk_checkpoints_in_hpo = bool(resolved.step6_2_hpo.get("skip_disk_checkpoints", True))
     stage_offsets = {
         "s2": 0,
         "warm_start": 1_000_000,
@@ -410,6 +475,7 @@ def run_optuna_study(
         run_cfg = deepcopy(base_run_cfg)
         params = suggest_trial_params(trial, study_family=study_family, resolved=resolved, run_cfg=run_cfg)
         resolved_trial, run_cfg = _apply_trial_params(resolved, run_cfg, params)
+        run_cfg = _apply_hpo_runtime_overrides(resolved_trial, run_cfg, study_family=study_family)
         run_cfg["run_name"] = f"{base_run_cfg['run_name']}__trial_{int(trial.number):04d}"
         start = time.time()
         try:
@@ -436,6 +502,10 @@ def run_optuna_study(
                         "study_family": study_family,
                         "trial_number": int(trial.number),
                         "hpo_mode": True,
+                        "skip_disk_checkpoints": bool(skip_disk_checkpoints_in_hpo),
+                        "allow_shared_s4_warm_start": bool(
+                            share_s4_warm_start_in_hpo and study_family.startswith("S4_")
+                        ),
                         "trial_params": params,
                     },
                 )
@@ -446,7 +516,10 @@ def run_optuna_study(
                 study_family=study_family,
                 run_name=str(run_cfg["run_name"]),
                 params=params,
+                objective_value=None,
+                objective_metric=objective_metric_name,
                 mean_success_hit_rate=None,
+                mean_success_hit_rate_discovery=None,
                 state="PRUNED",
             )
             raise
@@ -454,14 +527,30 @@ def run_optuna_study(
         metrics = result["method_metrics"]
         eval_df = result["evaluation_results_df"]
         mean_success_hit_rate = float(metrics["mean_success_hit_rate"])
-        trial.report(mean_success_hit_rate, step=9_999_999)
+        mean_success_hit_rate_discovery = float(metrics.get(objective_metric_name, mean_success_hit_rate))
+        trial.report(mean_success_hit_rate_discovery, step=9_999_999)
         trial.set_user_attr("mean_class_ok", float(eval_df["class_ok"].astype(float).mean()) if not eval_df.empty else float("nan"))
+        trial.set_user_attr(
+            "mean_class_ok_loose",
+            float(eval_df["class_ok_loose"].astype(float).mean()) if "class_ok_loose" in eval_df.columns and not eval_df.empty else float("nan"),
+        )
+        trial.set_user_attr(
+            "mean_class_ok_strict",
+            float(eval_df["class_ok_strict"].astype(float).mean()) if "class_ok_strict" in eval_df.columns and not eval_df.empty else float("nan"),
+        )
         trial.set_user_attr("mean_chi_ok", float(eval_df["chi_ok"].astype(float).mean()) if not eval_df.empty else float("nan"))
+        trial.set_user_attr(
+            "mean_chi_band_ok",
+            float(eval_df["chi_band_ok"].astype(float).mean()) if "chi_band_ok" in eval_df.columns and not eval_df.empty else float("nan"),
+        )
         trial.set_user_attr("mean_soluble_ok", float(eval_df["soluble_ok"].astype(float).mean()) if not eval_df.empty else float("nan"))
         trial.set_user_attr(
             "oracle_call_cost",
             float(metrics.get("mean_training_soluble_oracle_calls", 0.0)) + float(metrics.get("mean_training_chi_oracle_calls", 0.0)),
         )
+        trial.set_user_attr("objective_metric", objective_metric_name)
+        trial.set_user_attr("mean_success_hit_rate_reporting", mean_success_hit_rate)
+        trial.set_user_attr("mean_success_hit_rate_discovery", mean_success_hit_rate_discovery)
         trial.set_user_attr("wall_time_sec", float(wall_time))
         trial.set_user_attr("run_name", str(run_cfg["run_name"]))
         _write_trial_summary(
@@ -470,23 +559,48 @@ def run_optuna_study(
             study_family=study_family,
             run_name=str(run_cfg["run_name"]),
             params=params,
+            objective_value=mean_success_hit_rate_discovery,
+            objective_metric=objective_metric_name,
             mean_success_hit_rate=mean_success_hit_rate,
+            mean_success_hit_rate_discovery=mean_success_hit_rate_discovery,
             state="COMPLETE",
         )
-        return mean_success_hit_rate
+        return mean_success_hit_rate_discovery
 
     if remaining_trials > 0:
         study.optimize(objective, n_trials=remaining_trials, timeout=None)
     best_trial = _select_best_completed_trial(study, tie_epsilon=tie_epsilon)
 
     trials_df = study.trials_dataframe(attrs=("number", "value", "state", "params"))
-    trials_df = trials_df.rename(columns={"number": "trial_number", "value": "mean_success_hit_rate"})
+    trials_df = trials_df.rename(columns={"number": "trial_number", "value": "objective_value"})
+    attr_rows = [
+        {
+            "trial_number": int(trial.number),
+            "objective_metric": str(trial.user_attrs.get("objective_metric", objective_metric_name)),
+            "mean_success_hit_rate": trial.user_attrs.get("mean_success_hit_rate_reporting"),
+            "mean_success_hit_rate_discovery": trial.user_attrs.get("mean_success_hit_rate_discovery"),
+        }
+        for trial in study.trials
+    ]
+    if attr_rows:
+        trials_df = trials_df.merge(trials_df.__class__(attr_rows), on="trial_number", how="left")
     trials_df.to_csv(study_root / "trials.csv", index=False)
     trial_records = [
         {
             "trial_number": int(trial.number),
             "state": str(trial.state.name),
-            "mean_success_hit_rate": (float(trial.value) if trial.value is not None else None),
+            "objective_metric": str(trial.user_attrs.get("objective_metric", objective_metric_name)),
+            "objective_value": (float(trial.value) if trial.value is not None else None),
+            "mean_success_hit_rate": (
+                float(trial.user_attrs["mean_success_hit_rate_reporting"])
+                if "mean_success_hit_rate_reporting" in trial.user_attrs
+                else None
+            ),
+            "mean_success_hit_rate_discovery": (
+                float(trial.user_attrs["mean_success_hit_rate_discovery"])
+                if "mean_success_hit_rate_discovery" in trial.user_attrs
+                else None
+            ),
             "hyperparameters": dict(trial.params),
         }
         for trial in study.trials
@@ -500,8 +614,13 @@ def run_optuna_study(
                 "configured_n_trials": int(n_trials),
                 "existing_trial_count_at_start": int(existing_trial_count),
                 "remaining_trials_executed": int(remaining_trials),
+                "objective_metric": objective_metric_name,
                 "best_trial_number": int(best_trial.number),
-                "best_mean_success_hit_rate": float(best_trial.value),
+                "best_objective_value": float(best_trial.value),
+                "best_mean_success_hit_rate": float(best_trial.user_attrs.get("mean_success_hit_rate_reporting", best_trial.value)),
+                "best_mean_success_hit_rate_discovery": float(
+                    best_trial.user_attrs.get("mean_success_hit_rate_discovery", best_trial.value)
+                ),
                 "best_params": dict(best_trial.params),
             },
             handle,

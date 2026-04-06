@@ -11,9 +11,12 @@ from src.step6_2.conditional_sampling import ConditionalConstrainedSampler
 from src.step6_2.config import ResolvedStep62Config
 from src.step6_2.frozen_sampling import (
     ResolvedClassSamplingPrior,
+    _accepted_target_class_indices,
+    _build_backbone_template_multi_spans,
     _build_decode_constraint_multi_spans,
     _sample_lengths,
 )
+from src.evaluation.polymer_class import BACKBONE_CLASS_MATCH_CLASSES, PolymerClassifier
 from src.data.tokenizer import PSmilesTokenizer
 
 
@@ -39,6 +42,85 @@ class SamplingTrajectoryRecord:
     final_ids: torch.Tensor
     final_attention_mask: torch.Tensor
     steps: List[TrajectoryStepRecord]
+
+
+def _slice_sampling_trajectory(record: SamplingTrajectoryRecord, keep_rows: Sequence[int]) -> SamplingTrajectoryRecord:
+    keep = list(int(idx) for idx in keep_rows)
+    index_tensor = torch.tensor(keep, dtype=torch.long, device=record.final_ids.device)
+    sliced_steps: List[TrajectoryStepRecord] = []
+    for step in record.steps:
+        sliced_steps.append(
+            TrajectoryStepRecord(
+                timestep=int(step.timestep),
+                ids_before=step.ids_before.index_select(0, index_tensor),
+                attention_mask=step.attention_mask.index_select(0, index_tensor),
+                fixed_mask=step.fixed_mask.index_select(0, index_tensor),
+                unmask_positions=step.unmask_positions.index_select(0, index_tensor),
+                sampled_token_ids=step.sampled_token_ids.index_select(0, index_tensor),
+                unmask_counts=step.unmask_counts.index_select(0, index_tensor),
+            )
+        )
+    return SamplingTrajectoryRecord(
+        condition_bundle=record.condition_bundle.index_select(0, index_tensor),
+        cfg_scale=float(record.cfg_scale),
+        final_ids=record.final_ids.index_select(0, index_tensor),
+        final_attention_mask=record.final_attention_mask.index_select(0, index_tensor),
+        steps=sliced_steps,
+    )
+
+
+def _truncate_trajectory_records(
+    trajectories: List[SamplingTrajectoryRecord],
+    *,
+    keep_total: int,
+) -> List[SamplingTrajectoryRecord]:
+    remaining = int(keep_total)
+    out: List[SamplingTrajectoryRecord] = []
+    for trajectory in trajectories:
+        if remaining <= 0:
+            break
+        batch_count = int(trajectory.final_ids.shape[0])
+        if batch_count <= remaining:
+            out.append(trajectory)
+            remaining -= batch_count
+        else:
+            out.append(_slice_sampling_trajectory(trajectory, list(range(remaining))))
+            remaining = 0
+    return out
+
+
+def select_sampling_trajectory_rows(
+    trajectories: List[SamplingTrajectoryRecord],
+    *,
+    keep_indices: Sequence[int],
+) -> List[SamplingTrajectoryRecord]:
+    """Select arbitrary sample rows from a list of batched trajectory records."""
+
+    keep = sorted(int(idx) for idx in keep_indices)
+    if not keep:
+        return []
+
+    out: List[SamplingTrajectoryRecord] = []
+    offset = 0
+    keep_ptr = 0
+    for trajectory in trajectories:
+        batch_count = int(trajectory.final_ids.shape[0])
+        local_rows: List[int] = []
+        while keep_ptr < len(keep):
+            global_idx = keep[keep_ptr]
+            if global_idx < offset:
+                keep_ptr += 1
+                continue
+            if global_idx >= offset + batch_count:
+                break
+            local_rows.append(int(global_idx - offset))
+            keep_ptr += 1
+        if local_rows:
+            out.append(_slice_sampling_trajectory(trajectory, local_rows))
+        offset += batch_count
+        if keep_ptr >= len(keep):
+            break
+    return out
 
 
 def _pad_event_matrix(values: List[torch.Tensor], *, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -128,12 +210,7 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
             logits = self._apply_position_aware_paren_constraints(logits, ids)
             logits = self._apply_ring_constraints(logits, ids)
             logits = self._apply_bond_placement_constraints(logits, ids)
-        if (
-            self.class_token_logit_bias is not None
-            and step_progress >= float(self.class_token_bias_start_frac)
-        ):
-            bias_mask = (~fixed_mask).unsqueeze(-1).float()
-            logits = logits + self.class_token_logit_bias.unsqueeze(0).unsqueeze(0) * bias_mask
+        logits = self._apply_class_token_bias(logits, fixed_mask=fixed_mask, step_progress=step_progress)
         logits = self._apply_sampling_filters(logits)
         logits = self._apply_special_token_constraints(logits, ids)
         return self._ensure_valid_logits(logits)
@@ -563,6 +640,11 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
         self.condition_bundle = trajectory.condition_bundle.to(self.device)
         try:
             for step in trajectory.steps:
+                if int(step.unmask_counts.max().item()) <= 0:
+                    zero_step = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+                    total_logprob = total_logprob + zero_step
+                    per_step_logprob.append(zero_step)
+                    continue
                 ids = step.ids_before.to(self.device).clone()
                 attention_mask = step.attention_mask.to(self.device)
                 fixed_mask = step.fixed_mask.to(self.device)
@@ -635,6 +717,11 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
         self.condition_bundle = trajectory.condition_bundle.to(self.device)
         try:
             for step in trajectory.steps:
+                if int(step.unmask_counts.max().item()) <= 0:
+                    zero_step = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+                    total_kl = total_kl + zero_step
+                    per_step_kl.append(zero_step)
+                    continue
                 ids = step.ids_before.to(self.device).clone()
                 attention_mask = step.attention_mask.to(self.device)
                 fixed_mask = step.fixed_mask.to(self.device)
@@ -713,51 +800,141 @@ def sample_trajectories_with_class_prior(
     show_progress: bool = True,
 ) -> Tuple[List[str], List[SamplingTrajectoryRecord], Dict[str, object]]:
     """Trajectory-enabled variant of Step 6 class-prior sampling."""
-
     sampling_cfg = resolved.base_config.get("sampling", {})
-    lengths = _sample_lengths(
-        prior=prior,
-        tokenizer=tokenizer,
-        num_samples=int(num_samples),
-        sampling_cfg=sampling_cfg,
-    )
     batch_size = int(sampling_cfg.get("batch_size", 128))
-    if prior.motif_token_ids:
-        multi_spans, multi_span_starts, lengths = _build_decode_constraint_multi_spans(
-            motif_token_ids=prior.motif_token_ids,
-            lengths=lengths,
-            center_min_frac=prior.center_min_frac,
-            center_max_frac=prior.center_max_frac,
-            seq_length=int(tokenizer.max_length),
-            spans_per_sample=prior.spans_per_sample,
+    classifier = PolymerClassifier(patterns=resolved.polymer_patterns) if prior.enforce_class_match else None
+    accepted_smiles: List[str] = []
+    accepted_trajectories: List[SamplingTrajectoryRecord] = []
+    accepted_raw_count = 0
+    total_drawn = 0
+    attempts = 0
+
+    while len(accepted_smiles) < int(num_samples):
+        attempts += 1
+        if attempts > int(prior.class_match_sampling_attempts_max):
+            raise RuntimeError(
+                "Step 6_2 trajectory sampling could not satisfy the target-class quota. "
+                f"target_class={prior.target_class!r} accepted={len(accepted_smiles)} requested={int(num_samples)} "
+                f"after {int(prior.class_match_sampling_attempts_max)} attempts."
+            )
+        remaining = int(num_samples) - len(accepted_smiles)
+        request_size = remaining
+        if prior.enforce_class_match:
+            request_size = max(
+                remaining,
+                int(torch.ceil(torch.tensor(float(remaining) * float(prior.class_match_oversample_factor))).item()),
+            )
+
+        lengths = _sample_lengths(
+            prior=prior,
+            tokenizer=tokenizer,
+            num_samples=int(request_size),
+            sampling_cfg=sampling_cfg,
         )
-        all_ids, smiles, trajectories = sampler.sample_batch_with_multiple_fixed_spans_trajectory(
-            num_samples=int(num_samples),
-            seq_length=int(tokenizer.max_length),
-            span_token_ids=multi_spans,
-            span_start_positions=multi_span_starts,
-            batch_size=batch_size,
-            show_progress=show_progress,
-            lengths=lengths,
-        )
-    else:
-        all_ids, smiles, trajectories = sampler.sample_batch_trajectory(
-            num_samples=int(num_samples),
-            seq_length=int(tokenizer.max_length),
-            batch_size=batch_size,
-            show_progress=show_progress,
-            lengths=lengths,
-        )
+        if prior.backbone_template_enabled and prior.backbone_template_token_ids:
+            backbone_gap_token_id = int(tokenizer.vocab.get("C", tokenizer.unk_token_id))
+            if backbone_gap_token_id == int(tokenizer.unk_token_id):
+                raise ValueError("Tokenizer vocabulary must define token 'C' for backbone-template sampling")
+            multi_spans, multi_span_starts, lengths = _build_backbone_template_multi_spans(
+                backbone_template_token_ids=prior.backbone_template_token_ids,
+                lengths=lengths,
+                center_min_frac=prior.center_min_frac,
+                center_max_frac=prior.center_max_frac,
+                seq_length=int(tokenizer.max_length),
+                star_token_id=int(tokenizer.get_star_token_id()),
+                backbone_gap_token_id=backbone_gap_token_id,
+                min_gap_tokens=int(prior.backbone_template_min_gap_tokens),
+            )
+            _all_ids, smiles, trajectories = sampler.sample_batch_with_multiple_fixed_spans_trajectory(
+                num_samples=int(request_size),
+                seq_length=int(tokenizer.max_length),
+                span_token_ids=multi_spans,
+                span_start_positions=multi_span_starts,
+                batch_size=batch_size,
+                show_progress=show_progress and attempts == 1,
+                lengths=lengths,
+            )
+        elif prior.motif_token_ids:
+            multi_spans, multi_span_starts, lengths = _build_decode_constraint_multi_spans(
+                motif_token_ids=prior.motif_token_ids,
+                lengths=lengths,
+                center_min_frac=prior.center_min_frac,
+                center_max_frac=prior.center_max_frac,
+                seq_length=int(tokenizer.max_length),
+                spans_per_sample=prior.spans_per_sample,
+            )
+            _all_ids, smiles, trajectories = sampler.sample_batch_with_multiple_fixed_spans_trajectory(
+                num_samples=int(request_size),
+                seq_length=int(tokenizer.max_length),
+                span_token_ids=multi_spans,
+                span_start_positions=multi_span_starts,
+                batch_size=batch_size,
+                show_progress=show_progress and attempts == 1,
+                lengths=lengths,
+            )
+        else:
+            _all_ids, smiles, trajectories = sampler.sample_batch_trajectory(
+                num_samples=int(request_size),
+                seq_length=int(tokenizer.max_length),
+                batch_size=batch_size,
+                show_progress=show_progress and attempts == 1,
+                lengths=lengths,
+            )
+
+        total_drawn += int(len(smiles))
+        if prior.enforce_class_match and classifier is not None:
+            accepted_idx = _accepted_target_class_indices(smiles, prior=prior, classifier=classifier)
+        else:
+            accepted_idx = list(range(len(smiles)))
+        accepted_raw_count += int(len(accepted_idx))
+        accepted_set = set(int(idx) for idx in accepted_idx)
+        accepted_smiles.extend([smiles[idx] for idx in accepted_idx])
+
+        offset = 0
+        for trajectory in trajectories:
+            batch_count = int(trajectory.final_ids.shape[0])
+            keep_rows = [
+                row_idx
+                for row_idx in range(batch_count)
+                if (offset + row_idx) in accepted_set
+            ]
+            if keep_rows:
+                accepted_trajectories.append(_slice_sampling_trajectory(trajectory, keep_rows))
+            offset += batch_count
+
+    smiles = accepted_smiles[: int(num_samples)]
+    trajectories = _truncate_trajectory_records(accepted_trajectories, keep_total=int(num_samples))
 
     metadata = {
         "num_samples": int(num_samples),
         "num_trajectory_batches": int(len(trajectories)),
+        "total_raw_samples_drawn": int(total_drawn),
+        "accepted_raw_target_class_samples": int(accepted_raw_count),
+        "class_match_sampling_attempts": int(attempts),
+        "class_match_acceptance_rate": (
+            float(accepted_raw_count) / float(total_drawn) if total_drawn > 0 else 0.0
+        ),
+        "class_match_oversampling_ratio": (
+            float(total_drawn) / float(num_samples) if int(num_samples) > 0 else 0.0
+        ),
         "spans_per_sample": int(prior.spans_per_sample),
         "motif_count": int(len(prior.motifs)),
         "motif_source": prior.motif_source,
+        "backbone_template_enabled": bool(prior.backbone_template_enabled),
+        "backbone_template_core_count": int(len(prior.backbone_template_cores)),
+        "backbone_template_source": prior.backbone_template_source,
+        "backbone_template_layout": "contiguous_scaffold" if prior.backbone_template_enabled else "disabled",
         "length_prior_count": int(len(prior.length_prior_lengths)),
         "length_prior_source": prior.length_prior_source,
         "class_token_bias_enabled": bool(prior.class_token_logit_bias is not None),
         "class_token_bias_strength": float(prior.class_token_bias_strength),
+        "enforce_class_match": bool(prior.enforce_class_match),
+        "enforce_backbone_class_match": bool(prior.enforce_backbone_class_match),
+        "class_match_mode": (
+            "strict_backbone"
+            if prior.target_class in BACKBONE_CLASS_MATCH_CLASSES
+            and prior.enforce_backbone_class_match
+            else "loose"
+        ),
     }
     return smiles, trajectories, metadata

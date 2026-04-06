@@ -14,7 +14,7 @@ import pandas as pd
 from src.chi.data import SplitConfig, add_split_column, load_chi_dataset, make_split_assignments
 from src.chi.inverse_design_common import load_soluble_targets
 from src.evaluation.class_decode_constraints import load_decode_constraint_source_smiles
-from src.evaluation.polymer_class import PolymerClassifier
+from src.evaluation.polymer_class import BACKBONE_CLASS_MATCH_CLASSES, PolymerClassifier
 from src.utils.config import load_config
 from src.utils.model_scales import get_results_dir
 from src.utils.chemistry import canonicalize_smiles
@@ -67,6 +67,49 @@ def _build_target_row_key(c_target: str, temperature: float, phi: float, chi_tar
         f"{c_target}|T={_format_float(temperature)}"
         f"|phi={_format_float(phi)}|chi={_format_float(chi_target)}"
     )
+
+
+def _resolve_class_numeric_overrides(raw: Any) -> Dict[str, float]:
+    if not isinstance(raw, dict):
+        return {}
+    resolved: Dict[str, float] = {}
+    for key, value in raw.items():
+        class_name = str(key).strip().lower()
+        if not class_name:
+            continue
+        try:
+            resolved[class_name] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return resolved
+
+
+def resolve_step62_generation_budget(step6_cfg: Dict[str, Any], c_target: str) -> int:
+    """Resolve the per-class Step 6_2 generation budget."""
+    base_budget = int(step6_cfg["generation_budget"])
+    overrides = _resolve_class_numeric_overrides(step6_cfg.get("generation_budget_by_class", {}))
+    return int(round(overrides.get(str(c_target).strip().lower(), float(base_budget))))
+
+
+def resolve_step62_hpo_generation_budget(hpo_cfg: Dict[str, Any], c_target: str) -> int:
+    """Resolve the per-class Step 6_2 HPO generation budget."""
+    base_budget = int(hpo_cfg["hpo_generation_budget"])
+    overrides = _resolve_class_numeric_overrides(hpo_cfg.get("hpo_generation_budget_by_class", {}))
+    return int(round(overrides.get(str(c_target).strip().lower(), float(base_budget))))
+
+
+def resolve_step62_sa_thresholds(step6_cfg: Dict[str, Any], c_target: str) -> Dict[str, float]:
+    """Resolve reporting and discovery SA thresholds for a target class."""
+    target_key = str(c_target).strip().lower()
+    reporting_default = float(step6_cfg["target_sa_max"])
+    reporting_overrides = _resolve_class_numeric_overrides(step6_cfg.get("reporting_target_sa_max_by_class", {}))
+    discovery_overrides = _resolve_class_numeric_overrides(step6_cfg.get("discovery_target_sa_max_by_class", {}))
+    reporting = float(reporting_overrides.get(target_key, reporting_default))
+    discovery = float(discovery_overrides.get(target_key, reporting))
+    return {
+        "reporting": reporting,
+        "discovery": discovery,
+    }
 
 
 @dataclass(frozen=True)
@@ -325,7 +368,16 @@ def _build_validation_target_tables(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any], pd.DataFrame]:
     val_df = chi_split_df.loc[chi_split_df["split"].astype(str) == "val"].copy()
     if val_df.empty:
-        return pd.DataFrame(), pd.DataFrame(), {"coverage_warning": "no_val_rows"}, pd.DataFrame()
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(),
+            {
+                "coverage_warning": "no_val_rows",
+                "proxy_target_gap_warning": False,
+                "proxy_target_gap_warning_threshold": 0.3,
+            },
+            pd.DataFrame(),
+        )
 
     val_df["canonical_smiles"] = val_df["SMILES"].astype(str).map(canonicalize_smiles)
     val_df["canonical_smiles"] = val_df["canonical_smiles"].where(
@@ -338,7 +390,16 @@ def _build_validation_target_tables(
     ]
     eligible_df = val_df.loc[val_df["step3_chi_target"].notna()].copy()
     if eligible_df.empty:
-        return pd.DataFrame(), pd.DataFrame(), {"coverage_warning": "no_exact_step3_match"}, pd.DataFrame()
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(),
+            {
+                "coverage_warning": "no_exact_step3_match",
+                "proxy_target_gap_warning": False,
+                "proxy_target_gap_warning_threshold": 0.3,
+            },
+            pd.DataFrame(),
+        )
 
     ordered_buckets = (
         eligible_df[["temperature", "phi"]]
@@ -356,7 +417,7 @@ def _build_validation_target_tables(
     rl_buckets = ordered_buckets.iloc[:rl_bucket_count].copy()
     hpo_buckets = ordered_buckets.iloc[rl_bucket_count : rl_bucket_count + hpo_bucket_count].copy()
 
-    def _bucket_rows(bucket_df: pd.DataFrame, *, source_name: str) -> pd.DataFrame:
+    def _bucket_rows(bucket_df: pd.DataFrame, *, source_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         rows: List[Dict[str, Any]] = []
         drift_rows: List[Dict[str, Any]] = []
         for idx, bucket in bucket_df.reset_index(drop=True).iterrows():
@@ -364,10 +425,17 @@ def _build_validation_target_tables(
                 np.isclose(eligible_df["temperature"].astype(float), float(bucket["temperature"]))
                 & np.isclose(eligible_df["phi"].astype(float), float(bucket["phi"]))
             ].copy()
-            bucket_rows = bucket_rows.sort_values(["canonical_smiles", "Polymer", "row_id"]).reset_index(drop=True)
+            bucket_rows["abs_step3_gap"] = (
+                pd.to_numeric(bucket_rows["chi"], errors="coerce")
+                - pd.to_numeric(bucket_rows["step3_chi_target"], errors="coerce")
+            ).abs()
+            bucket_rows = bucket_rows.sort_values(
+                ["abs_step3_gap", "canonical_smiles", "Polymer", "row_id"]
+            ).reset_index(drop=True)
             selected = bucket_rows.iloc[0]
             chi_target = float(selected["chi"])
             step3_target = float(selected["step3_chi_target"])
+            abs_step3_gap = abs(chi_target - step3_target)
             target_row_id = int(idx + 1)
             rows.append(
                 {
@@ -391,7 +459,7 @@ def _build_validation_target_tables(
                     "source_polymer": str(selected["Polymer"]),
                     "source_canonical_smiles": str(selected["canonical_smiles"]),
                     "step3_chi_target": step3_target,
-                    "abs_step3_gap": abs(chi_target - step3_target),
+                    "abs_step3_gap": abs_step3_gap,
                 }
             )
             drift_rows.append(
@@ -401,7 +469,7 @@ def _build_validation_target_tables(
                     "phi": float(selected["phi"]),
                     "proxy_chi_target": chi_target,
                     "step3_chi_target": step3_target,
-                    "abs_step3_gap": abs(chi_target - step3_target),
+                    "abs_step3_gap": abs_step3_gap,
                 }
             )
         return pd.DataFrame(rows), pd.DataFrame(drift_rows)
@@ -409,11 +477,25 @@ def _build_validation_target_tables(
     rl_proxy_df, rl_drift_df = _bucket_rows(rl_buckets, source_name="rl_proxy")
     hpo_target_df, hpo_drift_df = _bucket_rows(hpo_buckets, source_name="hpo") if hpo_enabled else (pd.DataFrame(), pd.DataFrame())
     drift_df = pd.concat([rl_drift_df, hpo_drift_df], ignore_index=True) if not rl_drift_df.empty or not hpo_drift_df.empty else pd.DataFrame()
+    rl_mean_gap = float(rl_drift_df["abs_step3_gap"].mean()) if not rl_drift_df.empty else np.nan
+    rl_max_gap = float(rl_drift_df["abs_step3_gap"].max()) if not rl_drift_df.empty else np.nan
+    hpo_mean_gap = float(hpo_drift_df["abs_step3_gap"].mean()) if not hpo_drift_df.empty else np.nan
+    hpo_max_gap = float(hpo_drift_df["abs_step3_gap"].max()) if not hpo_drift_df.empty else np.nan
+    gap_threshold = 0.3
     diagnostics = {
         "eligible_validation_buckets": int(len(ordered_buckets)),
         "rl_proxy_bucket_count": int(rl_bucket_count),
         "hpo_bucket_count": int(hpo_bucket_count),
         "hpo_enabled": bool(hpo_enabled),
+        "rl_proxy_mean_abs_step3_gap": rl_mean_gap,
+        "rl_proxy_max_abs_step3_gap": rl_max_gap,
+        "hpo_mean_abs_step3_gap": hpo_mean_gap,
+        "hpo_max_abs_step3_gap": hpo_max_gap,
+        "proxy_target_gap_warning_threshold": float(gap_threshold),
+        "proxy_target_gap_warning": bool(
+            (np.isfinite(rl_mean_gap) and rl_mean_gap > gap_threshold)
+            or (np.isfinite(hpo_mean_gap) and hpo_mean_gap > gap_threshold)
+        ),
         "coverage_warning": None,
     }
     if hpo_enabled and hpo_bucket_count < int(hpo_num_targets):
@@ -446,19 +528,27 @@ def _compute_class_support_stats(
 ) -> Dict[str, Any]:
     source_smiles = [str(smi) for smi in source_smiles]
     classifier = PolymerClassifier(patterns=polymer_patterns)
-    positive = 0
+    positive_loose = 0
+    positive_strict = 0
+    target_is_backbone = bool(str(c_target).strip().lower() in BACKBONE_CLASS_MATCH_CLASSES)
     for smiles in source_smiles:
         try:
             if classifier.classify(smiles).get(c_target, False):
-                positive += 1
+                positive_loose += 1
+            if classifier.classify_backbone(smiles).get(c_target, False):
+                positive_strict += 1
         except Exception:
             continue
     return {
         "c_target": c_target,
+        "target_class_backbone_defined": bool(target_is_backbone),
         "source_corpus_size": int(len(source_smiles)),
-        "source_positive_count": int(positive),
-        "token_bias_available": bool(positive >= 10),
-        "sparse_class_warning": bool(positive < 20),
+        "source_positive_count": int(positive_loose),
+        "source_positive_count_loose": int(positive_loose),
+        "source_positive_count_strict": int(positive_strict),
+        "token_bias_available": bool(positive_loose >= 10),
+        "sparse_class_warning": bool(positive_loose < 20),
+        "strict_sparse_class_warning": bool(positive_strict < 20),
     }
 
 
@@ -618,7 +708,8 @@ def load_step6_2_config(
         warnings.warn(
             (
                 f"Low-support c_target={c_target!r}: "
-                f"source_positive_count={class_support_stats['source_positive_count']}"
+                f"source_positive_count_loose={class_support_stats['source_positive_count_loose']} "
+                f"source_positive_count_strict={class_support_stats['source_positive_count_strict']}"
             ),
             RuntimeWarning,
             stacklevel=2,

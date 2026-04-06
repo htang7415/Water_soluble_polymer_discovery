@@ -122,12 +122,7 @@ class GuidedSampler(ConstrainedSampler):
                 logits = self._apply_position_aware_paren_constraints(logits, ids)
                 logits = self._apply_ring_constraints(logits, ids)
                 logits = self._apply_bond_placement_constraints(logits, ids)
-            if (
-                self.class_token_logit_bias is not None
-                and step_progress >= float(self.class_token_bias_start_frac)
-            ):
-                bias_mask = (~fixed_mask).unsqueeze(-1).float()
-                logits = logits + self.class_token_logit_bias.unsqueeze(0).unsqueeze(0) * bias_mask
+            logits = self._apply_class_token_bias(logits, fixed_mask=fixed_mask, step_progress=step_progress)
             logits = self._apply_sampling_filters(logits)
             logits = self._apply_special_token_constraints(logits, ids)
             probs = self._logits_to_probs(logits)
@@ -351,12 +346,7 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
                 logits = self._apply_position_aware_paren_constraints(logits, ids)
                 logits = self._apply_ring_constraints(logits, ids)
                 logits = self._apply_bond_placement_constraints(logits, ids)
-            if (
-                self.class_token_logit_bias is not None
-                and step_progress >= float(self.class_token_bias_start_frac)
-            ):
-                bias_mask = (~fixed_mask).unsqueeze(-1).float()
-                logits = logits + self.class_token_logit_bias.unsqueeze(0).unsqueeze(0) * bias_mask
+            logits = self._apply_class_token_bias(logits, fixed_mask=fixed_mask, step_progress=step_progress)
             logits = self._apply_sampling_filters(logits)
             logits = self._apply_special_token_constraints(logits, ids)
             probs = self._logits_to_probs(logits)

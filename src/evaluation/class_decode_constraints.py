@@ -11,7 +11,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 
 from src.data.tokenizer import PSmilesTokenizer
-from src.evaluation.polymer_class import PolymerClassifier
+from src.evaluation.polymer_class import BACKBONE_CLASS_MATCH_CLASSES, PolymerClassifier
 
 
 # Short, token-safe motif fragments used when automatic mining is unavailable.
@@ -101,6 +101,50 @@ DEFAULT_CLASS_MOTIFS: Dict[str, List[str]] = {
         "CC(ccccc)C",           # backbone with 5 aromatic C
         "CC(cccc)C",            # backbone with 4 aromatic C
         "CC(ccc)C",             # backbone with 3 aromatic C
+    ],
+}
+
+# Backbone-template core fragments used by Step 6_2 constrained sampling.
+# These are inserted into a fixed ``*...core...*`` scaffold so the defining
+# backbone linkage is already present before diffusion infills the remaining
+# context. Side-chain classes intentionally do not use this path.
+#
+# Keep these fragments aliphatic-only. Aromatic lowercase ``c`` fragments are
+# fragile here because the sampler cannot guarantee the ring closures needed to
+# make a fixed aromatic subgraph valid.
+DEFAULT_BACKBONE_TEMPLATE_CORES: Dict[str, List[str]] = {
+    "polyimide": [
+        "CC(=O)NC(=O)CC",
+        "CC(=O)NC(=O)C",
+    ],
+    "polyester": [
+        "CC(=O)OCC",
+        "CC(=O)OC",
+    ],
+    "polyamide": [
+        "CC(=O)NCC",
+        "CC(=O)NC",
+    ],
+    "polyurethane": [
+        "CCOC(=O)NC",
+        "COC(=O)NCC",
+    ],
+    "polyether": [
+        "CCOCCOCC",
+        "COCCOC",
+    ],
+    "polysiloxane": [
+        "CSiOSiC",
+        "SiOSiOSi",
+        "CSiOSiOC",
+    ],
+    "polycarbonate": [
+        "CCOC(=O)OC",
+        "COC(=O)OC",
+    ],
+    "polysulfone": [
+        "CCS(=O)(=O)CC",
+        "CS(=O)(=O)CC",
     ],
 }
 
@@ -379,6 +423,27 @@ def resolve_class_decode_motifs(
         f"Could not resolve any decode-time motifs for class '{target_key}'. "
         "Provide decode_constraint_motif_bank_json or add defaults for this class."
     )
+
+
+def resolve_class_backbone_template_cores(
+    *,
+    target_class: str,
+    tokenizer: PSmilesTokenizer,
+    max_templates: int = 3,
+) -> Tuple[List[str], str]:
+    """Resolve default backbone-template cores for backbone-defined classes."""
+    target_key = str(target_class).strip().lower()
+    if target_key not in BACKBONE_CLASS_MATCH_CLASSES:
+        return [], "not_backbone_class"
+
+    fragments = _normalize_fragments(
+        DEFAULT_BACKBONE_TEMPLATE_CORES.get(target_key, []),
+        tokenizer,
+        max_motifs=max_templates,
+    )
+    if fragments:
+        return fragments, "default_backbone_templates"
+    return [], "unavailable"
 
 
 def resolve_class_decode_length_prior(

@@ -14,7 +14,7 @@ from src.chi.inverse_design_common import (
     prepare_novel_inference_cache,
     resolve_training_smiles,
 )
-from src.evaluation.polymer_class import PolymerClassifier
+from src.evaluation.polymer_class import BACKBONE_CLASS_MATCH_CLASSES, PolymerClassifier
 from src.utils.chemistry import (
     canonicalize_smiles,
     check_validity,
@@ -22,7 +22,7 @@ from src.utils.chemistry import (
     count_stars,
     has_terminal_connection_stars,
 )
-from .config import ResolvedStep62Config
+from .config import ResolvedStep62Config, resolve_step62_sa_thresholds
 
 
 REQUIRED_SAMPLE_COLUMNS = {
@@ -36,6 +36,27 @@ REQUIRED_SAMPLE_COLUMNS = {
     "canonical_family",
 }
 
+_ANNOTATION_GATES = [
+    "valid_ok",
+    "novel_ok",
+    "star_ok",
+    "sa_ok_reporting",
+    "sa_ok_discovery",
+    "sa_ok",
+    "soluble_ok",
+    "class_ok_loose",
+    "class_ok_strict",
+    "class_ok",
+    "chi_ok",
+    "chi_band_ok",
+    "success_hit_discovery_loose",
+    "success_hit_discovery_strict",
+    "success_hit_discovery",
+    "success_hit_loose",
+    "success_hit_strict",
+    "success_hit",
+]
+
 
 @dataclass
 class Step62Evaluator:
@@ -47,6 +68,8 @@ class Step62Evaluator:
     polymer_classifier: PolymerClassifier
     device: str
     target_sa_max: float
+    reporting_sa_thresholds: Dict[str, float]
+    discovery_sa_thresholds: Dict[str, float]
     chi_band_epsilon: float = 0.05
 
 
@@ -97,6 +120,12 @@ def load_step62_evaluator(
         ) from exc
     novelty_reference = resolve_training_smiles(resolved.results_dir, resolved.base_results_dir)
     classifier = PolymerClassifier(patterns=resolved.polymer_patterns)
+    reporting_sa_thresholds: Dict[str, float] = {}
+    discovery_sa_thresholds: Dict[str, float] = {}
+    for c_target in resolved.available_target_classes:
+        thresholds = resolve_step62_sa_thresholds(resolved.step6_2, c_target)
+        reporting_sa_thresholds[str(c_target)] = float(thresholds["reporting"])
+        discovery_sa_thresholds[str(c_target)] = float(thresholds["discovery"])
     return Step62Evaluator(
         resolved=resolved,
         inference_cache=inference_cache,
@@ -104,6 +133,8 @@ def load_step62_evaluator(
         polymer_classifier=classifier,
         device=device,
         target_sa_max=float(resolved.step6_2["target_sa_max"]),
+        reporting_sa_thresholds=reporting_sa_thresholds,
+        discovery_sa_thresholds=discovery_sa_thresholds,
     )
 
 
@@ -158,22 +189,43 @@ def _compute_basic_sample_annotations(
             and count_stars(smiles) == 2
             and has_terminal_connection_stars(smiles, expected_stars=2)
         )
-        sa_score = float(compute_sa_score(smiles)) if valid_ok else np.nan
-        sa_ok = bool(valid_ok and np.isfinite(sa_score) and sa_score <= evaluator.target_sa_max)
-        family_matches = evaluator.polymer_classifier.classify(smiles) if valid_ok else {}
-        matched_classes = sorted([name for name, matched in family_matches.items() if matched])
         c_target = str(row["c_target"])
+        sa_score = float(compute_sa_score(smiles)) if valid_ok else np.nan
+        reporting_sa_max = float(evaluator.reporting_sa_thresholds.get(c_target, evaluator.target_sa_max))
+        discovery_sa_max = float(evaluator.discovery_sa_thresholds.get(c_target, reporting_sa_max))
+        sa_ok_reporting = bool(valid_ok and np.isfinite(sa_score) and sa_score <= reporting_sa_max)
+        sa_ok_discovery = bool(valid_ok and np.isfinite(sa_score) and sa_score <= discovery_sa_max)
+        target_class_backbone_defined = bool(c_target in BACKBONE_CLASS_MATCH_CLASSES)
+        family_matches_loose = evaluator.polymer_classifier.classify(smiles) if valid_ok else {}
+        family_matches_strict = evaluator.polymer_classifier.classify_backbone(smiles) if valid_ok else {}
+        matched_classes_loose = sorted([name for name, matched in family_matches_loose.items() if matched])
+        matched_classes_strict = sorted([name for name, matched in family_matches_strict.items() if matched])
+        class_ok_loose = int(bool(family_matches_loose.get(c_target, False)))
+        class_ok_strict = int(bool(family_matches_strict.get(c_target, False)))
+        class_ok = int(class_ok_strict if target_class_backbone_defined else class_ok_loose)
         rows.append(
             {
                 **row,
                 "canonical_smiles": canonical_smiles,
+                "target_class_backbone_defined": int(target_class_backbone_defined),
                 "valid_ok": int(valid_ok),
                 "novel_ok": int(bool(valid_ok and canonical_smiles not in evaluator.novelty_reference)),
                 "star_ok": int(star_ok),
                 "sa_score": sa_score,
-                "sa_ok": int(sa_ok),
-                "class_ok": int(bool(family_matches.get(c_target, False))),
-                "matched_polymer_classes": ",".join(matched_classes),
+                "target_sa_max_reporting": reporting_sa_max,
+                "target_sa_max_discovery": discovery_sa_max,
+                "sa_ok_reporting": int(sa_ok_reporting),
+                "sa_ok_discovery": int(sa_ok_discovery),
+                "sa_ok": int(sa_ok_reporting),
+                "class_metric_mode": ("strict_backbone" if target_class_backbone_defined else "loose"),
+                "class_ok_loose": class_ok_loose,
+                "class_ok_strict": class_ok_strict,
+                "class_ok": class_ok,
+                "matched_polymer_classes_loose": ",".join(matched_classes_loose),
+                "matched_polymer_classes_strict": ",".join(matched_classes_strict),
+                "matched_polymer_classes": ",".join(
+                    matched_classes_strict if target_class_backbone_defined else matched_classes_loose
+                ),
             }
         )
     return pd.DataFrame(rows)
@@ -273,9 +325,12 @@ def evaluate_generated_samples(
     sample_df: pd.DataFrame,
     evaluator: Step62Evaluator,
     *,
-    chi_band_epsilon: float = 0.05,
+    chi_band_epsilon: float | None = None,
 ) -> pd.DataFrame:
     """Evaluate one raw generated-sample frame against the shared success gate."""
+
+    if chi_band_epsilon is None:
+        chi_band_epsilon = float(evaluator.resolved.step6_2.get("chi_band_epsilon", 0.25))
 
     missing = sorted(REQUIRED_SAMPLE_COLUMNS - set(sample_df.columns))
     if missing:
@@ -335,14 +390,35 @@ def evaluate_generated_samples(
             out["property_rule"],
         )
     ]
-    out["success_hit"] = (
+    out["chi_band_ok"] = [
+        _compute_chi_ok(chi_pred, chi_target, "band", chi_band_epsilon)
+        for chi_pred, chi_target in zip(
+            out["chi_pred_target"],
+            out["chi_target"],
+        )
+    ]
+    base_success_mask = (
         out["valid_ok"].astype(int)
         & out["novel_ok"].astype(int)
         & out["star_ok"].astype(int)
-        & out["sa_ok"].astype(int)
         & out["soluble_ok"].astype(int)
-        & out["class_ok"].astype(int)
         & pd.Series(out["chi_ok"], index=out.index).astype(int)
+    )
+    reporting_success_mask = base_success_mask & out["sa_ok_reporting"].astype(int)
+    discovery_success_mask = base_success_mask & out["sa_ok_discovery"].astype(int)
+    out["success_hit_discovery_loose"] = (discovery_success_mask & out["class_ok_loose"].astype(int)).astype(int)
+    out["success_hit_discovery_strict"] = (discovery_success_mask & out["class_ok_strict"].astype(int)).astype(int)
+    out["success_hit_discovery"] = np.where(
+        out["target_class_backbone_defined"].astype(int) == 1,
+        out["success_hit_discovery_strict"].astype(int),
+        out["success_hit_discovery_loose"].astype(int),
+    ).astype(int)
+    out["success_hit_loose"] = (reporting_success_mask & out["class_ok_loose"].astype(int)).astype(int)
+    out["success_hit_strict"] = (reporting_success_mask & out["class_ok_strict"].astype(int)).astype(int)
+    out["success_hit"] = np.where(
+        out["target_class_backbone_defined"].astype(int) == 1,
+        out["success_hit_strict"].astype(int),
+        out["success_hit_loose"].astype(int),
     ).astype(int)
     return out
 
@@ -366,7 +442,7 @@ def aggregate_target_row_metrics(evaluation_df: pd.DataFrame) -> pd.DataFrame:
     for keys, sub in evaluation_df.groupby(group_cols, dropna=False):
         row = {col: value for col, value in zip(group_cols, keys)}
         row["n_samples"] = int(len(sub))
-        for gate in ["valid_ok", "novel_ok", "star_ok", "sa_ok", "soluble_ok", "class_ok", "chi_ok", "success_hit"]:
+        for gate in _ANNOTATION_GATES:
             row[f"{gate}_count"] = int(sub[gate].astype(int).sum())
             row[f"{gate}_rate"] = float(sub[gate].astype(float).mean()) if len(sub) else np.nan
         row["benchmark_soluble_oracle_calls"] = int(sub["valid_ok"].astype(int).sum())
@@ -392,7 +468,7 @@ def summarize_target_rows(target_row_metrics_df: pd.DataFrame) -> pd.DataFrame:
     for keys, sub in target_row_metrics_df.groupby(group_cols, dropna=False):
         row = {col: value for col, value in zip(group_cols, keys)}
         row["num_rounds"] = int(sub["round_id"].nunique())
-        for gate in ["valid_ok", "novel_ok", "star_ok", "sa_ok", "soluble_ok", "class_ok", "chi_ok", "success_hit"]:
+        for gate in _ANNOTATION_GATES:
             rate_col = f"{gate}_rate"
             row[f"mean_{gate}_rate"] = float(sub[rate_col].mean()) if len(sub) else np.nan
             row[f"std_{gate}_rate"] = float(sub[rate_col].std(ddof=0)) if len(sub) else np.nan
@@ -418,11 +494,37 @@ def aggregate_round_metrics(
             & (target_row_metrics_df["round_id"] == row["round_id"])
         ]
         row["n_generated_samples"] = int(len(sub))
+        row["success_hit_rate_discovery_loose"] = (
+            float(sub["success_hit_discovery_loose"].astype(float).mean()) if len(sub) else np.nan
+        )
+        row["success_hit_rate_discovery_strict"] = (
+            float(sub["success_hit_discovery_strict"].astype(float).mean()) if len(sub) else np.nan
+        )
+        row["success_hit_rate_discovery"] = (
+            float(sub["success_hit_discovery"].astype(float).mean()) if len(sub) else np.nan
+        )
+        row["success_hit_rate_loose"] = float(sub["success_hit_loose"].astype(float).mean()) if len(sub) else np.nan
+        row["success_hit_rate_strict"] = float(sub["success_hit_strict"].astype(float).mean()) if len(sub) else np.nan
         row["success_hit_rate"] = float(sub["success_hit"].astype(float).mean()) if len(sub) else np.nan
+        row["macro_target_row_success_hit_rate_discovery_loose"] = (
+            float(target_sub["success_hit_discovery_loose_rate"].mean()) if len(target_sub) else np.nan
+        )
+        row["macro_target_row_success_hit_rate_discovery_strict"] = (
+            float(target_sub["success_hit_discovery_strict_rate"].mean()) if len(target_sub) else np.nan
+        )
+        row["macro_target_row_success_hit_rate_discovery"] = (
+            float(target_sub["success_hit_discovery_rate"].mean()) if len(target_sub) else np.nan
+        )
+        row["macro_target_row_success_hit_rate_loose"] = (
+            float(target_sub["success_hit_loose_rate"].mean()) if len(target_sub) else np.nan
+        )
+        row["macro_target_row_success_hit_rate_strict"] = (
+            float(target_sub["success_hit_strict_rate"].mean()) if len(target_sub) else np.nan
+        )
         row["macro_target_row_success_hit_rate"] = (
             float(target_sub["success_hit_rate"].mean()) if len(target_sub) else np.nan
         )
-        for gate in ["valid_ok", "novel_ok", "star_ok", "sa_ok", "soluble_ok", "class_ok", "chi_ok"]:
+        for gate in [gate for gate in _ANNOTATION_GATES if not gate.startswith("success_hit")]:
             row[f"mean_{gate}_rate"] = float(sub[gate].astype(float).mean()) if len(sub) else np.nan
         row["benchmark_soluble_oracle_calls"] = int(target_sub["benchmark_soluble_oracle_calls"].sum()) if len(target_sub) else 0
         row["benchmark_chi_oracle_calls"] = int(target_sub["benchmark_chi_oracle_calls"].sum()) if len(target_sub) else 0
@@ -441,17 +543,69 @@ def build_method_metrics(
     if round_metrics_df.empty:
         return {
             "mean_success_hit_rate": np.nan,
+            "mean_success_hit_rate_discovery": np.nan,
+            "mean_success_hit_rate_discovery_loose": np.nan,
+            "mean_success_hit_rate_discovery_strict": np.nan,
+            "mean_success_hit_rate_loose": np.nan,
+            "mean_success_hit_rate_strict": np.nan,
             "std_success_hit_rate": np.nan,
+            "std_success_hit_rate_discovery": np.nan,
+            "std_success_hit_rate_discovery_loose": np.nan,
+            "std_success_hit_rate_discovery_strict": np.nan,
+            "std_success_hit_rate_loose": np.nan,
+            "std_success_hit_rate_strict": np.nan,
             "macro_average_row_mean_success_hit_rate": np.nan,
+            "macro_average_row_mean_success_hit_rate_discovery": np.nan,
+            "macro_average_row_mean_success_hit_rate_discovery_loose": np.nan,
+            "macro_average_row_mean_success_hit_rate_discovery_strict": np.nan,
+            "macro_average_row_mean_success_hit_rate_loose": np.nan,
+            "macro_average_row_mean_success_hit_rate_strict": np.nan,
         }
     return {
         "mean_success_hit_rate": float(round_metrics_df["success_hit_rate"].mean()),
+        "mean_success_hit_rate_discovery": float(round_metrics_df["success_hit_rate_discovery"].mean()),
+        "mean_success_hit_rate_discovery_loose": float(round_metrics_df["success_hit_rate_discovery_loose"].mean()),
+        "mean_success_hit_rate_discovery_strict": float(round_metrics_df["success_hit_rate_discovery_strict"].mean()),
+        "mean_success_hit_rate_loose": float(round_metrics_df["success_hit_rate_loose"].mean()),
+        "mean_success_hit_rate_strict": float(round_metrics_df["success_hit_rate_strict"].mean()),
         "std_success_hit_rate": float(round_metrics_df["success_hit_rate"].std(ddof=0)),
+        "std_success_hit_rate_discovery": float(round_metrics_df["success_hit_rate_discovery"].std(ddof=0)),
+        "std_success_hit_rate_discovery_loose": float(round_metrics_df["success_hit_rate_discovery_loose"].std(ddof=0)),
+        "std_success_hit_rate_discovery_strict": float(round_metrics_df["success_hit_rate_discovery_strict"].std(ddof=0)),
+        "std_success_hit_rate_loose": float(round_metrics_df["success_hit_rate_loose"].std(ddof=0)),
+        "std_success_hit_rate_strict": float(round_metrics_df["success_hit_rate_strict"].std(ddof=0)),
         "macro_average_row_mean_success_hit_rate": (
             float(target_row_summary_df["mean_success_hit_rate"].mean())
             if not target_row_summary_df.empty
             else np.nan
         ),
+        "macro_average_row_mean_success_hit_rate_discovery": (
+            float(target_row_summary_df["mean_success_hit_discovery_rate"].mean())
+            if not target_row_summary_df.empty
+            else np.nan
+        ),
+        "macro_average_row_mean_success_hit_rate_discovery_loose": (
+            float(target_row_summary_df["mean_success_hit_discovery_loose_rate"].mean())
+            if not target_row_summary_df.empty
+            else np.nan
+        ),
+        "macro_average_row_mean_success_hit_rate_discovery_strict": (
+            float(target_row_summary_df["mean_success_hit_discovery_strict_rate"].mean())
+            if not target_row_summary_df.empty
+            else np.nan
+        ),
+        "macro_average_row_mean_success_hit_rate_loose": (
+            float(target_row_summary_df["mean_success_hit_loose_rate"].mean())
+            if not target_row_summary_df.empty
+            else np.nan
+        ),
+        "macro_average_row_mean_success_hit_rate_strict": (
+            float(target_row_summary_df["mean_success_hit_strict_rate"].mean())
+            if not target_row_summary_df.empty
+            else np.nan
+        ),
         "mean_benchmark_soluble_oracle_calls": float(round_metrics_df["benchmark_soluble_oracle_calls"].mean()),
         "mean_benchmark_chi_oracle_calls": float(round_metrics_df["benchmark_chi_oracle_calls"].mean()),
+        "success_metric_mode": "strict_backbone_else_loose",
+        "discovery_success_metric_mode": "strict_backbone_else_loose_with_class_specific_sa",
     }

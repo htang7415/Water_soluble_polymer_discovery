@@ -13,15 +13,42 @@ step6_2:
     - S3_conditional_guided
     - S3_cfg_2p0
     - S4_rl_finetuned
+    - S4_ppo
+    - S4_grpo
     - S4_dpo
   generation_budget: 512
+  generation_budget_by_class:
+    polyacrylate: 512
+    polyether: 1024
+    polyamide: 1024
+    polyester: 2048
+    polyimide: 4096
+    polysulfone: 2048
+    polystyrene: 1024
   sampling_temperature: 1.0
   inference_batch_size: 128
   raw_generation_valid_only: false
   class_decode_prior_mode: "on"
-  class_token_bias_start_frac: 0.7
+  class_token_bias_start_frac: 0.5
   class_token_bias_strength: 1.5
+  chi_band_epsilon: 0.25
   target_sa_max: 4.0
+  reporting_target_sa_max_by_class:
+    polyacrylate: 3.5
+    polyether: 4.0
+    polyamide: 4.0
+    polyester: 4.0
+    polyimide: 4.0
+    polysulfone: 4.0
+    polystyrene: 4.0
+  discovery_target_sa_max_by_class:
+    polyacrylate: 4.0
+    polyether: 4.5
+    polyamide: 5.0
+    polyester: 5.0
+    polyimide: 5.5
+    polysulfone: 5.5
+    polystyrene: 5.0
   figure_font_size: 16
   available_target_classes: [polyimide, polyamide, polyester, polyether, polyacrylate, polystyrene, polysulfone]
   c_target: polyimide
@@ -88,7 +115,9 @@ step6_2:
     cfg_scale: 1.0
     count_training_oracle_calls_separately: true
     rl_checkpoint_selection_mode: proxy_success_hit_rate
-    rl_prompt_source: benchmark_target_rows
+    rl_prompt_source: train_exact_step3_distribution
+    rl_use_class_family_sampling: false
+    rl_diffusion_num_steps: 25
     sol_log_prob_floor: -5.0
     reward_weights:
       w_success: 2.0
@@ -96,7 +125,8 @@ step6_2:
       w_novel: 0.0
       w_star: 1.0
       w_sa: 1.0
-      w_class: 1.0
+      w_sa_continuous: 0.5
+      w_class: 0.0
       w_sol: 1.0
       w_chi: 2.0
     learning_rate: 1.0e-5
@@ -107,16 +137,22 @@ step6_2:
     kl_weight: 0.01
     gradient_checkpointing: true
     rl_num_steps: 5000
+    policy_update_epochs: 1
+    normalize_advantages: false
+    ppo_clip_eps: 0.2
+    grpo_group_size: 8
+    grpo_advantage_epsilon: 1.0e-6
     rl_proxy_eval_interval_steps: 1000
     rl_proxy_num_targets: 5
     rl_proxy_generation_budget: 64
     trajectories_per_batch: 128
     dpo:
       offline_pair_budget: 10000
+      d_water_budget_fraction: 0.2
       val_pair_fraction: 0.2
-      beta: 0.1
+      beta: 0.02
       optimizer: adamw
-      batch_size: 128
+      batch_size: 64
       learning_rate: 3.0e-5
       weight_decay: 0.01
       warmup_steps: 0
@@ -126,7 +162,7 @@ step6_2:
       pair_refresh_mode: offline_fixed
       logprob_mode: single_step_t1
       checkpoint_selection_mode: val_dpo_loss
-      num_epochs: 3
+      num_epochs: 10
       synthetic_candidates_per_target: 16
 
   run_overrides:
@@ -150,26 +186,56 @@ step6_2:
       canonical_family: S4
       s4:
         alignment_mode: dpo
+    S4_ppo:
+      canonical_family: S4
+      s4:
+        alignment_mode: ppo
+        policy_update_epochs: 2
+        normalize_advantages: true
+        ppo_clip_eps: 0.2
+    S4_grpo:
+      canonical_family: S4
+      s4:
+        alignment_mode: grpo
+        policy_update_epochs: 2
+        normalize_advantages: true
+        ppo_clip_eps: 0.2
+        grpo_group_size: 8
 
 step6_3:
   compare_all_enabled_runs: true
   summarize_by_canonical_family: true
+  compare_metric: discovery_success_hit_rate
 
 step6_2_hpo:
   enabled: true
   sampler: tpe
   sampler_seed: 42
-  n_startup_trials: 20
+  n_startup_trials: 5
   pruner: median
   storage_uri: sqlite:///results_<model_size>/step6_2_hpo/<split_mode>/<c_target>/<study_family>/optuna.db
+  reuse_shared_s4_warm_start: true
+  skip_disk_checkpoints: true
+  hpo_s2_max_steps: 25000
+  hpo_rl_num_steps: 500
   hpo_num_targets: 8
   hpo_generation_budget: 128
+  hpo_generation_budget_by_class:
+    polyacrylate: 128
+    polyether: 256
+    polyamide: 256
+    polyester: 256
+    polyimide: 512
+    polysulfone: 384
+    polystyrene: 256
   hpo_num_rounds: 2
   hpo_sampling_seeds: [101, 102]
   tie_epsilon: 1.0e-4
   method_budgets:
-    S1: {n_trials: 120, timeout_hours_medium: null}
-    S2: {n_trials: 120, timeout_hours_medium: null}
-    S3: {n_trials: 120, timeout_hours_medium: null}
-    S4_rl: {n_trials: 120, timeout_hours_medium: null}
-    S4_dpo: {n_trials: 120, timeout_hours_medium: null}
+    S1: {n_trials: 50, timeout_hours_medium: null}
+    S2: {n_trials: 50, timeout_hours_medium: null}
+    S3: {n_trials: 50, timeout_hours_medium: null}
+    S4_rl: {n_trials: 50, timeout_hours_medium: null}
+    S4_ppo: {n_trials: 50, timeout_hours_medium: null}
+    S4_grpo: {n_trials: 50, timeout_hours_medium: null}
+    S4_dpo: {n_trials: 50, timeout_hours_medium: null}

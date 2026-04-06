@@ -7,7 +7,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import yaml
@@ -33,6 +33,60 @@ REQUIRED_RUN_FILES = [
     "metrics/target_row_summary.csv",
     "metrics/evaluation_results.csv",
 ]
+OPTIONAL_RUN_FILES = {
+    "sampling_metadata_df": "metrics/sampling_metadata.csv",
+}
+
+COMPARE_METRIC_REGISTRY = {
+    "discovery_success_hit_rate": {
+        "method_mean": "mean_success_hit_rate_discovery",
+        "method_std": "std_success_hit_rate_discovery",
+        "method_macro": "macro_average_row_mean_success_hit_rate_discovery",
+        "target_mean": "mean_success_hit_discovery_rate",
+        "target_std": "std_success_hit_discovery_rate",
+        "label": "Discovery success hit rate",
+    },
+    "reporting_success_hit_rate": {
+        "method_mean": "mean_success_hit_rate",
+        "method_std": "std_success_hit_rate",
+        "method_macro": "macro_average_row_mean_success_hit_rate",
+        "target_mean": "mean_success_hit_rate",
+        "target_std": "std_success_hit_rate",
+        "label": "Reporting success hit rate",
+    },
+    "strict_success_hit_rate": {
+        "method_mean": "mean_success_hit_rate_strict",
+        "method_std": "std_success_hit_rate_strict",
+        "method_macro": "macro_average_row_mean_success_hit_rate_strict",
+        "target_mean": "mean_success_hit_strict_rate",
+        "target_std": "std_success_hit_strict_rate",
+        "label": "Strict success hit rate",
+    },
+    "loose_success_hit_rate": {
+        "method_mean": "mean_success_hit_rate_loose",
+        "method_std": "std_success_hit_rate_loose",
+        "method_macro": "macro_average_row_mean_success_hit_rate_loose",
+        "target_mean": "mean_success_hit_loose_rate",
+        "target_std": "std_success_hit_loose_rate",
+        "label": "Loose success hit rate",
+    },
+    "discovery_strict_success_hit_rate": {
+        "method_mean": "mean_success_hit_rate_discovery_strict",
+        "method_std": "std_success_hit_rate_discovery_strict",
+        "method_macro": "macro_average_row_mean_success_hit_rate_discovery_strict",
+        "target_mean": "mean_success_hit_discovery_strict_rate",
+        "target_std": "std_success_hit_discovery_strict_rate",
+        "label": "Discovery strict success hit rate",
+    },
+    "discovery_loose_success_hit_rate": {
+        "method_mean": "mean_success_hit_rate_discovery_loose",
+        "method_std": "std_success_hit_rate_discovery_loose",
+        "method_macro": "macro_average_row_mean_success_hit_rate_discovery_loose",
+        "target_mean": "mean_success_hit_discovery_loose_rate",
+        "target_std": "std_success_hit_discovery_loose_rate",
+        "label": "Discovery loose success hit rate",
+    },
+}
 
 
 def _as_yamlable(value):
@@ -76,6 +130,33 @@ def _resolve_selected_runs(resolved, runs_arg: str | None) -> List[str]:
     return [run for run in resolved.enabled_runs if (resolved.benchmark_root / run).exists()]
 
 
+def _safe_float(value: object, default: float = float("nan")) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _resolve_compare_metric(resolved, run_payloads: List[Dict[str, object]]) -> Tuple[str, Dict[str, str]]:
+    requested = str(resolved.step6_3.get("compare_metric", "discovery_success_hit_rate")).strip().lower()
+    metric = COMPARE_METRIC_REGISTRY.get(requested)
+    if metric is None:
+        raise ValueError(
+            f"Unsupported step6_3.compare_metric={requested!r}. "
+            f"Choose from: {sorted(COMPARE_METRIC_REGISTRY.keys())}"
+        )
+
+    def _payload_has_metric(payload: Dict[str, object], spec: Dict[str, str]) -> bool:
+        method_metrics = dict(payload["method_metrics"])
+        return spec["method_mean"] in method_metrics and spec["method_std"] in method_metrics
+
+    if run_payloads and all(_payload_has_metric(payload, metric) for payload in run_payloads):
+        return requested, metric
+
+    fallback_name = "reporting_success_hit_rate"
+    return fallback_name, COMPARE_METRIC_REGISTRY[fallback_name]
+
+
 def _load_run_outputs(
     resolved,
     *,
@@ -91,6 +172,10 @@ def _load_run_outputs(
     round_metrics_df = pd.read_csv(run_dir / "metrics" / "round_metrics.csv")
     target_row_summary_df = pd.read_csv(run_dir / "metrics" / "target_row_summary.csv")
     evaluation_results_df = pd.read_csv(run_dir / "metrics" / "evaluation_results.csv")
+    optional_payloads: Dict[str, object] = {}
+    for key, rel_path in OPTIONAL_RUN_FILES.items():
+        path = run_dir / rel_path
+        optional_payloads[key] = pd.read_csv(path) if path.is_file() else pd.DataFrame()
     return {
         "run_name": run_name,
         "run_dir": run_dir,
@@ -98,45 +183,122 @@ def _load_run_outputs(
         "round_metrics_df": round_metrics_df,
         "target_row_summary_df": target_row_summary_df,
         "evaluation_results_df": evaluation_results_df,
+        **optional_payloads,
     }
 
 
-def _build_run_comparison_row(run_payload: Dict[str, object]) -> Dict[str, object]:
+def _build_run_comparison_row(
+    run_payload: Dict[str, object],
+    *,
+    compare_metric_name: str,
+    compare_metric: Dict[str, str],
+) -> Dict[str, object]:
     method_metrics = dict(run_payload["method_metrics"])
     round_metrics_df = run_payload["round_metrics_df"]
     evaluation_results_df = run_payload["evaluation_results_df"]
+    sampling_metadata_df = run_payload.get("sampling_metadata_df", pd.DataFrame())
 
     row = {
         "run_name": str(method_metrics["run_name"]),
         "canonical_family": str(method_metrics["canonical_family"]),
-        "mean_success_hit_rate": float(method_metrics["mean_success_hit_rate"]),
-        "std_success_hit_rate": float(method_metrics["std_success_hit_rate"]),
-        "macro_average_row_mean_success_hit_rate": float(method_metrics["macro_average_row_mean_success_hit_rate"]),
-        "mean_benchmark_soluble_oracle_calls": float(method_metrics.get("mean_benchmark_soluble_oracle_calls", 0.0)),
-        "mean_benchmark_chi_oracle_calls": float(method_metrics.get("mean_benchmark_chi_oracle_calls", 0.0)),
-        "mean_training_soluble_oracle_calls": float(method_metrics.get("mean_training_soluble_oracle_calls", 0.0)),
-        "mean_training_chi_oracle_calls": float(method_metrics.get("mean_training_chi_oracle_calls", 0.0)),
-        "mean_class_guidance_suppressed_steps": float(method_metrics.get("mean_class_guidance_suppressed_steps", 0.0)),
+        "mean_success_hit_rate": _safe_float(method_metrics.get("mean_success_hit_rate")),
+        "std_success_hit_rate": _safe_float(method_metrics.get("std_success_hit_rate")),
+        "macro_average_row_mean_success_hit_rate": _safe_float(method_metrics.get("macro_average_row_mean_success_hit_rate")),
+        "mean_success_hit_rate_discovery": _safe_float(method_metrics.get("mean_success_hit_rate_discovery")),
+        "std_success_hit_rate_discovery": _safe_float(method_metrics.get("std_success_hit_rate_discovery")),
+        "macro_average_row_mean_success_hit_rate_discovery": _safe_float(
+            method_metrics.get("macro_average_row_mean_success_hit_rate_discovery")
+        ),
+        "mean_success_hit_rate_strict": _safe_float(method_metrics.get("mean_success_hit_rate_strict")),
+        "std_success_hit_rate_strict": _safe_float(method_metrics.get("std_success_hit_rate_strict")),
+        "macro_average_row_mean_success_hit_rate_strict": _safe_float(
+            method_metrics.get("macro_average_row_mean_success_hit_rate_strict")
+        ),
+        "mean_success_hit_rate_loose": _safe_float(method_metrics.get("mean_success_hit_rate_loose")),
+        "std_success_hit_rate_loose": _safe_float(method_metrics.get("std_success_hit_rate_loose")),
+        "macro_average_row_mean_success_hit_rate_loose": _safe_float(
+            method_metrics.get("macro_average_row_mean_success_hit_rate_loose")
+        ),
+        "mean_success_hit_rate_discovery_strict": _safe_float(
+            method_metrics.get("mean_success_hit_rate_discovery_strict")
+        ),
+        "std_success_hit_rate_discovery_strict": _safe_float(
+            method_metrics.get("std_success_hit_rate_discovery_strict")
+        ),
+        "macro_average_row_mean_success_hit_rate_discovery_strict": _safe_float(
+            method_metrics.get("macro_average_row_mean_success_hit_rate_discovery_strict")
+        ),
+        "mean_success_hit_rate_discovery_loose": _safe_float(
+            method_metrics.get("mean_success_hit_rate_discovery_loose")
+        ),
+        "std_success_hit_rate_discovery_loose": _safe_float(
+            method_metrics.get("std_success_hit_rate_discovery_loose")
+        ),
+        "macro_average_row_mean_success_hit_rate_discovery_loose": _safe_float(
+            method_metrics.get("macro_average_row_mean_success_hit_rate_discovery_loose")
+        ),
+        "mean_benchmark_soluble_oracle_calls": _safe_float(method_metrics.get("mean_benchmark_soluble_oracle_calls", 0.0), 0.0),
+        "mean_benchmark_chi_oracle_calls": _safe_float(method_metrics.get("mean_benchmark_chi_oracle_calls", 0.0), 0.0),
+        "mean_training_soluble_oracle_calls": _safe_float(method_metrics.get("mean_training_soluble_oracle_calls", 0.0), 0.0),
+        "mean_training_chi_oracle_calls": _safe_float(method_metrics.get("mean_training_chi_oracle_calls", 0.0), 0.0),
+        "mean_class_guidance_suppressed_steps": _safe_float(method_metrics.get("mean_class_guidance_suppressed_steps", 0.0), 0.0),
+        "mean_class_match_acceptance_rate": _safe_float(method_metrics.get("mean_class_match_acceptance_rate")),
+        "mean_class_match_oversampling_ratio": _safe_float(method_metrics.get("mean_class_match_oversampling_ratio")),
+        "mean_total_raw_samples_drawn": _safe_float(method_metrics.get("mean_total_raw_samples_drawn")),
+        "success_metric_mode": str(method_metrics.get("success_metric_mode", "")),
+        "discovery_success_metric_mode": str(method_metrics.get("discovery_success_metric_mode", "")),
+        "comparison_metric_name": compare_metric_name,
+        "comparison_metric_label": str(compare_metric["label"]),
+        "comparison_mean_success_hit_rate": _safe_float(method_metrics.get(compare_metric["method_mean"])),
+        "comparison_std_success_hit_rate": _safe_float(method_metrics.get(compare_metric["method_std"])),
+        "comparison_macro_average_row_mean_success_hit_rate": _safe_float(method_metrics.get(compare_metric["method_macro"])),
     }
-    for gate in ["valid_ok", "novel_ok", "star_ok", "sa_ok", "soluble_ok", "class_ok", "chi_ok"]:
+    for gate in [
+        "valid_ok",
+        "novel_ok",
+        "star_ok",
+        "sa_ok_reporting",
+        "sa_ok_discovery",
+        "sa_ok",
+        "soluble_ok",
+        "class_ok_loose",
+        "class_ok_strict",
+        "class_ok",
+        "chi_ok",
+        "chi_band_ok",
+    ]:
         col = f"mean_{gate}_rate"
         row[col] = float(round_metrics_df[col].mean()) if col in round_metrics_df.columns and not round_metrics_df.empty else float("nan")
 
     row["num_rounds"] = int(round_metrics_df["round_id"].nunique()) if not round_metrics_df.empty else 0
     row["num_generated_samples"] = int(len(evaluation_results_df))
+    row["num_sampling_metadata_rows"] = int(len(sampling_metadata_df)) if isinstance(sampling_metadata_df, pd.DataFrame) else 0
     row["mean_total_oracle_calls"] = (
         row["mean_benchmark_soluble_oracle_calls"]
         + row["mean_benchmark_chi_oracle_calls"]
         + row["mean_training_soluble_oracle_calls"]
         + row["mean_training_chi_oracle_calls"]
     )
+    if isinstance(sampling_metadata_df, pd.DataFrame) and not sampling_metadata_df.empty:
+        if "class_match_acceptance_rate" in sampling_metadata_df.columns:
+            row["mean_class_match_acceptance_rate"] = float(sampling_metadata_df["class_match_acceptance_rate"].mean())
+        if "class_match_oversampling_ratio" in sampling_metadata_df.columns:
+            row["mean_class_match_oversampling_ratio"] = float(sampling_metadata_df["class_match_oversampling_ratio"].mean())
+        if "total_raw_samples_drawn" in sampling_metadata_df.columns:
+            row["mean_total_raw_samples_drawn"] = float(sampling_metadata_df["total_raw_samples_drawn"].mean())
     return row
 
 
-def _build_per_target_run_comparison(run_payloads: List[Dict[str, object]]) -> pd.DataFrame:
+def _build_per_target_run_comparison(
+    run_payloads: List[Dict[str, object]],
+    *,
+    compare_metric_name: str,
+    compare_metric: Dict[str, str],
+) -> pd.DataFrame:
     rows: List[pd.DataFrame] = []
     for payload in run_payloads:
         df = payload["target_row_summary_df"].copy()
+        sampling_metadata_df = payload.get("sampling_metadata_df", pd.DataFrame())
         keep = [
             "run_name",
             "canonical_family",
@@ -149,15 +311,69 @@ def _build_per_target_run_comparison(run_payloads: List[Dict[str, object]]) -> p
             "mean_valid_ok_rate",
             "mean_novel_ok_rate",
             "mean_star_ok_rate",
+            "mean_sa_ok_reporting_rate",
+            "mean_sa_ok_discovery_rate",
             "mean_sa_ok_rate",
             "mean_soluble_ok_rate",
+            "mean_class_ok_loose_rate",
+            "mean_class_ok_strict_rate",
             "mean_class_ok_rate",
             "mean_chi_ok_rate",
+            "mean_chi_band_ok_rate",
+            "mean_success_hit_discovery_rate",
+            "std_success_hit_discovery_rate",
+            "mean_success_hit_loose_rate",
+            "std_success_hit_loose_rate",
+            "mean_success_hit_strict_rate",
+            "std_success_hit_strict_rate",
+            "mean_success_hit_discovery_loose_rate",
+            "std_success_hit_discovery_loose_rate",
+            "mean_success_hit_discovery_strict_rate",
+            "std_success_hit_discovery_strict_rate",
             "mean_success_hit_rate",
             "std_success_hit_rate",
             "num_rounds",
         ]
-        rows.append(df[keep].copy())
+        keep = [column for column in keep if column in df.columns]
+        sub = df[keep].copy()
+        sub["comparison_metric_name"] = compare_metric_name
+        sub["comparison_metric_label"] = str(compare_metric["label"])
+        sub["comparison_mean_success_hit_rate"] = (
+            sub[compare_metric["target_mean"]].astype(float)
+            if compare_metric["target_mean"] in sub.columns
+            else sub["mean_success_hit_rate"].astype(float)
+        )
+        sub["comparison_std_success_hit_rate"] = (
+            sub[compare_metric["target_std"]].astype(float)
+            if compare_metric["target_std"] in sub.columns
+            else sub["std_success_hit_rate"].astype(float)
+        )
+        if isinstance(sampling_metadata_df, pd.DataFrame) and not sampling_metadata_df.empty and "target_row_id" in sampling_metadata_df.columns:
+            agg_dict = {}
+            for column in [
+                "class_match_acceptance_rate",
+                "class_match_oversampling_ratio",
+                "total_raw_samples_drawn",
+                "class_match_sampling_attempts",
+            ]:
+                if column in sampling_metadata_df.columns:
+                    agg_dict[column] = "mean"
+            if agg_dict:
+                sampling_target_df = (
+                    sampling_metadata_df.groupby("target_row_id", dropna=False)
+                    .agg(agg_dict)
+                    .reset_index()
+                    .rename(
+                        columns={
+                            "class_match_acceptance_rate": "mean_class_match_acceptance_rate",
+                            "class_match_oversampling_ratio": "mean_class_match_oversampling_ratio",
+                            "total_raw_samples_drawn": "mean_total_raw_samples_drawn",
+                            "class_match_sampling_attempts": "mean_class_match_sampling_attempts",
+                        }
+                    )
+                )
+                sub = sub.merge(sampling_target_df, on="target_row_id", how="left")
+        rows.append(sub)
     if not rows:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True).sort_values(
@@ -174,11 +390,18 @@ def _build_difficulty_summary(per_target_run_df: pd.DataFrame) -> pd.DataFrame:
     for keys, sub in per_target_run_df.groupby(group_cols, dropna=False):
         row = {col: value for col, value in zip(group_cols, keys)}
         row["num_runs"] = int(sub["run_name"].nunique())
-        row["mean_success_hit_rate_across_runs"] = float(sub["mean_success_hit_rate"].mean())
-        row["std_success_hit_rate_across_runs"] = float(sub["mean_success_hit_rate"].std(ddof=0))
+        row["comparison_metric_name"] = str(sub["comparison_metric_name"].iloc[0]) if "comparison_metric_name" in sub.columns else "reporting_success_hit_rate"
+        row["comparison_metric_label"] = str(sub["comparison_metric_label"].iloc[0]) if "comparison_metric_label" in sub.columns else "Reporting success hit rate"
+        row["mean_success_hit_rate_across_runs"] = float(sub["comparison_mean_success_hit_rate"].mean())
+        row["std_success_hit_rate_across_runs"] = float(sub["comparison_mean_success_hit_rate"].std(ddof=0))
         row["mean_class_ok_rate_across_runs"] = float(sub["mean_class_ok_rate"].mean())
+        row["mean_class_ok_strict_rate_across_runs"] = (
+            float(sub["mean_class_ok_strict_rate"].mean()) if "mean_class_ok_strict_rate" in sub.columns else float("nan")
+        )
         row["mean_soluble_ok_rate_across_runs"] = float(sub["mean_soluble_ok_rate"].mean())
         row["mean_chi_ok_rate_across_runs"] = float(sub["mean_chi_ok_rate"].mean())
+        if "mean_class_match_acceptance_rate" in sub.columns:
+            row["mean_class_match_acceptance_rate_across_runs"] = float(sub["mean_class_match_acceptance_rate"].mean())
         rows.append(row)
     out = pd.DataFrame(rows).sort_values(
         ["mean_success_hit_rate_across_runs", "target_row_id"],
@@ -195,7 +418,7 @@ def _build_canonical_family_comparison(run_comparison_df: pd.DataFrame) -> pd.Da
     rows: List[Dict[str, object]] = []
     for canonical_family, sub in run_comparison_df.groupby("canonical_family", sort=True):
         ordered = sub.sort_values(
-            ["mean_success_hit_rate", "run_name"],
+            ["comparison_mean_success_hit_rate", "run_name"],
             ascending=[False, True],
             kind="mergesort",
         ).reset_index(drop=True)
@@ -205,9 +428,11 @@ def _build_canonical_family_comparison(run_comparison_df: pd.DataFrame) -> pd.Da
                 "canonical_family": str(canonical_family),
                 "num_runs_compared": int(len(sub)),
                 "best_run_name": str(best["run_name"]),
-                "best_mean_success_hit_rate": float(best["mean_success_hit_rate"]),
-                "best_std_success_hit_rate": float(best["std_success_hit_rate"]),
-                "family_mean_success_hit_rate": float(sub["mean_success_hit_rate"].mean()),
+                "comparison_metric_name": str(best["comparison_metric_name"]),
+                "comparison_metric_label": str(best["comparison_metric_label"]),
+                "best_mean_success_hit_rate": float(best["comparison_mean_success_hit_rate"]),
+                "best_std_success_hit_rate": float(best["comparison_std_success_hit_rate"]),
+                "family_mean_success_hit_rate": float(sub["comparison_mean_success_hit_rate"].mean()),
             }
         )
     return pd.DataFrame(rows).sort_values(
@@ -247,6 +472,16 @@ def _write_compare_outputs(
         "c_target": resolved.c_target,
         "split_mode": resolved.split_mode,
         "model_size": resolved.model_size,
+        "compare_metric": (
+            str(run_comparison_df["comparison_metric_name"].iloc[0])
+            if "comparison_metric_name" in run_comparison_df.columns and not run_comparison_df.empty
+            else str(resolved.step6_3.get("compare_metric", "reporting_success_hit_rate"))
+        ),
+        "compare_metric_label": (
+            str(run_comparison_df["comparison_metric_label"].iloc[0])
+            if "comparison_metric_label" in run_comparison_df.columns and not run_comparison_df.empty
+            else "Reporting success hit rate"
+        ),
         "partial_compare": bool(partial_compare),
         "selected_runs": selected_runs,
         "skipped_runs": skipped_runs,
@@ -264,6 +499,7 @@ def _write_compare_outputs(
         "config_path": config_path,
         "compare_all_enabled_runs": bool(resolved.step6_3.get("compare_all_enabled_runs", True)),
         "summarize_by_canonical_family": bool(resolved.step6_3.get("summarize_by_canonical_family", True)),
+        "compare_metric": str(resolved.step6_3.get("compare_metric", "discovery_success_hit_rate")),
         "selected_runs": selected_runs,
         "skipped_runs": skipped_runs,
         "partial_compare": bool(partial_compare),
@@ -354,15 +590,27 @@ def main() -> None:
     if not run_payloads:
         raise ValueError("No completed Step 6_2 runs are available for Step 6_3 comparison.")
 
-    run_rows = [_build_run_comparison_row(payload) for payload in run_payloads]
+    compare_metric_name, compare_metric = _resolve_compare_metric(resolved, run_payloads)
+    run_rows = [
+        _build_run_comparison_row(
+            payload,
+            compare_metric_name=compare_metric_name,
+            compare_metric=compare_metric,
+        )
+        for payload in run_payloads
+    ]
     run_comparison_df = pd.DataFrame(run_rows).sort_values(
-        ["mean_success_hit_rate", "run_name"],
+        ["comparison_mean_success_hit_rate", "run_name"],
         ascending=[False, True],
         kind="mergesort",
     ).reset_index(drop=True)
     run_comparison_df["rank"] = range(1, len(run_comparison_df) + 1)
 
-    per_target_run_df = _build_per_target_run_comparison(run_payloads)
+    per_target_run_df = _build_per_target_run_comparison(
+        run_payloads,
+        compare_metric_name=compare_metric_name,
+        compare_metric=compare_metric,
+    )
     difficulty_df = _build_difficulty_summary(per_target_run_df)
     canonical_family_df = _build_canonical_family_comparison(run_comparison_df)
 

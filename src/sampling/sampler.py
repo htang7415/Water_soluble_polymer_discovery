@@ -101,6 +101,32 @@ class ConstrainedSampler:
             raise ValueError(f"class_token_bias_start_frac must be in [0, 1], got {start_frac}")
         self.class_token_bias_start_frac = start_frac
 
+    def _class_token_bias_scale(self, step_progress: float) -> float:
+        """Linearly ramp class-token bias from ``start_frac`` to the final step."""
+        if self.class_token_logit_bias is None:
+            return 0.0
+        start_frac = float(self.class_token_bias_start_frac)
+        progress = float(step_progress)
+        if progress < start_frac:
+            return 0.0
+        if start_frac >= 1.0:
+            return 1.0
+        return float(min(1.0, max(0.0, (progress - start_frac) / max(1.0e-8, 1.0 - start_frac))))
+
+    def _apply_class_token_bias(
+        self,
+        logits: torch.Tensor,
+        *,
+        fixed_mask: torch.Tensor,
+        step_progress: float,
+    ) -> torch.Tensor:
+        """Apply late-ramped class-token bias at non-fixed positions."""
+        scale = self._class_token_bias_scale(float(step_progress))
+        if scale <= 0.0 or self.class_token_logit_bias is None:
+            return logits
+        bias_mask = (~fixed_mask).unsqueeze(-1).float()
+        return logits + (scale * self.class_token_logit_bias.unsqueeze(0).unsqueeze(0) * bias_mask)
+
     def _step_progress_frac(self, t: int) -> float:
         """Map reverse-diffusion step ``t`` to progress fraction in [0, 1]."""
         if self.num_steps <= 1:
@@ -950,12 +976,7 @@ class ConstrainedSampler:
                 logits = self._apply_ring_constraints(logits, ids)
                 logits = self._apply_bond_placement_constraints(logits, ids)
             # Apply class-enriched token bias at non-fixed positions
-            if (
-                self.class_token_logit_bias is not None
-                and step_progress >= float(self.class_token_bias_start_frac)
-            ):
-                bias_mask = (~fixed_mask).unsqueeze(-1).float()
-                logits = logits + self.class_token_logit_bias.unsqueeze(0).unsqueeze(0) * bias_mask
+            logits = self._apply_class_token_bias(logits, fixed_mask=fixed_mask, step_progress=step_progress)
             logits = self._apply_sampling_filters(logits)
             logits = self._apply_special_token_constraints(logits, ids)
 

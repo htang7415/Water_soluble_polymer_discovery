@@ -274,8 +274,13 @@ chi_training:
     decode_constraint_spans_per_sample: 2  # Step 6 only: fix multiple class motifs per sequence to raise rare-class hit rate
     decode_constraint_center_min_frac: 0.25  # motif center placement lower bound as a fraction of sequence length
     decode_constraint_center_max_frac: 0.75  # motif center placement upper bound as a fraction of sequence length
+    decode_constraint_backbone_template_classes: ["polyimide", "polyamide", "polyester", "polyether", "polysulfone"]  # Step 6 only: backbone-template mode for current backbone target classes
+    decode_constraint_backbone_template_max_templates: 3
+    decode_constraint_backbone_template_min_gap_tokens: 3
     decode_constraint_enforce_class_match: true  # exact SMARTS class filter during constrained Step 2 valid-only acceptance
     decode_constraint_enforce_backbone_class_match: true  # require class motif on backbone (shortest path between * atoms) for backbone classes
+    decode_constraint_class_match_sampling_attempts_max: 12
+    decode_constraint_class_match_oversample_factor: 2.0
     decode_constraint_use_class_length_prior: true  # Step 6 only: sample token lengths from local target-class polymers when available
     resampling_skip_novelty_filter: false  # Step 6 only: keep valid class-matched proposals first; novelty is re-applied downstream
     resampling_skip_sa_filter: false  # Step 6 only: defer SA screening until after Step 2 proposal generation

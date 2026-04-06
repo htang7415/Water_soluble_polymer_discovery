@@ -230,6 +230,15 @@ def _save_supervised_checkpoint(
     torch.save(payload, checkpoint_path)
 
 
+def _clone_module_state_dict(module: Optional[torch.nn.Module]) -> Optional[Dict[str, torch.Tensor]]:
+    if module is None:
+        return None
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in module.state_dict().items()
+    }
+
+
 def train_s2_supervised_run(
     *,
     resolved: ResolvedStep62Config,
@@ -238,6 +247,7 @@ def train_s2_supervised_run(
     device: str,
     pruning_callback: Optional[Callable[..., None]] = None,
     pruning_stage: str = "s2",
+    skip_disk_checkpoints: bool = False,
 ) -> S2TrainingArtifacts:
     """Train the Step 6_2 conditional diffusion model for one S2-family run."""
 
@@ -338,6 +348,8 @@ def train_s2_supervised_run(
     rng = np.random.default_rng(int(resolved.step6_2["random_seed"]))
     history_rows: List[Dict[str, float]] = []
     running_train: List[float] = []
+    best_diffusion_state: Optional[Dict[str, torch.Tensor]] = None
+    best_aux_state: Optional[Dict[str, torch.Tensor]] = None
 
     for global_step in range(1, int(s2_cfg["max_steps"]) + 1):
         diffusion_model.train()
@@ -405,40 +417,45 @@ def train_s2_supervised_run(
         if improved:
             best_val_diffusion_loss = current_val
             patience_counter = 0
-            _save_supervised_checkpoint(
-                checkpoint_path=best_checkpoint_path,
-                diffusion_model=diffusion_model,
-                aux_heads=aux_heads,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                global_step=global_step,
-                best_val_diffusion_loss=best_val_diffusion_loss,
-                resolved=resolved,
-                run_cfg=run_cfg,
-                scaler=scaler,
-                step1_checkpoint_path=step1_checkpoint_path,
-                backbone_finetune_info=backbone_finetune_info,
-            )
+            if skip_disk_checkpoints:
+                best_diffusion_state = _clone_module_state_dict(diffusion_model)
+                best_aux_state = _clone_module_state_dict(aux_heads)
+            else:
+                _save_supervised_checkpoint(
+                    checkpoint_path=best_checkpoint_path,
+                    diffusion_model=diffusion_model,
+                    aux_heads=aux_heads,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    global_step=global_step,
+                    best_val_diffusion_loss=best_val_diffusion_loss,
+                    resolved=resolved,
+                    run_cfg=run_cfg,
+                    scaler=scaler,
+                    step1_checkpoint_path=step1_checkpoint_path,
+                    backbone_finetune_info=backbone_finetune_info,
+                )
         else:
             patience_counter += 1
 
         if patience_counter >= int(s2_cfg["early_stopping_patience_checks"]):
             break
 
-    _save_supervised_checkpoint(
-        checkpoint_path=last_checkpoint_path,
-        diffusion_model=diffusion_model,
-        aux_heads=aux_heads,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        global_step=(history_rows[-1]["global_step"] if history_rows else 0),
-        best_val_diffusion_loss=best_val_diffusion_loss,
-        resolved=resolved,
-        run_cfg=run_cfg,
-        scaler=scaler,
-        step1_checkpoint_path=step1_checkpoint_path,
-        backbone_finetune_info=backbone_finetune_info,
-    )
+    if not skip_disk_checkpoints:
+        _save_supervised_checkpoint(
+            checkpoint_path=last_checkpoint_path,
+            diffusion_model=diffusion_model,
+            aux_heads=aux_heads,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            global_step=(history_rows[-1]["global_step"] if history_rows else 0),
+            best_val_diffusion_loss=best_val_diffusion_loss,
+            resolved=resolved,
+            run_cfg=run_cfg,
+            scaler=scaler,
+            step1_checkpoint_path=step1_checkpoint_path,
+            backbone_finetune_info=backbone_finetune_info,
+        )
 
     history_df = pd.DataFrame(history_rows)
     history_df.to_csv(run_dirs["metrics_dir"] / "supervised_training_history.csv", index=False)
@@ -449,13 +466,19 @@ def train_s2_supervised_run(
         "num_validation_checks": int(len(history_df)),
         "batch_mix_counts": batch_mix_counts,
         "backbone_finetune_info": backbone_finetune_info,
-        "best_checkpoint_path": str(best_checkpoint_path),
-        "last_checkpoint_path": str(last_checkpoint_path),
+        "best_checkpoint_path": (None if skip_disk_checkpoints else str(best_checkpoint_path)),
+        "last_checkpoint_path": (None if skip_disk_checkpoints else str(last_checkpoint_path)),
+        "disk_checkpoints_saved": bool(not skip_disk_checkpoints),
     }
     with open(run_dirs["metrics_dir"] / "supervised_training_summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 
-    if best_checkpoint_path.exists():
+    if skip_disk_checkpoints:
+        if best_diffusion_state is not None:
+            diffusion_model.load_state_dict(best_diffusion_state)
+        if aux_heads is not None and best_aux_state is not None:
+            aux_heads.load_state_dict(best_aux_state)
+    elif best_checkpoint_path.exists():
         load_step62_checkpoint_into_modules(
             checkpoint_path=best_checkpoint_path,
             diffusion_model=diffusion_model,
