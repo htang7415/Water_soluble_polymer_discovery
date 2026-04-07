@@ -250,6 +250,7 @@ def _build_rl_training_prior(
         return prior
     return replace(
         prior,
+        family_sampling_mode="none",
         motifs=[],
         motif_source="disabled_for_rl",
         motif_token_ids=[],

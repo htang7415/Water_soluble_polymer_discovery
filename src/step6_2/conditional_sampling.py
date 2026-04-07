@@ -191,6 +191,7 @@ def sample_conditional_with_class_prior(
     num_samples: int,
     show_progress: bool = True,
 ) -> Tuple[List[str], Dict[str, object]]:
+    """Conditional Step 6_2 sampling through the shared family-aware decode path."""
     return sample_with_class_prior(
         sampler=sampler,
         tokenizer=tokenizer,

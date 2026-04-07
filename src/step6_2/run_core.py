@@ -815,6 +815,18 @@ def execute_step62_run(
         {
             "run_name": str(run_cfg["run_name"]),
             "canonical_family": str(run_cfg["canonical_family"]),
+            "family_sampling_mode": str(prior.family_sampling_mode),
+            "family_sampling_scope": str(prior.family_sampling_scope),
+            "family_sampling_center_min_frac": float(prior.center_min_frac),
+            "family_sampling_center_max_frac": float(prior.center_max_frac),
+            "family_sampling_spans_per_sample": int(prior.spans_per_sample),
+            "backbone_template_min_gap_tokens": int(prior.backbone_template_min_gap_tokens),
+            "backbone_template_core_count": int(len(prior.backbone_template_cores)),
+            "backbone_template_max_core_token_length": float(
+                max((len(tokenizer.tokenize(core)) for core in prior.backbone_template_cores), default=0)
+            ),
+            "class_token_bias_enabled": int(bool(prior.class_token_logit_bias is not None)),
+            "class_token_bias_strength": float(prior.class_token_bias_strength),
             "mean_training_soluble_oracle_calls": (
                 float(round_metrics_df["training_soluble_oracle_calls"].mean())
                 if "training_soluble_oracle_calls" in round_metrics_df.columns and not round_metrics_df.empty
@@ -864,6 +876,14 @@ def execute_step62_run(
                 "mean_class_match_oversampling_ratio": float(sampling_meta_df["class_match_oversampling_ratio"].mean())
                 if "class_match_oversampling_ratio" in sampling_meta_df.columns
                 else 0.0,
+                "family_sampling_mode": str(prior.family_sampling_mode),
+                "family_sampling_scope": str(prior.family_sampling_scope),
+                "family_sampling_center_min_frac": float(prior.center_min_frac),
+                "family_sampling_center_max_frac": float(prior.center_max_frac),
+                "backbone_template_min_gap_tokens": int(prior.backbone_template_min_gap_tokens),
+                "backbone_template_max_core_token_length": float(
+                    max((len(tokenizer.tokenize(core)) for core in prior.backbone_template_cores), default=0)
+                ),
                 "mean_total_raw_samples_drawn": float(sampling_meta_df["total_raw_samples_drawn"].mean())
                 if "total_raw_samples_drawn" in sampling_meta_df.columns
                 else 0.0,

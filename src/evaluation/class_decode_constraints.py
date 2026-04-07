@@ -114,14 +114,18 @@ DEFAULT_CLASS_MOTIFS: Dict[str, List[str]] = {
 # make a fixed aromatic subgraph valid.
 DEFAULT_BACKBONE_TEMPLATE_CORES: Dict[str, List[str]] = {
     "polyimide": [
+        "CCC(=O)NC(=O)CCC",
+        "CCOC(=O)NC(=O)OCC",
         "CC(=O)NC(=O)CC",
         "CC(=O)NC(=O)C",
     ],
     "polyester": [
+        "CCOC(=O)OCCC",
         "CC(=O)OCC",
         "CC(=O)OC",
     ],
     "polyamide": [
+        "CCC(=O)NCCC",
         "CC(=O)NCC",
         "CC(=O)NC",
     ],
@@ -130,6 +134,8 @@ DEFAULT_BACKBONE_TEMPLATE_CORES: Dict[str, List[str]] = {
         "COC(=O)NCC",
     ],
     "polyether": [
+        "CCOCCOCCOCC",
+        "CCOCCOCCOC",
         "CCOCCOCC",
         "COCCOC",
     ],
@@ -139,10 +145,13 @@ DEFAULT_BACKBONE_TEMPLATE_CORES: Dict[str, List[str]] = {
         "CSiOSiOC",
     ],
     "polycarbonate": [
+        "CCOC(=O)OCCO",
         "CCOC(=O)OC",
         "COC(=O)OC",
     ],
     "polysulfone": [
+        "CCCS(=O)(=O)CCC",
+        "CCS(=O)(=O)CCOCC",
         "CCS(=O)(=O)CC",
         "CS(=O)(=O)CC",
     ],

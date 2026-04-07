@@ -268,12 +268,21 @@ chi_training:
     uncertainty_score_weight: 0.0
     uncertainty_seed: 42
     decode_constraint_enabled: true  # Step 6 only: inject class-specific token motifs during fresh Step 2 resampling
+    decode_constraint_family_sampling_default_mode: "motif"  # Step 6 only: default family-aware decoding mode when no class override is provided
+    decode_constraint_family_sampling_scope: "final_only"  # Step 6 only: current class-family decoding is applied to final inverse-design generation, not RL rollouts
+    decode_constraint_family_sampling_mode_overrides:
+      polyimide: "backbone_template"
+      polyamide: "backbone_template"
+      polyester: "backbone_template"
+      polyether: "backbone_template"
+      polysulfone: "backbone_template"
     decode_constraint_motif_bank_json: null  # optional JSON mapping class -> list of p-SMILES motif fragments
     decode_constraint_resolution_strategy: "configured_or_defaults"  # Step 6 only: safer default than local auto-mined motifs; can override to configured_or_local_mined_or_defaults
     decode_constraint_max_motifs: 6
     decode_constraint_spans_per_sample: 2  # Step 6 only: fix multiple class motifs per sequence to raise rare-class hit rate
     decode_constraint_center_min_frac: 0.25  # motif center placement lower bound as a fraction of sequence length
     decode_constraint_center_max_frac: 0.75  # motif center placement upper bound as a fraction of sequence length
+    decode_constraint_backbone_template_enabled: true  # Step 6 only: global switch for backbone-template family decoding
     decode_constraint_backbone_template_classes: ["polyimide", "polyamide", "polyester", "polyether", "polysulfone"]  # Step 6 only: backbone-template mode for current backbone target classes
     decode_constraint_backbone_template_max_templates: 3
     decode_constraint_backbone_template_min_gap_tokens: 3

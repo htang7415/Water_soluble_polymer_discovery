@@ -1,4 +1,4 @@
-"""Frozen-model sampling helpers for Step 6_2 S0/S1."""
+"""Shared family-aware sampling helpers for Step 6_2 decoding."""
 
 from __future__ import annotations
 
@@ -26,9 +26,11 @@ from src.data.tokenizer import PSmilesTokenizer
 
 @dataclass
 class ResolvedClassSamplingPrior:
-    """Resolved class-aware sampling priors for frozen-model runs."""
+    """Resolved class-aware sampling priors shared across Step 6_2 samplers."""
 
     target_class: str
+    family_sampling_mode: str
+    family_sampling_scope: str
     source_smiles: List[str]
     motifs: List[str]
     motif_source: str
@@ -50,6 +52,26 @@ class ResolvedClassSamplingPrior:
     enforce_backbone_class_match: bool
     class_match_sampling_attempts_max: int
     class_match_oversample_factor: float
+
+
+def _normalize_family_sampling_mode(raw_mode: object) -> str:
+    mode = str(raw_mode if raw_mode is not None else "motif").strip().lower()
+    if mode not in {"none", "motif", "backbone_template", "sidechain_scaffold"}:
+        raise ValueError(
+            "decode constraint family_sampling_mode must be one of "
+            "{'none', 'motif', 'backbone_template', 'sidechain_scaffold'}"
+        )
+    return mode
+
+
+def _normalize_family_sampling_scope(raw_scope: object) -> str:
+    scope = str(raw_scope if raw_scope is not None else "final_only").strip().lower()
+    if scope not in {"final_only", "train_rollout_and_final"}:
+        raise ValueError(
+            "decode constraint family_sampling_scope must be one of "
+            "{'final_only', 'train_rollout_and_final'}"
+        )
+    return scope
 
 
 def _prepare_decode_constraint_token_ids(
@@ -380,7 +402,7 @@ def resolve_class_sampling_prior(
     *,
     metrics_dir: Optional[Path] = None,
 ) -> ResolvedClassSamplingPrior:
-    """Resolve Step 6-style class-aware sampling priors for S0/S1."""
+    """Resolve shared Step 6-style class-aware sampling priors."""
 
     step6_cfg = (
         resolved.base_config.get("chi_training", {}).get("step6_class_inverse_design", {})
@@ -389,6 +411,7 @@ def resolve_class_sampling_prior(
     )
     target_class = resolved.c_target
     source_smiles = load_decode_constraint_source_smiles(Path(resolved.base_config["paths"]["data_dir"]))
+    decode_constraint_enabled = bool(step6_cfg.get("decode_constraint_enabled", True))
     resolution_strategy = str(
         step6_cfg.get("decode_constraint_resolution_strategy", "configured_or_defaults")
     ).strip().lower()
@@ -428,13 +451,20 @@ def resolve_class_sampling_prior(
     enforce_backbone_class_match = bool(step6_cfg.get("decode_constraint_enforce_backbone_class_match", False))
     class_match_sampling_attempts_max = int(step6_cfg.get("decode_constraint_class_match_sampling_attempts_max", 12))
     class_match_oversample_factor = float(step6_cfg.get("decode_constraint_class_match_oversample_factor", 2.0))
-    class_token_logit_bias = compute_class_token_logit_bias(
-        target_class=target_class,
-        tokenizer=tokenizer,
-        source_smiles=source_smiles,
-        patterns=resolved.polymer_patterns,
-        bias_strength=class_token_bias_strength,
+    family_sampling_scope = _normalize_family_sampling_scope(
+        step6_cfg.get("decode_constraint_family_sampling_scope", "final_only")
     )
+    default_family_sampling_mode = _normalize_family_sampling_mode(
+        step6_cfg.get("decode_constraint_family_sampling_default_mode", "motif")
+    )
+    raw_mode_overrides = step6_cfg.get("decode_constraint_family_sampling_mode_overrides", {})
+    family_sampling_mode_overrides: Dict[str, str] = {}
+    if isinstance(raw_mode_overrides, dict):
+        for raw_key, raw_value in raw_mode_overrides.items():
+            key = str(raw_key).strip().lower()
+            if not key:
+                continue
+            family_sampling_mode_overrides[key] = _normalize_family_sampling_mode(raw_value)
     configured_template_classes_raw = step6_cfg.get("decode_constraint_backbone_template_classes", [])
     if isinstance(configured_template_classes_raw, str):
         configured_template_classes = {
@@ -448,13 +478,39 @@ def resolve_class_sampling_prior(
             for token in list(configured_template_classes_raw)
             if str(token).strip()
         }
-    template_enabled = (
-        target_class in BACKBONE_CLASS_MATCH_CLASSES
+    backbone_template_globally_enabled = bool(step6_cfg.get("decode_constraint_backbone_template_enabled", True))
+    explicit_family_mode = family_sampling_mode_overrides.get(target_class)
+    family_sampling_mode = explicit_family_mode or default_family_sampling_mode
+    if not decode_constraint_enabled:
+        family_sampling_mode = "none"
+    elif explicit_family_mode is None and (
+        backbone_template_globally_enabled
+        and target_class in BACKBONE_CLASS_MATCH_CLASSES
         and target_class in configured_template_classes
-    )
+    ):
+        family_sampling_mode = "backbone_template"
+
+    class_token_logit_bias = None
+    if family_sampling_mode != "none":
+        class_token_logit_bias = compute_class_token_logit_bias(
+            target_class=target_class,
+            tokenizer=tokenizer,
+            source_smiles=source_smiles,
+            patterns=resolved.polymer_patterns,
+            bias_strength=class_token_bias_strength,
+        )
+
+    template_enabled = family_sampling_mode == "backbone_template"
     backbone_template_cores: List[str] = []
     backbone_template_source: Optional[str] = None
     backbone_template_token_ids: List[List[int]] = []
+    if template_enabled:
+        if not backbone_template_globally_enabled or target_class not in BACKBONE_CLASS_MATCH_CLASSES:
+            family_sampling_mode = "motif" if motif_token_ids else "none"
+            template_enabled = False
+        elif explicit_family_mode is None and target_class not in configured_template_classes:
+            family_sampling_mode = "motif" if motif_token_ids else "none"
+            template_enabled = False
     if template_enabled:
         backbone_template_cores, backbone_template_source = resolve_class_backbone_template_cores(
             target_class=target_class,
@@ -463,10 +519,14 @@ def resolve_class_sampling_prior(
         )
         backbone_template_token_ids = _prepare_decode_constraint_token_ids(tokenizer, backbone_template_cores)
         template_enabled = bool(backbone_template_token_ids)
+        if not template_enabled:
+            family_sampling_mode = "motif" if motif_token_ids else "none"
     backbone_template_min_gap_tokens = int(step6_cfg.get("decode_constraint_backbone_template_min_gap_tokens", 1))
 
     prior = ResolvedClassSamplingPrior(
         target_class=target_class,
+        family_sampling_mode=str(family_sampling_mode),
+        family_sampling_scope=str(family_sampling_scope),
         source_smiles=source_smiles,
         motifs=motifs,
         motif_source=motif_source,
@@ -492,10 +552,16 @@ def resolve_class_sampling_prior(
 
     if metrics_dir is not None:
         metrics_dir.mkdir(parents=True, exist_ok=True)
+        backbone_core_token_lengths = [
+            int(len(tokenizer.tokenize(core)))
+            for core in prior.backbone_template_cores
+        ]
         with open(metrics_dir / "decode_constraint_motif_bank_resolved.json", "w", encoding="utf-8") as handle:
             json.dump(
                 {
                     "target_class": target_class,
+                    "family_sampling_mode": prior.family_sampling_mode,
+                    "family_sampling_scope": prior.family_sampling_scope,
                     "source": motif_source,
                     "motifs": motifs,
                 },
@@ -527,10 +593,16 @@ def resolve_class_sampling_prior(
             json.dump(
                 {
                     "target_class": target_class,
+                    "family_sampling_mode": prior.family_sampling_mode,
+                    "family_sampling_scope": prior.family_sampling_scope,
                     "enabled": bool(prior.backbone_template_enabled),
                     "source": prior.backbone_template_source,
                     "min_gap_tokens": int(prior.backbone_template_min_gap_tokens),
+                    "center_min_frac": float(prior.center_min_frac),
+                    "center_max_frac": float(prior.center_max_frac),
                     "cores": prior.backbone_template_cores,
+                    "core_token_lengths": backbone_core_token_lengths,
+                    "max_core_token_length": max(backbone_core_token_lengths) if backbone_core_token_lengths else 0,
                     "enforce_class_match": bool(prior.enforce_class_match),
                     "enforce_backbone_class_match": bool(prior.enforce_backbone_class_match),
                     "class_match_sampling_attempts_max": int(prior.class_match_sampling_attempts_max),
@@ -629,7 +701,7 @@ def _sample_raw_smiles_with_prior(
         sampling_cfg=sampling_cfg,
     )
 
-    if prior.backbone_template_enabled and prior.backbone_template_token_ids:
+    if prior.family_sampling_mode == "backbone_template" and prior.backbone_template_enabled and prior.backbone_template_token_ids:
         backbone_gap_token_id = int(tokenizer.vocab.get("C", tokenizer.unk_token_id))
         if backbone_gap_token_id == int(tokenizer.unk_token_id):
             raise ValueError("Tokenizer vocabulary must define token 'C' for backbone-template sampling")
@@ -652,7 +724,9 @@ def _sample_raw_smiles_with_prior(
             show_progress=show_progress,
             lengths=lengths,
         )
-    elif prior.motif_token_ids:
+    elif prior.family_sampling_mode == "sidechain_scaffold":
+        raise NotImplementedError("sidechain_scaffold family sampling mode is not implemented yet.")
+    elif prior.family_sampling_mode == "motif" and prior.motif_token_ids:
         multi_spans, multi_span_starts, lengths = _build_decode_constraint_multi_spans(
             motif_token_ids=prior.motif_token_ids,
             lengths=lengths,
@@ -723,7 +797,11 @@ def sample_with_class_prior(
     num_samples: int,
     show_progress: bool = True,
 ) -> Tuple[List[str], Dict[str, object]]:
-    """Sample polymers with Step 6 class priors using a sampler-compatible backend."""
+    """Sample polymers with Step 6 class priors using a sampler-compatible backend.
+
+    This decode path is shared by frozen and conditional samplers, so family-aware
+    template/scaffold changes here affect every final-generation Step 6_2 method.
+    """
     accepted_smiles: List[str] = []
     accepted_raw_count = 0
     total_drawn = 0
@@ -777,13 +855,21 @@ def sample_with_class_prior(
         "class_match_oversampling_ratio": (
             float(total_drawn) / float(num_samples) if int(num_samples) > 0 else 0.0
         ),
+        "family_sampling_mode": str(prior.family_sampling_mode),
+        "family_sampling_scope": str(prior.family_sampling_scope),
         "spans_per_sample": int(prior.spans_per_sample),
         "motif_count": int(len(prior.motifs)),
         "motif_source": prior.motif_source,
         "backbone_template_enabled": bool(prior.backbone_template_enabled),
         "backbone_template_core_count": int(len(prior.backbone_template_cores)),
         "backbone_template_source": prior.backbone_template_source,
+        "backbone_template_min_gap_tokens": int(prior.backbone_template_min_gap_tokens),
+        "backbone_template_max_core_token_length": (
+            max((len(tokenizer.tokenize(core)) for core in prior.backbone_template_cores), default=0)
+        ),
         "backbone_template_layout": "contiguous_scaffold" if prior.backbone_template_enabled else "disabled",
+        "center_min_frac": float(prior.center_min_frac),
+        "center_max_frac": float(prior.center_max_frac),
         "length_prior_count": int(last_raw_meta.get("length_prior_count", len(prior.length_prior_lengths))),
         "length_prior_source": last_raw_meta.get("length_prior_source", prior.length_prior_source),
         "class_token_bias_enabled": bool(prior.class_token_logit_bias is not None),
