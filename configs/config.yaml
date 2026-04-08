@@ -272,7 +272,7 @@ chi_training:
     decode_constraint_family_sampling_scope: "final_only"  # Step 6 only: current class-family decoding is applied to final inverse-design generation, not RL rollouts
     decode_constraint_family_sampling_mode_overrides:
       polyimide: "backbone_template"
-      polyamide: "backbone_template"
+      polyamide: "motif"  # polyamide backbone templates over-bias long hydrophobic scaffolds and suppress soluble hits in Step 6_2
       polyester: "backbone_template"
       polyether: "backbone_template"
       polysulfone: "backbone_template"

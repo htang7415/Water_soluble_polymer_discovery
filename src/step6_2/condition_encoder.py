@@ -7,7 +7,7 @@ import torch.nn as nn
 
 
 class ConditionEncoder(nn.Module):
-    """Encode the 7-scalar condition bundle or a CFG-dropped branch."""
+    """Encode the Step 6_2 condition bundle or a CFG-dropped branch."""
 
     def __init__(
         self,

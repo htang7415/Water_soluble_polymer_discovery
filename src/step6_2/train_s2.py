@@ -12,6 +12,8 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
+from src.utils.reporting import append_log_message
+
 from .config import ResolvedStep62Config
 from .dataset import (
     Step62ConditionalDataset,
@@ -258,6 +260,7 @@ def train_s2_supervised_run(
         supervised_frames["d_chi"],
         scaler=scaler,
         chi_lookup=resolved.chi_lookup,
+        available_target_classes=resolved.available_target_classes,
     )
     augmentation_diag_path = run_dirs["metrics_dir"] / "chi_target_augmentation_eligibility.csv"
     augmentation_diag_df.to_csv(augmentation_diag_path, index=False)
@@ -274,6 +277,7 @@ def train_s2_supervised_run(
             tokenizer=tokenizer,
             scaler=scaler,
             chi_lookup=resolved.chi_lookup,
+            available_target_classes=resolved.available_target_classes,
             split="train",
             chi_target_augmentation_rate=float(s2_cfg["chi_target_augmentation_rate"]),
             train=True,
@@ -284,6 +288,7 @@ def train_s2_supervised_run(
             tokenizer=tokenizer,
             scaler=scaler,
             chi_lookup=resolved.chi_lookup,
+            available_target_classes=resolved.available_target_classes,
             split="train",
             chi_target_augmentation_rate=0.0,
             train=True,
@@ -297,6 +302,7 @@ def train_s2_supervised_run(
                 tokenizer=tokenizer,
                 scaler=scaler,
                 chi_lookup=resolved.chi_lookup,
+                available_target_classes=resolved.available_target_classes,
                 split="val",
                 chi_target_augmentation_rate=0.0,
                 train=False,
@@ -310,6 +316,7 @@ def train_s2_supervised_run(
                 tokenizer=tokenizer,
                 scaler=scaler,
                 chi_lookup=resolved.chi_lookup,
+                available_target_classes=resolved.available_target_classes,
                 split="val",
                 chi_target_augmentation_rate=0.0,
                 train=False,
@@ -350,6 +357,16 @@ def train_s2_supervised_run(
     running_train: List[float] = []
     best_diffusion_state: Optional[Dict[str, torch.Tensor]] = None
     best_aux_state: Optional[Dict[str, torch.Tensor]] = None
+    append_log_message(
+        run_dirs["run_dir"],
+        (
+            f"S2 train start | run={run_cfg['run_name']} variant={s2_cfg['variant']} "
+            f"max_steps={int(s2_cfg['max_steps'])} val_interval={int(s2_cfg['val_check_interval_steps'])} "
+            f"train_d_chi={len(supervised_frames['train_d_chi'])} train_d_water={len(supervised_frames['train_d_water'])} "
+            f"val_d_chi={len(supervised_frames['val_d_chi'])} val_d_water={len(supervised_frames['val_d_water'])}"
+        ),
+        echo=True,
+    )
 
     for global_step in range(1, int(s2_cfg["max_steps"]) + 1):
         diffusion_model.train()
@@ -438,7 +455,26 @@ def train_s2_supervised_run(
         else:
             patience_counter += 1
 
+        append_log_message(
+            run_dirs["run_dir"],
+            (
+                f"S2 val | run={run_cfg['run_name']} step={int(global_step)}/{int(s2_cfg['max_steps'])} "
+                f"train_loss={float(history_row['train_diffusion_loss_window']):.4f} "
+                f"val_loss={float(current_val):.4f} best_val={float(best_val_diffusion_loss):.4f} "
+                f"improved={int(improved)} patience={int(patience_counter)}/{int(s2_cfg['early_stopping_patience_checks'])}"
+            ),
+            echo=True,
+        )
+
         if patience_counter >= int(s2_cfg["early_stopping_patience_checks"]):
+            append_log_message(
+                run_dirs["run_dir"],
+                (
+                    f"S2 early stop | run={run_cfg['run_name']} "
+                    f"step={int(global_step)} patience={int(patience_counter)}"
+                ),
+                echo=True,
+            )
             break
 
     if not skip_disk_checkpoints:
@@ -472,6 +508,15 @@ def train_s2_supervised_run(
     }
     with open(run_dirs["metrics_dir"] / "supervised_training_summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
+    append_log_message(
+        run_dirs["run_dir"],
+        (
+            f"S2 train complete | run={run_cfg['run_name']} "
+            f"best_val_diffusion_loss={float(best_val_diffusion_loss):.4f} "
+            f"validation_checks={int(len(history_df))}"
+        ),
+        echo=True,
+    )
 
     if skip_disk_checkpoints:
         if best_diffusion_state is not None:

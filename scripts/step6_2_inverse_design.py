@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
+from dataclasses import replace
 import json
 import sys
 from pathlib import Path
@@ -15,7 +17,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.step6_2.config import build_run_config, load_step6_2_config
+from src.step6_2.config import _deep_merge, build_run_config, load_step6_2_config
 from src.step6_2.evaluation import load_step62_evaluator
 from src.step6_2.run_core import execute_step62_run
 
@@ -43,6 +45,66 @@ def _parse_sampling_seeds(value: str | None) -> List[int] | None:
     if not seeds:
         raise ValueError("sampling_seeds must contain at least one integer when provided.")
     return [int(seed) for seed in seeds]
+
+
+def _validate_positive_int(name: str, value: int | None) -> None:
+    if value is not None and int(value) <= 0:
+        raise ValueError(f"{name} must be >= 1 when provided.")
+
+
+def _build_training_override(args) -> Dict[str, object]:
+    override: Dict[str, object] = {}
+
+    s2_override: Dict[str, object] = {}
+    if args.s2_max_steps is not None:
+        s2_override["max_steps"] = int(args.s2_max_steps)
+    if args.s2_val_check_interval_steps is not None:
+        s2_override["val_check_interval_steps"] = int(args.s2_val_check_interval_steps)
+    if args.s2_early_stopping_patience_checks is not None:
+        s2_override["early_stopping_patience_checks"] = int(args.s2_early_stopping_patience_checks)
+    if s2_override:
+        override["s2"] = s2_override
+
+    s4_override: Dict[str, object] = {}
+    if args.rl_num_steps is not None:
+        s4_override["rl_num_steps"] = int(args.rl_num_steps)
+    if args.dpo_num_epochs is not None:
+        s4_override["dpo"] = {"num_epochs": int(args.dpo_num_epochs)}
+    if s4_override:
+        override["s4"] = s4_override
+
+    return override
+
+
+def _apply_cli_resolved_overrides(resolved, *, training_override: Dict[str, object], benchmark_root_suffix: str | None):
+    if not training_override and not benchmark_root_suffix:
+        return resolved
+
+    step6_cfg = deepcopy(resolved.step6_2)
+    if training_override:
+        step6_cfg = _deep_merge(step6_cfg, training_override)
+
+    benchmark_root = resolved.benchmark_root
+    compare_root = resolved.compare_root
+    if benchmark_root_suffix:
+        suffix = str(benchmark_root_suffix)
+        benchmark_root = benchmark_root.parent / f"{benchmark_root.name}{suffix}"
+        compare_root = compare_root.parent / f"{compare_root.name}{suffix}"
+
+    snapshot = deepcopy(resolved.config_snapshot)
+    snapshot["step6_2"] = _as_yamlable(step6_cfg)
+    if "paths" not in snapshot or not isinstance(snapshot["paths"], dict):
+        snapshot["paths"] = {}
+    snapshot["paths"]["benchmark_root"] = str(benchmark_root)
+    snapshot["paths"]["compare_root"] = str(compare_root)
+
+    return replace(
+        resolved,
+        step6_2=step6_cfg,
+        benchmark_root=benchmark_root,
+        compare_root=compare_root,
+        config_snapshot=snapshot,
+    )
 
 
 def _write_frame(df: pd.DataFrame, path: Path) -> None:
@@ -196,6 +258,21 @@ def main() -> None:
     parser.add_argument("--allow_partial", action="store_true", help="Skip unsupported runs for development.")
     parser.add_argument("--generation_budget", type=int, default=None, help="Override samples per target row.")
     parser.add_argument("--num_rounds", type=int, default=None, help="Override number of sampling rounds.")
+    parser.add_argument("--s2_max_steps", type=int, default=None, help="Override Step 6_2 S2 supervised max_steps.")
+    parser.add_argument(
+        "--s2_val_check_interval_steps",
+        type=int,
+        default=None,
+        help="Override Step 6_2 S2 supervised val_check_interval_steps.",
+    )
+    parser.add_argument(
+        "--s2_early_stopping_patience_checks",
+        type=int,
+        default=None,
+        help="Override Step 6_2 S2 supervised early_stopping_patience_checks.",
+    )
+    parser.add_argument("--rl_num_steps", type=int, default=None, help="Override Step 6_2 S4 RL rl_num_steps.")
+    parser.add_argument("--dpo_num_epochs", type=int, default=None, help="Override Step 6_2 S4 DPO num_epochs.")
     parser.add_argument(
         "--sampling_seeds",
         default=None,
@@ -222,12 +299,31 @@ def main() -> None:
         default=None,
         help="Optional suffix appended to each run directory name to isolate smoke outputs.",
     )
+    parser.add_argument(
+        "--benchmark_root_suffix",
+        default=None,
+        help="Optional suffix appended to the benchmark root so shared and run outputs stay isolated.",
+    )
     args = parser.parse_args()
+
+    _validate_positive_int("generation_budget", args.generation_budget)
+    _validate_positive_int("num_rounds", args.num_rounds)
+    _validate_positive_int("s2_max_steps", args.s2_max_steps)
+    _validate_positive_int("s2_val_check_interval_steps", args.s2_val_check_interval_steps)
+    _validate_positive_int("s2_early_stopping_patience_checks", args.s2_early_stopping_patience_checks)
+    _validate_positive_int("rl_num_steps", args.rl_num_steps)
+    _validate_positive_int("dpo_num_epochs", args.dpo_num_epochs)
 
     resolved = load_step6_2_config(
         config_path=args.config,
         base_config_path=args.base_config,
         model_size=args.model_size,
+    )
+    training_override = _build_training_override(args)
+    resolved = _apply_cli_resolved_overrides(
+        resolved,
+        training_override=training_override,
+        benchmark_root_suffix=args.benchmark_root_suffix,
     )
     _prepare_shared_artifacts(resolved, config_path=args.config)
 
@@ -260,12 +356,24 @@ def main() -> None:
         extra_context["generation_budget_override"] = int(args.generation_budget)
     if args.num_rounds is not None:
         extra_context["num_rounds_override"] = int(args.num_rounds)
+    if args.s2_max_steps is not None:
+        extra_context["s2_max_steps_override"] = int(args.s2_max_steps)
+    if args.s2_val_check_interval_steps is not None:
+        extra_context["s2_val_check_interval_steps_override"] = int(args.s2_val_check_interval_steps)
+    if args.s2_early_stopping_patience_checks is not None:
+        extra_context["s2_early_stopping_patience_checks_override"] = int(args.s2_early_stopping_patience_checks)
+    if args.rl_num_steps is not None:
+        extra_context["rl_num_steps_override"] = int(args.rl_num_steps)
+    if args.dpo_num_epochs is not None:
+        extra_context["dpo_num_epochs_override"] = int(args.dpo_num_epochs)
     if sampling_seeds is not None:
         extra_context["sampling_seeds_override"] = sampling_seeds
     if args.no_figures:
         extra_context["save_figures"] = False
     if args.run_dir_suffix:
         extra_context["run_dir_suffix"] = str(args.run_dir_suffix)
+    if args.benchmark_root_suffix:
+        extra_context["benchmark_root_suffix"] = str(args.benchmark_root_suffix)
     extra_context = extra_context or None
 
     selected_run_cfgs = [build_run_config(resolved, run_name) for run_name in selected_runs]

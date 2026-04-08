@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+from src.utils.reporting import append_log_message
+
 from .conditional_sampling import create_conditional_sampler, sample_conditional_with_class_prior
 from .config import select_step62_proxy_target_rows
 from .dataset import (
@@ -202,7 +204,13 @@ def _sample_rollout_prompt_rows(
     return prompt_df
 
 
-def _prompt_df_to_condition_tensor(prompt_df: pd.DataFrame, *, scaler: ConditionScaler, device: str) -> torch.Tensor:
+def _prompt_df_to_condition_tensor(
+    prompt_df: pd.DataFrame,
+    *,
+    scaler: ConditionScaler,
+    available_target_classes: list[str],
+    device: str,
+) -> torch.Tensor:
     bundles = [
         build_inference_condition_bundle(
             temperature=float(row["temperature"]),
@@ -210,6 +218,8 @@ def _prompt_df_to_condition_tensor(prompt_df: pd.DataFrame, *, scaler: Condition
             chi_goal=float(row["chi_target"]),
             scaler=scaler,
             soluble=1,
+            available_target_classes=available_target_classes,
+            c_target=str(row.get("c_target", "")),
         )
         for row in prompt_df.to_dict(orient="records")
     ]
@@ -305,7 +315,12 @@ def _sample_on_policy_rollouts(
             per_prompt_draws,
         )
 
-        condition_bundle = _prompt_df_to_condition_tensor(expanded_prompt_df, scaler=scaler, device=device)
+        condition_bundle = _prompt_df_to_condition_tensor(
+            expanded_prompt_df,
+            scaler=scaler,
+            available_target_classes=resolved.available_target_classes,
+            device=device,
+        )
         trajectory_sampler = _create_trajectory_sampler(
             diffusion_model=policy_model,
             tokenizer=tokenizer,
@@ -574,6 +589,8 @@ def _evaluate_proxy_success_metrics(
                 chi_goal=float(target_row["chi_target"]),
                 scaler=scaler,
                 soluble=1,
+                available_target_classes=resolved.available_target_classes,
+                c_target=str(target_row.get("c_target", resolved.c_target)),
             ),
             dtype=torch.float32,
             device=device,
@@ -704,6 +721,15 @@ def train_s4_rl_alignment(
     normalize_advantages = bool(s4_cfg.get("normalize_advantages", alignment_mode in {"ppo", "grpo"}))
     grpo_group_size = int(s4_cfg.get("grpo_group_size", 4))
     grpo_advantage_epsilon = float(s4_cfg.get("grpo_advantage_epsilon", 1.0e-6))
+    append_log_message(
+        run_dirs["run_dir"],
+        (
+            f"RL train start | run={run_cfg['run_name']} mode={alignment_mode} "
+            f"rl_num_steps={int(s4_cfg['rl_num_steps'])} policy_update_epochs={int(policy_update_epochs)} "
+            f"prompt_source={str(s4_cfg['rl_prompt_source'])}"
+        ),
+        echo=True,
+    )
 
     for step_idx in range(1, int(s4_cfg["rl_num_steps"]) + 1):
         prompt_df = _sample_rollout_prompt_rows(
@@ -921,6 +947,19 @@ def train_s4_rl_alignment(
                 )
 
         history_rows.append(history_row)
+        proxy_value = float(history_row.get(proxy_objective_metric, float("nan")))
+        proxy_text = f"{proxy_value:.4f}" if np.isfinite(proxy_value) else "nan"
+        append_log_message(
+            run_dirs["run_dir"],
+            (
+                f"RL step | run={run_cfg['run_name']} mode={alignment_mode} "
+                f"step={int(step_idx)}/{int(s4_cfg['rl_num_steps'])} "
+                f"rollout_batch={int(len(evaluation_df))} reward={float(history_row['baseline_reward']):.4f} "
+                f"loss={float(history_row['loss']):.4f} proxy={proxy_text} "
+                f"lr={float(history_row['learning_rate']):.4g}"
+            ),
+            echo=True,
+        )
 
     if not skip_disk_checkpoints:
         _save_rl_checkpoint(
@@ -984,6 +1023,14 @@ def train_s4_rl_alignment(
             handle,
             indent=2,
         )
+    append_log_message(
+        run_dirs["run_dir"],
+        (
+            f"RL train complete | run={run_cfg['run_name']} mode={alignment_mode} "
+            f"steps_completed={int(len(history_df))} best_proxy={float(best_proxy_success):.4f}"
+        ),
+        echo=True,
+    )
 
     return RlTrainingArtifacts(
         tokenizer=warm_start.tokenizer,

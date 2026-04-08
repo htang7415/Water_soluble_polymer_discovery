@@ -41,6 +41,33 @@ bash scripts/run_step6_3.sh "$MODEL_SIZE"
 bash scripts/run_step6_3.sh "$MODEL_SIZE" "S2_conditional,S3_conditional_guided,S4_rl_finetuned"
 ```
 
+## Run Step 6_2 smoke tests
+```bash
+# isolated Step 6_2 smoke run using configs/config6_2_smoke.yaml
+# defaults: 1 target row, 1 sample, 1 round, short S2/RL/DPO schedules
+bash scripts/run_step6_2_smoke.sh "$MODEL_SIZE"
+
+# optional: choose a different run subset and output suffix
+bash scripts/run_step6_2_smoke.sh "$MODEL_SIZE" "S4_dpo" "__smoke_dpo"
+
+# optional: override smoke settings via env vars
+STEP62_SMOKE_S2_MAX_STEPS=8 STEP62_SMOKE_MAX_TARGET_ROWS=2 \
+  bash scripts/run_step6_2_smoke.sh "$MODEL_SIZE" "S2_conditional,S4_rl_finetuned" "__smoke_custom"
+```
+
+## Run Step 6_2 smoke suite
+```bash
+# runs S2_conditional, S4_dpo, and S4_rl_finetuned back-to-back
+# then checks their key artifacts and schedule overrides
+bash scripts/test_step6_2_smoke.sh "$MODEL_SIZE"
+
+# optional: use a different isolated suffix root
+bash scripts/test_step6_2_smoke.sh "$MODEL_SIZE" "__smoke_suite_alt"
+
+# optional: run and validate only one case from the suite
+bash scripts/test_step6_2_smoke.sh "$MODEL_SIZE" "__smoke_suite_rl" "S4_rl_finetuned"
+```
+
 ## Default: one command for Step 6_2 HPO + best refits + Step 6_3
 ```bash
 # default local workflow:

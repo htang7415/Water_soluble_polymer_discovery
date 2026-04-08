@@ -17,6 +17,7 @@ from .condition_encoder import ConditionEncoder
 from .conditional_diffusion import ConditionalDiscreteMaskingDiffusion
 from .conditional_dit import ConditionalDiffusionBackbone
 from .config import ResolvedStep62Config
+from .dataset import get_step62_condition_dim
 
 
 class Step62AuxHeads(nn.Module):
@@ -70,8 +71,9 @@ def build_s2_components_from_step1(
             f"Original error: {exc}"
         ) from exc
     hidden_size = int(pretrained_backbone.hidden_size)
+    condition_dim = get_step62_condition_dim(resolved.available_target_classes)
     condition_encoder = ConditionEncoder(
-        input_dim=7,
+        input_dim=condition_dim,
         hidden_dim=hidden_size,
         output_dim=hidden_size,
     ).to(device)

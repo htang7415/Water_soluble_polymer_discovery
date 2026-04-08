@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from src.data.tokenizer import PSmilesTokenizer
 from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars, has_terminal_connection_stars
 from src.utils.reproducibility import seed_everything
+from src.utils.reporting import append_log_message
 
 from .conditional_sampling import create_conditional_sampler, sample_conditional_with_class_prior
 from .config import ResolvedStep62Config, select_step62_proxy_target_rows
@@ -26,6 +27,7 @@ from .dataset import (
     ConditionScaler,
     build_inference_condition_bundle,
     build_step62_supervised_frames,
+    get_step62_family_condition_columns,
 )
 from .evaluation import build_generated_samples_frame, evaluate_generated_samples
 from .frozen_sampling import ResolvedClassSamplingPrior
@@ -34,7 +36,7 @@ from .supervised import build_optimizer_and_scheduler, load_step62_checkpoint_in
 from .train_s2 import S2TrainingArtifacts
 
 
-COND_COLS = [f"cond_{idx}" for idx in range(7)]
+COND_COL_PREFIX = "cond_"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -59,6 +61,9 @@ class Step62DpoDataset(Dataset):
     def __init__(self, df: pd.DataFrame, *, tokenizer: PSmilesTokenizer):
         self.df = df.reset_index(drop=True).copy()
         self.tokenizer = tokenizer
+        self.cond_cols = _resolve_condition_columns(self.df)
+        if not self.cond_cols:
+            raise ValueError("Step 6_2 DPO dataset is missing condition bundle columns.")
 
     def __len__(self) -> int:
         return len(self.df)
@@ -78,7 +83,7 @@ class Step62DpoDataset(Dataset):
             return_attention_mask=True,
         )
         return {
-            "condition_bundle": torch.tensor(row[COND_COLS].to_numpy(dtype=np.float32), dtype=torch.float32),
+            "condition_bundle": torch.tensor(row[self.cond_cols].to_numpy(dtype=np.float32), dtype=torch.float32),
             "chosen_input_ids": torch.tensor(chosen["input_ids"], dtype=torch.long),
             "chosen_attention_mask": torch.tensor(chosen["attention_mask"], dtype=torch.long),
             "rejected_input_ids": torch.tensor(rejected["input_ids"], dtype=torch.long),
@@ -99,8 +104,55 @@ def _canonical_sort_key(smiles: str) -> str:
     return canonical if canonical else str(smiles)
 
 
+def _resolve_condition_columns(df: pd.DataFrame) -> List[str]:
+    cond_cols = [str(column) for column in df.columns if str(column).startswith(COND_COL_PREFIX)]
+    return sorted(cond_cols, key=lambda column: int(str(column).split("_", 1)[1]))
+
+
 def _bundle_to_row(bundle: np.ndarray) -> Dict[str, float]:
-    return {column: float(bundle[idx]) for idx, column in enumerate(COND_COLS)}
+    bundle_arr = np.asarray(bundle, dtype=np.float32).reshape(-1)
+    return {f"{COND_COL_PREFIX}{idx}": float(bundle_arr[idx]) for idx in range(int(bundle_arr.shape[0]))}
+
+
+def _family_vector_from_row(
+    row: pd.Series | Dict[str, Any],
+    *,
+    available_target_classes: List[str],
+) -> np.ndarray:
+    family_cols = get_step62_family_condition_columns(available_target_classes)
+    if not family_cols:
+        return np.zeros(0, dtype=np.float32)
+    return np.asarray(
+        [float(pd.to_numeric(row.get(column, 0.0), errors="coerce")) for column in family_cols],
+        dtype=np.float32,
+    )
+
+
+def _build_pair_condition_bundle(
+    *,
+    temperature: float,
+    phi: float,
+    chi_goal: float,
+    scaler: ConditionScaler,
+    available_target_classes: List[str],
+    chosen_row: pd.Series | Dict[str, Any],
+) -> np.ndarray:
+    bundle = build_inference_condition_bundle(
+        temperature=float(temperature),
+        phi=float(phi),
+        chi_goal=float(chi_goal),
+        scaler=scaler,
+        soluble=1,
+        available_target_classes=available_target_classes,
+        c_target=None,
+    )
+    family_vector = _family_vector_from_row(
+        chosen_row,
+        available_target_classes=available_target_classes,
+    )
+    if family_vector.size > 0:
+        bundle[-family_vector.size :] = family_vector
+    return bundle
 
 
 def _compute_star_ok(smiles: str) -> int:
@@ -165,6 +217,9 @@ def _base_pair_record(
 
 def _build_d_water_pairs(
     train_d_water: pd.DataFrame,
+    *,
+    scaler: ConditionScaler,
+    available_target_classes: List[str],
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     filtered, star_stats = _filter_star_ok_rows(train_d_water)
     positives = filtered.loc[filtered["water_miscible"].astype(int) == 1].copy()
@@ -177,9 +232,16 @@ def _build_d_water_pairs(
     positives = positives.sort_values(["canonical_smiles", "Polymer", "row_id"]).reset_index(drop=True)
     negatives = negatives.sort_values(["canonical_smiles", "Polymer", "row_id"]).reset_index(drop=True)
 
-    condition_bundle = np.asarray([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
     rows: List[Dict[str, Any]] = []
     for _, chosen_row in positives.iterrows():
+        condition_bundle = _build_pair_condition_bundle(
+            temperature=np.nan,
+            phi=np.nan,
+            chi_goal=np.nan,
+            scaler=scaler,
+            available_target_classes=available_target_classes,
+            chosen_row=chosen_row,
+        )
         for _, rejected_row in negatives.iterrows():
             rows.append(
                 _base_pair_record(
@@ -207,6 +269,7 @@ def _build_d_chi_pairs(
     scaler: ConditionScaler,
     chi_lookup,
     pair_source: str,
+    available_target_classes: List[str],
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
     work, star_stats = _filter_star_ok_rows(train_d_chi)
     work["canonical_smiles"] = work["SMILES"].astype(str).map(_canonical_sort_key)
@@ -249,15 +312,16 @@ def _build_d_chi_pairs(
                 }
             )
 
-        condition_bundle = build_inference_condition_bundle(
-            temperature=float(temperature),
-            phi=float(phi),
-            chi_goal=float(chi_target),
-            scaler=scaler,
-            soluble=1,
-        )
         bucket_key = f"d_chi|T={float(temperature):.6f}|phi={float(phi):.6f}"
         for _, chosen_row in chosen_df.iterrows():
+            condition_bundle = _build_pair_condition_bundle(
+                temperature=float(temperature),
+                phi=float(phi),
+                chi_goal=float(chi_target),
+                scaler=scaler,
+                available_target_classes=available_target_classes,
+                chosen_row=chosen_row,
+            )
             for _, rejected_row in rejected_df.iterrows():
                 rows.append(
                     _base_pair_record(
@@ -357,6 +421,8 @@ def _build_target_row_synthetic_pairs(
                 chi_goal=float(target_row["chi_target"]),
                 scaler=warm_start.scaler,
                 soluble=1,
+                available_target_classes=resolved.available_target_classes,
+                c_target=str(target_row.get("c_target", resolved.c_target)),
             ),
             dtype=torch.float32,
             device=device,
@@ -411,6 +477,8 @@ def _build_target_row_synthetic_pairs(
             chi_goal=float(target_row["chi_target"]),
             scaler=warm_start.scaler,
             soluble=1,
+            available_target_classes=resolved.available_target_classes,
+            c_target=str(target_row.get("c_target", resolved.c_target)),
         )
         for chosen_idx in range(len(eval_df)):
             chosen_row = eval_df.iloc[chosen_idx]
@@ -639,13 +707,18 @@ def build_dpo_pair_splits(
         )
     else:
         frames = build_step62_supervised_frames(resolved)
-        d_water_pairs, d_water_star_stats = _build_d_water_pairs(frames["train_d_water"])
+        d_water_pairs, d_water_star_stats = _build_d_water_pairs(
+            frames["train_d_water"],
+            scaler=scaler,
+            available_target_classes=resolved.available_target_classes,
+        )
         d_chi_pair_source = pair_source if pair_source == "chi_aware_label_bucketed" else "label_water_miscibility"
         d_chi_pairs, chi_prompt_gap_df, d_chi_star_stats = _build_d_chi_pairs(
             frames["train_d_chi"],
             scaler=scaler,
             chi_lookup=resolved.chi_lookup,
             pair_source=d_chi_pair_source,
+            available_target_classes=resolved.available_target_classes,
         )
         selected_pairs = _take_budgeted_pairs(
             d_water_pairs=d_water_pairs,
@@ -880,6 +953,8 @@ def _evaluate_dpo_proxy_success_metrics(
                 chi_goal=float(target_row["chi_target"]),
                 scaler=warm_start.scaler,
                 soluble=1,
+                available_target_classes=resolved.available_target_classes,
+                c_target=str(target_row.get("c_target", resolved.c_target)),
             ),
             dtype=torch.float32,
             device=device,
@@ -1045,6 +1120,15 @@ def train_s4_dpo_alignment(
         )
 
     configured_num_epochs = int(dpo_cfg["num_epochs"])
+    append_log_message(
+        run_dirs["run_dir"],
+        (
+            f"DPO train start | run={run_cfg['run_name']} train_pairs={int(len(train_pairs_df))} "
+            f"val_pairs={int(len(val_pairs_df))} configured_epochs={configured_num_epochs} "
+            f"checkpoint_mode={checkpoint_mode}"
+        ),
+        echo=True,
+    )
     optimizer, scheduler = build_optimizer_and_scheduler(
         modules={"policy_model": policy_model},
         learning_rate=float(dpo_cfg["learning_rate"]),
@@ -1238,6 +1322,20 @@ def train_s4_dpo_alignment(
         history_row["next_epoch_dpo_beta"] = float(beta_value)
         history_row["effective_num_epochs"] = int(effective_num_epochs)
         history_rows.append(history_row)
+        proxy_value = float(history_row.get(proxy_objective_metric, float("nan")))
+        proxy_text = f"{proxy_value:.4f}" if np.isfinite(proxy_value) else "nan"
+        append_log_message(
+            run_dirs["run_dir"],
+            (
+                f"DPO epoch | run={run_cfg['run_name']} epoch={int(epoch_idx)}/{int(effective_num_epochs)} "
+                f"train_loss={float(history_row['train_dpo_loss']):.4f} "
+                f"val_loss={float(history_row['val_dpo_loss']):.4f} "
+                f"val_acc={float(history_row['val_preference_accuracy']):.4f} "
+                f"proxy={proxy_text} beta={float(current_beta):.4g} "
+                f"next_beta={float(beta_value):.4g} guard={int(history_row['saturation_guard_triggered'])}"
+            ),
+            echo=True,
+        )
         epoch_idx += 1
 
     if not skip_disk_checkpoints:
@@ -1294,6 +1392,15 @@ def train_s4_dpo_alignment(
             handle,
             indent=2,
         )
+    append_log_message(
+        run_dirs["run_dir"],
+        (
+            f"DPO train complete | run={run_cfg['run_name']} epochs_completed={int(epoch_counter)} "
+            f"configured_epochs={int(configured_num_epochs)} effective_epochs={int(effective_num_epochs)} "
+            f"best_val_dpo_loss={float(best_val_dpo_loss):.4f}"
+        ),
+        echo=True,
+    )
 
     return DpoTrainingArtifacts(
         tokenizer=warm_start.tokenizer,

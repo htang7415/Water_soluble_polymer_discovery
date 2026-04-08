@@ -36,7 +36,7 @@ from .rl_trainer import train_s4_rl_alignment
 from .supervised import build_s2_components_from_step1, load_step62_checkpoint_into_modules
 from .train_s2 import S2TrainingArtifacts, train_s2_supervised_run
 from src.utils.reproducibility import save_run_metadata, seed_everything
-from src.utils.reporting import save_artifact_manifest, write_initial_log
+from src.utils.reporting import append_log_message, save_artifact_manifest, write_initial_log
 
 _HPO_SHARED_S4_WARM_START_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -564,6 +564,8 @@ def run_single_target_sampling(
                 chi_goal=float(target_row["chi_target"]),
                 scaler=s2_scaler,
                 soluble=1,
+                available_target_classes=resolved.available_target_classes,
+                c_target=str(target_row.get("c_target", resolved.c_target)),
             ),
             dtype=torch.float32,
             device=device,
@@ -602,6 +604,8 @@ def run_single_target_sampling(
                 chi_goal=float(target_row["chi_target"]),
                 scaler=s2_scaler,
                 soluble=1,
+                available_target_classes=resolved.available_target_classes,
+                c_target=str(target_row.get("c_target", resolved.c_target)),
             ),
             dtype=torch.float32,
             device=device,
@@ -652,6 +656,8 @@ def run_single_target_sampling(
                 chi_goal=float(target_row["chi_target"]),
                 scaler=s2_scaler,
                 soluble=1,
+                available_target_classes=resolved.available_target_classes,
+                c_target=str(target_row.get("c_target", resolved.c_target)),
             ),
             dtype=torch.float32,
             device=device,
@@ -719,9 +725,18 @@ def execute_step62_run(
         config_path=config_path,
         extra_context=extra_context,
     )
+    canonical_family = str(run_cfg["canonical_family"])
+    append_log_message(
+        run_dirs["run_dir"],
+        (
+            f"Run start | run={run_cfg['run_name']} family={canonical_family} "
+            f"generation_budget={int(generation_budget)} num_rounds={int(num_rounds)} "
+            f"target_rows={int(len(target_rows_df))}"
+        ),
+        echo=True,
+    )
     evaluator = shared_evaluator
     s2_scaler = None
-    canonical_family = str(run_cfg["canonical_family"])
 
     if canonical_family in {"S2", "S3"}:
         reuse_checkpoint_path, reuse_metrics_dir = _resolve_reusable_s2_artifact_paths(extra_context=extra_context)
@@ -861,9 +876,22 @@ def execute_step62_run(
         evaluator = load_step62_evaluator(resolved, device=device)
 
     for round_id, sampling_seed in enumerate(sampling_seeds[:num_rounds], start=1):
+        append_log_message(
+            run_dirs["run_dir"],
+            (
+                f"Sampling round start | run={run_cfg['run_name']} "
+                f"round={int(round_id)}/{int(num_rounds)} seed={int(sampling_seed)} "
+                f"target_rows={int(len(target_rows_df))}"
+            ),
+            echo=True,
+        )
         seed_everything(int(sampling_seed), deterministic=True)
         round_soluble_calls = 0
         round_chi_calls = 0
+        round_generated_count = 0
+        round_valid_count = 0
+        round_property_hit_count = 0
+        round_success_hit_count = 0
         round_seen_canonical_smiles: Optional[set[str]] = set() if reject_duplicate_canonical_across_targets else None
         round_sampling_state: Optional[Dict[str, object]] = (
             {}
@@ -871,7 +899,19 @@ def execute_step62_run(
             else None
         )
 
-        for _, target_row in target_rows_df.iterrows():
+        for target_idx, (_, target_row) in enumerate(target_rows_df.iterrows(), start=1):
+            append_log_message(
+                run_dirs["run_dir"],
+                (
+                    f"Target start | run={run_cfg['run_name']} round={int(round_id)} "
+                    f"target={int(target_idx)}/{int(len(target_rows_df))} "
+                    f"target_row_id={int(target_row['target_row_id'])} "
+                    f"T={float(target_row['temperature']):.2f} "
+                    f"phi={float(target_row['phi']):.2f} "
+                    f"chi_target={float(target_row['chi_target']):.4f}"
+                ),
+                echo=True,
+            )
             smiles, guidance_stats, sample_meta = run_single_target_sampling(
                 run_cfg=run_cfg,
                 resolved=resolved,
@@ -914,10 +954,36 @@ def execute_step62_run(
             if evaluator is None:
                 evaluator = load_step62_evaluator(resolved, device=device)
             evaluation_df = evaluate_generated_samples(generated_df, evaluator)
+            generated_count = int(len(generated_df))
+            valid_count = int(evaluation_df["valid_ok"].astype(int).sum()) if "valid_ok" in evaluation_df.columns else 0
+            property_hit_count = (
+                int(evaluation_df["property_success_hit"].astype(int).sum())
+                if "property_success_hit" in evaluation_df.columns
+                else 0
+            )
+            success_hit_count = (
+                int(evaluation_df["success_hit"].astype(int).sum())
+                if "success_hit" in evaluation_df.columns
+                else 0
+            )
+            round_generated_count += generated_count
+            round_valid_count += valid_count
+            round_property_hit_count += property_hit_count
+            round_success_hit_count += success_hit_count
             generated_frames.append(generated_df)
             evaluation_frames.append(evaluation_df)
             round_soluble_calls += int(guidance_stats.get("training_soluble_oracle_calls", 0))
             round_chi_calls += int(guidance_stats.get("training_chi_oracle_calls", 0))
+            append_log_message(
+                run_dirs["run_dir"],
+                (
+                    f"Target done | run={run_cfg['run_name']} round={int(round_id)} "
+                    f"target={int(target_idx)}/{int(len(target_rows_df))} "
+                    f"generated={generated_count} valid={valid_count} "
+                    f"property_hits={property_hit_count} success_hits={success_hit_count}"
+                ),
+                echo=True,
+            )
 
         round_oracle_rows.append(
             {
@@ -928,6 +994,16 @@ def execute_step62_run(
                 "training_soluble_oracle_calls": int(round_soluble_calls),
                 "training_chi_oracle_calls": int(round_chi_calls),
             }
+        )
+        append_log_message(
+            run_dirs["run_dir"],
+            (
+                f"Sampling round complete | run={run_cfg['run_name']} round={int(round_id)}/{int(num_rounds)} "
+                f"generated={int(round_generated_count)} valid={int(round_valid_count)} "
+                f"property_hits={int(round_property_hit_count)} success_hits={int(round_success_hit_count)} "
+                f"train_sol_oracles={int(round_soluble_calls)} train_chi_oracles={int(round_chi_calls)}"
+            ),
+            echo=True,
         )
 
     generated_samples_df = pd.concat(generated_frames, ignore_index=True) if generated_frames else pd.DataFrame()
@@ -1050,6 +1126,16 @@ def execute_step62_run(
         step_dir=run_dirs["run_dir"],
         metrics_dir=run_dirs["metrics_dir"],
         figures_dir=run_dirs["figures_dir"],
+    )
+    append_log_message(
+        run_dirs["run_dir"],
+        (
+            f"Run complete | run={run_cfg['run_name']} "
+            f"total_generated={int(len(generated_samples_df))} "
+            f"total_evaluated={int(len(evaluation_results_df))} "
+            f"rounds_completed={int(num_rounds)}"
+        ),
+        echo=True,
     )
     return {
         "run_cfg": run_cfg,

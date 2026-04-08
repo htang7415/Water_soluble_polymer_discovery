@@ -48,10 +48,11 @@ class ConditionalConstrainedSampler(ConstrainedSampler):
         super().__init__(**kwargs)
         if condition_bundle.dim() == 1:
             condition_bundle = condition_bundle.unsqueeze(0)
-        if condition_bundle.dim() != 2 or condition_bundle.shape[-1] != 7:
+        if condition_bundle.dim() != 2 or int(condition_bundle.shape[-1]) <= 0:
             raise ValueError(
-                f"condition_bundle must have shape [batch, 7] or [7], got {tuple(condition_bundle.shape)}"
+                f"condition_bundle must have shape [batch, dim] or [dim], got {tuple(condition_bundle.shape)}"
             )
+        self.condition_dim = int(condition_bundle.shape[-1])
         self.condition_bundle = condition_bundle.detach().to(
             device=device_from_kwargs(kwargs),
             dtype=torch.float32,

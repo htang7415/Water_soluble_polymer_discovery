@@ -53,6 +53,25 @@ def write_initial_log(
     return out_path
 
 
+def append_log_message(
+    step_dir: Path,
+    message: str,
+    *,
+    filename: str = "log.txt",
+    echo: bool = False,
+) -> Path:
+    """Append a timestamped progress line to a step log."""
+    step_dir = Path(step_dir)
+    step_dir.mkdir(parents=True, exist_ok=True)
+    out_path = step_dir / filename
+    line = f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {str(message).strip()}"
+    with open(out_path, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+    if echo:
+        print(line, flush=True)
+    return out_path
+
+
 def save_artifact_manifest(
     step_dir: Path,
     metrics_dir: Path,
