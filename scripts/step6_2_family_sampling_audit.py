@@ -40,7 +40,10 @@ from src.step6_2.frozen_sampling import (
     resolve_class_sampling_prior,
     sample_unconditional_with_class_prior,
 )
-from src.step6_2.run_core import _load_s2_training_artifacts_from_existing_checkpoint
+from src.step6_2.run_core import (
+    _load_s2_training_artifacts_from_existing_checkpoint,
+    run_single_target_sampling,
+)
 from src.utils.chemistry import canonicalize_smiles, check_validity, count_stars, has_terminal_connection_stars
 from src.utils.reproducibility import seed_everything
 
@@ -251,16 +254,9 @@ def _run_s2_call(
     generation_budget: int,
     num_steps: Optional[int],
     seen_canonical_smiles: Optional[set[str]],
-    checkpoint_path: Path,
+    shared_artifacts,
 ) -> Tuple[List[str], Dict[str, Any], Optional[Path]]:
-    metrics_dir = checkpoint_path.parent.parent / "metrics"
-    artifacts = _load_s2_training_artifacts_from_existing_checkpoint(
-        resolved=resolved,
-        run_cfg=run_cfg,
-        checkpoint_path=checkpoint_path,
-        metrics_dir=metrics_dir,
-        device=device,
-    )
+    artifacts = shared_artifacts
     prior = resolve_class_sampling_prior(resolved, run_cfg, artifacts.tokenizer)
     chi_goal = float(target_row["chi_target"])
     condition_bundle = torch.tensor(
@@ -291,6 +287,63 @@ def _run_s2_call(
         resolved=resolved,
         num_samples=int(generation_budget),
         show_progress=False,
+        seen_canonical_smiles=seen_canonical_smiles,
+    )
+    return smiles, meta, artifacts.checkpoint_path
+
+
+def _run_s3_call(
+    *,
+    resolved,
+    run_cfg: Dict[str, Any],
+    target_row: pd.Series,
+    device: str,
+    generation_budget: int,
+    seen_canonical_smiles: Optional[set[str]],
+    shared_artifacts,
+    evaluator,
+) -> Tuple[List[str], Dict[str, Any], Optional[Path]]:
+    artifacts = shared_artifacts
+    prior = resolve_class_sampling_prior(resolved, run_cfg, artifacts.tokenizer)
+    smiles, _guidance_stats, meta = run_single_target_sampling(
+        run_cfg=run_cfg,
+        resolved=resolved,
+        target_row=target_row,
+        tokenizer=artifacts.tokenizer,
+        diffusion_model=artifacts.diffusion_model,
+        prior=prior,
+        evaluator=evaluator,
+        s2_scaler=artifacts.scaler,
+        device=device,
+        generation_budget=int(generation_budget),
+        seen_canonical_smiles=seen_canonical_smiles,
+    )
+    return smiles, meta, artifacts.checkpoint_path
+
+
+def _run_s1_call(
+    *,
+    resolved,
+    run_cfg: Dict[str, Any],
+    target_row: pd.Series,
+    device: str,
+    generation_budget: int,
+    seen_canonical_smiles: Optional[set[str]],
+    shared_artifacts: Tuple[Any, Any, Path],
+    evaluator,
+) -> Tuple[List[str], Dict[str, Any], Optional[Path]]:
+    tokenizer, diffusion_model, checkpoint_path = shared_artifacts
+    prior = resolve_class_sampling_prior(resolved, run_cfg, tokenizer)
+    smiles, _guidance_stats, meta = run_single_target_sampling(
+        run_cfg=run_cfg,
+        resolved=resolved,
+        target_row=target_row,
+        tokenizer=tokenizer,
+        diffusion_model=diffusion_model,
+        prior=prior,
+        evaluator=evaluator,
+        device=device,
+        generation_budget=int(generation_budget),
         seen_canonical_smiles=seen_canonical_smiles,
     )
     return smiles, meta, checkpoint_path
@@ -338,24 +391,45 @@ def _augment_summary_with_evaluation(
                 "soluble_ok_rate": 0.0,
                 "chi_ok_rate": 0.0,
                 "chi_band_ok_rate": 0.0,
+                "property_frontier_hit_rate": 0.0,
+                "property_frontier_band_hit_rate": 0.0,
+                "sa_blocked_property_frontier_rate": 0.0,
                 "sa_ok_discovery_rate": 0.0,
+                "property_success_hit_rate": 0.0,
+                "property_success_hit_rate_discovery": 0.0,
                 "success_hit_rate": 0.0,
                 "success_hit_rate_discovery": 0.0,
+                "macro_target_row_property_success_hit_rate": 0.0,
+                "macro_target_row_property_success_hit_rate_discovery": 0.0,
                 "macro_target_row_success_hit_rate": 0.0,
                 "macro_target_row_success_hit_rate_discovery": 0.0,
             }
         )
         return summary_row
 
+    frontier_hit_mask = evaluation_df["soluble_ok"].astype(int) & evaluation_df["chi_ok"].astype(int)
+    frontier_band_hit_mask = evaluation_df["soluble_ok"].astype(int) & evaluation_df["chi_band_ok"].astype(int)
+    sa_blocked_frontier_mask = frontier_hit_mask & (1 - evaluation_df["sa_ok_discovery"].astype(int))
     summary_row.update(
         {
             "novel_ok_rate": float(evaluation_df["novel_ok"].mean()),
             "soluble_ok_rate": float(evaluation_df["soluble_ok"].mean()),
             "chi_ok_rate": float(evaluation_df["chi_ok"].mean()),
             "chi_band_ok_rate": float(evaluation_df["chi_band_ok"].mean()),
+            "property_frontier_hit_rate": float(frontier_hit_mask.mean()),
+            "property_frontier_band_hit_rate": float(frontier_band_hit_mask.mean()),
+            "sa_blocked_property_frontier_rate": float(sa_blocked_frontier_mask.mean()),
             "sa_ok_discovery_rate": float(evaluation_df["sa_ok_discovery"].mean()),
+            "property_success_hit_rate": float(evaluation_df["property_success_hit"].mean()),
+            "property_success_hit_rate_discovery": float(evaluation_df["property_success_hit_discovery"].mean()),
             "success_hit_rate": float(evaluation_df["success_hit"].mean()),
             "success_hit_rate_discovery": float(evaluation_df["success_hit_discovery"].mean()),
+            "macro_target_row_property_success_hit_rate": float(
+                method_metrics.get("macro_average_row_mean_property_success_hit_rate", 0.0) or 0.0
+            ),
+            "macro_target_row_property_success_hit_rate_discovery": float(
+                method_metrics.get("macro_average_row_mean_property_success_hit_rate_discovery", 0.0) or 0.0
+            ),
             "macro_target_row_success_hit_rate": float(
                 method_metrics.get("macro_average_row_mean_success_hit_rate", 0.0) or 0.0
             ),
@@ -373,7 +447,7 @@ def main() -> None:
     parser.add_argument("--base_config", default="configs/config.yaml")
     parser.add_argument("--model_size", default="small")
     parser.add_argument("--device", default=None)
-    parser.add_argument("--mode", choices=["S0", "S2"], default="S0")
+    parser.add_argument("--mode", choices=["S0", "S1", "S2", "S3"], default="S0")
     parser.add_argument("--families", default=None)
     parser.add_argument("--rows", type=int, default=3)
     parser.add_argument("--seeds", default="42,43")
@@ -392,7 +466,13 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     classifier = PolymerClassifier()
-    run_name = "S0_raw_unconditional" if args.mode == "S0" else "S2_conditional"
+    run_name_map = {
+        "S0": "S0_raw_unconditional",
+        "S1": "S1_guided_frozen",
+        "S2": "S2_conditional",
+        "S3": "S3_conditional_guided",
+    }
+    run_name = run_name_map[str(args.mode)]
     call_rows: List[Dict[str, Any]] = []
     sample_rows: List[Dict[str, Any]] = []
     summary_rows: List[Dict[str, Any]] = []
@@ -403,8 +483,7 @@ def main() -> None:
     round_metric_frames: List[pd.DataFrame] = []
     method_metric_rows: List[Dict[str, Any]] = []
 
-    shared_s0_artifacts: Optional[Tuple[Any, Any, Path]] = None
-    shared_evaluator = None
+    shared_step1_artifacts: Optional[Tuple[Any, Any, Path]] = None
 
     for family in families:
         print(f"audit_start family={family} mode={args.mode} rows={int(args.rows)} seeds={seeds}")
@@ -425,18 +504,36 @@ def main() -> None:
             print(f"audit_skip family={family} reason=no_target_rows")
             continue
 
+        family_evaluator = None
+        if args.mode in {"S1", "S3"} or args.evaluate_step4:
+            family_evaluator = load_step62_evaluator(
+                resolved,
+                device=device,
+                skip_novelty_reference=bool(args.skip_novelty_reference),
+            )
+
         checkpoint_path: Optional[Path] = None
-        if args.mode == "S0":
-            if shared_s0_artifacts is None:
-                shared_s0_artifacts = load_step1_diffusion(resolved, device=device)
-            mode_context: Dict[str, Any] = {"shared_artifacts": shared_s0_artifacts}
+        if args.mode in {"S0", "S1"}:
+            if shared_step1_artifacts is None:
+                shared_step1_artifacts = load_step1_diffusion(resolved, device=device)
+            mode_context: Dict[str, Any] = {"shared_artifacts": shared_step1_artifacts}
         else:
             checkpoint_path = _find_latest_conditional_checkpoint(resolved.results_dir, family)
             if checkpoint_path is None:
                 missing_families.append({"family": str(family), "reason": "missing_conditional_checkpoint"})
                 print(f"audit_skip family={family} reason=missing_conditional_checkpoint")
                 continue
-            mode_context = {"checkpoint_path": checkpoint_path}
+            metrics_dir = checkpoint_path.parent.parent / "metrics"
+            mode_context = {
+                "checkpoint_path": checkpoint_path,
+                "shared_artifacts": _load_s2_training_artifacts_from_existing_checkpoint(
+                    resolved=resolved,
+                    run_cfg=run_cfg,
+                    checkpoint_path=checkpoint_path,
+                    metrics_dir=metrics_dir,
+                    device=device,
+                ),
+            }
 
         family_call_rows: List[Dict[str, Any]] = []
         family_sample_rows: List[Dict[str, Any]] = []
@@ -459,7 +556,18 @@ def main() -> None:
                             seen_canonical_smiles=seen_cache,
                             shared_artifacts=mode_context["shared_artifacts"],
                         )
-                    else:
+                    elif args.mode == "S1":
+                        accepted_smiles, meta, used_checkpoint = _run_s1_call(
+                            resolved=resolved,
+                            run_cfg=run_cfg,
+                            target_row=target_row,
+                            device=device,
+                            generation_budget=int(args.generation_budget),
+                            seen_canonical_smiles=seen_cache,
+                            shared_artifacts=mode_context["shared_artifacts"],
+                            evaluator=family_evaluator,
+                        )
+                    elif args.mode == "S2":
                         accepted_smiles, meta, used_checkpoint = _run_s2_call(
                             resolved=resolved,
                             run_cfg=run_cfg,
@@ -468,7 +576,18 @@ def main() -> None:
                             generation_budget=int(args.generation_budget),
                             num_steps=args.num_steps,
                             seen_canonical_smiles=seen_cache,
-                            checkpoint_path=mode_context["checkpoint_path"],
+                            shared_artifacts=mode_context["shared_artifacts"],
+                        )
+                    else:
+                        accepted_smiles, meta, used_checkpoint = _run_s3_call(
+                            resolved=resolved,
+                            run_cfg=run_cfg,
+                            target_row=target_row,
+                            device=device,
+                            generation_budget=int(args.generation_budget),
+                            seen_canonical_smiles=seen_cache,
+                            shared_artifacts=mode_context["shared_artifacts"],
+                            evaluator=family_evaluator,
                         )
                     quota_ok = True
                 except ClassConstrainedSamplingQuotaError as exc:
@@ -521,14 +640,8 @@ def main() -> None:
             family_sample_df["duplicate_within_audit"] = duplicate_mask.fillna(False).astype(int)
         family_summary_row = _summarize_family(family_call_df, family_sample_df)
         if args.evaluate_step4 and family_generated_frames:
-            if shared_evaluator is None:
-                shared_evaluator = load_step62_evaluator(
-                    resolved,
-                    device=device,
-                    skip_novelty_reference=bool(args.skip_novelty_reference),
-                )
             family_generated_df = pd.concat(family_generated_frames, ignore_index=True)
-            family_evaluation_df = evaluate_generated_samples(family_generated_df, shared_evaluator)
+            family_evaluation_df = evaluate_generated_samples(family_generated_df, family_evaluator)
             family_target_row_metrics_df = aggregate_target_row_metrics(family_evaluation_df)
             family_target_row_summary_df = summarize_target_rows(family_target_row_metrics_df)
             family_round_metrics_df = aggregate_round_metrics(family_evaluation_df, family_target_row_metrics_df)

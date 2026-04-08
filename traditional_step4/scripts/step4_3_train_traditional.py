@@ -3458,7 +3458,7 @@ def main() -> None:
         )
         cls_split_ratios = resolve_split_ratios(cls_cfg.holdout_test_ratio, cls_cfg.tuning_cv_folds)
 
-    reg_dataset = args.regression_dataset_path or shared_cfg.get("regression_dataset_path", "Data/chi/_250_polymers_T_phi.csv")
+    reg_dataset = args.regression_dataset_path or shared_cfg.get("regression_dataset_path", "Data/chi/polymers_T_phi.csv")
     cls_dataset = args.classification_dataset_path or shared_cfg.get(
         "classification_dataset_path",
         [

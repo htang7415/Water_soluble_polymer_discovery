@@ -98,12 +98,9 @@ def score_guidance_batch(
     target_row: Dict[str, object],
     evaluator: Step62Evaluator,
     tokenizer,
-    class_surrogate_mode: str,
-    class_term_enabled: bool,
     sol_log_prob_floor: float,
     w_sol: float,
     w_chi: float,
-    w_class: float,
     invalid_reward_penalty: float,
 ) -> Dict[str, object]:
     """Score provisional complete sequences for S1 guidance."""
@@ -120,24 +117,11 @@ def score_guidance_batch(
     smiles = tokenizer.batch_decode(provisional_ids.detach().cpu().tolist(), skip_special_tokens=True)
 
     valid_mask: List[int] = []
-    class_surrogate_vals: List[float] = []
-    target_class = str(target_row["c_target"])
-    mode = str(class_surrogate_mode).strip().lower()
-    if mode != "binary_exact":
-        raise NotImplementedError(
-            f"class_surrogate_mode={class_surrogate_mode!r} is not implemented in the current S1 increment."
-        )
     for smi in smiles:
         is_valid = bool(check_validity(smi))
         valid_mask.append(int(is_valid))
-        if not is_valid:
-            class_surrogate_vals.append(0.0)
-            continue
-        matches = evaluator.polymer_classifier.classify(smi)
-        class_surrogate_vals.append(1.0 if matches.get(target_class, False) else 0.0)
 
     valid_tensor = torch.tensor(valid_mask, dtype=torch.float32)
-    class_surrogate = torch.tensor(class_surrogate_vals, dtype=torch.float32)
     valid_frac = float(valid_tensor.mean().item()) if len(valid_tensor) else 0.0
 
     sol_term = torch.log(class_prob.clamp(min=np.exp(float(sol_log_prob_floor))))
@@ -155,16 +139,11 @@ def score_guidance_batch(
     valid_reward = float(w_sol) * sol_term + float(w_chi) * chi_term
     invalid_penalty = torch.full_like(valid_reward, float(invalid_reward_penalty))
     reward = torch.where(valid_tensor > 0.0, valid_reward, invalid_penalty)
-    if class_term_enabled:
-        reward = reward + float(w_class) * class_surrogate
-
     return {
         "reward": reward.cpu(),
         "smiles": smiles,
         "valid_mask": valid_tensor.cpu(),
         "valid_frac": valid_frac,
-        "class_surrogate": class_surrogate,
-        "class_term_enabled": bool(class_term_enabled),
         "oracle_calls_soluble": int(provisional_ids.shape[0]),
         "oracle_calls_chi": int(provisional_ids.shape[0]),
     }
@@ -200,7 +179,11 @@ def compute_success_shaped_rewards(
             chi_term_values.append(-max(0.0, float(chi_pred_value) - float(chi_target_value)))
     chi_term = torch.tensor(np.asarray(chi_term_values, dtype=np.float32), dtype=torch.float32)
 
-    success_col = "success_hit_discovery" if "success_hit_discovery" in evaluation_df.columns else "success_hit"
+    success_col = (
+        "property_success_hit_discovery"
+        if "property_success_hit_discovery" in evaluation_df.columns
+        else "property_success_hit"
+    )
     sa_col = "sa_ok_discovery" if "sa_ok_discovery" in evaluation_df.columns else "sa_ok"
     if "target_sa_max_discovery" in evaluation_df.columns:
         sa_threshold = pd.to_numeric(evaluation_df["target_sa_max_discovery"], errors="coerce").to_numpy(dtype=np.float32)
@@ -225,7 +208,6 @@ def compute_success_shaped_rewards(
         + float(reward_weights.get("w_star", 0.0)) * torch.tensor(evaluation_df["star_ok"].to_numpy(dtype=np.float32))
         + float(reward_weights.get("w_sa", 0.0)) * torch.tensor(evaluation_df[sa_col].to_numpy(dtype=np.float32))
         + float(reward_weights.get("w_sa_continuous", 0.0)) * sa_continuous
-        + float(reward_weights.get("w_class", 0.0)) * torch.tensor(evaluation_df["class_ok"].to_numpy(dtype=np.float32))
         + float(reward_weights.get("w_sol", 0.0)) * sol_term
         + float(reward_weights.get("w_chi", 0.0)) * chi_term
     )

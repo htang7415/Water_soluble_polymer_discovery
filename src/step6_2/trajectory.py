@@ -811,6 +811,7 @@ def sample_trajectories_with_class_prior(
     accepted_raw_count = 0
     total_drawn = 0
     attempts = 0
+    seen_canonical_smiles: set[str] = set()
 
     while len(accepted_smiles) < int(num_samples):
         attempts += 1
@@ -888,7 +889,12 @@ def sample_trajectories_with_class_prior(
 
         total_drawn += int(len(smiles))
         if prior.enforce_class_match and classifier is not None:
-            accepted_idx = _accepted_target_class_indices(smiles, prior=prior, classifier=classifier)
+            accepted_idx, _attempt_filter_stats = _accepted_target_class_indices(
+                smiles,
+                prior=prior,
+                classifier=classifier,
+                seen_canonical_smiles=seen_canonical_smiles,
+            )
         else:
             accepted_idx = list(range(len(smiles)))
         accepted_raw_count += int(len(accepted_idx))

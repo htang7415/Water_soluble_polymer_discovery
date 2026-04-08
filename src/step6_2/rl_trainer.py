@@ -14,13 +14,18 @@ import pandas as pd
 import torch
 
 from .conditional_sampling import create_conditional_sampler, sample_conditional_with_class_prior
+from .config import select_step62_proxy_target_rows
 from .dataset import (
     ConditionScaler,
     build_inference_condition_bundle,
     build_step62_supervised_frames,
 )
 from .evaluation import evaluate_generated_samples
-from .frozen_sampling import ResolvedClassSamplingPrior, _accepted_target_class_indices
+from .frozen_sampling import (
+    ResolvedClassSamplingPrior,
+    _accepted_target_class_indices,
+    _resolve_class_match_request_size,
+)
 from .rewards import compute_success_shaped_rewards
 from .supervised import build_optimizer_and_scheduler, load_step62_checkpoint_into_modules
 from .train_s2 import S2TrainingArtifacts
@@ -30,6 +35,7 @@ from .trajectory import (
     select_sampling_trajectory_rows,
 )
 from src.evaluation.polymer_class import BACKBONE_CLASS_MATCH_CLASSES, PolymerClassifier
+from src.utils.chemistry import canonicalize_smiles
 
 
 @dataclass
@@ -241,34 +247,6 @@ def _create_trajectory_sampler(
     return sampler
 
 
-def _build_rl_training_prior(
-    prior: ResolvedClassSamplingPrior,
-    *,
-    use_class_family_sampling: bool,
-) -> ResolvedClassSamplingPrior:
-    if bool(use_class_family_sampling):
-        return prior
-    return replace(
-        prior,
-        family_sampling_mode="none",
-        motifs=[],
-        motif_source="disabled_for_rl",
-        motif_token_ids=[],
-        spans_per_sample=1,
-        class_token_logit_bias=None,
-        class_token_bias_strength=0.0,
-        backbone_template_enabled=False,
-        backbone_template_cores=[],
-        backbone_template_source=None,
-        backbone_template_token_ids=[],
-        enforce_class_match=False,
-        enforce_backbone_class_match=False,
-        class_match_oversample_factor=1.0,
-        class_match_min_request_size=1,
-        enforce_star_ok_acceptance=False,
-    )
-
-
 def _sample_on_policy_rollouts(
     *,
     prompt_df: pd.DataFrame,
@@ -290,14 +268,15 @@ def _sample_on_policy_rollouts(
     accepted_raw_count = 0
     total_drawn = 0
     attempts = 0
-    sampling_prior = (
-        replace(
-            prior,
-            enforce_class_match=False,
-            class_match_oversample_factor=1.0,
-        )
-        if prior.enforce_class_match
-        else prior
+    seen_canonical_smiles: set[str] = set()
+    # Preserve the shared DiT family constraints in the rollout sampler, but keep
+    # prompt-level class acceptance in this function so batch size stays aligned
+    # with the prompt dataframe. The generic class-quota helper can oversample
+    # beyond the prompt batch, which breaks prompt-conditioned trajectory replay.
+    sampling_prior = replace(
+        prior,
+        enforce_class_match=False,
+        enforce_backbone_class_match=False,
     )
     classifier = PolymerClassifier(patterns=resolved.polymer_patterns) if prior.enforce_class_match else None
     last_raw_meta: Dict[str, object] = {}
@@ -310,8 +289,23 @@ def _sample_on_policy_rollouts(
                 f"target_class={prior.target_class!r} accepted={len(accepted_smiles)} requested={len(prompt_df)} "
                 f"after {int(prior.class_match_sampling_attempts_max)} attempts."
             )
+        remaining = int(len(pending_prompt_df))
+        request_size_total, request_debug = _resolve_class_match_request_size(
+            prior=prior,
+            remaining=int(remaining),
+            attempts=int(attempts),
+            total_drawn=int(total_drawn),
+            accepted_raw_count=int(accepted_raw_count),
+        )
+        per_prompt_draws = max(1, int(np.ceil(float(request_size_total) / float(max(1, remaining)))))
+        expanded_prompt_df = pending_prompt_df.loc[pending_prompt_df.index.repeat(per_prompt_draws)].copy()
+        expanded_prompt_df = expanded_prompt_df.reset_index(drop=True)
+        expanded_prompt_df["_pending_row_idx"] = np.repeat(
+            np.arange(len(pending_prompt_df), dtype=int),
+            per_prompt_draws,
+        )
 
-        condition_bundle = _prompt_df_to_condition_tensor(pending_prompt_df, scaler=scaler, device=device)
+        condition_bundle = _prompt_df_to_condition_tensor(expanded_prompt_df, scaler=scaler, device=device)
         trajectory_sampler = _create_trajectory_sampler(
             diffusion_model=policy_model,
             tokenizer=tokenizer,
@@ -327,29 +321,57 @@ def _sample_on_policy_rollouts(
             tokenizer=tokenizer,
             prior=sampling_prior,
             resolved=resolved,
-            num_samples=int(len(pending_prompt_df)),
+            num_samples=int(len(expanded_prompt_df)),
             show_progress=False,
         )
         last_raw_meta = raw_meta
         total_drawn += int(len(raw_smiles))
 
         if prior.enforce_class_match and classifier is not None:
-            accepted_idx = _accepted_target_class_indices(raw_smiles, prior=prior, classifier=classifier)
+            local_seen_canonical_smiles = set(seen_canonical_smiles)
+            accepted_idx, _attempt_filter_stats = _accepted_target_class_indices(
+                raw_smiles,
+                prior=prior,
+                classifier=classifier,
+                seen_canonical_smiles=local_seen_canonical_smiles,
+            )
         else:
             accepted_idx = list(range(len(raw_smiles)))
 
-        accepted_raw_count += int(len(accepted_idx))
-        if accepted_idx:
-            accepted_prompt_parts.append(pending_prompt_df.iloc[accepted_idx].copy())
-            accepted_smiles.extend([raw_smiles[idx] for idx in accepted_idx])
+        chosen_raw_idx: List[int] = []
+        chosen_pending_idx: List[int] = []
+        chosen_pending_idx_set: set[int] = set()
+        for raw_idx in accepted_idx:
+            pending_idx = int(expanded_prompt_df.iloc[int(raw_idx)]["_pending_row_idx"])
+            if pending_idx in chosen_pending_idx_set:
+                continue
+            chosen_pending_idx_set.add(pending_idx)
+            chosen_pending_idx.append(pending_idx)
+            chosen_raw_idx.append(int(raw_idx))
+            canonical_smiles = canonicalize_smiles(str(raw_smiles[int(raw_idx)]))
+            if canonical_smiles:
+                seen_canonical_smiles.add(canonical_smiles)
+
+        accepted_raw_count += int(len(chosen_raw_idx))
+        if chosen_raw_idx:
+            accepted_prompt_parts.append(pending_prompt_df.iloc[chosen_pending_idx].copy())
+            accepted_smiles.extend([raw_smiles[idx] for idx in chosen_raw_idx])
             accepted_trajectories.extend(
-                select_sampling_trajectory_rows(raw_trajectories, keep_indices=accepted_idx)
+                select_sampling_trajectory_rows(raw_trajectories, keep_indices=chosen_raw_idx)
             )
 
-        accepted_set = set(int(idx) for idx in accepted_idx)
+        accepted_set = set(int(idx) for idx in chosen_pending_idx)
         pending_prompt_df = pending_prompt_df.iloc[
             [idx for idx in range(len(pending_prompt_df)) if idx not in accepted_set]
         ].reset_index(drop=True)
+        last_raw_meta.update(
+            {
+                "requested_num_samples": int(request_size_total),
+                "per_prompt_draws": int(per_prompt_draws),
+                "expanded_prompt_batch_size": int(len(expanded_prompt_df)),
+                **request_debug,
+            }
+        )
 
     accepted_prompt_df = (
         pd.concat(accepted_prompt_parts, ignore_index=True).reset_index(drop=True)
@@ -399,11 +421,11 @@ def _save_rl_checkpoint(
     optimizer,
     scheduler,
     step_idx: int,
-    best_proxy_success_hit_rate: float,
+    best_proxy_metric_value: float,
     alignment_mode: str,
     run_cfg: Dict[str, object],
     warm_start: S2TrainingArtifacts,
-    proxy_metric_name: str = "proxy_success_hit_rate_discovery",
+    proxy_metric_name: str = "proxy_property_success_hit_rate_discovery",
 ) -> None:
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -411,8 +433,8 @@ def _save_rl_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "step_idx": int(step_idx),
-        "best_proxy_success_hit_rate": float(best_proxy_success_hit_rate),
-        "best_proxy_success_metric_name": str(proxy_metric_name),
+        "best_proxy_metric_value": float(best_proxy_metric_value),
+        "best_proxy_metric_name": str(proxy_metric_name),
         "run_name": str(run_cfg["run_name"]),
         "alignment_mode": str(alignment_mode),
         "reference_checkpoint_path": str(reference_checkpoint_path),
@@ -532,10 +554,19 @@ def _evaluate_proxy_success_metrics(
     device: str,
     step_idx: int,
     num_steps: int,
+    target_rows_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[Dict[str, float], pd.DataFrame]:
     rows: List[pd.DataFrame] = []
     sample_id_start = 1
-    for _, target_row in resolved.rl_proxy_df.iterrows():
+    proxy_target_df = select_step62_proxy_target_rows(
+        (
+            target_rows_df.copy()
+            if target_rows_df is not None and not target_rows_df.empty
+            else resolved.target_family_df.copy()
+        ),
+        num_targets=int(run_cfg["s4"]["rl_proxy_num_targets"]),
+    )
+    for _, target_row in proxy_target_df.iterrows():
         condition_bundle = torch.tensor(
             build_inference_condition_bundle(
                 temperature=float(target_row["temperature"]),
@@ -586,19 +617,23 @@ def _evaluate_proxy_success_metrics(
         rows.append(evaluate_generated_samples(sample_df, evaluator))
     if not rows:
         return {
-            "proxy_success_hit_rate_reporting": float("nan"),
-            "proxy_success_hit_rate_discovery": float("nan"),
+            "proxy_property_success_hit_rate_reporting": float("nan"),
+            "proxy_property_success_hit_rate_discovery": float("nan"),
         }, pd.DataFrame()
     eval_df = pd.concat(rows, ignore_index=True)
-    reporting = float(eval_df["success_hit"].astype(float).mean())
-    discovery = (
-        float(eval_df["success_hit_discovery"].astype(float).mean())
-        if "success_hit_discovery" in eval_df.columns
-        else reporting
+    property_reporting = (
+        float(eval_df["property_success_hit"].astype(float).mean())
+        if "property_success_hit" in eval_df.columns
+        else float("nan")
+    )
+    property_discovery = (
+        float(eval_df["property_success_hit_discovery"].astype(float).mean())
+        if "property_success_hit_discovery" in eval_df.columns
+        else property_reporting
     )
     return {
-        "proxy_success_hit_rate_reporting": reporting,
-        "proxy_success_hit_rate_discovery": discovery,
+        "proxy_property_success_hit_rate_reporting": property_reporting,
+        "proxy_property_success_hit_rate_discovery": property_discovery,
     }, eval_df
 
 
@@ -611,6 +646,7 @@ def train_s4_rl_alignment(
     prior: ResolvedClassSamplingPrior,
     evaluator,
     device: str,
+    target_rows_df: Optional[pd.DataFrame] = None,
     pruning_callback: Optional[Callable[..., None]] = None,
     skip_disk_checkpoints: bool = False,
 ) -> RlTrainingArtifacts:
@@ -618,20 +654,17 @@ def train_s4_rl_alignment(
 
     s4_cfg = dict(run_cfg["s4"])
     alignment_mode = _resolve_on_policy_alignment_mode(s4_cfg)
-    training_prior = _build_rl_training_prior(
-        prior,
-        use_class_family_sampling=bool(s4_cfg.get("rl_use_class_family_sampling", False)),
-    )
+    training_prior = prior
     rl_diffusion_num_steps = int(
         s4_cfg.get("rl_diffusion_num_steps", resolved.base_config["diffusion"]["num_steps"])
     )
-    if str(s4_cfg.get("rl_checkpoint_selection_mode", "proxy_success_hit_rate")).strip().lower() not in {
-        "proxy_success_hit_rate",
+    if str(s4_cfg.get("rl_checkpoint_selection_mode", "proxy_property_success_hit_rate")).strip().lower() not in {
+        "proxy_property_success_hit_rate",
         "final_checkpoint",
     }:
         raise NotImplementedError(
             "Step 6_2 RL currently supports only rl_checkpoint_selection_mode in "
-            "{'proxy_success_hit_rate', 'final_checkpoint'}."
+            "{'proxy_property_success_hit_rate', 'final_checkpoint'}."
         )
 
     policy_model = deepcopy(warm_start.diffusion_model).to(device)
@@ -664,7 +697,8 @@ def train_s4_rl_alignment(
     proxy_rows: List[Dict[str, Any]] = []
     best_proxy_success = float("-inf")
     best_policy_state: Optional[Dict[str, torch.Tensor]] = None
-    proxy_objective_metric = "proxy_success_hit_rate_discovery"
+    checkpoint_mode = str(s4_cfg.get("rl_checkpoint_selection_mode", "proxy_property_success_hit_rate")).strip().lower()
+    proxy_objective_metric = "proxy_property_success_hit_rate_discovery"
     sample_id_start = 1
     clip_eps = float(s4_cfg.get("ppo_clip_eps", 0.2))
     normalize_advantages = bool(s4_cfg.get("normalize_advantages", alignment_mode in {"ppo", "grpo"}))
@@ -823,7 +857,6 @@ def train_s4_rl_alignment(
                     rollout_meta.get("class_match_oversampling_ratio", float("nan"))
                 ),
                 "total_raw_samples_drawn": int(rollout_meta.get("total_raw_samples_drawn", len(evaluation_df))),
-                "rl_use_class_family_sampling": int(bool(s4_cfg.get("rl_use_class_family_sampling", False))),
                 "rl_diffusion_num_steps": int(rl_diffusion_num_steps),
                 "motif_count": int(rollout_meta.get("motif_count", 0)),
                 "class_token_bias_enabled": int(bool(rollout_meta.get("class_token_bias_enabled", False))),
@@ -831,9 +864,8 @@ def train_s4_rl_alignment(
             },
         }
 
-        checkpoint_mode = str(s4_cfg.get("rl_checkpoint_selection_mode", "proxy_success_hit_rate")).strip().lower()
         should_eval_proxy = (
-            checkpoint_mode == "proxy_success_hit_rate"
+            checkpoint_mode == "proxy_property_success_hit_rate"
             and (
                 step_idx % int(s4_cfg["rl_proxy_eval_interval_steps"]) == 0
                 or step_idx == int(s4_cfg["rl_num_steps"])
@@ -851,6 +883,7 @@ def train_s4_rl_alignment(
                 device=device,
                 step_idx=step_idx,
                 num_steps=int(rl_diffusion_num_steps),
+                target_rows_df=target_rows_df,
             )
             proxy_objective_value = float(proxy_metrics.get(proxy_objective_metric, float("nan")))
             proxy_rows.append(
@@ -858,7 +891,6 @@ def train_s4_rl_alignment(
                     "step_idx": int(step_idx),
                     **proxy_metrics,
                     "proxy_num_samples": int(len(proxy_eval_df)),
-                    "proxy_use_class_family_sampling": int(bool(s4_cfg.get("rl_use_class_family_sampling", False))),
                 }
             )
             history_row.update(proxy_metrics)
@@ -874,7 +906,7 @@ def train_s4_rl_alignment(
                         optimizer=optimizer,
                         scheduler=scheduler,
                         step_idx=step_idx,
-                        best_proxy_success_hit_rate=best_proxy_success,
+                        best_proxy_metric_value=best_proxy_success,
                         alignment_mode=alignment_mode,
                         run_cfg=run_cfg,
                         warm_start=warm_start,
@@ -898,18 +930,17 @@ def train_s4_rl_alignment(
             optimizer=optimizer,
             scheduler=scheduler,
             step_idx=int(s4_cfg["rl_num_steps"]),
-            best_proxy_success_hit_rate=best_proxy_success,
+            best_proxy_metric_value=best_proxy_success,
             alignment_mode=alignment_mode,
             run_cfg=run_cfg,
             warm_start=warm_start,
             proxy_metric_name=proxy_objective_metric,
         )
 
-    checkpoint_mode = str(s4_cfg.get("rl_checkpoint_selection_mode", "proxy_success_hit_rate")).strip().lower()
-    if skip_disk_checkpoints and checkpoint_mode == "proxy_success_hit_rate":
+    if skip_disk_checkpoints and checkpoint_mode == "proxy_property_success_hit_rate":
         if best_policy_state is not None:
             policy_model.load_state_dict(best_policy_state)
-    elif checkpoint_mode == "proxy_success_hit_rate" and best_checkpoint_path.exists():
+    elif checkpoint_mode == "proxy_property_success_hit_rate" and best_checkpoint_path.exists():
         load_step62_checkpoint_into_modules(
             checkpoint_path=best_checkpoint_path,
             diffusion_model=policy_model,
@@ -938,7 +969,7 @@ def train_s4_rl_alignment(
                 "alignment_mode": str(alignment_mode),
                 "rl_prompt_source": str(s4_cfg["rl_prompt_source"]),
                 "proxy_objective_metric": proxy_objective_metric,
-                "best_proxy_success_hit_rate": float(best_proxy_success),
+                "best_proxy_metric_value": float(best_proxy_success),
                 "checkpoint_selection_mode": checkpoint_mode,
                 "best_checkpoint_path": (None if skip_disk_checkpoints else str(best_checkpoint_path)),
                 "last_checkpoint_path": (None if skip_disk_checkpoints else str(last_checkpoint_path)),
@@ -947,8 +978,6 @@ def train_s4_rl_alignment(
                 "policy_update_epochs": int(policy_update_epochs),
                 "ppo_clip_eps": (float(clip_eps) if alignment_mode in {"ppo", "grpo"} else None),
                 "grpo_group_size": (int(grpo_group_size) if alignment_mode == "grpo" else None),
-                "rl_use_class_family_sampling": bool(s4_cfg.get("rl_use_class_family_sampling", False)),
-                "proxy_use_class_family_sampling": bool(s4_cfg.get("rl_use_class_family_sampling", False)),
                 "rl_diffusion_num_steps": int(rl_diffusion_num_steps),
                 "disk_checkpoints_saved": bool(not skip_disk_checkpoints),
             },

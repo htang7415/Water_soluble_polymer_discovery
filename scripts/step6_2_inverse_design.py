@@ -36,6 +36,15 @@ SUPPORTED_RUNS = {
 }
 
 
+def _parse_sampling_seeds(value: str | None) -> List[int] | None:
+    if value is None:
+        return None
+    seeds = [chunk.strip() for chunk in str(value).split(",") if chunk.strip()]
+    if not seeds:
+        raise ValueError("sampling_seeds must contain at least one integer when provided.")
+    return [int(seed) for seed in seeds]
+
+
 def _write_frame(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
@@ -138,6 +147,13 @@ def _execute_run(
     device: str,
     config_path: str,
     shared_evaluator=None,
+    run_dir=None,
+    target_rows_df=None,
+    generation_budget: int | None = None,
+    sampling_seeds: List[int] | None = None,
+    num_rounds: int | None = None,
+    save_figures: bool = True,
+    extra_context: Dict | None = None,
 ) -> None:
     execute_step62_run(
         resolved=resolved,
@@ -145,6 +161,13 @@ def _execute_run(
         device=device,
         config_path=config_path,
         shared_evaluator=shared_evaluator,
+        run_dir=run_dir,
+        target_rows_df=target_rows_df,
+        generation_budget=generation_budget,
+        sampling_seeds=sampling_seeds,
+        num_rounds=num_rounds,
+        save_figures=save_figures,
+        extra_context=extra_context,
     )
 
 
@@ -171,6 +194,34 @@ def main() -> None:
     parser.add_argument("--prepare_only", action="store_true")
     parser.add_argument("--runs", default=None, help="Comma-separated subset of enabled runs.")
     parser.add_argument("--allow_partial", action="store_true", help="Skip unsupported runs for development.")
+    parser.add_argument("--generation_budget", type=int, default=None, help="Override samples per target row.")
+    parser.add_argument("--num_rounds", type=int, default=None, help="Override number of sampling rounds.")
+    parser.add_argument(
+        "--sampling_seeds",
+        default=None,
+        help="Comma-separated sampling seeds override used with --num_rounds or for deterministic smoke runs.",
+    )
+    parser.add_argument(
+        "--max_target_rows",
+        type=int,
+        default=None,
+        help="Limit execution to the first N target rows for fast smoke tests.",
+    )
+    parser.add_argument(
+        "--skip_disk_checkpoints",
+        action="store_true",
+        help="Keep temporary checkpoints in memory only during testing.",
+    )
+    parser.add_argument(
+        "--no_figures",
+        action="store_true",
+        help="Skip figure generation for faster smoke tests.",
+    )
+    parser.add_argument(
+        "--run_dir_suffix",
+        default=None,
+        help="Optional suffix appended to each run directory name to isolate smoke outputs.",
+    )
     args = parser.parse_args()
 
     resolved = load_step6_2_config(
@@ -191,6 +242,31 @@ def main() -> None:
 
     selected_runs = _resolve_requested_runs(resolved, args.runs, args.allow_partial)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    sampling_seeds = _parse_sampling_seeds(args.sampling_seeds)
+    if args.max_target_rows is not None and int(args.max_target_rows) <= 0:
+        raise ValueError("max_target_rows must be >= 1 when provided.")
+    target_rows_df = None
+    if args.max_target_rows is not None:
+        target_rows_df = resolved.target_family_df.head(int(args.max_target_rows)).copy()
+        if target_rows_df.empty:
+            raise ValueError("max_target_rows selected zero target rows.")
+
+    extra_context = {}
+    if args.skip_disk_checkpoints:
+        extra_context["skip_disk_checkpoints"] = True
+    if args.max_target_rows is not None:
+        extra_context["max_target_rows"] = int(args.max_target_rows)
+    if args.generation_budget is not None:
+        extra_context["generation_budget_override"] = int(args.generation_budget)
+    if args.num_rounds is not None:
+        extra_context["num_rounds_override"] = int(args.num_rounds)
+    if sampling_seeds is not None:
+        extra_context["sampling_seeds_override"] = sampling_seeds
+    if args.no_figures:
+        extra_context["save_figures"] = False
+    if args.run_dir_suffix:
+        extra_context["run_dir_suffix"] = str(args.run_dir_suffix)
+    extra_context = extra_context or None
 
     selected_run_cfgs = [build_run_config(resolved, run_name) for run_name in selected_runs]
     shared_evaluator = None
@@ -198,12 +274,22 @@ def main() -> None:
         shared_evaluator = load_step62_evaluator(resolved, device=device)
 
     for run_cfg in selected_run_cfgs:
+        run_dir = None
+        if args.run_dir_suffix:
+            run_dir = resolved.benchmark_root / f"{run_cfg['run_name']}{args.run_dir_suffix}"
         _execute_run(
             resolved=resolved,
             run_name=str(run_cfg["run_name"]),
             device=device,
             config_path=args.config,
             shared_evaluator=shared_evaluator,
+            run_dir=run_dir,
+            target_rows_df=target_rows_df,
+            generation_budget=args.generation_budget,
+            sampling_seeds=sampling_seeds,
+            num_rounds=args.num_rounds,
+            save_figures=not args.no_figures,
+            extra_context=extra_context,
         )
 
 

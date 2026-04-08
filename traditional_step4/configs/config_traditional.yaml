@@ -13,7 +13,7 @@ plotting:
 
 traditional_step4:
   shared:
-    regression_dataset_path: "Data/chi/_250_polymers_T_phi.csv"
+    regression_dataset_path: "Data/chi/polymers_T_phi.csv"
     classification_dataset_path:
       - "Data/water_solvent/water_miscible_polymer.csv"
       - "Data/water_solvent/water_immiscible_polymer.csv"

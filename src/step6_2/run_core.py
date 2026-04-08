@@ -534,13 +534,9 @@ def run_single_target_sampling(
             target_row=target_row.to_dict(),
             best_of_k=int(s1_cfg["best_of_k"]),
             guidance_start_frac=float(s1_cfg["guidance_start_frac"]),
-            class_guidance_start_frac=float(s1_cfg["class_guidance_start_frac"]),
-            class_guidance_min_valid_frac=float(s1_cfg["class_guidance_min_valid_frac"]),
-            class_surrogate_mode=str(s1_cfg["class_surrogate_mode"]),
             sol_log_prob_floor=float(s1_cfg["sol_log_prob_floor"]),
             w_sol=float(s1_cfg["w_sol"]),
             w_chi=float(s1_cfg["w_chi"]),
-            w_class=float(s1_cfg["w_class"]),
             invalid_reward_penalty=float(s1_cfg.get("invalid_reward_penalty", -10.0)),
         )
         sampler.set_class_token_bias_start_frac(float(resolved.step6_2.get("class_token_bias_start_frac", 0.0)))
@@ -626,13 +622,9 @@ def run_single_target_sampling(
             target_row=target_row.to_dict(),
             best_of_k=int(s3_cfg["best_of_k"]),
             guidance_start_frac=float(s3_cfg["guidance_start_frac"]),
-            class_guidance_start_frac=float(s3_cfg["class_guidance_start_frac"]),
-            class_guidance_min_valid_frac=float(s3_cfg["class_guidance_min_valid_frac"]),
-            class_surrogate_mode=str(s3_cfg["class_surrogate_mode"]),
             sol_log_prob_floor=float(s3_cfg["sol_log_prob_floor"]),
             w_sol=float(s3_cfg["w_sol"]),
             w_chi=float(s3_cfg["w_chi"]),
-            w_class=float(s3_cfg["w_class"]),
             invalid_reward_penalty=float(s3_cfg.get("invalid_reward_penalty", -10.0)),
         )
         sampler.set_class_token_bias_start_frac(float(resolved.step6_2.get("class_token_bias_start_frac", 0.0)))
@@ -779,7 +771,8 @@ def execute_step62_run(
             metrics_dir=run_dirs["metrics_dir"],
         )
         pair_source = str(run_cfg["s4"]["dpo"]["pair_source"]).strip().lower()
-        if pair_source == "target_row_synthetic" and evaluator is None:
+        checkpoint_mode = str(run_cfg["s4"]["dpo"].get("checkpoint_selection_mode", "val_dpo_loss")).strip().lower()
+        if (pair_source == "target_row_synthetic" or checkpoint_mode == "proxy_property_success_hit_rate") and evaluator is None:
             evaluator = load_step62_evaluator(resolved, device=device)
         dpo_artifacts = train_s4_dpo_alignment(
             resolved=resolved,
@@ -789,6 +782,7 @@ def execute_step62_run(
             prior=prior,
             evaluator=evaluator,
             device=device,
+            target_rows_df=target_rows_df,
             skip_disk_checkpoints=skip_disk_checkpoints,
             pruning_callback=pruning_callback,
         )
@@ -831,6 +825,7 @@ def execute_step62_run(
             prior=prior,
             evaluator=evaluator,
             device=device,
+            target_rows_df=target_rows_df,
             skip_disk_checkpoints=skip_disk_checkpoints,
             pruning_callback=pruning_callback,
         )
@@ -869,7 +864,6 @@ def execute_step62_run(
         seed_everything(int(sampling_seed), deterministic=True)
         round_soluble_calls = 0
         round_chi_calls = 0
-        round_class_guidance_suppressed_steps = 0
         round_seen_canonical_smiles: Optional[set[str]] = set() if reject_duplicate_canonical_across_targets else None
         round_sampling_state: Optional[Dict[str, object]] = (
             {}
@@ -924,7 +918,6 @@ def execute_step62_run(
             evaluation_frames.append(evaluation_df)
             round_soluble_calls += int(guidance_stats.get("training_soluble_oracle_calls", 0))
             round_chi_calls += int(guidance_stats.get("training_chi_oracle_calls", 0))
-            round_class_guidance_suppressed_steps += int(guidance_stats.get("class_guidance_suppressed_steps", 0))
 
         round_oracle_rows.append(
             {
@@ -934,7 +927,6 @@ def execute_step62_run(
                 "sampling_seed": int(sampling_seed),
                 "training_soluble_oracle_calls": int(round_soluble_calls),
                 "training_chi_oracle_calls": int(round_chi_calls),
-                "class_guidance_suppressed_steps": int(round_class_guidance_suppressed_steps),
             }
         )
 
@@ -981,11 +973,6 @@ def execute_step62_run(
             "mean_training_chi_oracle_calls": (
                 float(round_metrics_df["training_chi_oracle_calls"].mean())
                 if "training_chi_oracle_calls" in round_metrics_df.columns and not round_metrics_df.empty
-                else 0.0
-            ),
-            "mean_class_guidance_suppressed_steps": (
-                float(round_metrics_df["class_guidance_suppressed_steps"].mean())
-                if "class_guidance_suppressed_steps" in round_metrics_df.columns and not round_metrics_df.empty
                 else 0.0
             ),
             "mean_class_match_acceptance_rate": (

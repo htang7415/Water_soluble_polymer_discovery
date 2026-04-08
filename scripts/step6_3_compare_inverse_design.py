@@ -38,53 +38,21 @@ OPTIONAL_RUN_FILES = {
 }
 
 COMPARE_METRIC_REGISTRY = {
-    "discovery_success_hit_rate": {
-        "method_mean": "mean_success_hit_rate_discovery",
-        "method_std": "std_success_hit_rate_discovery",
-        "method_macro": "macro_average_row_mean_success_hit_rate_discovery",
-        "target_mean": "mean_success_hit_discovery_rate",
-        "target_std": "std_success_hit_discovery_rate",
-        "label": "Discovery success hit rate",
+    "property_discovery_success_hit_rate": {
+        "method_mean": "mean_property_success_hit_rate_discovery",
+        "method_std": "std_property_success_hit_rate_discovery",
+        "method_macro": "macro_average_row_mean_property_success_hit_rate_discovery",
+        "target_mean": "mean_property_success_hit_discovery_rate",
+        "target_std": "std_property_success_hit_discovery_rate",
+        "label": "Property discovery success hit rate",
     },
-    "reporting_success_hit_rate": {
-        "method_mean": "mean_success_hit_rate",
-        "method_std": "std_success_hit_rate",
-        "method_macro": "macro_average_row_mean_success_hit_rate",
-        "target_mean": "mean_success_hit_rate",
-        "target_std": "std_success_hit_rate",
-        "label": "Reporting success hit rate",
-    },
-    "strict_success_hit_rate": {
-        "method_mean": "mean_success_hit_rate_strict",
-        "method_std": "std_success_hit_rate_strict",
-        "method_macro": "macro_average_row_mean_success_hit_rate_strict",
-        "target_mean": "mean_success_hit_strict_rate",
-        "target_std": "std_success_hit_strict_rate",
-        "label": "Strict success hit rate",
-    },
-    "loose_success_hit_rate": {
-        "method_mean": "mean_success_hit_rate_loose",
-        "method_std": "std_success_hit_rate_loose",
-        "method_macro": "macro_average_row_mean_success_hit_rate_loose",
-        "target_mean": "mean_success_hit_loose_rate",
-        "target_std": "std_success_hit_loose_rate",
-        "label": "Loose success hit rate",
-    },
-    "discovery_strict_success_hit_rate": {
-        "method_mean": "mean_success_hit_rate_discovery_strict",
-        "method_std": "std_success_hit_rate_discovery_strict",
-        "method_macro": "macro_average_row_mean_success_hit_rate_discovery_strict",
-        "target_mean": "mean_success_hit_discovery_strict_rate",
-        "target_std": "std_success_hit_discovery_strict_rate",
-        "label": "Discovery strict success hit rate",
-    },
-    "discovery_loose_success_hit_rate": {
-        "method_mean": "mean_success_hit_rate_discovery_loose",
-        "method_std": "std_success_hit_rate_discovery_loose",
-        "method_macro": "macro_average_row_mean_success_hit_rate_discovery_loose",
-        "target_mean": "mean_success_hit_discovery_loose_rate",
-        "target_std": "std_success_hit_discovery_loose_rate",
-        "label": "Discovery loose success hit rate",
+    "property_reporting_success_hit_rate": {
+        "method_mean": "mean_property_success_hit_rate",
+        "method_std": "std_property_success_hit_rate",
+        "method_macro": "macro_average_row_mean_property_success_hit_rate",
+        "target_mean": "mean_property_success_hit_rate",
+        "target_std": "std_property_success_hit_rate",
+        "label": "Property reporting success hit rate",
     },
 }
 
@@ -138,7 +106,7 @@ def _safe_float(value: object, default: float = float("nan")) -> float:
 
 
 def _resolve_compare_metric(resolved, run_payloads: List[Dict[str, object]]) -> Tuple[str, Dict[str, str]]:
-    requested = str(resolved.step6_3.get("compare_metric", "discovery_success_hit_rate")).strip().lower()
+    requested = str(resolved.step6_3.get("compare_metric", "property_discovery_success_hit_rate")).strip().lower()
     metric = COMPARE_METRIC_REGISTRY.get(requested)
     if metric is None:
         raise ValueError(
@@ -153,7 +121,7 @@ def _resolve_compare_metric(resolved, run_payloads: List[Dict[str, object]]) -> 
     if run_payloads and all(_payload_has_metric(payload, metric) for payload in run_payloads):
         return requested, metric
 
-    fallback_name = "reporting_success_hit_rate"
+    fallback_name = "property_reporting_success_hit_rate"
     return fallback_name, COMPARE_METRIC_REGISTRY[fallback_name]
 
 
@@ -241,7 +209,6 @@ def _build_run_comparison_row(
         "mean_benchmark_chi_oracle_calls": _safe_float(method_metrics.get("mean_benchmark_chi_oracle_calls", 0.0), 0.0),
         "mean_training_soluble_oracle_calls": _safe_float(method_metrics.get("mean_training_soluble_oracle_calls", 0.0), 0.0),
         "mean_training_chi_oracle_calls": _safe_float(method_metrics.get("mean_training_chi_oracle_calls", 0.0), 0.0),
-        "mean_class_guidance_suppressed_steps": _safe_float(method_metrics.get("mean_class_guidance_suppressed_steps", 0.0), 0.0),
         "mean_class_match_acceptance_rate": _safe_float(method_metrics.get("mean_class_match_acceptance_rate")),
         "mean_class_match_oversampling_ratio": _safe_float(method_metrics.get("mean_class_match_oversampling_ratio")),
         "mean_total_raw_samples_drawn": _safe_float(method_metrics.get("mean_total_raw_samples_drawn")),
@@ -261,9 +228,6 @@ def _build_run_comparison_row(
         "sa_ok_discovery",
         "sa_ok",
         "soluble_ok",
-        "class_ok_loose",
-        "class_ok_strict",
-        "class_ok",
         "chi_ok",
         "chi_band_ok",
     ]:
@@ -315,21 +279,14 @@ def _build_per_target_run_comparison(
             "mean_sa_ok_discovery_rate",
             "mean_sa_ok_rate",
             "mean_soluble_ok_rate",
-            "mean_class_ok_loose_rate",
-            "mean_class_ok_strict_rate",
-            "mean_class_ok_rate",
             "mean_chi_ok_rate",
             "mean_chi_band_ok_rate",
+            "mean_property_success_hit_discovery_rate",
+            "std_property_success_hit_discovery_rate",
+            "mean_property_success_hit_rate",
+            "std_property_success_hit_rate",
             "mean_success_hit_discovery_rate",
             "std_success_hit_discovery_rate",
-            "mean_success_hit_loose_rate",
-            "std_success_hit_loose_rate",
-            "mean_success_hit_strict_rate",
-            "std_success_hit_strict_rate",
-            "mean_success_hit_discovery_loose_rate",
-            "std_success_hit_discovery_loose_rate",
-            "mean_success_hit_discovery_strict_rate",
-            "std_success_hit_discovery_strict_rate",
             "mean_success_hit_rate",
             "std_success_hit_rate",
             "num_rounds",
@@ -390,14 +347,14 @@ def _build_difficulty_summary(per_target_run_df: pd.DataFrame) -> pd.DataFrame:
     for keys, sub in per_target_run_df.groupby(group_cols, dropna=False):
         row = {col: value for col, value in zip(group_cols, keys)}
         row["num_runs"] = int(sub["run_name"].nunique())
-        row["comparison_metric_name"] = str(sub["comparison_metric_name"].iloc[0]) if "comparison_metric_name" in sub.columns else "reporting_success_hit_rate"
+        row["comparison_metric_name"] = (
+            str(sub["comparison_metric_name"].iloc[0])
+            if "comparison_metric_name" in sub.columns
+            else "property_reporting_success_hit_rate"
+        )
         row["comparison_metric_label"] = str(sub["comparison_metric_label"].iloc[0]) if "comparison_metric_label" in sub.columns else "Reporting success hit rate"
         row["mean_success_hit_rate_across_runs"] = float(sub["comparison_mean_success_hit_rate"].mean())
         row["std_success_hit_rate_across_runs"] = float(sub["comparison_mean_success_hit_rate"].std(ddof=0))
-        row["mean_class_ok_rate_across_runs"] = float(sub["mean_class_ok_rate"].mean())
-        row["mean_class_ok_strict_rate_across_runs"] = (
-            float(sub["mean_class_ok_strict_rate"].mean()) if "mean_class_ok_strict_rate" in sub.columns else float("nan")
-        )
         row["mean_soluble_ok_rate_across_runs"] = float(sub["mean_soluble_ok_rate"].mean())
         row["mean_chi_ok_rate_across_runs"] = float(sub["mean_chi_ok_rate"].mean())
         if "mean_class_match_acceptance_rate" in sub.columns:
@@ -475,12 +432,12 @@ def _write_compare_outputs(
         "compare_metric": (
             str(run_comparison_df["comparison_metric_name"].iloc[0])
             if "comparison_metric_name" in run_comparison_df.columns and not run_comparison_df.empty
-            else str(resolved.step6_3.get("compare_metric", "reporting_success_hit_rate"))
+            else str(resolved.step6_3.get("compare_metric", "property_reporting_success_hit_rate"))
         ),
         "compare_metric_label": (
             str(run_comparison_df["comparison_metric_label"].iloc[0])
             if "comparison_metric_label" in run_comparison_df.columns and not run_comparison_df.empty
-            else "Reporting success hit rate"
+            else "Property reporting success hit rate"
         ),
         "partial_compare": bool(partial_compare),
         "selected_runs": selected_runs,
@@ -499,7 +456,7 @@ def _write_compare_outputs(
         "config_path": config_path,
         "compare_all_enabled_runs": bool(resolved.step6_3.get("compare_all_enabled_runs", True)),
         "summarize_by_canonical_family": bool(resolved.step6_3.get("summarize_by_canonical_family", True)),
-        "compare_metric": str(resolved.step6_3.get("compare_metric", "discovery_success_hit_rate")),
+        "compare_metric": str(resolved.step6_3.get("compare_metric", "property_discovery_success_hit_rate")),
         "selected_runs": selected_runs,
         "skipped_runs": skipped_runs,
         "partial_compare": bool(partial_compare),

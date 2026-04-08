@@ -50,17 +50,24 @@ def plot_per_target_success(
     apply_step62_plot_style(font_size=font_size, dpi=dpi)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ordered = target_row_summary_df.sort_values(["temperature", "phi", "target_row_id"]).reset_index(drop=True)
+    mean_col = "mean_property_success_hit_rate"
+    std_col = "std_property_success_hit_rate"
+    ylabel = "Property success hit rate"
+    if mean_col not in ordered.columns:
+        mean_col = "mean_success_hit_rate"
+        std_col = "std_success_hit_rate"
+        ylabel = "Success hit rate"
 
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.bar(
         range(len(ordered)),
-        ordered["mean_success_hit_rate"].astype(float),
-        yerr=ordered["std_success_hit_rate"].astype(float),
+        ordered[mean_col].astype(float),
+        yerr=ordered[std_col].astype(float) if std_col in ordered.columns else None,
         color="#4c78a8",
         alpha=0.85,
     )
     ax.set_xlabel("Target row")
-    ax.set_ylabel("Success hit rate")
+    ax.set_ylabel(ylabel)
     ax.set_xticks(range(len(ordered)))
     ax.set_xticklabels(ordered["target_row_key"].tolist(), rotation=90)
     fig.tight_layout()
@@ -79,7 +86,28 @@ def plot_success_gate_funnel(
 
     apply_step62_plot_style(font_size=font_size, dpi=dpi)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    gates = ["valid_ok", "novel_ok", "star_ok", "sa_ok", "soluble_ok", "class_ok", "chi_ok", "success_hit"]
+    if "property_success_hit_discovery" in evaluation_df.columns:
+        gates = [
+            "valid_ok",
+            "novel_ok",
+            "star_ok",
+            "sa_ok_discovery",
+            "soluble_ok",
+            "chi_ok",
+            "property_success_hit_discovery",
+        ]
+    elif "property_success_hit" in evaluation_df.columns:
+        gates = [
+            "valid_ok",
+            "novel_ok",
+            "star_ok",
+            "sa_ok",
+            "soluble_ok",
+            "chi_ok",
+            "property_success_hit",
+        ]
+    else:
+        gates = ["valid_ok", "novel_ok", "star_ok", "sa_ok", "soluble_ok", "chi_ok", "success_hit"]
     rates = [float(evaluation_df[gate].astype(float).mean()) for gate in gates]
 
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -288,8 +316,13 @@ def plot_success_gate_funnel_compare(
         if "comparison_metric_name" in run_comparison_df.columns and not run_comparison_df.empty
         else "reporting_success_hit_rate"
     )
-    sa_gate = "sa_ok_discovery" if compare_metric_name.startswith("discovery_") else "sa_ok"
-    gates = ["valid_ok", "novel_ok", "star_ok", sa_gate, "soluble_ok", "class_ok", "chi_ok", "success_hit"]
+    is_discovery_metric = "discovery" in compare_metric_name
+    is_property_metric = compare_metric_name.startswith("property_")
+    sa_gate = "sa_ok_discovery" if is_discovery_metric else "sa_ok"
+    final_gate = "property_success_hit" if is_property_metric else "success_hit"
+    gates = ["valid_ok", "novel_ok", "star_ok", sa_gate, "soluble_ok", "chi_ok", final_gate]
+    if not is_property_metric:
+        gates.insert(-2, "class_ok")
 
     fig, ax = plt.subplots(figsize=(11, 5))
     ordered = run_comparison_df.sort_values([mean_col, "run_name"], ascending=[False, True]).reset_index(drop=True)

@@ -22,13 +22,9 @@ class GuidedSampler(ConstrainedSampler):
         target_row: Dict[str, object],
         best_of_k: int,
         guidance_start_frac: float,
-        class_guidance_start_frac: float,
-        class_guidance_min_valid_frac: float,
-        class_surrogate_mode: str,
         sol_log_prob_floor: float,
         w_sol: float,
         w_chi: float,
-        w_class: float,
         invalid_reward_penalty: float,
         **kwargs,
     ):
@@ -37,30 +33,23 @@ class GuidedSampler(ConstrainedSampler):
         self.target_row = target_row
         self.best_of_k = int(best_of_k)
         self.guidance_start_frac = float(guidance_start_frac)
-        self.class_guidance_start_frac = float(class_guidance_start_frac)
-        self.class_guidance_min_valid_frac = float(class_guidance_min_valid_frac)
-        self.class_surrogate_mode = str(class_surrogate_mode)
         self.sol_log_prob_floor = float(sol_log_prob_floor)
         self.w_sol = float(w_sol)
         self.w_chi = float(w_chi)
-        self.w_class = float(w_class)
         self.invalid_reward_penalty = float(invalid_reward_penalty)
         self.training_oracle_calls_soluble = 0
         self.training_oracle_calls_chi = 0
-        self.class_guidance_suppressed_steps = 0
         self.guidance_no_valid_fallback_steps = 0
 
     def reset_guidance_stats(self) -> None:
         self.training_oracle_calls_soluble = 0
         self.training_oracle_calls_chi = 0
-        self.class_guidance_suppressed_steps = 0
         self.guidance_no_valid_fallback_steps = 0
 
     def get_guidance_stats(self) -> Dict[str, int]:
         return {
             "training_soluble_oracle_calls": int(self.training_oracle_calls_soluble),
             "training_chi_oracle_calls": int(self.training_oracle_calls_chi),
-            "class_guidance_suppressed_steps": int(self.class_guidance_suppressed_steps),
             "guidance_no_valid_fallback_steps": int(self.guidance_no_valid_fallback_steps),
         }
 
@@ -179,29 +168,19 @@ class GuidedSampler(ConstrainedSampler):
                 if candidate_blocks:
                     provisional_ids = torch.cat(candidate_blocks, dim=0)
                     provisional_attention = torch.cat(attention_blocks, dim=0)
-                    class_term_enabled = step_progress >= self.class_guidance_start_frac
                     scored = score_guidance_batch(
                         provisional_ids,
                         provisional_attention,
                         target_row=self.target_row,
                         evaluator=self.evaluator,
                         tokenizer=self.tokenizer,
-                        class_surrogate_mode=self.class_surrogate_mode,
-                        class_term_enabled=class_term_enabled,
                         sol_log_prob_floor=self.sol_log_prob_floor,
                         w_sol=self.w_sol,
                         w_chi=self.w_chi,
-                        w_class=self.w_class,
                         invalid_reward_penalty=self.invalid_reward_penalty,
                     )
                     self.training_oracle_calls_soluble += int(scored["oracle_calls_soluble"])
                     self.training_oracle_calls_chi += int(scored["oracle_calls_chi"])
-
-                    valid_frac = float(scored["valid_frac"])
-                    class_term_final = bool(class_term_enabled and valid_frac >= self.class_guidance_min_valid_frac)
-                    if class_term_enabled and not class_term_final:
-                        self.class_guidance_suppressed_steps += 1
-                        scored["reward"] = scored["reward"] - float(self.w_class) * scored["class_surrogate"]
 
                     rewards = scored["reward"]
                     valid_mask = scored["valid_mask"].bool()
@@ -266,13 +245,9 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
         target_row: Dict[str, object],
         best_of_k: int,
         guidance_start_frac: float,
-        class_guidance_start_frac: float,
-        class_guidance_min_valid_frac: float,
-        class_surrogate_mode: str,
         sol_log_prob_floor: float,
         w_sol: float,
         w_chi: float,
-        w_class: float,
         invalid_reward_penalty: float,
         **kwargs,
     ):
@@ -281,29 +256,23 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
         self.target_row = target_row
         self.best_of_k = int(best_of_k)
         self.guidance_start_frac = float(guidance_start_frac)
-        self.class_guidance_start_frac = float(class_guidance_start_frac)
-        self.class_guidance_min_valid_frac = float(class_guidance_min_valid_frac)
-        self.class_surrogate_mode = str(class_surrogate_mode)
         self.sol_log_prob_floor = float(sol_log_prob_floor)
         self.w_sol = float(w_sol)
         self.w_chi = float(w_chi)
-        self.w_class = float(w_class)
         self.invalid_reward_penalty = float(invalid_reward_penalty)
         self.training_oracle_calls_soluble = 0
         self.training_oracle_calls_chi = 0
-        self.class_guidance_suppressed_steps = 0
         self.guidance_no_valid_fallback_steps = 0
 
     def reset_guidance_stats(self) -> None:
         self.training_oracle_calls_soluble = 0
         self.training_oracle_calls_chi = 0
-        self.class_guidance_suppressed_steps = 0
+        self.guidance_no_valid_fallback_steps = 0
 
     def get_guidance_stats(self) -> Dict[str, int]:
         return {
             "training_soluble_oracle_calls": int(self.training_oracle_calls_soluble),
             "training_chi_oracle_calls": int(self.training_oracle_calls_chi),
-            "class_guidance_suppressed_steps": int(self.class_guidance_suppressed_steps),
             "guidance_no_valid_fallback_steps": int(self.guidance_no_valid_fallback_steps),
         }
 
@@ -428,29 +397,19 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
                 if candidate_blocks:
                     provisional_ids = torch.cat(candidate_blocks, dim=0)
                     provisional_attention = torch.cat(attention_blocks, dim=0)
-                    class_term_enabled = step_progress >= self.class_guidance_start_frac
                     scored = score_guidance_batch(
                         provisional_ids,
                         provisional_attention,
                         target_row=self.target_row,
                         evaluator=self.evaluator,
                         tokenizer=self.tokenizer,
-                        class_surrogate_mode=self.class_surrogate_mode,
-                        class_term_enabled=class_term_enabled,
                         sol_log_prob_floor=self.sol_log_prob_floor,
                         w_sol=self.w_sol,
                         w_chi=self.w_chi,
-                        w_class=self.w_class,
                         invalid_reward_penalty=self.invalid_reward_penalty,
                     )
                     self.training_oracle_calls_soluble += int(scored["oracle_calls_soluble"])
                     self.training_oracle_calls_chi += int(scored["oracle_calls_chi"])
-
-                    valid_frac = float(scored["valid_frac"])
-                    class_term_final = bool(class_term_enabled and valid_frac >= self.class_guidance_min_valid_frac)
-                    if class_term_enabled and not class_term_final:
-                        self.class_guidance_suppressed_steps += 1
-                        scored["reward"] = scored["reward"] - float(self.w_class) * scored["class_surrogate"]
 
                     rewards = scored["reward"]
                     valid_mask = scored["valid_mask"].bool()

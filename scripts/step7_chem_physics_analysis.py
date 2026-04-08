@@ -923,7 +923,7 @@ def _default_step7_config(config: Dict) -> Dict:
         step7_cfg = {}
     out = {
         "split_mode": str(shared.get("split_mode", "polymer")),
-        "chi_dataset_path": str(shared.get("dataset_path", "Data/chi/_250_polymers_T_phi.csv")),
+        "chi_dataset_path": str(shared.get("dataset_path", "Data/chi/polymers_T_phi.csv")),
         "baseline_max_samples": int(step7_cfg.get("baseline_max_samples", 3000)),
         "novelty_similarity_threshold": float(step7_cfg.get("novelty_similarity_threshold", 0.40)),
         "descriptor_top_k": int(step7_cfg.get("descriptor_top_k", 8)),

@@ -132,7 +132,7 @@ training_property:
 # Step 3-6 chi workflow config (per-step structure)
 chi_training:
   shared:
-    dataset_path: "Data/chi/_250_polymers_T_phi.csv"  # labeled chi(T,phi) dataset used in Step 3 and Step4_1
+    dataset_path: "Data/chi/polymers_T_phi.csv"  # labeled chi(T,phi) dataset (288 Polymer entries / 293 SMILES / 7,325 rows) used in Step 3 and Step4_1
     split_mode: "polymer"  # data split mode: polymer (hold out polymers) | random (row-wise random)
     classification_split_mode: "polymer"  # Step4_2 split mode (independent of split_mode used by Step4_1)
     split:
@@ -152,7 +152,7 @@ chi_training:
   # Step4_1: chi(T,phi) regression
   # Main pipeline uses one random_seed per run; optional multi-seed evaluation is handled by scripts/step4_1_multiseed_eval.py.
   step4_1_regression:
-    dataset_path: "Data/chi/_250_polymers_T_phi.csv"
+    dataset_path: "Data/chi/polymers_T_phi.csv"
     batch_size: 128
     num_epochs: 500
     patience: 20
@@ -316,7 +316,7 @@ chi_training:
     decode_constraint_class_match_oversample_factor: 2.0
     decode_constraint_class_match_oversample_factor_overrides:
       polyimide: 4.0
-      polysulfone: 4.0
+      polysulfone: 3.0
     decode_constraint_class_match_min_request_size: 1
     decode_constraint_class_match_min_request_size_overrides:
       polyamide: 4

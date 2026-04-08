@@ -501,7 +501,7 @@ def _default_chi_config(config: Dict) -> Dict:
     )
 
     defaults = {
-        "dataset_path": "Data/chi/_250_polymers_T_phi.csv",
+        "dataset_path": "Data/chi/polymers_T_phi.csv",
         "step4_2_dataset_path": [
             "Data/water_solvent/water_miscible_polymer.csv",
             "Data/water_solvent/water_immiscible_polymer.csv",

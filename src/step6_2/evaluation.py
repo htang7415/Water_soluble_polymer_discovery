@@ -44,6 +44,8 @@ _ANNOTATION_GATES = [
     "sa_ok_discovery",
     "sa_ok",
     "soluble_ok",
+    "property_success_hit_discovery",
+    "property_success_hit",
     "class_ok_loose",
     "class_ok_strict",
     "class_ok",
@@ -411,6 +413,8 @@ def evaluate_generated_samples(
     )
     reporting_success_mask = base_success_mask & out["sa_ok_reporting"].astype(int)
     discovery_success_mask = base_success_mask & out["sa_ok_discovery"].astype(int)
+    out["property_success_hit_discovery"] = discovery_success_mask.astype(int)
+    out["property_success_hit"] = reporting_success_mask.astype(int)
     out["success_hit_discovery_loose"] = (discovery_success_mask & out["class_ok_loose"].astype(int)).astype(int)
     out["success_hit_discovery_strict"] = (discovery_success_mask & out["class_ok_strict"].astype(int)).astype(int)
     out["success_hit_discovery"] = np.where(
@@ -547,6 +551,10 @@ def build_method_metrics(
 
     if round_metrics_df.empty:
         return {
+            "mean_property_success_hit_rate": np.nan,
+            "mean_property_success_hit_rate_discovery": np.nan,
+            "std_property_success_hit_rate": np.nan,
+            "std_property_success_hit_rate_discovery": np.nan,
             "mean_success_hit_rate": np.nan,
             "mean_success_hit_rate_discovery": np.nan,
             "mean_success_hit_rate_discovery_loose": np.nan,
@@ -567,6 +575,14 @@ def build_method_metrics(
             "macro_average_row_mean_success_hit_rate_strict": np.nan,
         }
     return {
+        "mean_property_success_hit_rate": float(round_metrics_df["mean_property_success_hit_rate"].mean()),
+        "mean_property_success_hit_rate_discovery": float(
+            round_metrics_df["mean_property_success_hit_discovery_rate"].mean()
+        ),
+        "std_property_success_hit_rate": float(round_metrics_df["mean_property_success_hit_rate"].std(ddof=0)),
+        "std_property_success_hit_rate_discovery": float(
+            round_metrics_df["mean_property_success_hit_discovery_rate"].std(ddof=0)
+        ),
         "mean_success_hit_rate": float(round_metrics_df["success_hit_rate"].mean()),
         "mean_success_hit_rate_discovery": float(round_metrics_df["success_hit_rate_discovery"].mean()),
         "mean_success_hit_rate_discovery_loose": float(round_metrics_df["success_hit_rate_discovery_loose"].mean()),
@@ -581,6 +597,16 @@ def build_method_metrics(
         "std_success_hit_rate_strict": float(round_metrics_df["success_hit_rate_strict"].std(ddof=0)),
         "macro_average_row_mean_success_hit_rate": (
             float(target_row_summary_df["mean_success_hit_rate"].mean())
+            if not target_row_summary_df.empty
+            else np.nan
+        ),
+        "macro_average_row_mean_property_success_hit_rate": (
+            float(target_row_summary_df["mean_property_success_hit_rate"].mean())
+            if not target_row_summary_df.empty
+            else np.nan
+        ),
+        "macro_average_row_mean_property_success_hit_rate_discovery": (
+            float(target_row_summary_df["mean_property_success_hit_discovery_rate"].mean())
             if not target_row_summary_df.empty
             else np.nan
         ),
@@ -611,6 +637,6 @@ def build_method_metrics(
         ),
         "mean_benchmark_soluble_oracle_calls": float(round_metrics_df["benchmark_soluble_oracle_calls"].mean()),
         "mean_benchmark_chi_oracle_calls": float(round_metrics_df["benchmark_chi_oracle_calls"].mean()),
-        "success_metric_mode": "strict_backbone_else_loose",
-        "discovery_success_metric_mode": "strict_backbone_else_loose_with_class_specific_sa",
+        "success_metric_mode": "property_only_reporting",
+        "discovery_success_metric_mode": "property_only_discovery",
     }

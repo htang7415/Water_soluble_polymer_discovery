@@ -112,6 +112,45 @@ def resolve_step62_sa_thresholds(step6_cfg: Dict[str, Any], c_target: str) -> Di
     }
 
 
+def select_step62_proxy_target_rows(
+    source_df: pd.DataFrame,
+    *,
+    num_targets: int,
+) -> pd.DataFrame:
+    """Select a small deterministic proxy slice from benchmark target rows.
+
+    This is used by S4 checkpoint selection so the proxy objective stays aligned
+    with the actual inverse-design target distribution instead of a disjoint
+    validation table.
+    """
+
+    work = source_df.reset_index(drop=True).copy()
+    if work.empty:
+        return work
+    limit = max(1, min(int(num_targets), int(len(work))))
+    if limit >= len(work):
+        return work
+
+    candidate_indices = np.linspace(0, len(work) - 1, num=limit, dtype=int)
+    seen: set[int] = set()
+    ordered_indices: List[int] = []
+    for idx in candidate_indices.tolist():
+        idx = int(idx)
+        if idx in seen:
+            continue
+        seen.add(idx)
+        ordered_indices.append(idx)
+    if len(ordered_indices) < limit:
+        for idx in range(len(work)):
+            if idx in seen:
+                continue
+            seen.add(idx)
+            ordered_indices.append(int(idx))
+            if len(ordered_indices) >= limit:
+                break
+    return work.iloc[ordered_indices].reset_index(drop=True)
+
+
 @dataclass(frozen=True)
 class ExactChiTargetLookup:
     """Exact-match Step 3 chi-target lookup."""

@@ -8,7 +8,6 @@ import shutil
 import tempfile
 import time
 from copy import deepcopy
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
@@ -50,14 +49,6 @@ def _storage_uri(resolved, *, study_family: str | None = None) -> str:
             db_path = Path(substituted[len("sqlite:///") :])
             substituted = f"sqlite:///{db_path.parent / study_family / db_path.name}"
     return substituted
-
-
-def _token_bias_available(resolved) -> bool:
-    return bool(resolved.class_support_stats.get("token_bias_available", False))
-
-
-def _tune_class_token_bias_in_hpo(resolved) -> bool:
-    return bool(resolved.step6_2_hpo.get("tune_class_token_bias", False))
 
 
 def _backbone_num_layers(resolved) -> int:
@@ -142,12 +133,6 @@ def _apply_hpo_runtime_overrides(resolved, run_cfg: Dict[str, object], *, study_
 
 def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, Any]):
     resolved_trial = resolved
-    if "class_token_bias_start_frac" in params:
-        step62 = deepcopy(resolved.step6_2)
-        step62["class_token_bias_start_frac"] = float(params["class_token_bias_start_frac"])
-        resolved_trial = replace(resolved, step6_2=step62)
-    if "class_token_bias_strength" in params:
-        run_cfg["class_token_bias_strength"] = float(params["class_token_bias_strength"])
     if "finetune_last_layers" in params:
         finetune_value = params["finetune_last_layers"]
         run_cfg["s2"]["finetune_last_layers"] = None if finetune_value == "full" else int(finetune_value)
@@ -158,11 +143,8 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
             {
                 "best_of_k": int(params["best_of_k"]),
                 "guidance_start_frac": float(params["guidance_start_frac"]),
-                "class_guidance_start_frac": float(params["class_guidance_start_frac"]),
-                "class_guidance_min_valid_frac": float(params["class_guidance_min_valid_frac"]),
                 "w_sol": float(params["w_sol"]),
                 "w_chi": float(params["w_chi"]),
-                "w_class": float(params["w_class"]),
             }
         )
     elif family == "S2":
@@ -179,11 +161,8 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
                 "cfg_scale": float(params["cfg_scale"]),
                 "best_of_k": int(params["best_of_k"]),
                 "guidance_start_frac": float(params["guidance_start_frac"]),
-                "class_guidance_start_frac": float(params["class_guidance_start_frac"]),
-                "class_guidance_min_valid_frac": float(params["class_guidance_min_valid_frac"]),
                 "w_sol": float(params["w_sol"]),
                 "w_chi": float(params["w_chi"]),
-                "w_class": float(params["w_class"]),
             }
         )
     elif family == "S4":
@@ -232,18 +211,12 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
 
 def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[str, object]) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
-    token_bias_active = _token_bias_available(resolved)
-    tune_class_token_bias = bool(token_bias_active and _tune_class_token_bias_in_hpo(resolved))
 
     if study_family == "S1":
         params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 8])
         params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.40, 0.65)
-        class_lo = max(params["guidance_start_frac"] + 0.10, 0.60)
-        params["class_guidance_start_frac"] = trial.suggest_float("class_guidance_start_frac", class_lo, 0.90)
-        params["class_guidance_min_valid_frac"] = trial.suggest_float("class_guidance_min_valid_frac", 0.10, 0.40)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
-        params["w_class"] = trial.suggest_float("w_class", 0.25, 2.0, log=True)
     elif study_family == "S2":
         params["finetune_last_layers"] = trial.suggest_categorical(
             "finetune_last_layers", _finetune_last_layer_choices(resolved)
@@ -258,12 +231,8 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 3.0)
         params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 8])
         params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.40, 0.65)
-        class_lo = max(params["guidance_start_frac"] + 0.10, 0.60)
-        params["class_guidance_start_frac"] = trial.suggest_float("class_guidance_start_frac", class_lo, 0.90)
-        params["class_guidance_min_valid_frac"] = trial.suggest_float("class_guidance_min_valid_frac", 0.10, 0.40)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
-        params["w_class"] = trial.suggest_float("w_class", 0.10, 1.0, log=True)
     elif study_family == "S4_rl":
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
@@ -310,10 +279,6 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
             )
     else:
         raise ValueError(f"Unsupported Step 6_2 HPO study family: {study_family}")
-
-    if tune_class_token_bias:
-        params["class_token_bias_start_frac"] = trial.suggest_float("class_token_bias_start_frac", 0.4, 0.75)
-        params["class_token_bias_strength"] = trial.suggest_float("class_token_bias_strength", 0.5, 3.0, log=True)
     return params
 
 
@@ -321,11 +286,9 @@ def _trial_tie_break_key(trial, *, tie_epsilon: float) -> tuple:
     attrs = trial.user_attrs
     return (
         round(float(trial.value or float("-inf")) / max(tie_epsilon, 1.0e-12)),
-        float(attrs.get("mean_class_ok", float("-inf"))),
-        float(attrs.get("mean_chi_ok", float("-inf"))),
         float(attrs.get("mean_soluble_ok", float("-inf"))),
-        float(attrs.get("mean_class_match_acceptance_rate", float("-inf"))),
-        -float(attrs.get("mean_total_raw_samples_drawn", float("inf"))),
+        float(attrs.get("mean_chi_ok", float("-inf"))),
+        float(attrs.get("mean_chi_band_ok", float("-inf"))),
         -float(attrs.get("oracle_call_cost", float("inf"))),
         -float(attrs.get("wall_time_sec", float("inf"))),
     )
@@ -354,6 +317,8 @@ def _write_trial_summary(
     params: Dict[str, Any],
     objective_value: float | None,
     objective_metric: str,
+    mean_property_success_hit_rate: float | None,
+    mean_property_success_hit_rate_discovery: float | None,
     mean_success_hit_rate: float | None,
     mean_success_hit_rate_discovery: float | None,
     mean_class_match_acceptance_rate: float | None = None,
@@ -367,6 +332,14 @@ def _write_trial_summary(
         "state": str(state),
         "objective_metric": str(objective_metric),
         "objective_value": (float(objective_value) if objective_value is not None else None),
+        "mean_property_success_hit_rate": (
+            float(mean_property_success_hit_rate) if mean_property_success_hit_rate is not None else None
+        ),
+        "mean_property_success_hit_rate_discovery": (
+            float(mean_property_success_hit_rate_discovery)
+            if mean_property_success_hit_rate_discovery is not None
+            else None
+        ),
         "mean_success_hit_rate": (float(mean_success_hit_rate) if mean_success_hit_rate is not None else None),
         "mean_success_hit_rate_discovery": (
             float(mean_success_hit_rate_discovery) if mean_success_hit_rate_discovery is not None else None
@@ -389,14 +362,10 @@ def _write_search_space(
     path: Path,
     *,
     study_family: str,
-    token_bias_available: bool,
-    tune_class_token_bias: bool,
     pair_source: str,
 ) -> None:
     payload = {
         "study_family": study_family,
-        "token_bias_available": bool(token_bias_available),
-        "tune_class_token_bias": bool(tune_class_token_bias),
         "pair_source": pair_source,
     }
     with open(path, "w", encoding="utf-8") as handle:
@@ -440,8 +409,6 @@ def run_optuna_study(
     _write_search_space(
         study_root / "search_space.yaml",
         study_family=study_family,
-        token_bias_available=_token_bias_available(resolved),
-        tune_class_token_bias=_tune_class_token_bias_in_hpo(resolved),
         pair_source=str(base_run_cfg.get("s4", {}).get("dpo", {}).get("pair_source", "")),
     )
     resolved.hpo_target_df.to_csv(study_root / "d_hpo_family.csv", index=False)
@@ -476,7 +443,7 @@ def run_optuna_study(
     hpo_num_rounds = int(resolved.step6_2_hpo["hpo_num_rounds"])
     hpo_sampling_seeds = [int(x) for x in resolved.step6_2_hpo["hpo_sampling_seeds"]]
     tie_epsilon = float(resolved.step6_2_hpo.get("tie_epsilon", 1.0e-4))
-    objective_metric_name = "mean_success_hit_rate_discovery"
+    objective_metric_name = "mean_property_success_hit_rate_discovery"
     share_s4_warm_start_in_hpo = bool(resolved.step6_2_hpo.get("reuse_shared_s4_warm_start", True))
     skip_disk_checkpoints_in_hpo = bool(resolved.step6_2_hpo.get("skip_disk_checkpoints", True))
     stage_offsets = {
@@ -542,6 +509,8 @@ def run_optuna_study(
                 params=params,
                 objective_value=None,
                 objective_metric=objective_metric_name,
+                mean_property_success_hit_rate=None,
+                mean_property_success_hit_rate_discovery=None,
                 mean_success_hit_rate=None,
                 mean_success_hit_rate_discovery=None,
                 mean_class_match_acceptance_rate=None,
@@ -552,18 +521,15 @@ def run_optuna_study(
         wall_time = time.time() - start
         metrics = result["method_metrics"]
         eval_df = result["evaluation_results_df"]
+        mean_property_success_hit_rate = float(metrics.get("mean_property_success_hit_rate", float("nan")))
+        mean_property_success_hit_rate_discovery = float(
+            metrics.get(objective_metric_name, mean_property_success_hit_rate)
+        )
         mean_success_hit_rate = float(metrics["mean_success_hit_rate"])
-        mean_success_hit_rate_discovery = float(metrics.get(objective_metric_name, mean_success_hit_rate))
-        trial.report(mean_success_hit_rate_discovery, step=9_999_999)
-        trial.set_user_attr("mean_class_ok", float(eval_df["class_ok"].astype(float).mean()) if not eval_df.empty else float("nan"))
-        trial.set_user_attr(
-            "mean_class_ok_loose",
-            float(eval_df["class_ok_loose"].astype(float).mean()) if "class_ok_loose" in eval_df.columns and not eval_df.empty else float("nan"),
+        mean_success_hit_rate_discovery = float(
+            metrics.get("mean_success_hit_rate_discovery", mean_success_hit_rate)
         )
-        trial.set_user_attr(
-            "mean_class_ok_strict",
-            float(eval_df["class_ok_strict"].astype(float).mean()) if "class_ok_strict" in eval_df.columns and not eval_df.empty else float("nan"),
-        )
+        trial.report(mean_property_success_hit_rate_discovery, step=9_999_999)
         trial.set_user_attr("mean_chi_ok", float(eval_df["chi_ok"].astype(float).mean()) if not eval_df.empty else float("nan"))
         trial.set_user_attr(
             "mean_chi_band_ok",
@@ -575,6 +541,8 @@ def run_optuna_study(
             float(metrics.get("mean_training_soluble_oracle_calls", 0.0)) + float(metrics.get("mean_training_chi_oracle_calls", 0.0)),
         )
         trial.set_user_attr("objective_metric", objective_metric_name)
+        trial.set_user_attr("mean_property_success_hit_rate_reporting", mean_property_success_hit_rate)
+        trial.set_user_attr("mean_property_success_hit_rate_discovery", mean_property_success_hit_rate_discovery)
         trial.set_user_attr("mean_success_hit_rate_reporting", mean_success_hit_rate)
         trial.set_user_attr("mean_success_hit_rate_discovery", mean_success_hit_rate_discovery)
         trial.set_user_attr(
@@ -593,15 +561,17 @@ def run_optuna_study(
             study_family=study_family,
             run_name=str(run_cfg["run_name"]),
             params=params,
-            objective_value=mean_success_hit_rate_discovery,
+            objective_value=mean_property_success_hit_rate_discovery,
             objective_metric=objective_metric_name,
+            mean_property_success_hit_rate=mean_property_success_hit_rate,
+            mean_property_success_hit_rate_discovery=mean_property_success_hit_rate_discovery,
             mean_success_hit_rate=mean_success_hit_rate,
             mean_success_hit_rate_discovery=mean_success_hit_rate_discovery,
             mean_class_match_acceptance_rate=float(metrics.get("mean_class_match_acceptance_rate", float("nan"))),
             mean_total_raw_samples_drawn=float(metrics.get("mean_total_raw_samples_drawn", float("nan"))),
             state="COMPLETE",
         )
-        return mean_success_hit_rate_discovery
+        return mean_property_success_hit_rate_discovery
 
     if remaining_trials > 0:
         study.optimize(objective, n_trials=remaining_trials, timeout=None)
@@ -613,6 +583,8 @@ def run_optuna_study(
         {
             "trial_number": int(trial.number),
             "objective_metric": str(trial.user_attrs.get("objective_metric", objective_metric_name)),
+            "mean_property_success_hit_rate": trial.user_attrs.get("mean_property_success_hit_rate_reporting"),
+            "mean_property_success_hit_rate_discovery": trial.user_attrs.get("mean_property_success_hit_rate_discovery"),
             "mean_success_hit_rate": trial.user_attrs.get("mean_success_hit_rate_reporting"),
             "mean_success_hit_rate_discovery": trial.user_attrs.get("mean_success_hit_rate_discovery"),
             "mean_class_match_acceptance_rate": trial.user_attrs.get("mean_class_match_acceptance_rate"),
@@ -629,6 +601,16 @@ def run_optuna_study(
             "state": str(trial.state.name),
             "objective_metric": str(trial.user_attrs.get("objective_metric", objective_metric_name)),
             "objective_value": (float(trial.value) if trial.value is not None else None),
+            "mean_property_success_hit_rate": (
+                float(trial.user_attrs["mean_property_success_hit_rate_reporting"])
+                if "mean_property_success_hit_rate_reporting" in trial.user_attrs
+                else None
+            ),
+            "mean_property_success_hit_rate_discovery": (
+                float(trial.user_attrs["mean_property_success_hit_rate_discovery"])
+                if "mean_property_success_hit_rate_discovery" in trial.user_attrs
+                else None
+            ),
             "mean_success_hit_rate": (
                 float(trial.user_attrs["mean_success_hit_rate_reporting"])
                 if "mean_success_hit_rate_reporting" in trial.user_attrs
@@ -665,6 +647,12 @@ def run_optuna_study(
                 "objective_metric": objective_metric_name,
                 "best_trial_number": int(best_trial.number),
                 "best_objective_value": float(best_trial.value),
+                "best_mean_property_success_hit_rate": float(
+                    best_trial.user_attrs.get("mean_property_success_hit_rate_reporting", best_trial.value)
+                ),
+                "best_mean_property_success_hit_rate_discovery": float(
+                    best_trial.user_attrs.get("mean_property_success_hit_rate_discovery", best_trial.value)
+                ),
                 "best_mean_success_hit_rate": float(best_trial.user_attrs.get("mean_success_hit_rate_reporting", best_trial.value)),
                 "best_mean_success_hit_rate_discovery": float(
                     best_trial.user_attrs.get("mean_success_hit_rate_discovery", best_trial.value)

@@ -63,13 +63,9 @@ step6_2:
   s1:
     best_of_k: 2
     guidance_start_frac: 0.5
-    class_guidance_start_frac: 0.7
-    class_guidance_min_valid_frac: 0.25
-    class_surrogate_mode: binary_exact
     sol_log_prob_floor: -5.0
     w_sol: 1.0
     w_chi: 2.0
-    w_class: 0.5
     invalid_reward_penalty: -10.0
     embedding_timestep: 1
 
@@ -104,13 +100,9 @@ step6_2:
     supervised_train_config_source: s2
     best_of_k: 2
     guidance_start_frac: 0.5
-    class_guidance_start_frac: 0.7
-    class_guidance_min_valid_frac: 0.25
-    class_surrogate_mode: binary_exact
     sol_log_prob_floor: -5.0
     w_sol: 1.0
     w_chi: 2.0
-    w_class: 0.25
     invalid_reward_penalty: -10.0
     embedding_timestep: 1
     cfg_scale: 1.0
@@ -123,9 +115,8 @@ step6_2:
     optimizer: adamw
     cfg_scale: 1.0
     count_training_oracle_calls_separately: true
-    rl_checkpoint_selection_mode: proxy_success_hit_rate
+    rl_checkpoint_selection_mode: proxy_property_success_hit_rate
     rl_prompt_source: train_exact_step3_distribution
-    rl_use_class_family_sampling: false
     rl_diffusion_num_steps: 25
     sol_log_prob_floor: -5.0
     reward_weights:
@@ -135,7 +126,6 @@ step6_2:
       w_star: 1.0
       w_sa: 1.0
       w_sa_continuous: 0.5
-      w_class: 0.0
       w_sol: 1.0
       w_chi: 2.0
     learning_rate: 1.0e-5
@@ -175,6 +165,17 @@ step6_2:
       synthetic_candidates_per_target: 4
 
   run_overrides:
+    S3_conditional_guided:
+      canonical_family: S3
+      s2:
+        variant: mt
+        mt_aux:
+          head_type: linear
+          soluble_loss_weight: 0.25
+          chi_loss_weight: 0.05
+      s3:
+        guidance_start_frac: 0.75
+        cfg_scale: 0.5
     S2_mt:
       canonical_family: S2
       s2:
@@ -189,6 +190,12 @@ step6_2:
         cfg_scale: 2.0
     S3_cfg_2p0:
       canonical_family: S3
+      s2:
+        variant: mt
+        mt_aux:
+          head_type: linear
+          soluble_loss_weight: 0.25
+          chi_loss_weight: 0.05
       s3:
         cfg_scale: 2.0
     S4_dpo:
@@ -214,7 +221,7 @@ step6_2:
 step6_3:
   compare_all_enabled_runs: false
   summarize_by_canonical_family: true
-  compare_metric: discovery_success_hit_rate
+  compare_metric: property_discovery_success_hit_rate
 
 step6_2_hpo:
   enabled: true
@@ -222,7 +229,6 @@ step6_2_hpo:
   sampler_seed: 42
   n_startup_trials: 5
   pruner: median
-  tune_class_token_bias: false  # keep family-specific class-token bias frozen during per-family HPO unless explicitly re-enabled
   storage_uri: sqlite:///results_<model_size>/step6_2_hpo/<split_mode>/<c_target>/<study_family>/optuna_smoke.db
   reuse_shared_s4_warm_start: true
   skip_disk_checkpoints: true

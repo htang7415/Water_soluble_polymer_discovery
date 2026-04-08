@@ -37,7 +37,7 @@ def _default_chi_config(config: Dict) -> Dict:
     )
 
     defaults = {
-        "dataset_path": "Data/chi/_250_polymers_T_phi.csv",
+        "dataset_path": "Data/chi/polymers_T_phi.csv",
         "split_mode": "polymer",
         "train_ratio": 0.70,
         "val_ratio": 0.14,
