@@ -151,17 +151,37 @@ def load_backbone_from_step1(
     )
     tokenizer = PSmilesTokenizer.load(tokenizer_path)
 
-    backbone_cfg = get_model_config(model_size, config, model_type="sequence")
-    backbone = DiffusionBackbone(
-        vocab_size=tokenizer.vocab_size,
-        hidden_size=backbone_cfg["hidden_size"],
-        num_layers=backbone_cfg["num_layers"],
-        num_heads=backbone_cfg["num_heads"],
-        ffn_hidden_size=backbone_cfg["ffn_hidden_size"],
-        max_position_embeddings=backbone_cfg["max_position_embeddings"],
-        num_diffusion_steps=config["diffusion"]["num_steps"],
-        dropout=backbone_cfg["dropout"],
-        pad_token_id=tokenizer.pad_token_id,
+    backbone = load_backbone_only_from_step1(
+        config=config,
+        tokenizer=tokenizer,
+        model_size=model_size,
+        split_mode=split_mode,
+        checkpoint_path=checkpoint_path,
+        device=device,
+    )
+    return tokenizer, backbone, ckpt_path
+
+
+def load_backbone_only_from_step1(
+    config: Dict,
+    tokenizer: PSmilesTokenizer,
+    model_size: Optional[str] = None,
+    split_mode: Optional[str] = None,
+    checkpoint_path: Optional[str] = None,
+    device: str = "cpu",
+):
+    """Load only the Step 1 backbone encoder using an already-loaded tokenizer."""
+    _, ckpt_path = resolve_step1_artifacts(
+        config=config,
+        model_size=model_size,
+        split_mode=split_mode,
+        checkpoint_path=checkpoint_path,
+    )
+
+    backbone = build_backbone_architecture(
+        config=config,
+        tokenizer=tokenizer,
+        model_size=model_size,
     )
 
     diffusion = DiscreteMaskingDiffusion(
@@ -181,7 +201,28 @@ def load_backbone_from_step1(
 
     backbone = diffusion.backbone.to(device)
     backbone.eval()
-    return tokenizer, backbone, ckpt_path
+    return backbone
+
+
+def build_backbone_architecture(
+    config: Dict,
+    tokenizer: PSmilesTokenizer,
+    model_size: Optional[str] = None,
+):
+    """Instantiate the Step 1 backbone architecture without loading weights."""
+    backbone_cfg = get_model_config(model_size, config, model_type="sequence")
+    backbone = DiffusionBackbone(
+        vocab_size=tokenizer.vocab_size,
+        hidden_size=backbone_cfg["hidden_size"],
+        num_layers=backbone_cfg["num_layers"],
+        num_heads=backbone_cfg["num_heads"],
+        ffn_hidden_size=backbone_cfg["ffn_hidden_size"],
+        max_position_embeddings=backbone_cfg["max_position_embeddings"],
+        num_diffusion_steps=config["diffusion"]["num_steps"],
+        dropout=backbone_cfg["dropout"],
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    return backbone
 
 
 @torch.no_grad()

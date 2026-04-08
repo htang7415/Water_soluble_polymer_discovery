@@ -16,6 +16,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.step6_2.config import build_run_config, load_step6_2_config
+from src.step6_2.evaluation import load_step62_evaluator
 from src.step6_2.run_core import execute_step62_run
 
 
@@ -136,13 +137,29 @@ def _execute_run(
     run_name: str,
     device: str,
     config_path: str,
+    shared_evaluator=None,
 ) -> None:
     execute_step62_run(
         resolved=resolved,
         run_name=run_name,
         device=device,
         config_path=config_path,
+        shared_evaluator=shared_evaluator,
     )
+
+
+def _run_requires_shared_evaluator(run_cfg: Dict[str, object]) -> bool:
+    canonical_family = str(run_cfg.get("canonical_family", "")).strip()
+    if canonical_family in {"S1", "S3"}:
+        return True
+    if canonical_family != "S4":
+        return False
+    alignment_mode = str(run_cfg.get("s4", {}).get("alignment_mode", "")).strip().lower()
+    if alignment_mode in {"rl", "ppo", "grpo"}:
+        return True
+    if alignment_mode == "dpo":
+        return str(run_cfg.get("s4", {}).get("dpo", {}).get("pair_source", "")).strip().lower() == "target_row_synthetic"
+    return False
 
 
 def main() -> None:
@@ -175,12 +192,18 @@ def main() -> None:
     selected_runs = _resolve_requested_runs(resolved, args.runs, args.allow_partial)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    for run_name in selected_runs:
+    selected_run_cfgs = [build_run_config(resolved, run_name) for run_name in selected_runs]
+    shared_evaluator = None
+    if any(_run_requires_shared_evaluator(run_cfg) for run_cfg in selected_run_cfgs):
+        shared_evaluator = load_step62_evaluator(resolved, device=device)
+
+    for run_cfg in selected_run_cfgs:
         _execute_run(
             resolved=resolved,
-            run_name=run_name,
+            run_name=str(run_cfg["run_name"]),
             device=device,
             config_path=args.config,
+            shared_evaluator=shared_evaluator,
         )
 
 

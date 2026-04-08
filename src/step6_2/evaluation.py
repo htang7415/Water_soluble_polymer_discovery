@@ -78,6 +78,7 @@ def load_step62_evaluator(
     *,
     device: str,
     embedding_pooling: str = "mean",
+    skip_novelty_reference: bool = False,
 ) -> Step62Evaluator:
     """Load the shared Step 4-based evaluator bundle."""
 
@@ -118,7 +119,11 @@ def load_step62_evaluator(
             f"Resolved Step4_2 metrics dir: {resolved.step4_cls_metrics_dir}. "
             f"Original error: {exc}"
         ) from exc
-    novelty_reference = resolve_training_smiles(resolved.results_dir, resolved.base_results_dir)
+    novelty_reference = (
+        set()
+        if bool(skip_novelty_reference)
+        else resolve_training_smiles(resolved.results_dir, resolved.base_results_dir)
+    )
     classifier = PolymerClassifier(patterns=resolved.polymer_patterns)
     reporting_sa_thresholds: Dict[str, float] = {}
     discovery_sa_thresholds: Dict[str, float] = {}

@@ -62,6 +62,24 @@ def _as_yamlable(value):
     return value
 
 
+def _resolve_cross_target_duplicate_rejection_enabled(resolved) -> bool:
+    decode_cfg = (
+        resolved.base_config.get("chi_training", {}).get("step6_class_inverse_design", {})
+        if isinstance(resolved.base_config.get("chi_training", {}).get("step6_class_inverse_design", {}), dict)
+        else {}
+    )
+    default_value = bool(decode_cfg.get("decode_constraint_reject_duplicate_canonical_across_targets", False))
+    overrides = decode_cfg.get("decode_constraint_reject_duplicate_canonical_across_targets_overrides", {})
+    if not isinstance(overrides, dict):
+        return default_value
+    target_class = str(resolved.c_target).strip().lower()
+    for raw_key, raw_value in overrides.items():
+        if str(raw_key).strip().lower() != target_class:
+            continue
+        return bool(raw_value)
+    return default_value
+
+
 def create_run_dirs(run_dir: Path, *, create_checkpoints_dir: bool = True) -> Dict[str, Path]:
     metrics_dir = run_dir / "metrics"
     figures_dir = run_dir / "figures"
@@ -127,7 +145,13 @@ def build_s4_warm_start_run_cfg(resolved, run_cfg: Dict[str, object]) -> Dict[st
         raise NotImplementedError(
             f"Unsupported Step 6_2 S4 warm-start source: {source_name}. Only 's2' is implemented."
         )
-    warm_cfg = build_run_config(resolved, "S2_conditional")
+    if "S2_conditional" in resolved.enabled_runs:
+        warm_cfg = build_run_config(resolved, "S2_conditional")
+    else:
+        warm_cfg = deepcopy(resolved.step6_2)
+        warm_cfg["run_name"] = "S2_conditional"
+        warm_cfg["canonical_family"] = "S2"
+        warm_cfg["c_target"] = resolved.c_target
     if isinstance(run_cfg.get("s2"), dict):
         warm_cfg["s2"] = deepcopy(run_cfg["s2"])
     supervised_override = run_cfg.get("s4", {}).get("supervised_train_override")
@@ -311,6 +335,84 @@ def _load_warm_start_artifacts_from_checkpoint(
     )
 
 
+def _load_s2_training_artifacts_from_existing_checkpoint(
+    *,
+    resolved,
+    run_cfg: Dict[str, object],
+    checkpoint_path: Path,
+    metrics_dir: Optional[Path],
+    device: str,
+) -> S2TrainingArtifacts:
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Reusable S2 checkpoint not found: {checkpoint_path}")
+
+    tokenizer, diffusion_model, aux_heads, step1_checkpoint_path, backbone_finetune_info = build_s2_components_from_step1(
+        resolved,
+        device=device,
+        run_cfg=run_cfg,
+    )
+    payload = load_step62_checkpoint_into_modules(
+        checkpoint_path=checkpoint_path,
+        diffusion_model=diffusion_model,
+        aux_heads=aux_heads,
+        device=device,
+    )
+    scaler_payload = dict(payload.get("condition_scaler", {}))
+    scaler = ConditionScaler(
+        temperature_min=float(scaler_payload["temperature_min"]),
+        temperature_max=float(scaler_payload["temperature_max"]),
+        phi_min=float(scaler_payload["phi_min"]),
+        phi_max=float(scaler_payload["phi_max"]),
+        chi_goal_min=float(scaler_payload["chi_goal_min"]),
+        chi_goal_max=float(scaler_payload["chi_goal_max"]),
+    )
+    history_df = pd.DataFrame()
+    augmentation_diag_df = pd.DataFrame()
+    batch_mix_counts: Dict[str, int] = {}
+    if metrics_dir is not None:
+        history_path = metrics_dir / "supervised_training_history.csv"
+        augmentation_path = metrics_dir / "chi_target_augmentation_eligibility.csv"
+        batch_mix_path = metrics_dir / "train_batch_mix_resolved.json"
+        history_df = pd.read_csv(history_path) if history_path.exists() else pd.DataFrame()
+        augmentation_diag_df = pd.read_csv(augmentation_path) if augmentation_path.exists() else pd.DataFrame()
+        if batch_mix_path.exists():
+            with open(batch_mix_path, "r", encoding="utf-8") as handle:
+                batch_mix_counts = json.load(handle)
+
+    return S2TrainingArtifacts(
+        tokenizer=tokenizer,
+        diffusion_model=diffusion_model,
+        aux_heads=aux_heads,
+        checkpoint_path=checkpoint_path,
+        last_checkpoint_path=checkpoint_path.parent / "conditional_diffusion_last.pt",
+        step1_checkpoint_path=step1_checkpoint_path,
+        scaler=scaler,
+        history_df=history_df,
+        augmentation_diag_df=augmentation_diag_df,
+        batch_mix_counts=batch_mix_counts,
+        backbone_finetune_info=backbone_finetune_info,
+    )
+
+
+def _resolve_reusable_s2_artifact_paths(
+    *,
+    extra_context: Optional[Dict[str, Any]],
+) -> tuple[Optional[Path], Optional[Path]]:
+    context = extra_context or {}
+    run_dir_raw = str(context.get("reuse_s2_run_dir", "") or "").strip()
+    if run_dir_raw:
+        run_dir = Path(run_dir_raw)
+        return run_dir / "checkpoints" / "conditional_diffusion_best.pt", run_dir / "metrics"
+
+    checkpoint_raw = str(context.get("reuse_s2_checkpoint_path", "") or "").strip()
+    if not checkpoint_raw:
+        return None, None
+    checkpoint_path = Path(checkpoint_raw)
+    metrics_raw = str(context.get("reuse_s2_metrics_dir", "") or "").strip()
+    metrics_dir = Path(metrics_raw) if metrics_raw else checkpoint_path.parent.parent / "metrics"
+    return checkpoint_path, metrics_dir
+
+
 def _prepare_s4_warm_start(
     *,
     resolved,
@@ -391,6 +493,8 @@ def run_single_target_sampling(
     generation_budget: int,
     evaluator=None,
     s2_scaler=None,
+    seen_canonical_smiles: Optional[set[str]] = None,
+    sampling_state: Optional[Dict[str, object]] = None,
 ) -> Tuple[List[str], Dict[str, int], Dict[str, object]]:
     if run_cfg["run_name"] == "S0_raw_unconditional":
         sampler = create_constrained_sampler(
@@ -407,6 +511,8 @@ def run_single_target_sampling(
             resolved=resolved,
             num_samples=int(generation_budget),
             show_progress=False,
+            seen_canonical_smiles=seen_canonical_smiles,
+            sampling_state=sampling_state,
         )
         return smiles, {"training_soluble_oracle_calls": 0, "training_chi_oracle_calls": 0}, sample_meta
 
@@ -435,6 +541,7 @@ def run_single_target_sampling(
             w_sol=float(s1_cfg["w_sol"]),
             w_chi=float(s1_cfg["w_chi"]),
             w_class=float(s1_cfg["w_class"]),
+            invalid_reward_penalty=float(s1_cfg.get("invalid_reward_penalty", -10.0)),
         )
         sampler.set_class_token_bias_start_frac(float(resolved.step6_2.get("class_token_bias_start_frac", 0.0)))
         if prior.class_token_logit_bias is not None:
@@ -446,6 +553,8 @@ def run_single_target_sampling(
             resolved=resolved,
             num_samples=int(generation_budget),
             show_progress=False,
+            seen_canonical_smiles=seen_canonical_smiles,
+            sampling_state=sampling_state,
         )
         return smiles, sampler.get_guidance_stats(), sample_meta
 
@@ -479,6 +588,8 @@ def run_single_target_sampling(
             resolved=resolved,
             num_samples=int(generation_budget),
             show_progress=False,
+            seen_canonical_smiles=seen_canonical_smiles,
+            sampling_state=sampling_state,
         )
         return smiles, {"training_soluble_oracle_calls": 0, "training_chi_oracle_calls": 0}, sample_meta
 
@@ -522,6 +633,7 @@ def run_single_target_sampling(
             w_sol=float(s3_cfg["w_sol"]),
             w_chi=float(s3_cfg["w_chi"]),
             w_class=float(s3_cfg["w_class"]),
+            invalid_reward_penalty=float(s3_cfg.get("invalid_reward_penalty", -10.0)),
         )
         sampler.set_class_token_bias_start_frac(float(resolved.step6_2.get("class_token_bias_start_frac", 0.0)))
         if prior.class_token_logit_bias is not None:
@@ -533,6 +645,8 @@ def run_single_target_sampling(
             resolved=resolved,
             num_samples=int(generation_budget),
             show_progress=False,
+            seen_canonical_smiles=seen_canonical_smiles,
+            sampling_state=sampling_state,
         )
         return smiles, sampler.get_guidance_stats(), sample_meta
 
@@ -566,6 +680,8 @@ def run_single_target_sampling(
             resolved=resolved,
             num_samples=int(generation_budget),
             show_progress=False,
+            seen_canonical_smiles=seen_canonical_smiles,
+            sampling_state=sampling_state,
         )
         return smiles, {"training_soluble_oracle_calls": 0, "training_chi_oracle_calls": 0}, sample_meta
 
@@ -616,15 +732,32 @@ def execute_step62_run(
     canonical_family = str(run_cfg["canonical_family"])
 
     if canonical_family in {"S2", "S3"}:
-        training_artifacts = train_s2_supervised_run(
-            resolved=resolved,
-            run_cfg=run_cfg,
-            run_dirs=run_dirs,
-            device=device,
-            skip_disk_checkpoints=skip_disk_checkpoints,
-            pruning_callback=pruning_callback,
-            pruning_stage="s2",
-        )
+        reuse_checkpoint_path, reuse_metrics_dir = _resolve_reusable_s2_artifact_paths(extra_context=extra_context)
+        if reuse_checkpoint_path is not None:
+            training_artifacts = _load_s2_training_artifacts_from_existing_checkpoint(
+                resolved=resolved,
+                run_cfg=run_cfg,
+                checkpoint_path=reuse_checkpoint_path,
+                metrics_dir=reuse_metrics_dir,
+                device=device,
+            )
+            _write_json(
+                {
+                    "reused_s2_checkpoint_path": str(reuse_checkpoint_path),
+                    "reused_s2_metrics_dir": (str(reuse_metrics_dir) if reuse_metrics_dir is not None else None),
+                },
+                run_dirs["metrics_dir"] / "reused_s2_checkpoint.json",
+            )
+        else:
+            training_artifacts = train_s2_supervised_run(
+                resolved=resolved,
+                run_cfg=run_cfg,
+                run_dirs=run_dirs,
+                device=device,
+                skip_disk_checkpoints=skip_disk_checkpoints,
+                pruning_callback=pruning_callback,
+                pruning_stage="s2",
+            )
         tokenizer = training_artifacts.tokenizer
         diffusion_model = training_artifacts.diffusion_model
         prior = resolve_class_sampling_prior(resolved, run_cfg, tokenizer, metrics_dir=run_dirs["metrics_dir"])
@@ -724,6 +857,10 @@ def execute_step62_run(
     round_oracle_rows: List[Dict[str, int]] = []
     sampling_meta_rows: List[Dict[str, Any]] = []
     sample_id_start = 1
+    reject_duplicate_canonical_across_targets = _resolve_cross_target_duplicate_rejection_enabled(resolved)
+    cycle_backbone_template_cores_across_targets = bool(
+        getattr(prior, "cycle_backbone_template_cores_across_targets", False)
+    )
 
     if canonical_family in {"S1", "S3"} and evaluator is None:
         evaluator = load_step62_evaluator(resolved, device=device)
@@ -733,6 +870,12 @@ def execute_step62_run(
         round_soluble_calls = 0
         round_chi_calls = 0
         round_class_guidance_suppressed_steps = 0
+        round_seen_canonical_smiles: Optional[set[str]] = set() if reject_duplicate_canonical_across_targets else None
+        round_sampling_state: Optional[Dict[str, object]] = (
+            {}
+            if cycle_backbone_template_cores_across_targets
+            else None
+        )
 
         for _, target_row in target_rows_df.iterrows():
             smiles, guidance_stats, sample_meta = run_single_target_sampling(
@@ -746,6 +889,8 @@ def execute_step62_run(
                 device=device,
                 s2_scaler=s2_scaler,
                 generation_budget=generation_budget,
+                seen_canonical_smiles=round_seen_canonical_smiles,
+                sampling_state=round_sampling_state,
             )
             sampling_meta_rows.append(
                 {
@@ -825,6 +970,7 @@ def execute_step62_run(
             "backbone_template_max_core_token_length": float(
                 max((len(tokenizer.tokenize(core)) for core in prior.backbone_template_cores), default=0)
             ),
+            "enforce_star_ok_acceptance": int(bool(prior.enforce_star_ok_acceptance)),
             "class_token_bias_enabled": int(bool(prior.class_token_logit_bias is not None)),
             "class_token_bias_strength": float(prior.class_token_bias_strength),
             "mean_training_soluble_oracle_calls": (
@@ -884,6 +1030,7 @@ def execute_step62_run(
                 "backbone_template_max_core_token_length": float(
                     max((len(tokenizer.tokenize(core)) for core in prior.backbone_template_cores), default=0)
                 ),
+                "enforce_star_ok_acceptance": int(bool(prior.enforce_star_ok_acceptance)),
                 "mean_total_raw_samples_drawn": float(sampling_meta_df["total_raw_samples_drawn"].mean())
                 if "total_raw_samples_drawn" in sampling_meta_df.columns
                 else 0.0,

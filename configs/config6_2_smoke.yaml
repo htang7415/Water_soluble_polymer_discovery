@@ -8,6 +8,10 @@ step6_2:
   enabled_runs:
     - S0_raw_unconditional
     - S1_guided_frozen
+    - S2_conditional
+    - S3_conditional_guided
+    - S4_rl_finetuned
+    - S4_dpo
     - S4_ppo
     - S4_grpo
   generation_budget: 4
@@ -25,6 +29,15 @@ step6_2:
   class_decode_prior_mode: "on"
   class_token_bias_start_frac: 0.5
   class_token_bias_strength: 1.5
+  conditional_cfg_scale_early_frac: 1.0
+  conditional_cfg_scale_ramp_start_frac: 0.0
+  conditional_cfg_scale_retry_multiplier: 1.0
+  conditional_cfg_scale_early_frac_overrides:
+    polystyrene: 0.75
+  conditional_cfg_scale_ramp_start_frac_overrides:
+    polystyrene: 0.6
+  conditional_cfg_scale_retry_multiplier_overrides:
+    polystyrene: 1.25
   chi_band_epsilon: 0.25
   target_sa_max: 4.0
   reporting_target_sa_max_by_class:
@@ -57,6 +70,7 @@ step6_2:
     w_sol: 1.0
     w_chi: 2.0
     w_class: 0.5
+    invalid_reward_penalty: -10.0
     embedding_timestep: 1
 
   s2:
@@ -84,7 +98,7 @@ step6_2:
       head_type: linear
       soluble_loss_weight: 0.1
       chi_loss_weight: 0.1
-    cfg_scale: 1.0
+    cfg_scale: 0.5
 
   s3:
     supervised_train_config_source: s2
@@ -97,6 +111,7 @@ step6_2:
     w_sol: 1.0
     w_chi: 2.0
     w_class: 0.25
+    invalid_reward_penalty: -10.0
     embedding_timestep: 1
     cfg_scale: 1.0
 
@@ -207,6 +222,7 @@ step6_2_hpo:
   sampler_seed: 42
   n_startup_trials: 5
   pruner: median
+  tune_class_token_bias: false  # keep family-specific class-token bias frozen during per-family HPO unless explicitly re-enabled
   storage_uri: sqlite:///results_<model_size>/step6_2_hpo/<split_mode>/<c_target>/<study_family>/optuna_smoke.db
   reuse_shared_s4_warm_start: true
   skip_disk_checkpoints: true

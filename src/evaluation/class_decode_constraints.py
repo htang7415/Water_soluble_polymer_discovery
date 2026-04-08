@@ -95,12 +95,13 @@ DEFAULT_CLASS_MOTIFS: Dict[str, List[str]] = {
     ],
     "polystyrene": [
         # SMARTS: [#6]-[#6](c1ccccc1)-[#6]
-        # Ring digits are forbidden in motifs, so we provide aromatic-C chains
-        # that the diffusion model can complete into phenyl rings.
-        "CC(cccccc)C",          # backbone with 6 aromatic C (full ring hint)
-        "CC(ccccc)C",           # backbone with 5 aromatic C
-        "CC(cccc)C",            # backbone with 4 aromatic C
-        "CC(ccc)C",             # backbone with 3 aromatic C
+        # Use ring-complete phenyl-bearing motifs. These are token-safe with the
+        # Step 1 tokenizer and give a far stronger class signal than partial
+        # aromatic fragments.
+        "CC(c1ccccc1)C",        # minimal styrene-like phenyl side chain
+        "CC(c1ccccc1)CC",       # slightly longer aliphatic continuation
+        "CCC(c1ccccc1)C",       # alternate phenyl placement with more context
+        "CCC(c1ccccc1)CC",      # longer variant for diffusion infill stability
     ],
 }
 
@@ -125,6 +126,11 @@ DEFAULT_BACKBONE_TEMPLATE_CORES: Dict[str, List[str]] = {
         "CC(=O)OC",
     ],
     "polyamide": [
+        "CCCCCC(=O)NCCCCC",
+        "CCCCC(=O)NCCCC",
+        "CCCC(=O)NCCCCC",
+        "CCC(=O)NCCCCC",
+        "CC(C)C(=O)NCC(C)C",
         "CCC(=O)NCCC",
         "CC(=O)NCC",
         "CC(=O)NC",
@@ -233,11 +239,14 @@ def _is_valid_fragment_tokens(tokens: Sequence[str]) -> bool:
         return False
     if tokens[0] in _FORBIDDEN_EDGE_TOKENS or tokens[-1] in _FORBIDDEN_EDGE_TOKENS:
         return False
-    if any(token.isdigit() or token.startswith("%") for token in tokens):
+    if tokens[0].isdigit() or tokens[-1].isdigit():
+        return False
+    if tokens[0].startswith("%") or tokens[-1].startswith("%"):
         return False
 
     paren_depth = 0
     atom_like_count = 0
+    ring_token_counts: Counter[str] = Counter()
     for token in tokens:
         if token == "(":
             paren_depth += 1
@@ -245,9 +254,13 @@ def _is_valid_fragment_tokens(tokens: Sequence[str]) -> bool:
             paren_depth -= 1
             if paren_depth < 0:
                 return False
+        elif token.isdigit() or token.startswith("%"):
+            ring_token_counts[token] += 1
         if token.startswith("[") or token[:1].isalpha():
             atom_like_count += 1
     if paren_depth != 0:
+        return False
+    if any(count % 2 != 0 for count in ring_token_counts.values()):
         return False
     if atom_like_count < 3:
         return False

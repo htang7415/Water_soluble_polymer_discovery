@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import gzip
+import json
+import os
 import subprocess
 import sys
+import time
 from typing import Dict, List, Tuple
 import warnings
 
@@ -12,7 +16,12 @@ import torch
 import numpy as np
 import pandas as pd
 
-from src.chi.embeddings import load_backbone_from_step1
+from src.chi.embeddings import (
+    build_backbone_architecture,
+    load_backbone_only_from_step1,
+    resolve_step1_artifacts,
+)
+from src.data.tokenizer import PSmilesTokenizer
 from src.chi.model import (
     BackboneDirectChiModel,
     BackbonePhysicsGuidedChiModel,
@@ -29,6 +38,7 @@ CLASS_LABEL_INTERNAL = "water_miscible"
 CLASS_LABEL_PUBLIC = "water_miscible"
 
 CLASS_NAME_MAP = {1: "Water-miscible", 0: "Water-immiscible"}
+_TRAINING_SMILES_CACHE: Dict[Tuple[str, str], set[str]] = {}
 
 
 def unique_preserving_order(values: List[str]) -> List[str]:
@@ -463,17 +473,82 @@ def resolve_training_smiles(results_dir: Path, base_results_dir: Path) -> set[st
     if not train_path.exists():
         raise FileNotFoundError(f"Training set not found for novelty reference: {train_path}")
 
-    train_df = pd.read_csv(train_path)
-    if "p_smiles" in train_df.columns:
+    cache_key = (str(train_path.resolve()), str(train_path.stat().st_mtime_ns))
+    cached = _TRAINING_SMILES_CACHE.get(cache_key)
+    if cached is not None:
+        return set(cached)
+
+    cache_txt = train_path.with_name(f"{train_path.stem}_canonical_smiles_cache.txt.gz")
+    cache_meta = cache_txt.with_suffix(".json")
+    expected_meta = {
+        "source_path": str(train_path.resolve()),
+        "source_size": int(train_path.stat().st_size),
+        "source_mtime_ns": int(train_path.stat().st_mtime_ns),
+    }
+    if cache_txt.exists() and cache_meta.exists():
+        try:
+            with open(cache_meta, "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+            if (
+                str(meta.get("source_path", "")) == expected_meta["source_path"]
+                and int(meta.get("source_size", -1)) == expected_meta["source_size"]
+                and int(meta.get("source_mtime_ns", -1)) == expected_meta["source_mtime_ns"]
+            ):
+                with gzip.open(cache_txt, "rt", encoding="utf-8") as handle:
+                    canonical_set = {line.strip() for line in handle if line.strip()}
+                _TRAINING_SMILES_CACHE[cache_key] = canonical_set
+                return set(canonical_set)
+        except Exception:
+            pass
+
+    header_df = pd.read_csv(train_path, nrows=0)
+    if "p_smiles" in header_df.columns:
         smiles_col = "p_smiles"
-    elif "smiles" in train_df.columns:
+    elif "smiles" in header_df.columns:
         smiles_col = "smiles"
     else:
         raise ValueError(f"Training CSV missing smiles column: {train_path}")
 
-    canonical = train_df[smiles_col].astype(str).map(canonicalize_smiles)
-    canonical = canonical[canonical.notna()]
-    return set(canonical.tolist())
+    verbose_progress = str(os.environ.get("STEP62_EVAL_LOAD_PROGRESS", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
+    chunk_size = int(str(os.environ.get("STEP62_TRAINING_SMILES_CHUNKSIZE", "50000")).strip() or "50000")
+    canonical_set: set[str] = set()
+    rows_seen = 0
+    for chunk_index, chunk_df in enumerate(
+        pd.read_csv(train_path, usecols=[smiles_col], chunksize=chunk_size),
+        start=1,
+    ):
+        canonical = chunk_df[smiles_col].astype(str).map(canonicalize_smiles)
+        canonical = canonical[canonical.notna()]
+        canonical_set.update(canonical.tolist())
+        rows_seen += int(len(chunk_df))
+        if verbose_progress and (chunk_index == 1 or chunk_index % 10 == 0):
+            print(
+                "[step6_2_evaluator_load] "
+                f"stage=novelty_cache_build rows_seen={rows_seen} unique_canonical={len(canonical_set)}",
+                flush=True,
+            )
+    try:
+        with gzip.open(cache_txt, "wt", encoding="utf-8") as handle:
+            for smi in sorted(canonical_set):
+                handle.write(f"{smi}\n")
+        with open(cache_meta, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    **expected_meta,
+                    "n_canonical_smiles": int(len(canonical_set)),
+                },
+                handle,
+                indent=2,
+            )
+    except Exception:
+        pass
+    _TRAINING_SMILES_CACHE[cache_key] = canonical_set
+    return set(canonical_set)
 
 
 def prepare_novel_candidates(
@@ -683,6 +758,19 @@ def prepare_novel_inference_cache(
     device: str,
     split_mode: str,
 ) -> Dict[str, object]:
+    load_start = time.perf_counter()
+    verbose_progress = str(os.environ.get("STEP62_EVAL_LOAD_PROGRESS", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
+
+    def _log_progress(stage: str) -> None:
+        if verbose_progress:
+            elapsed = time.perf_counter() - load_start
+            print(f"[step6_2_evaluator_load] stage={stage} elapsed_s={elapsed:.2f}", flush=True)
+
     uncertainty_enabled = bool(getattr(args, "uncertainty_enabled", chi_cfg.get("uncertainty_enabled", False)))
     uncertainty_mc_samples = int(
         getattr(args, "uncertainty_mc_samples", chi_cfg.get("uncertainty_mc_samples", 20))
@@ -698,13 +786,15 @@ def prepare_novel_inference_cache(
         step4_cls_metrics_dir=step4_cls_metrics_dir,
     )
 
-    tokenizer, step1_backbone, _ = load_backbone_from_step1(
+    tokenizer_path, _ = resolve_step1_artifacts(
         config=config,
         model_size=args.model_size,
         split_mode=split_mode,
         checkpoint_path=args.backbone_checkpoint,
-        device=device,
     )
+    tokenizer = PSmilesTokenizer.load(tokenizer_path)
+    step1_backbone = None
+    _log_progress("tokenizer_loaded")
 
     reg_ckpt = torch.load(chi_checkpoint, map_location=device, weights_only=True)
     reg_state = _normalize_checkpoint_state_dict(reg_ckpt["model_state_dict"])
@@ -712,12 +802,10 @@ def prepare_novel_inference_cache(
     reg_timestep = int(reg_ckpt.get("timestep_for_embedding", timestep))
     regression_mode = str(reg_ckpt.get("regression_mode", "physics_guided")).strip().lower()
     if reg_finetune_last_layers > 0:
-        _, reg_backbone, _ = load_backbone_from_step1(
+        reg_backbone = build_backbone_architecture(
             config=config,
+            tokenizer=tokenizer,
             model_size=args.model_size,
-            split_mode=split_mode,
-            checkpoint_path=args.backbone_checkpoint,
-            device=device,
         )
         if regression_mode == "direct_chi":
             reg_head = DirectChiRegressor(
@@ -768,6 +856,7 @@ def prepare_novel_inference_cache(
         reg_model.train()
     else:
         reg_model.eval()
+    _log_progress("regression_model_loaded")
 
     cls_model = None
     cls_finetune_last_layers = 0
@@ -777,12 +866,10 @@ def prepare_novel_inference_cache(
     cls_finetune_last_layers = int(cls_ckpt.get("finetune_last_layers", 0) or 0)
     cls_timestep = int(cls_ckpt.get("timestep_for_embedding", timestep))
     if cls_finetune_last_layers > 0:
-        _, cls_backbone, _ = load_backbone_from_step1(
+        cls_backbone = build_backbone_architecture(
             config=config,
+            tokenizer=tokenizer,
             model_size=args.model_size,
-            split_mode=split_mode,
-            checkpoint_path=args.backbone_checkpoint,
-            device=device,
         )
         cls_head = SolubilityClassifier(
             embedding_dim=int(cls_ckpt["embedding_dim"]),
@@ -813,6 +900,7 @@ def prepare_novel_inference_cache(
         cls_model.train()
     else:
         cls_model.eval()
+    _log_progress("classification_model_loaded")
 
     if reg_finetune_last_layers > 0:
         warnings.warn(
@@ -835,8 +923,18 @@ def prepare_novel_inference_cache(
 
     reg_needs_step1_embeddings = reg_finetune_last_layers == 0
     cls_needs_step1_embeddings = cls_finetune_last_layers == 0
-    if not (reg_needs_step1_embeddings or cls_needs_step1_embeddings):
-        step1_backbone = None
+    if reg_needs_step1_embeddings or cls_needs_step1_embeddings:
+        step1_backbone = load_backbone_only_from_step1(
+            config=config,
+            tokenizer=tokenizer,
+            model_size=args.model_size,
+            split_mode=split_mode,
+            checkpoint_path=args.backbone_checkpoint,
+            device=device,
+        )
+        _log_progress("step1_backbone_loaded")
+
+    _log_progress("prepare_novel_inference_cache_done")
 
     return {
         "tokenizer": tokenizer,

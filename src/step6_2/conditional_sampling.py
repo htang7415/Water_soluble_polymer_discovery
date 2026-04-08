@@ -13,6 +13,23 @@ from src.step6_2.frozen_sampling import ResolvedClassSamplingPrior, sample_with_
 from src.data.tokenizer import PSmilesTokenizer
 
 
+def _resolve_step62_class_override(
+    step62_cfg: Dict[str, object],
+    *,
+    key: str,
+    target_class: str,
+    default_value: float,
+) -> float:
+    overrides = step62_cfg.get(f"{key}_overrides", {})
+    if isinstance(overrides, dict):
+        target_key = str(target_class).strip().lower()
+        for raw_key, raw_value in overrides.items():
+            if str(raw_key).strip().lower() != target_key:
+                continue
+            return float(raw_value)
+    return float(step62_cfg.get(key, default_value))
+
+
 class ConditionalConstrainedSampler(ConstrainedSampler):
     """Constrained sampler that uses Step 6_2 conditional CFG logits."""
 
@@ -23,6 +40,9 @@ class ConditionalConstrainedSampler(ConstrainedSampler):
         *,
         condition_bundle: torch.Tensor,
         cfg_scale: float,
+        cfg_scale_early_frac: float = 1.0,
+        cfg_scale_ramp_start_frac: float = 0.0,
+        cfg_scale_retry_multiplier: float = 1.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -37,6 +57,55 @@ class ConditionalConstrainedSampler(ConstrainedSampler):
             dtype=torch.float32,
         )
         self.cfg_scale = float(cfg_scale)
+        self.cfg_scale_early_frac = float(cfg_scale_early_frac)
+        self.cfg_scale_ramp_start_frac = float(cfg_scale_ramp_start_frac)
+        self.cfg_scale_retry_multiplier = float(cfg_scale_retry_multiplier)
+        self.cfg_scale_current_attempt_multiplier = 1.0
+        if not (0.0 <= self.cfg_scale_early_frac <= 1.0):
+            raise ValueError(
+                f"cfg_scale_early_frac must be in [0, 1], got {self.cfg_scale_early_frac}"
+            )
+        if not (0.0 <= self.cfg_scale_ramp_start_frac <= 1.0):
+            raise ValueError(
+                f"cfg_scale_ramp_start_frac must be in [0, 1], got {self.cfg_scale_ramp_start_frac}"
+            )
+        if self.cfg_scale_retry_multiplier <= 0.0:
+            raise ValueError(
+                f"cfg_scale_retry_multiplier must be > 0, got {self.cfg_scale_retry_multiplier}"
+            )
+
+    def set_retry_sampling_context(
+        self,
+        *,
+        request_strategy: str,
+        attempts: int,
+        remaining: int,
+        smoothed_acceptance_rate: float,
+    ) -> None:
+        del attempts, remaining, smoothed_acceptance_rate
+        self.cfg_scale_current_attempt_multiplier = (
+            float(self.cfg_scale_retry_multiplier)
+            if str(request_strategy).strip().lower() == "adaptive_acceptance_tail"
+            else 1.0
+        )
+
+    def _cfg_scale_progress_multiplier(self, step_progress: float) -> float:
+        early = float(self.cfg_scale_early_frac)
+        start = float(self.cfg_scale_ramp_start_frac)
+        progress = float(step_progress)
+        if early >= 1.0:
+            return 1.0
+        if progress <= start:
+            return early
+        ramp = (progress - start) / max(1.0e-8, 1.0 - start)
+        return float(early + ((1.0 - early) * max(0.0, min(1.0, ramp))))
+
+    def _effective_cfg_scale(self, step_progress: float) -> float:
+        return (
+            float(self.cfg_scale)
+            * float(self.cfg_scale_current_attempt_multiplier)
+            * float(self._cfg_scale_progress_multiplier(step_progress))
+        )
 
     def _condition_for_batch(self, batch_size: int) -> torch.Tensor:
         if self.condition_bundle.shape[0] == batch_size:
@@ -76,7 +145,7 @@ class ConditionalConstrainedSampler(ConstrainedSampler):
                     timesteps,
                     attention_mask,
                     condition_bundle=cond,
-                    cfg_scale=self.cfg_scale,
+                    cfg_scale=self._effective_cfg_scale(step_progress),
                 )
 
             logits = logits / self.temperature
@@ -161,6 +230,8 @@ def create_conditional_sampler(
     num_steps: int | None = None,
 ) -> ConditionalConstrainedSampler:
     sampling_cfg = resolved.base_config.get("sampling", {})
+    step62_cfg = dict(resolved.step6_2)
+    target_class = str(getattr(resolved, "c_target", "") or step62_cfg.get("c_target", "")).strip().lower()
     sampler = ConditionalConstrainedSampler(
         diffusion_model=diffusion_model,
         tokenizer=tokenizer,
@@ -175,6 +246,24 @@ def create_conditional_sampler(
         device=device,
         condition_bundle=condition_bundle,
         cfg_scale=float(cfg_scale),
+        cfg_scale_early_frac=_resolve_step62_class_override(
+            step62_cfg,
+            key="conditional_cfg_scale_early_frac",
+            target_class=target_class,
+            default_value=1.0,
+        ),
+        cfg_scale_ramp_start_frac=_resolve_step62_class_override(
+            step62_cfg,
+            key="conditional_cfg_scale_ramp_start_frac",
+            target_class=target_class,
+            default_value=0.0,
+        ),
+        cfg_scale_retry_multiplier=_resolve_step62_class_override(
+            step62_cfg,
+            key="conditional_cfg_scale_retry_multiplier",
+            target_class=target_class,
+            default_value=1.0,
+        ),
     )
     sampler.set_class_token_bias_start_frac(float(resolved.step6_2.get("class_token_bias_start_frac", 0.0)))
     if prior.class_token_logit_bias is not None:
@@ -190,6 +279,8 @@ def sample_conditional_with_class_prior(
     resolved: ResolvedStep62Config,
     num_samples: int,
     show_progress: bool = True,
+    seen_canonical_smiles: set[str] | None = None,
+    sampling_state: Dict[str, object] | None = None,
 ) -> Tuple[List[str], Dict[str, object]]:
     """Conditional Step 6_2 sampling through the shared family-aware decode path."""
     return sample_with_class_prior(
@@ -199,4 +290,6 @@ def sample_conditional_with_class_prior(
         resolved=resolved,
         num_samples=num_samples,
         show_progress=show_progress,
+        seen_canonical_smiles=seen_canonical_smiles,
+        sampling_state=sampling_state,
     )

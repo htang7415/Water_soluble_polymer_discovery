@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -22,6 +23,12 @@ from src.model.diffusion import DiscreteMaskingDiffusion
 from src.sampling.sampler import ConstrainedSampler
 from src.step6_2.config import ResolvedStep62Config
 from src.data.tokenizer import PSmilesTokenizer
+from src.utils.chemistry import (
+    canonicalize_smiles,
+    check_validity,
+    count_stars,
+    has_terminal_connection_stars,
+)
 
 
 @dataclass
@@ -40,6 +47,8 @@ class ResolvedClassSamplingPrior:
     center_max_frac: float
     length_prior_lengths: List[int]
     length_prior_source: Optional[str]
+    length_prior_min_tokens: Optional[int]
+    length_prior_max_tokens: Optional[int]
     fallback_source_lengths: List[int]
     class_token_logit_bias: Optional[List[float]]
     class_token_bias_strength: float
@@ -48,10 +57,45 @@ class ResolvedClassSamplingPrior:
     backbone_template_source: Optional[str]
     backbone_template_token_ids: List[List[int]]
     backbone_template_min_gap_tokens: int
+    backbone_template_terminal_star_anchor: bool
+    cycle_backbone_template_cores_across_targets: bool
     enforce_class_match: bool
     enforce_backbone_class_match: bool
     class_match_sampling_attempts_max: int
     class_match_oversample_factor: float
+    class_match_min_request_size: int
+    enforce_star_ok_acceptance: bool
+    reject_duplicate_canonical_acceptance: bool
+    reject_sidechain_backbone_hybrids: bool
+    allowed_atomic_symbols: Optional[List[str]]
+
+
+class ClassConstrainedSamplingQuotaError(RuntimeError):
+    """Raised when class-constrained final sampling cannot fill the requested quota."""
+
+    def __init__(
+        self,
+        *,
+        target_class: str,
+        accepted_smiles: List[str],
+        requested_num_samples: int,
+        attempts_max: int,
+        metadata: Dict[str, object],
+        last_raw_smiles: Optional[List[str]] = None,
+    ):
+        message = (
+            "Step 6_2 class-constrained sampling could not satisfy the target-class quota. "
+            f"target_class={target_class!r} accepted={len(accepted_smiles)} requested={int(requested_num_samples)} "
+            f"after {int(attempts_max)} attempts."
+        )
+        super().__init__(message)
+        self.target_class = str(target_class)
+        self.accepted_smiles = [str(smiles) for smiles in accepted_smiles]
+        self.partial_smiles = list(self.accepted_smiles)
+        self.requested_num_samples = int(requested_num_samples)
+        self.attempts_max = int(attempts_max)
+        self.metadata = dict(metadata)
+        self.last_raw_smiles = [str(smiles) for smiles in (last_raw_smiles or [])]
 
 
 def _normalize_family_sampling_mode(raw_mode: object) -> str:
@@ -72,6 +116,82 @@ def _normalize_family_sampling_scope(raw_scope: object) -> str:
             "{'final_only', 'train_rollout_and_final'}"
         )
     return scope
+
+
+def _resolve_class_override(
+    raw_overrides: object,
+    *,
+    target_class: str,
+    default_value,
+    cast,
+):
+    if not isinstance(raw_overrides, dict):
+        return default_value
+    for raw_key, raw_value in raw_overrides.items():
+        key = str(raw_key).strip().lower()
+        if key != str(target_class).strip().lower():
+            continue
+        return cast(raw_value)
+    return default_value
+
+
+def _resolve_optional_class_int_override(
+    raw_overrides: object,
+    *,
+    target_class: str,
+    default_value: Optional[int],
+) -> Optional[int]:
+    if not isinstance(raw_overrides, dict):
+        return default_value
+    for raw_key, raw_value in raw_overrides.items():
+        key = str(raw_key).strip().lower()
+        if key != str(target_class).strip().lower():
+            continue
+        if raw_value in {None, "", "null"}:
+            return None
+        return int(raw_value)
+    return default_value
+
+
+def _normalize_optional_symbol_list(raw_value: object) -> Optional[List[str]]:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, str) and raw_value.strip().lower() in {"", "null"}:
+        return None
+    if isinstance(raw_value, str):
+        tokens = [token.strip() for token in raw_value.split(",") if token.strip()]
+    elif isinstance(raw_value, (list, tuple, set)):
+        tokens = [str(token).strip() for token in raw_value if str(token).strip()]
+    else:
+        raise ValueError(
+            "decode constraint allowed atomic symbol overrides must be null, a comma-delimited string, or a list"
+        )
+    if not tokens:
+        return None
+    seen: set[str] = set()
+    normalized: List[str] = []
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        normalized.append(token)
+    return normalized
+
+
+def _resolve_optional_class_symbol_list_override(
+    raw_overrides: object,
+    *,
+    target_class: str,
+    default_value: Optional[List[str]],
+) -> Optional[List[str]]:
+    if not isinstance(raw_overrides, dict):
+        return default_value
+    for raw_key, raw_value in raw_overrides.items():
+        key = str(raw_key).strip().lower()
+        if key != str(target_class).strip().lower():
+            continue
+        return _normalize_optional_symbol_list(raw_value)
+    return default_value
 
 
 def _prepare_decode_constraint_token_ids(
@@ -295,6 +415,8 @@ def _build_backbone_template_multi_spans(
     star_token_id: int,
     backbone_gap_token_id: int,
     min_gap_tokens: int,
+    anchor_terminal_stars: bool,
+    sampling_state: Optional[Dict[str, object]] = None,
 ) -> tuple[List[List[List[int]]], List[List[int]], List[int]]:
     if not backbone_template_token_ids:
         raise ValueError("backbone_template_token_ids is empty")
@@ -316,30 +438,64 @@ def _build_backbone_template_multi_spans(
     start_positions: List[List[int]] = []
     star_span = [int(star_token_id)]
     gap_span = [int(backbone_gap_token_id)] * max(0, int(min_gap_tokens))
-
     for effective_length in adjusted_lengths:
-        fitting = [
-            ids
-            for ids in backbone_template_token_ids
+        fitting_indices = [
+            idx
+            for idx, ids in enumerate(backbone_template_token_ids)
             if len(ids) <= max(1, int(effective_length) - 4 - (2 * int(min_gap_tokens)))
         ]
-        if not fitting:
+        if not fitting_indices:
             raise ValueError(
                 f"No backbone-template core fits effective sequence length {effective_length}. "
                 "Increase allowed lengths or shorten the template core."
             )
-        core_ids = list(fitting[np.random.randint(0, len(fitting))])
+        selected_index: int
+        if sampling_state is not None:
+            used_raw = sampling_state.get("used_backbone_template_core_indices", [])
+            if isinstance(used_raw, (list, tuple, set)):
+                used_indices = {int(value) for value in used_raw}
+            else:
+                used_indices = set()
+            available_indices = [idx for idx in fitting_indices if idx not in used_indices]
+            if not available_indices:
+                used_indices = set()
+                available_indices = list(fitting_indices)
+            selected_index = int(available_indices[np.random.randint(0, len(available_indices))])
+            used_indices.add(selected_index)
+            sampling_state["used_backbone_template_core_indices"] = sorted(used_indices)
+        else:
+            selected_index = int(fitting_indices[np.random.randint(0, len(fitting_indices))])
+        core_ids = list(backbone_template_token_ids[selected_index])
+        center_frac = (
+            center_min_frac
+            if center_min_frac == center_max_frac
+            else float(np.random.uniform(center_min_frac, center_max_frac))
+        )
+        if anchor_terminal_stars:
+            left_span = star_span + gap_span
+            right_span = gap_span + star_span
+            left_start = 1
+            right_start = int(effective_length) - 1 - len(right_span)
+            min_core_start = left_start + len(left_span)
+            max_core_start = right_start - len(core_ids)
+            if max_core_start < min_core_start:
+                raise ValueError(
+                    f"Anchored backbone-template core length {len(core_ids)} does not fit sequence length {effective_length}"
+                )
+            candidate_core_start = int(
+                round(center_frac * float(max(1, effective_length - 1)) - (0.5 * len(core_ids)))
+            )
+            core_start = max(min_core_start, min(max_core_start, candidate_core_start))
+            chosen_spans.append([left_span, core_ids, right_span])
+            start_positions.append([left_start, core_start, right_start])
+            continue
+
         scaffold_ids = star_span + gap_span + core_ids + gap_span + star_span
         max_start = int(effective_length) - 1 - len(scaffold_ids)
         if max_start < 1:
             raise ValueError(
                 f"Backbone-template scaffold length {len(scaffold_ids)} does not fit sequence length {effective_length}"
             )
-        center_frac = (
-            center_min_frac
-            if center_min_frac == center_max_frac
-            else float(np.random.uniform(center_min_frac, center_max_frac))
-        )
         candidate_start = int(round(center_frac * float(max(1, effective_length - 1)) - (0.5 * len(scaffold_ids))))
         scaffold_start = max(1, min(max_start, candidate_start))
         chosen_spans.append([scaffold_ids])
@@ -445,12 +601,78 @@ def resolve_class_sampling_prior(
             patterns=resolved.polymer_patterns,
             max_length=int(tokenizer.max_length),
         )
+    raw_length_prior_min_tokens = step6_cfg.get("decode_constraint_length_prior_min_tokens")
+    length_prior_min_tokens_default = (
+        None
+        if raw_length_prior_min_tokens in {None, "", "null"}
+        else int(raw_length_prior_min_tokens)
+    )
+    length_prior_min_tokens = _resolve_optional_class_int_override(
+        step6_cfg.get("decode_constraint_length_prior_min_tokens_overrides", {}),
+        target_class=target_class,
+        default_value=length_prior_min_tokens_default,
+    )
+    raw_length_prior_max_tokens = step6_cfg.get("decode_constraint_length_prior_max_tokens")
+    length_prior_max_tokens_default = (
+        None
+        if raw_length_prior_max_tokens in {None, "", "null"}
+        else int(raw_length_prior_max_tokens)
+    )
+    length_prior_max_tokens = _resolve_optional_class_int_override(
+        step6_cfg.get("decode_constraint_length_prior_max_tokens_overrides", {}),
+        target_class=target_class,
+        default_value=length_prior_max_tokens_default,
+    )
     fallback_source_lengths = _token_lengths_from_smiles(tokenizer, source_smiles)
-    class_token_bias_strength = float(run_cfg.get("class_token_bias_strength", 1.5))
+    class_token_bias_strength = _resolve_class_override(
+        step6_cfg.get("decode_constraint_class_token_bias_strength_overrides", {}),
+        target_class=target_class,
+        default_value=float(run_cfg.get("class_token_bias_strength", 1.5)),
+        cast=float,
+    )
     enforce_class_match = bool(step6_cfg.get("decode_constraint_enforce_class_match", False))
     enforce_backbone_class_match = bool(step6_cfg.get("decode_constraint_enforce_backbone_class_match", False))
-    class_match_sampling_attempts_max = int(step6_cfg.get("decode_constraint_class_match_sampling_attempts_max", 12))
-    class_match_oversample_factor = float(step6_cfg.get("decode_constraint_class_match_oversample_factor", 2.0))
+    class_match_sampling_attempts_max = _resolve_class_override(
+        step6_cfg.get("decode_constraint_class_match_sampling_attempts_max_overrides", {}),
+        target_class=target_class,
+        default_value=int(step6_cfg.get("decode_constraint_class_match_sampling_attempts_max", 12)),
+        cast=int,
+    )
+    class_match_oversample_factor = _resolve_class_override(
+        step6_cfg.get("decode_constraint_class_match_oversample_factor_overrides", {}),
+        target_class=target_class,
+        default_value=float(step6_cfg.get("decode_constraint_class_match_oversample_factor", 2.0)),
+        cast=float,
+    )
+    class_match_min_request_size = _resolve_class_override(
+        step6_cfg.get("decode_constraint_class_match_min_request_size_overrides", {}),
+        target_class=target_class,
+        default_value=int(step6_cfg.get("decode_constraint_class_match_min_request_size", 1)),
+        cast=int,
+    )
+    enforce_star_ok_acceptance = _resolve_class_override(
+        step6_cfg.get("decode_constraint_enforce_star_ok_acceptance_overrides", {}),
+        target_class=target_class,
+        default_value=bool(step6_cfg.get("decode_constraint_enforce_star_ok_acceptance", False)),
+        cast=bool,
+    )
+    reject_duplicate_canonical_acceptance = bool(
+        step6_cfg.get("decode_constraint_reject_duplicate_canonical_acceptance", True)
+    )
+    reject_sidechain_backbone_hybrids = _resolve_class_override(
+        step6_cfg.get("decode_constraint_reject_sidechain_backbone_hybrid_overrides", {}),
+        target_class=target_class,
+        default_value=bool(step6_cfg.get("decode_constraint_reject_sidechain_backbone_hybrid", False)),
+        cast=bool,
+    )
+    allowed_atomic_symbols_default = _normalize_optional_symbol_list(
+        step6_cfg.get("decode_constraint_allowed_atomic_symbols")
+    )
+    allowed_atomic_symbols = _resolve_optional_class_symbol_list_override(
+        step6_cfg.get("decode_constraint_allowed_atomic_symbols_overrides", {}),
+        target_class=target_class,
+        default_value=allowed_atomic_symbols_default,
+    )
     family_sampling_scope = _normalize_family_sampling_scope(
         step6_cfg.get("decode_constraint_family_sampling_scope", "final_only")
     )
@@ -479,6 +701,18 @@ def resolve_class_sampling_prior(
             if str(token).strip()
         }
     backbone_template_globally_enabled = bool(step6_cfg.get("decode_constraint_backbone_template_enabled", True))
+    center_min_frac = _resolve_class_override(
+        step6_cfg.get("decode_constraint_center_min_frac_overrides", {}),
+        target_class=target_class,
+        default_value=float(step6_cfg.get("decode_constraint_center_min_frac", 0.25)),
+        cast=float,
+    )
+    center_max_frac = _resolve_class_override(
+        step6_cfg.get("decode_constraint_center_max_frac_overrides", {}),
+        target_class=target_class,
+        default_value=float(step6_cfg.get("decode_constraint_center_max_frac", 0.75)),
+        cast=float,
+    )
     explicit_family_mode = family_sampling_mode_overrides.get(target_class)
     family_sampling_mode = explicit_family_mode or default_family_sampling_mode
     if not decode_constraint_enabled:
@@ -512,16 +746,39 @@ def resolve_class_sampling_prior(
             family_sampling_mode = "motif" if motif_token_ids else "none"
             template_enabled = False
     if template_enabled:
+        backbone_template_max_templates = _resolve_class_override(
+            step6_cfg.get("decode_constraint_backbone_template_max_templates_overrides", {}),
+            target_class=target_class,
+            default_value=int(step6_cfg.get("decode_constraint_backbone_template_max_templates", 3)),
+            cast=int,
+        )
         backbone_template_cores, backbone_template_source = resolve_class_backbone_template_cores(
             target_class=target_class,
             tokenizer=tokenizer,
-            max_templates=int(step6_cfg.get("decode_constraint_backbone_template_max_templates", 3)),
+            max_templates=int(backbone_template_max_templates),
         )
         backbone_template_token_ids = _prepare_decode_constraint_token_ids(tokenizer, backbone_template_cores)
         template_enabled = bool(backbone_template_token_ids)
         if not template_enabled:
             family_sampling_mode = "motif" if motif_token_ids else "none"
-    backbone_template_min_gap_tokens = int(step6_cfg.get("decode_constraint_backbone_template_min_gap_tokens", 1))
+    backbone_template_min_gap_tokens = _resolve_class_override(
+        step6_cfg.get("decode_constraint_backbone_template_min_gap_tokens_overrides", {}),
+        target_class=target_class,
+        default_value=int(step6_cfg.get("decode_constraint_backbone_template_min_gap_tokens", 1)),
+        cast=int,
+    )
+    backbone_template_terminal_star_anchor = _resolve_class_override(
+        step6_cfg.get("decode_constraint_backbone_template_terminal_star_anchor_overrides", {}),
+        target_class=target_class,
+        default_value=bool(step6_cfg.get("decode_constraint_backbone_template_terminal_star_anchor", False)),
+        cast=bool,
+    )
+    cycle_backbone_template_cores_across_targets = _resolve_class_override(
+        step6_cfg.get("decode_constraint_cycle_backbone_template_cores_across_targets_overrides", {}),
+        target_class=target_class,
+        default_value=bool(step6_cfg.get("decode_constraint_cycle_backbone_template_cores_across_targets", False)),
+        cast=bool,
+    )
 
     prior = ResolvedClassSamplingPrior(
         target_class=target_class,
@@ -532,10 +789,12 @@ def resolve_class_sampling_prior(
         motif_source=motif_source,
         motif_token_ids=motif_token_ids,
         spans_per_sample=int(step6_cfg.get("decode_constraint_spans_per_sample", 2)),
-        center_min_frac=float(step6_cfg.get("decode_constraint_center_min_frac", 0.25)),
-        center_max_frac=float(step6_cfg.get("decode_constraint_center_max_frac", 0.75)),
+        center_min_frac=float(center_min_frac),
+        center_max_frac=float(center_max_frac),
         length_prior_lengths=length_prior_lengths,
         length_prior_source=length_prior_source,
+        length_prior_min_tokens=length_prior_min_tokens,
+        length_prior_max_tokens=length_prior_max_tokens,
         fallback_source_lengths=fallback_source_lengths,
         class_token_logit_bias=class_token_logit_bias,
         class_token_bias_strength=class_token_bias_strength,
@@ -544,10 +803,17 @@ def resolve_class_sampling_prior(
         backbone_template_source=backbone_template_source,
         backbone_template_token_ids=backbone_template_token_ids,
         backbone_template_min_gap_tokens=backbone_template_min_gap_tokens,
+        backbone_template_terminal_star_anchor=bool(backbone_template_terminal_star_anchor),
+        cycle_backbone_template_cores_across_targets=bool(cycle_backbone_template_cores_across_targets),
         enforce_class_match=bool(enforce_class_match),
         enforce_backbone_class_match=bool(enforce_backbone_class_match),
         class_match_sampling_attempts_max=int(class_match_sampling_attempts_max),
         class_match_oversample_factor=float(class_match_oversample_factor),
+        class_match_min_request_size=max(1, int(class_match_min_request_size)),
+        enforce_star_ok_acceptance=bool(enforce_star_ok_acceptance),
+        reject_duplicate_canonical_acceptance=bool(reject_duplicate_canonical_acceptance),
+        reject_sidechain_backbone_hybrids=bool(reject_sidechain_backbone_hybrids),
+        allowed_atomic_symbols=list(allowed_atomic_symbols) if allowed_atomic_symbols else None,
     )
 
     if metrics_dir is not None:
@@ -575,6 +841,8 @@ def resolve_class_sampling_prior(
                         "target_class": target_class,
                         "source": length_prior_source,
                         "lengths": length_prior_lengths,
+                        "min_tokens": prior.length_prior_min_tokens,
+                        "max_tokens": prior.length_prior_max_tokens,
                     },
                     handle,
                     indent=2,
@@ -598,6 +866,8 @@ def resolve_class_sampling_prior(
                     "enabled": bool(prior.backbone_template_enabled),
                     "source": prior.backbone_template_source,
                     "min_gap_tokens": int(prior.backbone_template_min_gap_tokens),
+                    "terminal_star_anchor": bool(prior.backbone_template_terminal_star_anchor),
+                    "cycle_cores_across_targets": bool(prior.cycle_backbone_template_cores_across_targets),
                     "center_min_frac": float(prior.center_min_frac),
                     "center_max_frac": float(prior.center_max_frac),
                     "cores": prior.backbone_template_cores,
@@ -607,6 +877,11 @@ def resolve_class_sampling_prior(
                     "enforce_backbone_class_match": bool(prior.enforce_backbone_class_match),
                     "class_match_sampling_attempts_max": int(prior.class_match_sampling_attempts_max),
                     "class_match_oversample_factor": float(prior.class_match_oversample_factor),
+                    "class_match_min_request_size": int(prior.class_match_min_request_size),
+                    "enforce_star_ok_acceptance": bool(prior.enforce_star_ok_acceptance),
+                    "reject_duplicate_canonical_acceptance": bool(prior.reject_duplicate_canonical_acceptance),
+                    "reject_sidechain_backbone_hybrids": bool(prior.reject_sidechain_backbone_hybrids),
+                    "allowed_atomic_symbols": prior.allowed_atomic_symbols,
                 },
                 handle,
                 indent=2,
@@ -651,9 +926,15 @@ def _sample_lengths(
             + 4
             + (2 * int(prior.backbone_template_min_gap_tokens)),
         )
-    if motif_buffer > 0:
-        lengths = [max(int(length), int(motif_buffer)) for length in lengths]
-    return [min(int(tokenizer.max_length), int(length)) for length in lengths]
+    min_length = max(2, int(prior.length_prior_min_tokens or 0), int(motif_buffer))
+    max_length = int(tokenizer.max_length)
+    if prior.length_prior_max_tokens is not None:
+        max_length = min(max_length, int(prior.length_prior_max_tokens))
+    max_length = max(int(min_length), int(max_length))
+    return [
+        min(int(tokenizer.max_length), max(int(min_length), min(int(max_length), int(length))))
+        for length in lengths
+    ]
 
 
 def create_constrained_sampler(
@@ -692,6 +973,7 @@ def _sample_raw_smiles_with_prior(
     resolved: ResolvedStep62Config,
     num_samples: int,
     show_progress: bool,
+    sampling_state: Optional[Dict[str, object]] = None,
 ) -> Tuple[List[str], Dict[str, object]]:
     sampling_cfg = resolved.base_config.get("sampling", {})
     lengths = _sample_lengths(
@@ -714,6 +996,12 @@ def _sample_raw_smiles_with_prior(
             star_token_id=int(tokenizer.get_star_token_id()),
             backbone_gap_token_id=backbone_gap_token_id,
             min_gap_tokens=int(prior.backbone_template_min_gap_tokens),
+            anchor_terminal_stars=bool(prior.backbone_template_terminal_star_anchor),
+            sampling_state=(
+                sampling_state
+                if prior.cycle_backbone_template_cores_across_targets
+                else None
+            ),
         )
         _, smiles = sampler.sample_batch_with_multiple_fixed_spans(
             num_samples=num_samples,
@@ -767,85 +1055,129 @@ def _sample_raw_smiles_with_prior(
     return smiles, {
         "length_prior_count": int(len(prior.length_prior_lengths)),
         "length_prior_source": prior.length_prior_source,
+        "sampled_lengths": [int(length) for length in lengths],
     }
+
+
+def _unexpected_atomic_symbols(
+    smiles: str,
+    *,
+    allowed_atomic_symbols: Optional[List[str]],
+) -> List[str]:
+    if not allowed_atomic_symbols:
+        return []
+    try:
+        from rdkit import Chem
+
+        smiles_clean = str(smiles).replace("*", "[*]")
+        mol = Chem.MolFromSmiles(smiles_clean)
+        if mol is None:
+            mol = Chem.MolFromSmiles(str(smiles))
+        if mol is None:
+            return []
+        allowed = set(str(symbol) for symbol in allowed_atomic_symbols)
+        return sorted({atom.GetSymbol() for atom in mol.GetAtoms() if atom.GetSymbol() not in allowed})
+    except Exception:
+        return []
 
 
 def _accepted_target_class_indices(
     smiles_list: List[str],
     *,
     prior: ResolvedClassSamplingPrior,
-    classifier: PolymerClassifier,
-) -> List[int]:
+    classifier: Optional[PolymerClassifier],
+    seen_canonical_smiles: set[str],
+) -> tuple[List[int], Dict[str, int]]:
     use_backbone = bool(prior.target_class in BACKBONE_CLASS_MATCH_CLASSES and prior.enforce_backbone_class_match)
     accepted: List[int] = []
+    stats = {
+        "target_class_candidate_count": 0,
+        "star_filter_rejected_count": 0,
+        "sidechain_backbone_hybrid_rejected_count": 0,
+        "unexpected_atoms_rejected_count": 0,
+        "duplicate_canonical_rejected_count": 0,
+    }
     for idx, smiles in enumerate(smiles_list):
+        smiles_str = str(smiles)
+        valid_ok = bool(check_validity(smiles_str))
         try:
-            matches = classifier.classify_backbone(str(smiles)) if use_backbone else classifier.classify(str(smiles))
+            if prior.enforce_class_match and classifier is not None:
+                matches = classifier.classify_backbone(smiles_str) if use_backbone else classifier.classify(smiles_str)
+            else:
+                matches = {prior.target_class: True}
         except Exception:
             matches = {}
-        if bool(matches.get(prior.target_class, False)):
+        class_ok = bool(matches.get(prior.target_class, False))
+        if not class_ok:
+            continue
+        stats["target_class_candidate_count"] += 1
+        if prior.enforce_star_ok_acceptance:
+            if not (
+                valid_ok
+                and count_stars(smiles_str) == 2
+                and has_terminal_connection_stars(smiles_str, expected_stars=2)
+            ):
+                stats["star_filter_rejected_count"] += 1
+                continue
+        if prior.reject_sidechain_backbone_hybrids and prior.target_class not in BACKBONE_CLASS_MATCH_CLASSES:
+            backbone_matches = classifier.classify_backbone(smiles_str) if (valid_ok and classifier is not None) else {}
+            hybrid_backbone_families = [
+                str(name)
+                for name, matched in backbone_matches.items()
+                if matched and name in BACKBONE_CLASS_MATCH_CLASSES
+            ]
+            if hybrid_backbone_families:
+                stats["sidechain_backbone_hybrid_rejected_count"] += 1
+                continue
+        if prior.allowed_atomic_symbols:
+            unexpected_symbols = _unexpected_atomic_symbols(
+                smiles_str,
+                allowed_atomic_symbols=prior.allowed_atomic_symbols,
+            )
+            if unexpected_symbols:
+                stats["unexpected_atoms_rejected_count"] += 1
+                continue
+        canonical_smiles = canonicalize_smiles(smiles_str) if valid_ok else None
+        if (
+            prior.reject_duplicate_canonical_acceptance
+            and canonical_smiles is not None
+            and canonical_smiles in seen_canonical_smiles
+        ):
+            stats["duplicate_canonical_rejected_count"] += 1
+            continue
+        if canonical_smiles is not None:
+            seen_canonical_smiles.add(canonical_smiles)
+        if class_ok:
             accepted.append(int(idx))
-    return accepted
+    return accepted, stats
 
 
-def sample_with_class_prior(
+def _build_class_sampling_metadata(
     *,
-    sampler: ConstrainedSampler,
     tokenizer: PSmilesTokenizer,
     prior: ResolvedClassSamplingPrior,
-    resolved: ResolvedStep62Config,
     num_samples: int,
-    show_progress: bool = True,
-) -> Tuple[List[str], Dict[str, object]]:
-    """Sample polymers with Step 6 class priors using a sampler-compatible backend.
-
-    This decode path is shared by frozen and conditional samplers, so family-aware
-    template/scaffold changes here affect every final-generation Step 6_2 method.
-    """
-    accepted_smiles: List[str] = []
-    accepted_raw_count = 0
-    total_drawn = 0
-    attempts = 0
-    classifier = PolymerClassifier(patterns=resolved.polymer_patterns) if prior.enforce_class_match else None
-    last_raw_meta: Dict[str, object] = {}
-
-    while len(accepted_smiles) < int(num_samples):
-        attempts += 1
-        if attempts > int(prior.class_match_sampling_attempts_max):
-            raise RuntimeError(
-                "Step 6_2 class-constrained sampling could not satisfy the target-class quota. "
-                f"target_class={prior.target_class!r} accepted={len(accepted_smiles)} requested={int(num_samples)} "
-                f"after {int(prior.class_match_sampling_attempts_max)} attempts."
-            )
-        remaining = int(num_samples) - len(accepted_smiles)
-        request_size = remaining
-        if prior.enforce_class_match:
-            request_size = max(
-                remaining,
-                int(np.ceil(float(remaining) * float(prior.class_match_oversample_factor))),
-            )
-        raw_smiles, raw_meta = _sample_raw_smiles_with_prior(
-            sampler=sampler,
-            tokenizer=tokenizer,
-            prior=prior,
-            resolved=resolved,
-            num_samples=int(request_size),
-            show_progress=show_progress and attempts == 1,
-        )
-        last_raw_meta = raw_meta
-        total_drawn += int(len(raw_smiles))
-        if prior.enforce_class_match and classifier is not None:
-            accepted_idx = _accepted_target_class_indices(raw_smiles, prior=prior, classifier=classifier)
-            accepted_raw_count += int(len(accepted_idx))
-            accepted_smiles.extend([raw_smiles[idx] for idx in accepted_idx])
-        else:
-            accepted_raw_count += int(len(raw_smiles))
-            accepted_smiles.extend(raw_smiles)
-
-    smiles = accepted_smiles[: int(num_samples)]
-
+    returned_smiles: List[str],
+    accepted_smiles: List[str],
+    total_drawn: int,
+    accepted_raw_count: int,
+    attempts: int,
+    last_raw_meta: Dict[str, object],
+    quota_satisfied: bool,
+    attempt_log: Optional[List[Dict[str, object]]] = None,
+    last_raw_smiles: Optional[List[str]] = None,
+    last_raw_accepted_indices: Optional[List[int]] = None,
+    filter_rejection_counts: Optional[Dict[str, int]] = None,
+    total_wall_time_seconds: Optional[float] = None,
+    total_raw_sampling_wall_time_seconds: Optional[float] = None,
+    total_filter_wall_time_seconds: Optional[float] = None,
+) -> Dict[str, object]:
     metadata = {
         "num_samples": int(num_samples),
+        "returned_num_samples": int(len(returned_smiles)),
+        "accepted_num_samples": int(len(accepted_smiles)),
+        "remaining_num_samples": max(0, int(num_samples) - int(len(returned_smiles))),
+        "quota_satisfied": bool(quota_satisfied),
         "total_raw_samples_drawn": int(total_drawn),
         "accepted_raw_target_class_samples": int(accepted_raw_count),
         "class_match_sampling_attempts": int(attempts),
@@ -855,6 +1187,34 @@ def sample_with_class_prior(
         "class_match_oversampling_ratio": (
             float(total_drawn) / float(num_samples) if int(num_samples) > 0 else 0.0
         ),
+        "class_match_total_wall_time_seconds": (
+            float(total_wall_time_seconds) if total_wall_time_seconds is not None else None
+        ),
+        "class_match_total_raw_sampling_wall_time_seconds": (
+            float(total_raw_sampling_wall_time_seconds)
+            if total_raw_sampling_wall_time_seconds is not None
+            else None
+        ),
+        "class_match_total_filter_wall_time_seconds": (
+            float(total_filter_wall_time_seconds)
+            if total_filter_wall_time_seconds is not None
+            else None
+        ),
+        "class_match_wall_time_seconds_per_raw_draw": (
+            float(total_wall_time_seconds) / float(total_drawn)
+            if total_wall_time_seconds is not None and total_drawn > 0
+            else None
+        ),
+        "class_match_raw_sampling_wall_time_seconds_per_raw_draw": (
+            float(total_raw_sampling_wall_time_seconds) / float(total_drawn)
+            if total_raw_sampling_wall_time_seconds is not None and total_drawn > 0
+            else None
+        ),
+        "class_match_min_request_size": int(prior.class_match_min_request_size),
+        "enforce_star_ok_acceptance": bool(prior.enforce_star_ok_acceptance),
+        "reject_duplicate_canonical_acceptance": bool(prior.reject_duplicate_canonical_acceptance),
+        "reject_sidechain_backbone_hybrids": bool(prior.reject_sidechain_backbone_hybrids),
+        "allowed_atomic_symbols": list(prior.allowed_atomic_symbols) if prior.allowed_atomic_symbols else None,
         "family_sampling_mode": str(prior.family_sampling_mode),
         "family_sampling_scope": str(prior.family_sampling_scope),
         "spans_per_sample": int(prior.spans_per_sample),
@@ -864,14 +1224,25 @@ def sample_with_class_prior(
         "backbone_template_core_count": int(len(prior.backbone_template_cores)),
         "backbone_template_source": prior.backbone_template_source,
         "backbone_template_min_gap_tokens": int(prior.backbone_template_min_gap_tokens),
+        "backbone_template_terminal_star_anchor": bool(prior.backbone_template_terminal_star_anchor),
         "backbone_template_max_core_token_length": (
             max((len(tokenizer.tokenize(core)) for core in prior.backbone_template_cores), default=0)
         ),
-        "backbone_template_layout": "contiguous_scaffold" if prior.backbone_template_enabled else "disabled",
+        "backbone_template_layout": (
+            "terminal_star_anchored_scaffold"
+            if prior.backbone_template_enabled and prior.backbone_template_terminal_star_anchor
+            else ("contiguous_scaffold" if prior.backbone_template_enabled else "disabled")
+        ),
         "center_min_frac": float(prior.center_min_frac),
         "center_max_frac": float(prior.center_max_frac),
         "length_prior_count": int(last_raw_meta.get("length_prior_count", len(prior.length_prior_lengths))),
         "length_prior_source": last_raw_meta.get("length_prior_source", prior.length_prior_source),
+        "length_prior_min_tokens": (
+            int(prior.length_prior_min_tokens) if prior.length_prior_min_tokens is not None else None
+        ),
+        "length_prior_max_tokens": (
+            int(prior.length_prior_max_tokens) if prior.length_prior_max_tokens is not None else None
+        ),
         "class_token_bias_enabled": bool(prior.class_token_logit_bias is not None),
         "class_token_bias_strength": float(prior.class_token_bias_strength),
         "enforce_class_match": bool(prior.enforce_class_match),
@@ -882,6 +1253,277 @@ def sample_with_class_prior(
             else "loose"
         ),
     }
+    if filter_rejection_counts is not None:
+        metadata["filter_rejection_counts"] = {
+            str(key): int(value)
+            for key, value in dict(filter_rejection_counts).items()
+        }
+    if attempt_log is not None and not quota_satisfied:
+        metadata["attempt_log"] = [dict(row) for row in attempt_log]
+    if last_raw_smiles is not None and not quota_satisfied:
+        metadata["last_raw_smiles"] = [str(smiles) for smiles in last_raw_smiles]
+        metadata["last_raw_batch_size"] = int(len(last_raw_smiles))
+    if last_raw_accepted_indices is not None and not quota_satisfied:
+        metadata["last_raw_accepted_indices"] = [int(idx) for idx in last_raw_accepted_indices]
+        metadata["last_raw_accepted_count"] = int(len(last_raw_accepted_indices))
+    if not quota_satisfied:
+        metadata["partial_accepted_smiles"] = [str(smiles) for smiles in accepted_smiles]
+    return metadata
+
+
+def _smoothed_class_match_acceptance_rate(
+    *,
+    total_drawn: int,
+    accepted_raw_count: int,
+) -> float:
+    """Conservative smoothed acceptance estimate for adaptive class-match retries."""
+
+    return float(accepted_raw_count + 0.5) / float(total_drawn + 1.0)
+
+
+def _resolve_class_match_request_size(
+    *,
+    prior: ResolvedClassSamplingPrior,
+    remaining: int,
+    attempts: int,
+    total_drawn: int,
+    accepted_raw_count: int,
+) -> tuple[int, Dict[str, float | int | str]]:
+    base_request_size = int(remaining)
+    request_strategy = "remaining_only"
+    attempts_left_including_current = max(
+        1,
+        int(prior.class_match_sampling_attempts_max) - int(attempts) + 1,
+    )
+    target_accepts_this_attempt = int(remaining)
+    smoothed_acceptance_rate = float("nan")
+
+    if prior.enforce_class_match:
+        base_request_size = max(
+            int(remaining),
+            int(np.ceil(float(remaining) * float(prior.class_match_oversample_factor))),
+            int(prior.class_match_min_request_size),
+        )
+        request_strategy = "static_floor"
+        target_accepts_this_attempt = max(
+            1,
+            int(np.ceil(float(remaining) / float(attempts_left_including_current))),
+        )
+
+    request_size = int(base_request_size)
+    if prior.enforce_class_match and total_drawn > 0 and attempts > 1:
+        smoothed_acceptance_rate = _smoothed_class_match_acceptance_rate(
+            total_drawn=int(total_drawn),
+            accepted_raw_count=int(accepted_raw_count),
+        )
+        expected_accepts_from_base = float(base_request_size) * float(smoothed_acceptance_rate)
+        if expected_accepts_from_base + 1.0e-9 < float(target_accepts_this_attempt):
+            adaptive_request_size = int(
+                np.ceil(
+                    (float(target_accepts_this_attempt) / max(float(smoothed_acceptance_rate), 1.0e-6))
+                    * 1.15
+                )
+            )
+            request_size = max(int(base_request_size), int(adaptive_request_size))
+            request_strategy = "adaptive_acceptance_tail"
+
+    return int(request_size), {
+        "base_request_size": int(base_request_size),
+        "request_strategy": str(request_strategy),
+        "attempts_left_including_current": int(attempts_left_including_current),
+        "target_accepts_this_attempt": int(target_accepts_this_attempt),
+        "smoothed_acceptance_rate": float(smoothed_acceptance_rate),
+    }
+
+
+def sample_with_class_prior(
+    *,
+    sampler: ConstrainedSampler,
+    tokenizer: PSmilesTokenizer,
+    prior: ResolvedClassSamplingPrior,
+    resolved: ResolvedStep62Config,
+    num_samples: int,
+    show_progress: bool = True,
+    seen_canonical_smiles: Optional[set[str]] = None,
+    sampling_state: Optional[Dict[str, object]] = None,
+) -> Tuple[List[str], Dict[str, object]]:
+    """Sample polymers with Step 6 class priors using a sampler-compatible backend.
+
+    This decode path is shared by frozen and conditional samplers, so family-aware
+    template/scaffold changes here affect every final-generation Step 6_2 method.
+    """
+    accepted_smiles: List[str] = []
+    accepted_raw_count = 0
+    total_drawn = 0
+    attempts = 0
+    need_classifier = bool(prior.enforce_class_match or prior.reject_sidechain_backbone_hybrids)
+    classifier = PolymerClassifier(patterns=resolved.polymer_patterns) if need_classifier else None
+    last_raw_meta: Dict[str, object] = {}
+    last_raw_smiles: List[str] = []
+    last_raw_accepted_indices: List[int] = []
+    attempt_log: List[Dict[str, object]] = []
+    seen_canonical_smiles = seen_canonical_smiles if seen_canonical_smiles is not None else set()
+    filter_rejection_counts = {
+        "target_class_candidate_count": 0,
+        "star_filter_rejected_count": 0,
+        "sidechain_backbone_hybrid_rejected_count": 0,
+        "unexpected_atoms_rejected_count": 0,
+        "duplicate_canonical_rejected_count": 0,
+    }
+    sampling_start_time = time.perf_counter()
+    total_raw_sampling_wall_time_seconds = 0.0
+    total_filter_wall_time_seconds = 0.0
+
+    while len(accepted_smiles) < int(num_samples):
+        attempt_start_time = time.perf_counter()
+        attempts += 1
+        if attempts > int(prior.class_match_sampling_attempts_max):
+            metadata = _build_class_sampling_metadata(
+                tokenizer=tokenizer,
+                prior=prior,
+                num_samples=int(num_samples),
+                returned_smiles=accepted_smiles,
+                accepted_smiles=accepted_smiles,
+                total_drawn=total_drawn,
+                accepted_raw_count=accepted_raw_count,
+                attempts=int(prior.class_match_sampling_attempts_max),
+                last_raw_meta=last_raw_meta,
+                quota_satisfied=False,
+                attempt_log=attempt_log,
+                last_raw_smiles=last_raw_smiles,
+                last_raw_accepted_indices=last_raw_accepted_indices,
+                filter_rejection_counts=filter_rejection_counts,
+                total_wall_time_seconds=(time.perf_counter() - sampling_start_time),
+                total_raw_sampling_wall_time_seconds=total_raw_sampling_wall_time_seconds,
+                total_filter_wall_time_seconds=total_filter_wall_time_seconds,
+            )
+            raise ClassConstrainedSamplingQuotaError(
+                target_class=prior.target_class,
+                accepted_smiles=accepted_smiles,
+                requested_num_samples=int(num_samples),
+                attempts_max=int(prior.class_match_sampling_attempts_max),
+                metadata=metadata,
+                last_raw_smiles=last_raw_smiles,
+            )
+        remaining = int(num_samples) - len(accepted_smiles)
+        request_size, request_debug = _resolve_class_match_request_size(
+            prior=prior,
+            remaining=int(remaining),
+            attempts=int(attempts),
+            total_drawn=int(total_drawn),
+            accepted_raw_count=int(accepted_raw_count),
+        )
+        retry_context_setter = getattr(sampler, "set_retry_sampling_context", None)
+        if callable(retry_context_setter):
+            retry_context_setter(
+                request_strategy=str(request_debug["request_strategy"]),
+                attempts=int(attempts),
+                remaining=int(remaining),
+                smoothed_acceptance_rate=float(request_debug["smoothed_acceptance_rate"]),
+            )
+        raw_sampling_start_time = time.perf_counter()
+        raw_smiles, raw_meta = _sample_raw_smiles_with_prior(
+            sampler=sampler,
+            tokenizer=tokenizer,
+            prior=prior,
+            resolved=resolved,
+            num_samples=int(request_size),
+            show_progress=show_progress and attempts == 1,
+            sampling_state=sampling_state,
+        )
+        raw_sampling_wall_time_seconds = time.perf_counter() - raw_sampling_start_time
+        total_raw_sampling_wall_time_seconds += float(raw_sampling_wall_time_seconds)
+        last_raw_meta = raw_meta
+        last_raw_smiles = [str(smiles) for smiles in raw_smiles]
+        total_drawn += int(len(raw_smiles))
+        filter_start_time = time.perf_counter()
+        if prior.enforce_class_match and classifier is not None:
+            accepted_idx, attempt_filter_stats = _accepted_target_class_indices(
+                raw_smiles,
+                prior=prior,
+                classifier=classifier,
+                seen_canonical_smiles=seen_canonical_smiles,
+            )
+            last_raw_accepted_indices = [int(idx) for idx in accepted_idx]
+            for key, value in attempt_filter_stats.items():
+                filter_rejection_counts[key] = int(filter_rejection_counts.get(key, 0)) + int(value)
+            accepted_raw_count += int(len(accepted_idx))
+            accepted_batch = [raw_smiles[idx] for idx in accepted_idx]
+            accepted_smiles.extend(accepted_batch)
+        else:
+            accepted_idx, attempt_filter_stats = _accepted_target_class_indices(
+                raw_smiles,
+                prior=prior,
+                classifier=classifier,
+                seen_canonical_smiles=seen_canonical_smiles,
+            )
+            last_raw_accepted_indices = [int(idx) for idx in accepted_idx]
+            for key, value in attempt_filter_stats.items():
+                filter_rejection_counts[key] = int(filter_rejection_counts.get(key, 0)) + int(value)
+            accepted_raw_count += int(len(accepted_idx))
+            accepted_batch = [raw_smiles[idx] for idx in accepted_idx]
+            accepted_smiles.extend(accepted_batch)
+        filter_wall_time_seconds = time.perf_counter() - filter_start_time
+        total_filter_wall_time_seconds += float(filter_wall_time_seconds)
+        attempt_log.append(
+            {
+                "attempt": int(attempts),
+                "remaining_before_attempt": int(remaining),
+                "base_request_size": int(request_debug["base_request_size"]),
+                "request_size": int(request_size),
+                "request_strategy": str(request_debug["request_strategy"]),
+                "attempts_left_including_current": int(request_debug["attempts_left_including_current"]),
+                "target_accepts_this_attempt": int(request_debug["target_accepts_this_attempt"]),
+                "smoothed_acceptance_rate": float(request_debug["smoothed_acceptance_rate"]),
+                "raw_draw_count": int(len(raw_smiles)),
+                "target_class_candidates_in_attempt": int(attempt_filter_stats.get("target_class_candidate_count", 0)),
+                "accepted_in_attempt": int(len(accepted_batch)),
+                "accepted_cumulative": int(len(accepted_smiles)),
+                "acceptance_rate_in_attempt": (
+                    float(len(accepted_batch)) / float(len(raw_smiles)) if raw_smiles else 0.0
+                ),
+                "star_filter_rejected_in_attempt": int(attempt_filter_stats.get("star_filter_rejected_count", 0)),
+                "sidechain_backbone_hybrid_rejected_in_attempt": int(
+                    attempt_filter_stats.get("sidechain_backbone_hybrid_rejected_count", 0)
+                ),
+                "unexpected_atoms_rejected_in_attempt": int(
+                    attempt_filter_stats.get("unexpected_atoms_rejected_count", 0)
+                ),
+                "duplicate_canonical_rejected_in_attempt": int(
+                    attempt_filter_stats.get("duplicate_canonical_rejected_count", 0)
+                ),
+                "raw_sampling_wall_time_seconds": float(raw_sampling_wall_time_seconds),
+                "filter_wall_time_seconds": float(filter_wall_time_seconds),
+                "attempt_wall_time_seconds": float(time.perf_counter() - attempt_start_time),
+                "raw_sampling_wall_time_seconds_per_raw_draw": (
+                    float(raw_sampling_wall_time_seconds) / float(len(raw_smiles))
+                    if raw_smiles
+                    else None
+                ),
+            }
+        )
+
+    smiles = accepted_smiles[: int(num_samples)]
+
+    metadata = _build_class_sampling_metadata(
+        tokenizer=tokenizer,
+        prior=prior,
+        num_samples=int(num_samples),
+        returned_smiles=smiles,
+        accepted_smiles=accepted_smiles,
+        total_drawn=total_drawn,
+        accepted_raw_count=accepted_raw_count,
+        attempts=attempts,
+        last_raw_meta=last_raw_meta,
+        quota_satisfied=True,
+        attempt_log=attempt_log,
+        last_raw_smiles=last_raw_smiles,
+        last_raw_accepted_indices=last_raw_accepted_indices,
+        filter_rejection_counts=filter_rejection_counts,
+        total_wall_time_seconds=(time.perf_counter() - sampling_start_time),
+        total_raw_sampling_wall_time_seconds=total_raw_sampling_wall_time_seconds,
+        total_filter_wall_time_seconds=total_filter_wall_time_seconds,
+    )
     return smiles, metadata
 
 
@@ -893,6 +1535,8 @@ def sample_unconditional_with_class_prior(
     resolved: ResolvedStep62Config,
     num_samples: int,
     show_progress: bool = True,
+    seen_canonical_smiles: Optional[set[str]] = None,
+    sampling_state: Optional[Dict[str, object]] = None,
 ) -> Tuple[List[str], Dict[str, object]]:
     """Backward-compatible alias for S0/S1 class-aware sampling."""
 
@@ -903,4 +1547,6 @@ def sample_unconditional_with_class_prior(
         resolved=resolved,
         num_samples=num_samples,
         show_progress=show_progress,
+        seen_canonical_smiles=seen_canonical_smiles,
+        sampling_state=sampling_state,
     )

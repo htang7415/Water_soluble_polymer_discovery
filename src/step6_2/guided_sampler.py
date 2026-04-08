@@ -29,6 +29,7 @@ class GuidedSampler(ConstrainedSampler):
         w_sol: float,
         w_chi: float,
         w_class: float,
+        invalid_reward_penalty: float,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -43,20 +44,24 @@ class GuidedSampler(ConstrainedSampler):
         self.w_sol = float(w_sol)
         self.w_chi = float(w_chi)
         self.w_class = float(w_class)
+        self.invalid_reward_penalty = float(invalid_reward_penalty)
         self.training_oracle_calls_soluble = 0
         self.training_oracle_calls_chi = 0
         self.class_guidance_suppressed_steps = 0
+        self.guidance_no_valid_fallback_steps = 0
 
     def reset_guidance_stats(self) -> None:
         self.training_oracle_calls_soluble = 0
         self.training_oracle_calls_chi = 0
         self.class_guidance_suppressed_steps = 0
+        self.guidance_no_valid_fallback_steps = 0
 
     def get_guidance_stats(self) -> Dict[str, int]:
         return {
             "training_soluble_oracle_calls": int(self.training_oracle_calls_soluble),
             "training_chi_oracle_calls": int(self.training_oracle_calls_chi),
             "class_guidance_suppressed_steps": int(self.class_guidance_suppressed_steps),
+            "guidance_no_valid_fallback_steps": int(self.guidance_no_valid_fallback_steps),
         }
 
     def _apply_within_step_constraint_updates(
@@ -187,6 +192,7 @@ class GuidedSampler(ConstrainedSampler):
                         w_sol=self.w_sol,
                         w_chi=self.w_chi,
                         w_class=self.w_class,
+                        invalid_reward_penalty=self.invalid_reward_penalty,
                     )
                     self.training_oracle_calls_soluble += int(scored["oracle_calls_soluble"])
                     self.training_oracle_calls_chi += int(scored["oracle_calls_chi"])
@@ -198,11 +204,31 @@ class GuidedSampler(ConstrainedSampler):
                         scored["reward"] = scored["reward"] - float(self.w_class) * scored["class_surrogate"]
 
                     rewards = scored["reward"]
+                    valid_mask = scored["valid_mask"].bool()
                     reward_offset = 0
                     for i, unmask_positions in unmask_positions_by_sample.items():
                         sample_rewards = rewards[reward_offset : reward_offset + self.best_of_k]
-                        best_idx = int(torch.argmax(sample_rewards).item())
-                        chosen_ids = provisional_ids[reward_offset + best_idx]
+                        sample_valid = valid_mask[reward_offset : reward_offset + self.best_of_k]
+                        if sample_valid.any():
+                            valid_rewards = sample_rewards[sample_valid]
+                            valid_indices = torch.nonzero(sample_valid, as_tuple=False).flatten()
+                            best_idx = int(valid_indices[int(torch.argmax(valid_rewards).item())].item())
+                            chosen_ids = provisional_ids[reward_offset + best_idx]
+                        else:
+                            self.guidance_no_valid_fallback_steps += 1
+                            chosen_ids = ids[i].clone()
+                            for pos in unmask_positions:
+                                sampled = torch.multinomial(probs[i, pos], 1)
+                                chosen_token = int(sampled.item())
+                                chosen_ids[int(pos.item())] = chosen_token
+                                probs[i] = self._apply_within_step_constraint_updates(
+                                    logits[i],
+                                    probs[i],
+                                    chosen_ids,
+                                    fixed_mask[i],
+                                    chosen_token,
+                                    int(pos.item()),
+                                )
                         reward_offset += self.best_of_k
                         for pos in unmask_positions:
                             chosen_token = int(chosen_ids[int(pos.item())].item())
@@ -247,6 +273,7 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
         w_sol: float,
         w_chi: float,
         w_class: float,
+        invalid_reward_penalty: float,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -261,9 +288,11 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
         self.w_sol = float(w_sol)
         self.w_chi = float(w_chi)
         self.w_class = float(w_class)
+        self.invalid_reward_penalty = float(invalid_reward_penalty)
         self.training_oracle_calls_soluble = 0
         self.training_oracle_calls_chi = 0
         self.class_guidance_suppressed_steps = 0
+        self.guidance_no_valid_fallback_steps = 0
 
     def reset_guidance_stats(self) -> None:
         self.training_oracle_calls_soluble = 0
@@ -275,6 +304,7 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
             "training_soluble_oracle_calls": int(self.training_oracle_calls_soluble),
             "training_chi_oracle_calls": int(self.training_oracle_calls_chi),
             "class_guidance_suppressed_steps": int(self.class_guidance_suppressed_steps),
+            "guidance_no_valid_fallback_steps": int(self.guidance_no_valid_fallback_steps),
         }
 
     def _apply_within_step_constraint_updates(
@@ -411,6 +441,7 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
                         w_sol=self.w_sol,
                         w_chi=self.w_chi,
                         w_class=self.w_class,
+                        invalid_reward_penalty=self.invalid_reward_penalty,
                     )
                     self.training_oracle_calls_soluble += int(scored["oracle_calls_soluble"])
                     self.training_oracle_calls_chi += int(scored["oracle_calls_chi"])
@@ -422,11 +453,31 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
                         scored["reward"] = scored["reward"] - float(self.w_class) * scored["class_surrogate"]
 
                     rewards = scored["reward"]
+                    valid_mask = scored["valid_mask"].bool()
                     reward_offset = 0
                     for i, unmask_positions in unmask_positions_by_sample.items():
                         sample_rewards = rewards[reward_offset : reward_offset + self.best_of_k]
-                        best_idx = int(torch.argmax(sample_rewards).item())
-                        chosen_ids = provisional_ids[reward_offset + best_idx]
+                        sample_valid = valid_mask[reward_offset : reward_offset + self.best_of_k]
+                        if sample_valid.any():
+                            valid_rewards = sample_rewards[sample_valid]
+                            valid_indices = torch.nonzero(sample_valid, as_tuple=False).flatten()
+                            best_idx = int(valid_indices[int(torch.argmax(valid_rewards).item())].item())
+                            chosen_ids = provisional_ids[reward_offset + best_idx]
+                        else:
+                            self.guidance_no_valid_fallback_steps += 1
+                            chosen_ids = ids[i].clone()
+                            for pos in unmask_positions:
+                                sampled = torch.multinomial(probs[i, pos], 1)
+                                chosen_token = int(sampled.item())
+                                chosen_ids[int(pos.item())] = chosen_token
+                                probs[i] = self._apply_within_step_constraint_updates(
+                                    logits[i],
+                                    probs[i],
+                                    chosen_ids,
+                                    fixed_mask[i],
+                                    chosen_token,
+                                    int(pos.item()),
+                                )
                         reward_offset += self.best_of_k
                         for pos in unmask_positions:
                             chosen_token = int(chosen_ids[int(pos.item())].item())

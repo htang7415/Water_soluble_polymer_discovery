@@ -104,6 +104,7 @@ def score_guidance_batch(
     w_sol: float,
     w_chi: float,
     w_class: float,
+    invalid_reward_penalty: float,
 ) -> Dict[str, object]:
     """Score provisional complete sequences for S1 guidance."""
 
@@ -151,13 +152,16 @@ def score_guidance_batch(
     else:
         chi_term = -torch.relu(chi_pred - float(chi_target))
 
-    reward = float(w_sol) * sol_term + float(w_chi) * chi_term
+    valid_reward = float(w_sol) * sol_term + float(w_chi) * chi_term
+    invalid_penalty = torch.full_like(valid_reward, float(invalid_reward_penalty))
+    reward = torch.where(valid_tensor > 0.0, valid_reward, invalid_penalty)
     if class_term_enabled:
         reward = reward + float(w_class) * class_surrogate
 
     return {
         "reward": reward.cpu(),
         "smiles": smiles,
+        "valid_mask": valid_tensor.cpu(),
         "valid_frac": valid_frac,
         "class_surrogate": class_surrogate,
         "class_term_enabled": bool(class_term_enabled),

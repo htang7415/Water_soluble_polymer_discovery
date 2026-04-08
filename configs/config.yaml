@@ -282,15 +282,75 @@ chi_training:
     decode_constraint_spans_per_sample: 2  # Step 6 only: fix multiple class motifs per sequence to raise rare-class hit rate
     decode_constraint_center_min_frac: 0.25  # motif center placement lower bound as a fraction of sequence length
     decode_constraint_center_max_frac: 0.75  # motif center placement upper bound as a fraction of sequence length
+    decode_constraint_center_min_frac_overrides:
+      polyimide: 0.35
+      polysulfone: 0.35
+    decode_constraint_center_max_frac_overrides:
+      polyimide: 0.65
+      polysulfone: 0.65
     decode_constraint_backbone_template_enabled: true  # Step 6 only: global switch for backbone-template family decoding
     decode_constraint_backbone_template_classes: ["polyimide", "polyamide", "polyester", "polyether", "polysulfone"]  # Step 6 only: backbone-template mode for current backbone target classes
     decode_constraint_backbone_template_max_templates: 3
+    decode_constraint_backbone_template_max_templates_overrides:
+      polyamide: 6
+      polyimide: 4
+      polysulfone: 4
     decode_constraint_backbone_template_min_gap_tokens: 3
+    decode_constraint_backbone_template_min_gap_tokens_overrides:
+      polyimide: 4
+      polysulfone: 3
+    decode_constraint_backbone_template_terminal_star_anchor: false
+    decode_constraint_backbone_template_terminal_star_anchor_overrides:
+      polyamide: true
+      polyether: true
+      polyester: true
+      polyimide: true
+      polysulfone: true
+    decode_constraint_cycle_backbone_template_cores_across_targets: false
     decode_constraint_enforce_class_match: true  # exact SMARTS class filter during constrained Step 2 valid-only acceptance
     decode_constraint_enforce_backbone_class_match: true  # require class motif on backbone (shortest path between * atoms) for backbone classes
     decode_constraint_class_match_sampling_attempts_max: 12
+    decode_constraint_class_match_sampling_attempts_max_overrides:
+      polyimide: 32
+      polysulfone: 24
     decode_constraint_class_match_oversample_factor: 2.0
+    decode_constraint_class_match_oversample_factor_overrides:
+      polyimide: 4.0
+      polysulfone: 4.0
+    decode_constraint_class_match_min_request_size: 1
+    decode_constraint_class_match_min_request_size_overrides:
+      polyamide: 4
+      polyimide: 4
+      polysulfone: 6
+      polystyrene: 8
+    decode_constraint_enforce_star_ok_acceptance: false
+    decode_constraint_enforce_star_ok_acceptance_overrides:
+      polyacrylate: true
+      polyamide: true
+      polyether: true
+      polyimide: true
+      polyester: true
+      polysulfone: true
+      polystyrene: true
+    decode_constraint_reject_duplicate_canonical_acceptance: true
+    decode_constraint_reject_duplicate_canonical_across_targets: false
+    decode_constraint_reject_duplicate_canonical_across_targets_overrides:
+      polyimide: true
+    decode_constraint_reject_sidechain_backbone_hybrid: false
+    decode_constraint_reject_sidechain_backbone_hybrid_overrides:
+      polyacrylate: true
+      polystyrene: true
+    decode_constraint_allowed_atomic_symbols_overrides:
+      polyimide: ["C", "N", "O", "*"]
+      polyamide: ["C", "N", "O", "*"]
+      polyester: ["C", "O", "*"]
+      polyether: ["C", "O", "*"]
+      polysulfone: ["C", "O", "S", "*"]
+      polyacrylate: ["C", "N", "O", "*"]
+      polystyrene: ["C", "N", "O", "*"]
     decode_constraint_use_class_length_prior: true  # Step 6 only: sample token lengths from local target-class polymers when available
+    decode_constraint_length_prior_max_tokens_overrides:
+      polyimide: 29
     resampling_skip_novelty_filter: false  # Step 6 only: keep valid class-matched proposals first; novelty is re-applied downstream
     resampling_skip_sa_filter: false  # Step 6 only: defer SA screening until after Step 2 proposal generation
 

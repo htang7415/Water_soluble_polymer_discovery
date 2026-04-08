@@ -264,6 +264,8 @@ def _build_rl_training_prior(
         enforce_class_match=False,
         enforce_backbone_class_match=False,
         class_match_oversample_factor=1.0,
+        class_match_min_request_size=1,
+        enforce_star_ok_acceptance=False,
     )
 
 

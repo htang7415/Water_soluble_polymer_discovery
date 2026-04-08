@@ -14,6 +14,7 @@ from src.step6_2.frozen_sampling import (
     _accepted_target_class_indices,
     _build_backbone_template_multi_spans,
     _build_decode_constraint_multi_spans,
+    _resolve_class_match_request_size,
     _sample_lengths,
 )
 from src.evaluation.polymer_class import BACKBONE_CLASS_MATCH_CLASSES, PolymerClassifier
@@ -187,13 +188,14 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
         batch_size = ids.shape[0]
         cond = self._condition_for_batch(batch_size)
         step_progress = self._step_progress_frac(int(timesteps[0].item()))
+        effective_cfg_scale = self._effective_cfg_scale(step_progress)
         if grad_enabled:
             logits = diffusion_model.classifier_free_guidance_logits_impl(
                 ids,
                 timesteps,
                 attention_mask,
                 condition_bundle=cond,
-                cfg_scale=self.cfg_scale,
+                cfg_scale=effective_cfg_scale,
             )
         else:
             logits = diffusion_model.classifier_free_guidance_logits(
@@ -201,7 +203,7 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
                 timesteps,
                 attention_mask,
                 condition_bundle=cond,
-                cfg_scale=self.cfg_scale,
+                cfg_scale=effective_cfg_scale,
             )
         logits = logits / self.temperature
         if self.use_constraints:
@@ -775,12 +777,13 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
         batch_size = int(input_ids.shape[0])
         cond = self._condition_for_batch(batch_size)
         timesteps = torch.ones(batch_size, dtype=torch.long, device=self.device)
+        step_progress = self._step_progress_frac(1)
         logits = self.diffusion_model.classifier_free_guidance_logits(
             input_ids,
             timesteps,
             attention_mask,
             condition_bundle=cond,
-            cfg_scale=self.cfg_scale,
+            cfg_scale=self._effective_cfg_scale(step_progress),
         )
         log_probs = torch.log_softmax(logits, dim=-1)
         token_log_probs = log_probs.gather(dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
@@ -818,12 +821,13 @@ def sample_trajectories_with_class_prior(
                 f"after {int(prior.class_match_sampling_attempts_max)} attempts."
             )
         remaining = int(num_samples) - len(accepted_smiles)
-        request_size = remaining
-        if prior.enforce_class_match:
-            request_size = max(
-                remaining,
-                int(torch.ceil(torch.tensor(float(remaining) * float(prior.class_match_oversample_factor))).item()),
-            )
+        request_size, _request_debug = _resolve_class_match_request_size(
+            prior=prior,
+            remaining=int(remaining),
+            attempts=int(attempts),
+            total_drawn=int(total_drawn),
+            accepted_raw_count=int(accepted_raw_count),
+        )
 
         lengths = _sample_lengths(
             prior=prior,
@@ -844,6 +848,7 @@ def sample_trajectories_with_class_prior(
                 star_token_id=int(tokenizer.get_star_token_id()),
                 backbone_gap_token_id=backbone_gap_token_id,
                 min_gap_tokens=int(prior.backbone_template_min_gap_tokens),
+                anchor_terminal_stars=bool(prior.backbone_template_terminal_star_anchor),
             )
             _all_ids, smiles, trajectories = sampler.sample_batch_with_multiple_fixed_spans_trajectory(
                 num_samples=int(request_size),

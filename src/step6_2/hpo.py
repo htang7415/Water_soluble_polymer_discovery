@@ -56,6 +56,10 @@ def _token_bias_available(resolved) -> bool:
     return bool(resolved.class_support_stats.get("token_bias_available", False))
 
 
+def _tune_class_token_bias_in_hpo(resolved) -> bool:
+    return bool(resolved.step6_2_hpo.get("tune_class_token_bias", False))
+
+
 def _backbone_num_layers(resolved) -> int:
     return int(get_model_config(resolved.model_size, resolved.base_config, model_type="sequence")["num_layers"])
 
@@ -229,6 +233,7 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
 def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[str, object]) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
     token_bias_active = _token_bias_available(resolved)
+    tune_class_token_bias = bool(token_bias_active and _tune_class_token_bias_in_hpo(resolved))
 
     if study_family == "S1":
         params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 8])
@@ -306,7 +311,7 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
     else:
         raise ValueError(f"Unsupported Step 6_2 HPO study family: {study_family}")
 
-    if token_bias_active:
+    if tune_class_token_bias:
         params["class_token_bias_start_frac"] = trial.suggest_float("class_token_bias_start_frac", 0.4, 0.75)
         params["class_token_bias_strength"] = trial.suggest_float("class_token_bias_strength", 0.5, 3.0, log=True)
     return params
@@ -319,6 +324,8 @@ def _trial_tie_break_key(trial, *, tie_epsilon: float) -> tuple:
         float(attrs.get("mean_class_ok", float("-inf"))),
         float(attrs.get("mean_chi_ok", float("-inf"))),
         float(attrs.get("mean_soluble_ok", float("-inf"))),
+        float(attrs.get("mean_class_match_acceptance_rate", float("-inf"))),
+        -float(attrs.get("mean_total_raw_samples_drawn", float("inf"))),
         -float(attrs.get("oracle_call_cost", float("inf"))),
         -float(attrs.get("wall_time_sec", float("inf"))),
     )
@@ -349,6 +356,8 @@ def _write_trial_summary(
     objective_metric: str,
     mean_success_hit_rate: float | None,
     mean_success_hit_rate_discovery: float | None,
+    mean_class_match_acceptance_rate: float | None = None,
+    mean_total_raw_samples_drawn: float | None = None,
     state: str,
 ) -> None:
     payload = {
@@ -362,6 +371,12 @@ def _write_trial_summary(
         "mean_success_hit_rate_discovery": (
             float(mean_success_hit_rate_discovery) if mean_success_hit_rate_discovery is not None else None
         ),
+        "mean_class_match_acceptance_rate": (
+            float(mean_class_match_acceptance_rate) if mean_class_match_acceptance_rate is not None else None
+        ),
+        "mean_total_raw_samples_drawn": (
+            float(mean_total_raw_samples_drawn) if mean_total_raw_samples_drawn is not None else None
+        ),
         "hyperparameters": dict(params),
     }
     trial_path = _trial_summary_path(study_root, int(trial_number))
@@ -370,10 +385,18 @@ def _write_trial_summary(
         json.dump(payload, handle, indent=2)
 
 
-def _write_search_space(path: Path, *, study_family: str, token_bias_active: bool, pair_source: str) -> None:
+def _write_search_space(
+    path: Path,
+    *,
+    study_family: str,
+    token_bias_available: bool,
+    tune_class_token_bias: bool,
+    pair_source: str,
+) -> None:
     payload = {
         "study_family": study_family,
-        "token_bias_active": bool(token_bias_active),
+        "token_bias_available": bool(token_bias_available),
+        "tune_class_token_bias": bool(tune_class_token_bias),
         "pair_source": pair_source,
     }
     with open(path, "w", encoding="utf-8") as handle:
@@ -417,7 +440,8 @@ def run_optuna_study(
     _write_search_space(
         study_root / "search_space.yaml",
         study_family=study_family,
-        token_bias_active=_token_bias_available(resolved),
+        token_bias_available=_token_bias_available(resolved),
+        tune_class_token_bias=_tune_class_token_bias_in_hpo(resolved),
         pair_source=str(base_run_cfg.get("s4", {}).get("dpo", {}).get("pair_source", "")),
     )
     resolved.hpo_target_df.to_csv(study_root / "d_hpo_family.csv", index=False)
@@ -520,6 +544,8 @@ def run_optuna_study(
                 objective_metric=objective_metric_name,
                 mean_success_hit_rate=None,
                 mean_success_hit_rate_discovery=None,
+                mean_class_match_acceptance_rate=None,
+                mean_total_raw_samples_drawn=None,
                 state="PRUNED",
             )
             raise
@@ -551,6 +577,14 @@ def run_optuna_study(
         trial.set_user_attr("objective_metric", objective_metric_name)
         trial.set_user_attr("mean_success_hit_rate_reporting", mean_success_hit_rate)
         trial.set_user_attr("mean_success_hit_rate_discovery", mean_success_hit_rate_discovery)
+        trial.set_user_attr(
+            "mean_class_match_acceptance_rate",
+            float(metrics.get("mean_class_match_acceptance_rate", float("nan"))),
+        )
+        trial.set_user_attr(
+            "mean_total_raw_samples_drawn",
+            float(metrics.get("mean_total_raw_samples_drawn", float("nan"))),
+        )
         trial.set_user_attr("wall_time_sec", float(wall_time))
         trial.set_user_attr("run_name", str(run_cfg["run_name"]))
         _write_trial_summary(
@@ -563,6 +597,8 @@ def run_optuna_study(
             objective_metric=objective_metric_name,
             mean_success_hit_rate=mean_success_hit_rate,
             mean_success_hit_rate_discovery=mean_success_hit_rate_discovery,
+            mean_class_match_acceptance_rate=float(metrics.get("mean_class_match_acceptance_rate", float("nan"))),
+            mean_total_raw_samples_drawn=float(metrics.get("mean_total_raw_samples_drawn", float("nan"))),
             state="COMPLETE",
         )
         return mean_success_hit_rate_discovery
@@ -579,6 +615,8 @@ def run_optuna_study(
             "objective_metric": str(trial.user_attrs.get("objective_metric", objective_metric_name)),
             "mean_success_hit_rate": trial.user_attrs.get("mean_success_hit_rate_reporting"),
             "mean_success_hit_rate_discovery": trial.user_attrs.get("mean_success_hit_rate_discovery"),
+            "mean_class_match_acceptance_rate": trial.user_attrs.get("mean_class_match_acceptance_rate"),
+            "mean_total_raw_samples_drawn": trial.user_attrs.get("mean_total_raw_samples_drawn"),
         }
         for trial in study.trials
     ]
@@ -601,6 +639,16 @@ def run_optuna_study(
                 if "mean_success_hit_rate_discovery" in trial.user_attrs
                 else None
             ),
+            "mean_class_match_acceptance_rate": (
+                float(trial.user_attrs["mean_class_match_acceptance_rate"])
+                if "mean_class_match_acceptance_rate" in trial.user_attrs
+                else None
+            ),
+            "mean_total_raw_samples_drawn": (
+                float(trial.user_attrs["mean_total_raw_samples_drawn"])
+                if "mean_total_raw_samples_drawn" in trial.user_attrs
+                else None
+            ),
             "hyperparameters": dict(trial.params),
         }
         for trial in study.trials
@@ -620,6 +668,12 @@ def run_optuna_study(
                 "best_mean_success_hit_rate": float(best_trial.user_attrs.get("mean_success_hit_rate_reporting", best_trial.value)),
                 "best_mean_success_hit_rate_discovery": float(
                     best_trial.user_attrs.get("mean_success_hit_rate_discovery", best_trial.value)
+                ),
+                "best_mean_class_match_acceptance_rate": float(
+                    best_trial.user_attrs.get("mean_class_match_acceptance_rate", float("nan"))
+                ),
+                "best_mean_total_raw_samples_drawn": float(
+                    best_trial.user_attrs.get("mean_total_raw_samples_drawn", float("nan"))
                 ),
                 "best_params": dict(best_trial.params),
             },
