@@ -12,6 +12,35 @@ from src.step6_2.evaluation import Step62Evaluator
 from src.step6_2.rewards import score_guidance_batch
 
 
+def _resolve_guided_sample_mask(
+    *,
+    is_masked: torch.Tensor,
+    initial_mask_counts: torch.Tensor,
+    step_progress: float,
+    guidance_start_frac: float,
+    best_of_k: int,
+) -> torch.Tensor:
+    """Enable guidance once a sample is sufficiently complete.
+
+    Short class-constrained sequences can finish unmasking before a late
+    diffusion-step fraction such as 0.5 or 0.75 is ever reached. Use the
+    per-sample editable-token completion ratio as an additional progress signal
+    so guidance still activates on short, heavily constrained generations.
+    """
+
+    masked_counts = is_masked.sum(dim=1)
+    if int(best_of_k) < 2:
+        return torch.zeros_like(masked_counts, dtype=torch.bool)
+
+    editable_counts = initial_mask_counts.to(dtype=torch.float32).clamp(min=1.0)
+    completion_progress = 1.0 - (masked_counts.to(dtype=torch.float32) / editable_counts)
+    guidance_progress = torch.maximum(
+        completion_progress,
+        torch.full_like(completion_progress, float(step_progress)),
+    )
+    return (masked_counts > 0) & (guidance_progress >= float(guidance_start_frac))
+
+
 class GuidedSampler(ConstrainedSampler):
     """Frozen-model guided sampler with late oracle guidance."""
 
@@ -97,6 +126,7 @@ class GuidedSampler(ConstrainedSampler):
         batch_size = ids.shape[0]
         final_logits = None
         steps = range(self.num_steps, 0, -1)
+        initial_mask_counts = ((ids == self.mask_id) & (~fixed_mask)).sum(dim=1).to(dtype=torch.float32)
 
         if show_progress:
             from tqdm import tqdm
@@ -123,16 +153,26 @@ class GuidedSampler(ConstrainedSampler):
 
             is_masked = (ids == self.mask_id) & (~fixed_mask)
             unmask_prob = 1.0 / t
-            guided = step_progress >= self.guidance_start_frac and self.best_of_k >= 2
+            guided_mask = _resolve_guided_sample_mask(
+                is_masked=is_masked,
+                initial_mask_counts=initial_mask_counts,
+                step_progress=step_progress,
+                guidance_start_frac=self.guidance_start_frac,
+                best_of_k=self.best_of_k,
+            )
 
-            if not guided:
-                for i in range(batch_size):
-                    masked_pos = torch.where(is_masked[i])[0]
-                    if len(masked_pos) == 0:
-                        continue
-                    num_unmask = max(1, int(len(masked_pos) * unmask_prob))
-                    unmask_indices = torch.randperm(len(masked_pos), device=self.device)[:num_unmask]
-                    unmask_positions = masked_pos[unmask_indices]
+            candidate_blocks: List[torch.Tensor] = []
+            attention_blocks: List[torch.Tensor] = []
+            unmask_positions_by_sample: Dict[int, torch.Tensor] = {}
+
+            for i in range(batch_size):
+                masked_pos = torch.where(is_masked[i])[0]
+                if len(masked_pos) == 0:
+                    continue
+                num_unmask = max(1, int(len(masked_pos) * unmask_prob))
+                unmask_indices = torch.randperm(len(masked_pos), device=self.device)[:num_unmask]
+                unmask_positions = masked_pos[unmask_indices]
+                if not bool(guided_mask[i].item()):
                     for pos in unmask_positions:
                         sampled = torch.multinomial(probs[i, pos], 1)
                         ids[i, pos] = sampled
@@ -144,82 +184,71 @@ class GuidedSampler(ConstrainedSampler):
                             int(sampled.item()),
                             int(pos.item()),
                         )
-            else:
-                candidate_blocks: List[torch.Tensor] = []
-                attention_blocks: List[torch.Tensor] = []
-                unmask_positions_by_sample: Dict[int, torch.Tensor] = {}
+                    continue
+                unmask_positions_by_sample[i] = unmask_positions
 
-                for i in range(batch_size):
-                    masked_pos = torch.where(is_masked[i])[0]
-                    if len(masked_pos) == 0:
-                        continue
-                    num_unmask = max(1, int(len(masked_pos) * unmask_prob))
-                    unmask_indices = torch.randperm(len(masked_pos), device=self.device)[:num_unmask]
-                    unmask_positions = masked_pos[unmask_indices]
-                    unmask_positions_by_sample[i] = unmask_positions
+                candidate_ids = ids[i].unsqueeze(0).repeat(self.best_of_k, 1)
+                for pos in masked_pos:
+                    sampled = torch.multinomial(probs[i, pos], self.best_of_k, replacement=True)
+                    candidate_ids[:, int(pos.item())] = sampled
+                candidate_blocks.append(candidate_ids)
+                attention_blocks.append(attention_mask[i].unsqueeze(0).repeat(self.best_of_k, 1))
 
-                    candidate_ids = ids[i].unsqueeze(0).repeat(self.best_of_k, 1)
-                    for pos in masked_pos:
-                        sampled = torch.multinomial(probs[i, pos], self.best_of_k, replacement=True)
-                        candidate_ids[:, int(pos.item())] = sampled
-                    candidate_blocks.append(candidate_ids)
-                    attention_blocks.append(attention_mask[i].unsqueeze(0).repeat(self.best_of_k, 1))
+            if candidate_blocks:
+                provisional_ids = torch.cat(candidate_blocks, dim=0)
+                provisional_attention = torch.cat(attention_blocks, dim=0)
+                scored = score_guidance_batch(
+                    provisional_ids,
+                    provisional_attention,
+                    target_row=self.target_row,
+                    evaluator=self.evaluator,
+                    tokenizer=self.tokenizer,
+                    sol_log_prob_floor=self.sol_log_prob_floor,
+                    w_sol=self.w_sol,
+                    w_chi=self.w_chi,
+                    invalid_reward_penalty=self.invalid_reward_penalty,
+                )
+                self.training_oracle_calls_soluble += int(scored["oracle_calls_soluble"])
+                self.training_oracle_calls_chi += int(scored["oracle_calls_chi"])
 
-                if candidate_blocks:
-                    provisional_ids = torch.cat(candidate_blocks, dim=0)
-                    provisional_attention = torch.cat(attention_blocks, dim=0)
-                    scored = score_guidance_batch(
-                        provisional_ids,
-                        provisional_attention,
-                        target_row=self.target_row,
-                        evaluator=self.evaluator,
-                        tokenizer=self.tokenizer,
-                        sol_log_prob_floor=self.sol_log_prob_floor,
-                        w_sol=self.w_sol,
-                        w_chi=self.w_chi,
-                        invalid_reward_penalty=self.invalid_reward_penalty,
-                    )
-                    self.training_oracle_calls_soluble += int(scored["oracle_calls_soluble"])
-                    self.training_oracle_calls_chi += int(scored["oracle_calls_chi"])
-
-                    rewards = scored["reward"]
-                    valid_mask = scored["valid_mask"].bool()
-                    reward_offset = 0
-                    for i, unmask_positions in unmask_positions_by_sample.items():
-                        sample_rewards = rewards[reward_offset : reward_offset + self.best_of_k]
-                        sample_valid = valid_mask[reward_offset : reward_offset + self.best_of_k]
-                        if sample_valid.any():
-                            valid_rewards = sample_rewards[sample_valid]
-                            valid_indices = torch.nonzero(sample_valid, as_tuple=False).flatten()
-                            best_idx = int(valid_indices[int(torch.argmax(valid_rewards).item())].item())
-                            chosen_ids = provisional_ids[reward_offset + best_idx]
-                        else:
-                            self.guidance_no_valid_fallback_steps += 1
-                            chosen_ids = ids[i].clone()
-                            for pos in unmask_positions:
-                                sampled = torch.multinomial(probs[i, pos], 1)
-                                chosen_token = int(sampled.item())
-                                chosen_ids[int(pos.item())] = chosen_token
-                                probs[i] = self._apply_within_step_constraint_updates(
-                                    logits[i],
-                                    probs[i],
-                                    chosen_ids,
-                                    fixed_mask[i],
-                                    chosen_token,
-                                    int(pos.item()),
-                                )
-                        reward_offset += self.best_of_k
+                rewards = scored["reward"]
+                valid_mask = scored["valid_mask"].bool()
+                reward_offset = 0
+                for i, unmask_positions in unmask_positions_by_sample.items():
+                    sample_rewards = rewards[reward_offset : reward_offset + self.best_of_k]
+                    sample_valid = valid_mask[reward_offset : reward_offset + self.best_of_k]
+                    if sample_valid.any():
+                        valid_rewards = sample_rewards[sample_valid]
+                        valid_indices = torch.nonzero(sample_valid, as_tuple=False).flatten()
+                        best_idx = int(valid_indices[int(torch.argmax(valid_rewards).item())].item())
+                        chosen_ids = provisional_ids[reward_offset + best_idx]
+                    else:
+                        self.guidance_no_valid_fallback_steps += 1
+                        chosen_ids = ids[i].clone()
                         for pos in unmask_positions:
-                            chosen_token = int(chosen_ids[int(pos.item())].item())
-                            ids[i, int(pos.item())] = chosen_token
+                            sampled = torch.multinomial(probs[i, pos], 1)
+                            chosen_token = int(sampled.item())
+                            chosen_ids[int(pos.item())] = chosen_token
                             probs[i] = self._apply_within_step_constraint_updates(
                                 logits[i],
                                 probs[i],
-                                ids[i],
+                                chosen_ids,
                                 fixed_mask[i],
                                 chosen_token,
                                 int(pos.item()),
                             )
+                    reward_offset += self.best_of_k
+                    for pos in unmask_positions:
+                        chosen_token = int(chosen_ids[int(pos.item())].item())
+                        ids[i, int(pos.item())] = chosen_token
+                        probs[i] = self._apply_within_step_constraint_updates(
+                            logits[i],
+                            probs[i],
+                            ids[i],
+                            fixed_mask[i],
+                            chosen_token,
+                            int(pos.item()),
+                        )
 
             if t == 1:
                 final_logits = logits
@@ -320,6 +349,7 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
         cond = self._condition_for_batch(batch_size)
         final_logits = None
         steps = range(self.num_steps, 0, -1)
+        initial_mask_counts = ((ids == self.mask_id) & (~fixed_mask)).sum(dim=1).to(dtype=torch.float32)
 
         if show_progress:
             from tqdm import tqdm
@@ -352,16 +382,26 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
 
             is_masked = (ids == self.mask_id) & (~fixed_mask)
             unmask_prob = 1.0 / t
-            guided = step_progress >= self.guidance_start_frac and self.best_of_k >= 2
+            guided_mask = _resolve_guided_sample_mask(
+                is_masked=is_masked,
+                initial_mask_counts=initial_mask_counts,
+                step_progress=step_progress,
+                guidance_start_frac=self.guidance_start_frac,
+                best_of_k=self.best_of_k,
+            )
 
-            if not guided:
-                for i in range(batch_size):
-                    masked_pos = torch.where(is_masked[i])[0]
-                    if len(masked_pos) == 0:
-                        continue
-                    num_unmask = max(1, int(len(masked_pos) * unmask_prob))
-                    unmask_indices = torch.randperm(len(masked_pos), device=self.device)[:num_unmask]
-                    unmask_positions = masked_pos[unmask_indices]
+            candidate_blocks: List[torch.Tensor] = []
+            attention_blocks: List[torch.Tensor] = []
+            unmask_positions_by_sample: Dict[int, torch.Tensor] = {}
+
+            for i in range(batch_size):
+                masked_pos = torch.where(is_masked[i])[0]
+                if len(masked_pos) == 0:
+                    continue
+                num_unmask = max(1, int(len(masked_pos) * unmask_prob))
+                unmask_indices = torch.randperm(len(masked_pos), device=self.device)[:num_unmask]
+                unmask_positions = masked_pos[unmask_indices]
+                if not bool(guided_mask[i].item()):
                     for pos in unmask_positions:
                         sampled = torch.multinomial(probs[i, pos], 1)
                         ids[i, pos] = sampled
@@ -373,82 +413,71 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
                             int(sampled.item()),
                             int(pos.item()),
                         )
-            else:
-                candidate_blocks: List[torch.Tensor] = []
-                attention_blocks: List[torch.Tensor] = []
-                unmask_positions_by_sample: Dict[int, torch.Tensor] = {}
+                    continue
+                unmask_positions_by_sample[i] = unmask_positions
 
-                for i in range(batch_size):
-                    masked_pos = torch.where(is_masked[i])[0]
-                    if len(masked_pos) == 0:
-                        continue
-                    num_unmask = max(1, int(len(masked_pos) * unmask_prob))
-                    unmask_indices = torch.randperm(len(masked_pos), device=self.device)[:num_unmask]
-                    unmask_positions = masked_pos[unmask_indices]
-                    unmask_positions_by_sample[i] = unmask_positions
+                candidate_ids = ids[i].unsqueeze(0).repeat(self.best_of_k, 1)
+                for pos in masked_pos:
+                    sampled = torch.multinomial(probs[i, pos], self.best_of_k, replacement=True)
+                    candidate_ids[:, int(pos.item())] = sampled
+                candidate_blocks.append(candidate_ids)
+                attention_blocks.append(attention_mask[i].unsqueeze(0).repeat(self.best_of_k, 1))
 
-                    candidate_ids = ids[i].unsqueeze(0).repeat(self.best_of_k, 1)
-                    for pos in masked_pos:
-                        sampled = torch.multinomial(probs[i, pos], self.best_of_k, replacement=True)
-                        candidate_ids[:, int(pos.item())] = sampled
-                    candidate_blocks.append(candidate_ids)
-                    attention_blocks.append(attention_mask[i].unsqueeze(0).repeat(self.best_of_k, 1))
+            if candidate_blocks:
+                provisional_ids = torch.cat(candidate_blocks, dim=0)
+                provisional_attention = torch.cat(attention_blocks, dim=0)
+                scored = score_guidance_batch(
+                    provisional_ids,
+                    provisional_attention,
+                    target_row=self.target_row,
+                    evaluator=self.evaluator,
+                    tokenizer=self.tokenizer,
+                    sol_log_prob_floor=self.sol_log_prob_floor,
+                    w_sol=self.w_sol,
+                    w_chi=self.w_chi,
+                    invalid_reward_penalty=self.invalid_reward_penalty,
+                )
+                self.training_oracle_calls_soluble += int(scored["oracle_calls_soluble"])
+                self.training_oracle_calls_chi += int(scored["oracle_calls_chi"])
 
-                if candidate_blocks:
-                    provisional_ids = torch.cat(candidate_blocks, dim=0)
-                    provisional_attention = torch.cat(attention_blocks, dim=0)
-                    scored = score_guidance_batch(
-                        provisional_ids,
-                        provisional_attention,
-                        target_row=self.target_row,
-                        evaluator=self.evaluator,
-                        tokenizer=self.tokenizer,
-                        sol_log_prob_floor=self.sol_log_prob_floor,
-                        w_sol=self.w_sol,
-                        w_chi=self.w_chi,
-                        invalid_reward_penalty=self.invalid_reward_penalty,
-                    )
-                    self.training_oracle_calls_soluble += int(scored["oracle_calls_soluble"])
-                    self.training_oracle_calls_chi += int(scored["oracle_calls_chi"])
-
-                    rewards = scored["reward"]
-                    valid_mask = scored["valid_mask"].bool()
-                    reward_offset = 0
-                    for i, unmask_positions in unmask_positions_by_sample.items():
-                        sample_rewards = rewards[reward_offset : reward_offset + self.best_of_k]
-                        sample_valid = valid_mask[reward_offset : reward_offset + self.best_of_k]
-                        if sample_valid.any():
-                            valid_rewards = sample_rewards[sample_valid]
-                            valid_indices = torch.nonzero(sample_valid, as_tuple=False).flatten()
-                            best_idx = int(valid_indices[int(torch.argmax(valid_rewards).item())].item())
-                            chosen_ids = provisional_ids[reward_offset + best_idx]
-                        else:
-                            self.guidance_no_valid_fallback_steps += 1
-                            chosen_ids = ids[i].clone()
-                            for pos in unmask_positions:
-                                sampled = torch.multinomial(probs[i, pos], 1)
-                                chosen_token = int(sampled.item())
-                                chosen_ids[int(pos.item())] = chosen_token
-                                probs[i] = self._apply_within_step_constraint_updates(
-                                    logits[i],
-                                    probs[i],
-                                    chosen_ids,
-                                    fixed_mask[i],
-                                    chosen_token,
-                                    int(pos.item()),
-                                )
-                        reward_offset += self.best_of_k
+                rewards = scored["reward"]
+                valid_mask = scored["valid_mask"].bool()
+                reward_offset = 0
+                for i, unmask_positions in unmask_positions_by_sample.items():
+                    sample_rewards = rewards[reward_offset : reward_offset + self.best_of_k]
+                    sample_valid = valid_mask[reward_offset : reward_offset + self.best_of_k]
+                    if sample_valid.any():
+                        valid_rewards = sample_rewards[sample_valid]
+                        valid_indices = torch.nonzero(sample_valid, as_tuple=False).flatten()
+                        best_idx = int(valid_indices[int(torch.argmax(valid_rewards).item())].item())
+                        chosen_ids = provisional_ids[reward_offset + best_idx]
+                    else:
+                        self.guidance_no_valid_fallback_steps += 1
+                        chosen_ids = ids[i].clone()
                         for pos in unmask_positions:
-                            chosen_token = int(chosen_ids[int(pos.item())].item())
-                            ids[i, int(pos.item())] = chosen_token
+                            sampled = torch.multinomial(probs[i, pos], 1)
+                            chosen_token = int(sampled.item())
+                            chosen_ids[int(pos.item())] = chosen_token
                             probs[i] = self._apply_within_step_constraint_updates(
                                 logits[i],
                                 probs[i],
-                                ids[i],
+                                chosen_ids,
                                 fixed_mask[i],
                                 chosen_token,
                                 int(pos.item()),
                             )
+                    reward_offset += self.best_of_k
+                    for pos in unmask_positions:
+                        chosen_token = int(chosen_ids[int(pos.item())].item())
+                        ids[i, int(pos.item())] = chosen_token
+                        probs[i] = self._apply_within_step_constraint_updates(
+                            logits[i],
+                            probs[i],
+                            ids[i],
+                            fixed_mask[i],
+                            chosen_token,
+                            int(pos.item()),
+                        )
 
             if t == 1:
                 final_logits = logits

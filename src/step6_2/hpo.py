@@ -213,9 +213,9 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
     params: Dict[str, Any] = {}
 
     if study_family == "S1":
-        params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 8])
-        params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.40, 0.65)
-        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
+        params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 6, 8])
+        params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.0, 0.65)
+        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
     elif study_family == "S2":
         params["finetune_last_layers"] = trial.suggest_categorical(
@@ -229,13 +229,13 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         )
         _suggest_s2_training_params(trial, params, prefix="s2_")
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 3.0)
-        params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 8])
-        params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.40, 0.65)
-        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
+        params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 6, 8])
+        params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.0, 0.65)
+        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
     elif study_family == "S4_rl":
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
-        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
+        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
         params["w_sa"] = trial.suggest_float("w_sa", 0.0, 1.5)
         params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)
@@ -244,7 +244,7 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
     elif study_family == "S4_ppo":
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
-        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
+        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
         params["w_sa"] = trial.suggest_float("w_sa", 0.0, 1.5)
         params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)
@@ -255,7 +255,7 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["ppo_clip_eps"] = trial.suggest_float("ppo_clip_eps", 0.10, 0.30)
     elif study_family == "S4_grpo":
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
-        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 2.0, log=True)
+        params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
         params["w_sa"] = trial.suggest_float("w_sa", 0.0, 1.5)
         params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)

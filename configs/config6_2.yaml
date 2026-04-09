@@ -108,14 +108,22 @@ step6_2:
     guidance_start_frac: 0.5
     guidance_start_frac_by_class_overrides:
       polyamide: 0.5
+      polyimide: 0.1
     sol_log_prob_floor: -5.0
+    sol_log_prob_floor_by_class_overrides:
+      polyimide: -12.0
     w_sol: 1.0
+    w_sol_by_class_overrides:
+      polyimide: 4.0
     w_chi: 2.0
+    w_chi_by_class_overrides:
+      polyimide: 0.5
     invalid_reward_penalty: -10.0
     embedding_timestep: 1
     cfg_scale: 1.0
     cfg_scale_by_class_overrides:
       polyamide: 2.0
+      polyimide: 1.0
 
   s4:
     alignment_mode: rl
@@ -129,6 +137,8 @@ step6_2:
     rl_prompt_source: train_exact_step3_distribution
     rl_diffusion_num_steps: 25
     sol_log_prob_floor: -5.0
+    sol_log_prob_floor_by_class_overrides:
+      polyimide: -12.0
     reward_weights:
       w_success: 2.0
       w_valid: 1.0
@@ -138,6 +148,24 @@ step6_2:
       w_sa_continuous: 0.5
       w_sol: 1.0
       w_chi: 2.0
+    reward_weights_by_class_overrides:
+      polyimide:
+        w_success: 2.0
+        w_valid: 1.0
+        w_novel: 0.0
+        w_star: 1.0
+        w_sa: 1.0
+        w_sa_continuous: 0.5
+        w_sol: 4.0
+        w_chi: 0.5
+    supervised_train_override_by_class_overrides:
+      polyimide:
+        s2:
+          variant: mt
+          mt_aux:
+            head_type: linear
+            soluble_loss_weight: 0.75
+            chi_loss_weight: 0.05
     learning_rate: 1.0e-5
     weight_decay: 0.01
     warmup_steps: 0
@@ -186,6 +214,8 @@ step6_2:
         mt_aux:
           head_type: linear
           soluble_loss_weight: 0.25
+          soluble_loss_weight_by_class_overrides:
+            polyimide: 0.75
           chi_loss_weight: 0.05
       s3:
         guidance_start_frac: 0.75
