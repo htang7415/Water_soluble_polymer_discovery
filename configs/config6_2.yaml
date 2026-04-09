@@ -188,6 +188,8 @@ step6_2:
       offline_pair_budget_by_class_overrides:
         polyether: 256
       d_water_budget_fraction: 0.2
+      d_water_budget_fraction_by_class_overrides:
+        polyimide: 0.5
       val_pair_fraction: 0.2
       beta: 0.02
       optimizer: adamw
@@ -202,6 +204,7 @@ step6_2:
       logprob_mode: single_step_t1
       checkpoint_selection_mode: val_dpo_loss
       checkpoint_selection_mode_by_class_overrides:
+        polyimide: proxy_property_success_hit_rate
         polyether: proxy_property_success_hit_rate
       num_epochs: 10
       synthetic_candidates_per_target: 16
