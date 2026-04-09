@@ -8,7 +8,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.step6_2.evaluation import Step62Evaluator
+from src.step6_2.evaluation import (
+    Step62Evaluator,
+    compute_chi_penalty_from_bounds,
+    resolve_effective_chi_bounds,
+)
 from src.utils.chemistry import check_validity
 
 
@@ -129,12 +133,24 @@ def score_guidance_batch(
 
     property_rule = str(target_row.get("property_rule", "upper_bound")).strip().lower()
     chi_target = float(target_row["chi_target"])
-    if property_rule == "lower_bound":
-        chi_term = -torch.relu(torch.tensor(float(chi_target)) - chi_pred)
-    elif property_rule == "band":
-        chi_term = -torch.abs(chi_pred - float(chi_target))
-    else:
-        chi_term = -torch.relu(chi_pred - float(chi_target))
+    bounds = resolve_effective_chi_bounds(
+        row=target_row,
+        chi_target=chi_target,
+        property_rule=property_rule,
+        epsilon=float(evaluator.resolved.step6_2.get("chi_band_epsilon", 0.25)),
+        step6_cfg=evaluator.resolved.step6_2,
+    )
+    chi_term = torch.tensor(
+        [
+            compute_chi_penalty_from_bounds(
+                float(pred),
+                lower_bound=float(bounds["chi_target_effective_lower"]),
+                upper_bound=float(bounds["chi_target_effective_upper"]),
+            )
+            for pred in chi_pred.cpu().numpy().tolist()
+        ],
+        dtype=torch.float32,
+    )
 
     valid_reward = float(w_sol) * sol_term + float(w_chi) * chi_term
     invalid_penalty = torch.full_like(valid_reward, float(invalid_reward_penalty))
@@ -165,18 +181,43 @@ def compute_success_shaped_rewards(
     chi_pred = pd.to_numeric(evaluation_df["chi_pred_target"], errors="coerce").to_numpy(dtype=np.float32)
     chi_target = pd.to_numeric(evaluation_df["chi_target"], errors="coerce").to_numpy(dtype=np.float32)
     property_rules = evaluation_df["property_rule"].astype(str).tolist()
+    lower_series = (
+        evaluation_df["chi_target_effective_lower"]
+        if "chi_target_effective_lower" in evaluation_df.columns
+        else pd.Series(np.nan, index=evaluation_df.index)
+    )
+    upper_series = (
+        evaluation_df["chi_target_effective_upper"]
+        if "chi_target_effective_upper" in evaluation_df.columns
+        else pd.Series(np.nan, index=evaluation_df.index)
+    )
+    lower_bounds = pd.to_numeric(lower_series, errors="coerce").to_numpy(dtype=np.float32)
+    upper_bounds = pd.to_numeric(upper_series, errors="coerce").to_numpy(dtype=np.float32)
     chi_term_values: List[float] = []
-    for chi_pred_value, chi_target_value, property_rule in zip(chi_pred, chi_target, property_rules):
+    for chi_pred_value, chi_target_value, property_rule, lower_bound, upper_bound in zip(
+        chi_pred,
+        chi_target,
+        property_rules,
+        lower_bounds,
+        upper_bounds,
+    ):
         if not np.isfinite(chi_pred_value):
             chi_term_values.append(-abs(float(chi_target_value)) if np.isfinite(chi_target_value) else -1.0)
             continue
         rule = str(property_rule).strip().lower()
-        if rule == "lower_bound":
-            chi_term_values.append(-max(0.0, float(chi_target_value) - float(chi_pred_value)))
-        elif rule == "band":
-            chi_term_values.append(-abs(float(chi_pred_value) - float(chi_target_value)))
-        else:
-            chi_term_values.append(-max(0.0, float(chi_pred_value) - float(chi_target_value)))
+        lower = float(lower_bound)
+        upper = float(upper_bound)
+        if not np.isfinite(lower) and rule in {"lower_bound", "band"}:
+            lower = float(chi_target_value) if rule == "lower_bound" else float(chi_target_value)
+        if not np.isfinite(upper) and rule in {"upper_bound", "band"}:
+            upper = float(chi_target_value) if rule == "upper_bound" else float(chi_target_value)
+        chi_term_values.append(
+            compute_chi_penalty_from_bounds(
+                float(chi_pred_value),
+                lower_bound=lower,
+                upper_bound=upper,
+            )
+        )
     chi_term = torch.tensor(np.asarray(chi_term_values, dtype=np.float32), dtype=torch.float32)
 
     success_col = (

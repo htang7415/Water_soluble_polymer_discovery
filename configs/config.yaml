@@ -274,7 +274,7 @@ chi_training:
       polyimide: "backbone_template"
       polyamide: "motif"  # polyamide backbone templates over-bias long hydrophobic scaffolds and suppress soluble hits in Step 6_2
       polyester: "backbone_template"
-      polyether: "backbone_template"
+      polyether: "motif"  # polyether motif decoding improves soluble hits in Step 6_2 more reliably than the old backbone-template prior
       polysulfone: "backbone_template"
     decode_constraint_motif_bank_json: null  # optional JSON mapping class -> list of p-SMILES motif fragments
     decode_constraint_resolution_strategy: "configured_or_defaults"  # Step 6 only: safer default than local auto-mined motifs; can override to configured_or_local_mined_or_defaults
@@ -311,6 +311,7 @@ chi_training:
     decode_constraint_enforce_backbone_class_match: true  # require class motif on backbone (shortest path between * atoms) for backbone classes
     decode_constraint_class_match_sampling_attempts_max: 12
     decode_constraint_class_match_sampling_attempts_max_overrides:
+      polyether: 24
       polyimide: 32
       polysulfone: 24
     decode_constraint_class_match_oversample_factor: 2.0

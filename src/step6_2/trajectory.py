@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
@@ -141,6 +142,27 @@ def _pad_event_matrix(values: List[torch.Tensor], *, device: torch.device) -> Tu
 
 class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
     """Conditional sampler that can emit replayable trajectories for S4."""
+
+    def _validate_batched_condition_bundle(self, *, num_samples: int) -> None:
+        condition_rows = int(self.condition_bundle.shape[0])
+        if condition_rows not in {1, int(num_samples)}:
+            raise ValueError(
+                "TrajectoryConditionalSampler batch helpers require condition_bundle to have "
+                f"either 1 row or num_samples rows. Got condition_rows={condition_rows}, "
+                f"num_samples={int(num_samples)}."
+            )
+
+    @contextmanager
+    def _condition_bundle_slice(self, start_idx: int, end_idx: int):
+        original_condition = self.condition_bundle
+        if int(original_condition.shape[0]) == 1:
+            yield
+            return
+        self.condition_bundle = original_condition[int(start_idx) : int(end_idx)]
+        try:
+            yield
+        finally:
+            self.condition_bundle = original_condition
 
     def _apply_within_step_constraint_updates(
         self,
@@ -394,6 +416,7 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
         all_trajectories: List[SamplingTrajectoryRecord] = []
         if lengths is not None and len(lengths) != int(num_samples):
             raise ValueError("lengths must match num_samples")
+        self._validate_batched_condition_bundle(num_samples=int(num_samples))
 
         sample_idx = 0
         num_batches = (int(num_samples) + int(batch_size) - 1) // int(batch_size)
@@ -405,19 +428,20 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
 
         for _ in iterator:
             current_batch_size = min(int(batch_size), int(num_samples) - sample_idx)
-            if lengths is None:
-                ids, smiles, trajectory = self.sample_with_trajectory(
-                    batch_size=current_batch_size,
-                    seq_length=int(seq_length),
-                    show_progress=False,
-                )
-            else:
-                batch_lengths = lengths[sample_idx : sample_idx + current_batch_size]
-                ids, smiles, trajectory = self.sample_with_lengths_trajectory(
-                    batch_lengths,
-                    max_length=int(seq_length),
-                    show_progress=False,
-                )
+            with self._condition_bundle_slice(sample_idx, sample_idx + current_batch_size):
+                if lengths is None:
+                    ids, smiles, trajectory = self.sample_with_trajectory(
+                        batch_size=current_batch_size,
+                        seq_length=int(seq_length),
+                        show_progress=False,
+                    )
+                else:
+                    batch_lengths = lengths[sample_idx : sample_idx + current_batch_size]
+                    ids, smiles, trajectory = self.sample_with_lengths_trajectory(
+                        batch_lengths,
+                        max_length=int(seq_length),
+                        show_progress=False,
+                    )
             all_ids.append(ids)
             all_smiles.extend(smiles)
             all_trajectories.append(trajectory)
@@ -441,6 +465,7 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
             raise ValueError("span_start_positions must match num_samples")
         if lengths is not None and len(lengths) != int(num_samples):
             raise ValueError("lengths must match num_samples")
+        self._validate_batched_condition_bundle(num_samples=int(num_samples))
 
         all_ids: List[torch.Tensor] = []
         all_smiles: List[str] = []
@@ -458,13 +483,14 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
             batch_span_ids = span_token_ids[sample_idx : sample_idx + current_batch_size]
             batch_span_starts = span_start_positions[sample_idx : sample_idx + current_batch_size]
             batch_lengths = None if lengths is None else lengths[sample_idx : sample_idx + current_batch_size]
-            ids, smiles, trajectory = self.sample_with_fixed_spans_trajectory(
-                span_token_ids=batch_span_ids,
-                span_start_positions=batch_span_starts,
-                seq_length=int(seq_length),
-                lengths=batch_lengths,
-                show_progress=False,
-            )
+            with self._condition_bundle_slice(sample_idx, sample_idx + current_batch_size):
+                ids, smiles, trajectory = self.sample_with_fixed_spans_trajectory(
+                    span_token_ids=batch_span_ids,
+                    span_start_positions=batch_span_starts,
+                    seq_length=int(seq_length),
+                    lengths=batch_lengths,
+                    show_progress=False,
+                )
             all_ids.append(ids)
             all_smiles.extend(smiles)
             all_trajectories.append(trajectory)
@@ -488,6 +514,7 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
             raise ValueError("span_start_positions must match num_samples")
         if lengths is not None and len(lengths) != int(num_samples):
             raise ValueError("lengths must match num_samples")
+        self._validate_batched_condition_bundle(num_samples=int(num_samples))
 
         all_ids: List[torch.Tensor] = []
         all_smiles: List[str] = []
@@ -505,13 +532,14 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
             batch_span_ids = span_token_ids[sample_idx : sample_idx + current_batch_size]
             batch_span_starts = span_start_positions[sample_idx : sample_idx + current_batch_size]
             batch_lengths = None if lengths is None else lengths[sample_idx : sample_idx + current_batch_size]
-            ids, smiles, trajectory = self.sample_with_multiple_fixed_spans_trajectory(
-                span_token_ids=batch_span_ids,
-                span_start_positions=batch_span_starts,
-                seq_length=int(seq_length),
-                lengths=batch_lengths,
-                show_progress=False,
-            )
+            with self._condition_bundle_slice(sample_idx, sample_idx + current_batch_size):
+                ids, smiles, trajectory = self.sample_with_multiple_fixed_spans_trajectory(
+                    span_token_ids=batch_span_ids,
+                    span_start_positions=batch_span_starts,
+                    seq_length=int(seq_length),
+                    lengths=batch_lengths,
+                    show_progress=False,
+                )
             all_ids.append(ids)
             all_smiles.extend(smiles)
             all_trajectories.append(trajectory)

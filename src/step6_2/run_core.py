@@ -13,7 +13,7 @@ import yaml
 
 from .config import build_run_config, resolve_step62_generation_budget
 from .conditional_sampling import create_conditional_sampler, sample_conditional_with_class_prior
-from .dataset import ConditionScaler, build_inference_condition_bundle
+from .dataset import ConditionScaler, build_inference_condition_bundle_from_target_row
 from .dpo import train_s4_dpo_alignment
 from .evaluation import (
     aggregate_round_metrics,
@@ -558,10 +558,8 @@ def run_single_target_sampling(
         if s2_scaler is None:
             raise ValueError("S2 conditional sampling requires the fitted ConditionScaler.")
         condition_bundle = torch.tensor(
-            build_inference_condition_bundle(
-                temperature=float(target_row["temperature"]),
-                phi=float(target_row["phi"]),
-                chi_goal=float(target_row["chi_target"]),
+            build_inference_condition_bundle_from_target_row(
+                target_row.to_dict(),
                 scaler=s2_scaler,
                 soluble=1,
                 available_target_classes=resolved.available_target_classes,
@@ -598,10 +596,8 @@ def run_single_target_sampling(
             raise ValueError("S3 conditional guided sampling requires the fitted ConditionScaler.")
         s3_cfg = run_cfg["s3"]
         condition_bundle = torch.tensor(
-            build_inference_condition_bundle(
-                temperature=float(target_row["temperature"]),
-                phi=float(target_row["phi"]),
-                chi_goal=float(target_row["chi_target"]),
+            build_inference_condition_bundle_from_target_row(
+                target_row.to_dict(),
                 scaler=s2_scaler,
                 soluble=1,
                 available_target_classes=resolved.available_target_classes,
@@ -650,10 +646,8 @@ def run_single_target_sampling(
         if s2_scaler is None:
             raise ValueError("S4 sampling requires the fitted ConditionScaler from the warm start.")
         condition_bundle = torch.tensor(
-            build_inference_condition_bundle(
-                temperature=float(target_row["temperature"]),
-                phi=float(target_row["phi"]),
-                chi_goal=float(target_row["chi_target"]),
+            build_inference_condition_bundle_from_target_row(
+                target_row.to_dict(),
                 scaler=s2_scaler,
                 soluble=1,
                 available_target_classes=resolved.available_target_classes,

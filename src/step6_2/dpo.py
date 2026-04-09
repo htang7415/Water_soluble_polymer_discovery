@@ -26,6 +26,7 @@ from .config import ResolvedStep62Config, select_step62_proxy_target_rows
 from .dataset import (
     ConditionScaler,
     build_inference_condition_bundle,
+    build_inference_condition_bundle_from_target_row,
     build_step62_supervised_frames,
     get_step62_family_condition_columns,
 )
@@ -133,6 +134,9 @@ def _build_pair_condition_bundle(
     temperature: float,
     phi: float,
     chi_goal: float,
+    property_rule: str,
+    chi_goal_lower: float,
+    chi_goal_upper: float,
     scaler: ConditionScaler,
     available_target_classes: List[str],
     chosen_row: pd.Series | Dict[str, Any],
@@ -145,6 +149,9 @@ def _build_pair_condition_bundle(
         soluble=1,
         available_target_classes=available_target_classes,
         c_target=None,
+        property_rule=str(property_rule),
+        chi_goal_lower=chi_goal_lower,
+        chi_goal_upper=chi_goal_upper,
     )
     family_vector = _family_vector_from_row(
         chosen_row,
@@ -238,6 +245,9 @@ def _build_d_water_pairs(
             temperature=np.nan,
             phi=np.nan,
             chi_goal=np.nan,
+            property_rule="upper_bound",
+            chi_goal_lower=np.nan,
+            chi_goal_upper=np.nan,
             scaler=scaler,
             available_target_classes=available_target_classes,
             chosen_row=chosen_row,
@@ -279,9 +289,13 @@ def _build_d_chi_pairs(
     for (temperature, phi), bucket in work.groupby(["temperature", "phi"], dropna=False):
         if not np.isfinite(temperature) or not np.isfinite(phi):
             continue
-        chi_target = chi_lookup.lookup(float(temperature), float(phi), warn_on_missing=False)
-        if chi_target is None:
+        chi_target_row = chi_lookup.lookup_row(float(temperature), float(phi), warn_on_missing=False)
+        if chi_target_row is None:
             continue
+        chi_target = float(chi_target_row["chi_target"])
+        property_rule = str(chi_target_row.get("property_rule", "upper_bound"))
+        chi_target_lower = pd.to_numeric(chi_target_row.get("chi_target_boot_q025", np.nan), errors="coerce")
+        chi_target_upper = pd.to_numeric(chi_target_row.get("chi_target_boot_q975", np.nan), errors="coerce")
         bucket = bucket.sort_values(["canonical_smiles", "Polymer", "row_id"]).reset_index(drop=True)
         if pair_source == "label_water_miscibility":
             chosen_df = bucket.loc[bucket["water_miscible"].astype(int) == 1].copy()
@@ -318,6 +332,9 @@ def _build_d_chi_pairs(
                 temperature=float(temperature),
                 phi=float(phi),
                 chi_goal=float(chi_target),
+                property_rule=property_rule,
+                chi_goal_lower=chi_target_lower,
+                chi_goal_upper=chi_target_upper,
                 scaler=scaler,
                 available_target_classes=available_target_classes,
                 chosen_row=chosen_row,
@@ -403,6 +420,7 @@ def _build_target_row_synthetic_pairs(
     evaluator,
     device: str,
     metrics_dir: Path,
+    target_rows_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     dpo_cfg = dict(run_cfg["s4"]["dpo"])
     synthetic_per_target = int(dpo_cfg["synthetic_candidates_per_target"])
@@ -412,13 +430,17 @@ def _build_target_row_synthetic_pairs(
     sample_id_start = 1
     base_seed = int(resolved.step6_2["random_seed"])
 
-    for target_offset, (_, target_row) in enumerate(resolved.target_family_df.iterrows()):
+    pair_target_df = (
+        target_rows_df.copy().reset_index(drop=True)
+        if target_rows_df is not None and not target_rows_df.empty
+        else resolved.target_family_df.copy().reset_index(drop=True)
+    )
+
+    for target_offset, (_, target_row) in enumerate(pair_target_df.iterrows()):
         seed_everything(base_seed + 10_000 + target_offset, deterministic=True)
         condition_bundle = torch.tensor(
-            build_inference_condition_bundle(
-                temperature=float(target_row["temperature"]),
-                phi=float(target_row["phi"]),
-                chi_goal=float(target_row["chi_target"]),
+            build_inference_condition_bundle_from_target_row(
+                target_row.to_dict(),
                 scaler=warm_start.scaler,
                 soluble=1,
                 available_target_classes=resolved.available_target_classes,
@@ -471,10 +493,8 @@ def _build_target_row_synthetic_pairs(
         eval_df["synthetic_rank"] = np.arange(1, len(eval_df) + 1, dtype=int)
         candidate_frames.append(eval_df)
 
-        bundle_np = build_inference_condition_bundle(
-            temperature=float(target_row["temperature"]),
-            phi=float(target_row["phi"]),
-            chi_goal=float(target_row["chi_target"]),
+        bundle_np = build_inference_condition_bundle_from_target_row(
+            target_row.to_dict(),
             scaler=warm_start.scaler,
             soluble=1,
             available_target_classes=resolved.available_target_classes,
@@ -680,6 +700,7 @@ def build_dpo_pair_splits(
     prior: Optional[ResolvedClassSamplingPrior] = None,
     evaluator=None,
     device: Optional[str] = None,
+    target_rows_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     """Construct offline DPO pair splits for the configured pair source."""
 
@@ -700,6 +721,7 @@ def build_dpo_pair_splits(
             evaluator=evaluator,
             device=device,
             metrics_dir=metrics_dir,
+            target_rows_df=target_rows_df,
         )
         selected_pairs = _take_budgeted_single_source_pairs(
             pair_df=synthetic_pairs,
@@ -947,10 +969,8 @@ def _evaluate_dpo_proxy_success_metrics(
     )
     for _, target_row in proxy_target_df.iterrows():
         condition_bundle = torch.tensor(
-            build_inference_condition_bundle(
-                temperature=float(target_row["temperature"]),
-                phi=float(target_row["phi"]),
-                chi_goal=float(target_row["chi_target"]),
+            build_inference_condition_bundle_from_target_row(
+                target_row.to_dict(),
                 scaler=warm_start.scaler,
                 soluble=1,
                 available_target_classes=resolved.available_target_classes,
@@ -1092,6 +1112,7 @@ def train_s4_dpo_alignment(
         prior=prior,
         evaluator=evaluator,
         device=device,
+        target_rows_df=target_rows_df,
     )
 
     policy_model = deepcopy(warm_start.diffusion_model).to(device)
@@ -1150,6 +1171,8 @@ def train_s4_dpo_alignment(
     saturation_guard_triggered = False
     best_policy_state: Optional[Dict[str, torch.Tensor]] = None
     proxy_objective_metric = "proxy_property_success_hit_rate_discovery"
+    best_checkpoint_metric_name = "val_dpo_loss" if checkpoint_mode == "val_dpo_loss" else proxy_objective_metric
+    best_checkpoint_metric_value = float("inf") if checkpoint_mode == "val_dpo_loss" else float("-inf")
 
     if checkpoint_mode == "proxy_property_success_hit_rate":
         proxy_metrics, proxy_eval_df = _evaluate_dpo_proxy_success_metrics(
@@ -1173,6 +1196,7 @@ def train_s4_dpo_alignment(
         )
         if np.isfinite(proxy_objective_value):
             best_proxy_success = float(proxy_objective_value)
+            best_checkpoint_metric_value = float(proxy_objective_value)
             best_policy_state = _clone_policy_state_dict(policy_model)
 
     epoch_counter = 0
@@ -1230,6 +1254,8 @@ def train_s4_dpo_alignment(
         current_val = float(val_metrics["val_dpo_loss"]) if np.isfinite(val_metrics["val_dpo_loss"]) else float(
             history_row["train_dpo_loss"]
         )
+        if np.isfinite(current_val):
+            best_val_dpo_loss = min(best_val_dpo_loss, current_val)
         if checkpoint_mode == "proxy_property_success_hit_rate":
             proxy_metrics, proxy_eval_df = _evaluate_dpo_proxy_success_metrics(
                 resolved=resolved,
@@ -1253,6 +1279,7 @@ def train_s4_dpo_alignment(
             history_row.update(proxy_metrics)
             if np.isfinite(proxy_objective_value) and proxy_objective_value > best_proxy_success:
                 best_proxy_success = float(proxy_objective_value)
+                best_checkpoint_metric_value = float(proxy_objective_value)
                 if skip_disk_checkpoints:
                     best_policy_state = _clone_policy_state_dict(policy_model)
                 else:
@@ -1282,8 +1309,8 @@ def train_s4_dpo_alignment(
                     value=-float(current_val),
                     metrics=history_row,
                 )
-            if current_val < best_val_dpo_loss:
-                best_val_dpo_loss = current_val
+            if current_val < best_checkpoint_metric_value:
+                best_checkpoint_metric_value = float(current_val)
                 if skip_disk_checkpoints:
                     best_policy_state = _clone_policy_state_dict(policy_model)
                 else:
@@ -1372,6 +1399,10 @@ def train_s4_dpo_alignment(
                 "run_name": str(run_cfg["run_name"]),
                 "pair_source": diagnostics["pair_source"],
                 "best_val_dpo_loss": float(best_val_dpo_loss),
+                "best_checkpoint_metric_name": best_checkpoint_metric_name,
+                "best_checkpoint_metric_value": (
+                    float(best_checkpoint_metric_value) if np.isfinite(best_checkpoint_metric_value) else None
+                ),
                 "best_proxy_metric_value": (
                     float(best_proxy_success) if np.isfinite(best_proxy_success) else None
                 ),
@@ -1397,6 +1428,9 @@ def train_s4_dpo_alignment(
         (
             f"DPO train complete | run={run_cfg['run_name']} epochs_completed={int(epoch_counter)} "
             f"configured_epochs={int(configured_num_epochs)} effective_epochs={int(effective_num_epochs)} "
+            f"best_checkpoint_metric={best_checkpoint_metric_name} "
+            f"best_checkpoint_metric_value="
+            f"{(float(best_checkpoint_metric_value) if np.isfinite(best_checkpoint_metric_value) else float('nan')):.4f} "
             f"best_val_dpo_loss={float(best_val_dpo_loss):.4f}"
         ),
         echo=True,

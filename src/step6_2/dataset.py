@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 import numpy as np
 import pandas as pd
@@ -102,12 +102,15 @@ def _build_step62_condition_bundle_from_values(
     temperature: float,
     phi: float,
     chi_goal: float,
+    chi_goal_lower: float,
+    chi_goal_upper: float,
     scaler: ConditionScaler,
     family_vector: np.ndarray,
 ) -> np.ndarray:
     t_present = float(np.isfinite(temperature))
     phi_present = float(np.isfinite(phi))
     chi_present = float(np.isfinite(chi_goal))
+    del chi_goal_lower, chi_goal_upper
     base_bundle = np.asarray(
         [
             float(int(soluble)),
@@ -345,11 +348,17 @@ def build_condition_bundle(
     chi_observed = row.get("chi", np.nan)
 
     chi_goal = float(chi_observed) if np.isfinite(chi_observed) else np.nan
+    chi_goal_lower = float(chi_observed) if np.isfinite(chi_observed) else np.nan
+    chi_goal_upper = float(chi_observed) if np.isfinite(chi_observed) else np.nan
     step3_target = None
     augmentation_eligible = False
     augmented = False
     if np.isfinite(temperature) and np.isfinite(phi):
-        step3_target = chi_lookup.lookup(float(temperature), float(phi), warn_on_missing=False)
+        step3_target_row = chi_lookup.lookup_row(float(temperature), float(phi), warn_on_missing=False)
+    else:
+        step3_target_row = None
+    if step3_target_row is not None:
+        step3_target = float(step3_target_row["chi_target"])
     if step3_target is not None and np.isfinite(chi_observed):
         augmentation_eligible = bool(
             int(row["water_miscible"]) == 1 and float(chi_observed) <= float(step3_target)
@@ -367,13 +376,19 @@ def build_condition_bundle(
         temperature=float(temperature) if np.isfinite(temperature) else np.nan,
         phi=float(phi) if np.isfinite(phi) else np.nan,
         chi_goal=float(chi_goal) if np.isfinite(chi_goal) else np.nan,
+        chi_goal_lower=float(chi_goal_lower) if np.isfinite(chi_goal_lower) else np.nan,
+        chi_goal_upper=float(chi_goal_upper) if np.isfinite(chi_goal_upper) else np.nan,
         scaler=scaler,
         family_vector=family_vector,
     )
     return {
         "condition_bundle": bundle,
         "chi_goal": float(chi_goal) if np.isfinite(chi_goal) else np.nan,
+        "chi_goal_lower": float(chi_goal_lower) if np.isfinite(chi_goal_lower) else np.nan,
+        "chi_goal_upper": float(chi_goal_upper) if np.isfinite(chi_goal_upper) else np.nan,
         "step3_chi_target": np.nan if step3_target is None else float(step3_target),
+        "step3_chi_target_lower": np.nan,
+        "step3_chi_target_upper": np.nan,
         "augmentation_eligible": int(augmentation_eligible),
         "augmented_to_step3_target": int(augmented),
     }
@@ -388,6 +403,9 @@ def build_inference_condition_bundle(
     soluble: int = 1,
     available_target_classes: List[str],
     c_target: str | None = None,
+    property_rule: str = "upper_bound",
+    chi_goal_lower: float = np.nan,
+    chi_goal_upper: float = np.nan,
 ) -> np.ndarray:
     """Build the canonical Step 6_2 inference condition bundle."""
 
@@ -400,8 +418,34 @@ def build_inference_condition_bundle(
         temperature=float(temperature),
         phi=float(phi),
         chi_goal=float(chi_goal),
+        chi_goal_lower=np.nan,
+        chi_goal_upper=np.nan,
         scaler=scaler,
         family_vector=family_vector,
+    )
+
+
+def build_inference_condition_bundle_from_target_row(
+    target_row: Mapping[str, Any],
+    *,
+    scaler: ConditionScaler,
+    available_target_classes: List[str],
+    soluble: int = 1,
+    c_target: str | None = None,
+) -> np.ndarray:
+    """Build the canonical Step 6_2 inference condition bundle from a target-row mapping."""
+
+    return build_inference_condition_bundle(
+        temperature=float(target_row["temperature"]),
+        phi=float(target_row["phi"]),
+        chi_goal=float(target_row["chi_target"]),
+        scaler=scaler,
+        soluble=int(soluble),
+        available_target_classes=available_target_classes,
+        c_target=str(target_row.get("c_target", c_target or "")),
+        property_rule=str(target_row.get("property_rule", "upper_bound")),
+        chi_goal_lower=pd.to_numeric(target_row.get("chi_target_boot_q025", np.nan), errors="coerce"),
+        chi_goal_upper=pd.to_numeric(target_row.get("chi_target_boot_q975", np.nan), errors="coerce"),
     )
 
 

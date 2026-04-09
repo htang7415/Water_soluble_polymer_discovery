@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import numpy as np
 import pandas as pd
@@ -73,6 +73,76 @@ class Step62Evaluator:
     reporting_sa_thresholds: Dict[str, float]
     discovery_sa_thresholds: Dict[str, float]
     chi_band_epsilon: float = 0.05
+
+
+def resolve_step62_chi_target_bound_mode(step6_cfg: Mapping[str, Any] | None) -> str:
+    if not isinstance(step6_cfg, Mapping):
+        return "point_estimate"
+    mode = str(step6_cfg.get("chi_target_bound_mode", "point_estimate")).strip().lower()
+    if mode not in {"point_estimate", "step3_bootstrap_interval"}:
+        raise ValueError(
+            "step6_2.chi_target_bound_mode must be one of "
+            "{'point_estimate', 'step3_bootstrap_interval'}."
+        )
+    return mode
+
+
+def resolve_effective_chi_bounds(
+    *,
+    row: Mapping[str, Any],
+    chi_target: float,
+    property_rule: str,
+    epsilon: float,
+    step6_cfg: Mapping[str, Any] | None,
+) -> Dict[str, Any]:
+    mode = resolve_step62_chi_target_bound_mode(step6_cfg)
+    rule = str(property_rule).strip().lower()
+
+    # Step 3 bootstrap quantiles are uncertainty metadata, not acceptance bounds.
+    if rule == "lower_bound":
+        lower_bound = float(chi_target)
+        upper_bound = float("inf")
+    elif rule == "band":
+        lower_bound = float(chi_target) - float(epsilon)
+        upper_bound = float(chi_target) + float(epsilon)
+    else:
+        lower_bound = float("-inf")
+        upper_bound = float(chi_target)
+    return {
+        "chi_target_effective_lower": float(lower_bound),
+        "chi_target_effective_upper": float(upper_bound),
+        "chi_target_bound_mode": mode,
+    }
+
+
+def compute_chi_ok_from_bounds(
+    chi_pred: float,
+    *,
+    lower_bound: float,
+    upper_bound: float,
+) -> int:
+    if not np.isfinite(chi_pred):
+        return 0
+    if np.isfinite(lower_bound) and chi_pred < float(lower_bound):
+        return 0
+    if np.isfinite(upper_bound) and chi_pred > float(upper_bound):
+        return 0
+    return 1
+
+
+def compute_chi_penalty_from_bounds(
+    chi_pred: float,
+    *,
+    lower_bound: float,
+    upper_bound: float,
+) -> float:
+    if not np.isfinite(chi_pred):
+        return -1.0
+    if np.isfinite(lower_bound) and chi_pred < float(lower_bound):
+        return float(chi_pred) - float(lower_bound)
+    if np.isfinite(upper_bound) and chi_pred > float(upper_bound):
+        return float(upper_bound) - float(chi_pred)
+    return 0.0
 
 
 def load_step62_evaluator(
@@ -177,6 +247,10 @@ def build_generated_samples_frame(
                 "smiles": str(smiles),
             }
         )
+        for optional_col in ("chi_target_boot_q025", "chi_target_boot_q975"):
+            optional_value = pd.to_numeric(target_row.get(optional_col, np.nan), errors="coerce")
+            if np.isfinite(optional_value):
+                rows[-1][optional_col] = float(optional_value)
     return pd.DataFrame(rows)
 
 
@@ -389,12 +463,29 @@ def evaluate_generated_samples(
     out["class_prob"] = pd.to_numeric(out["class_prob"], errors="coerce")
     out["chi_pred_target"] = pd.to_numeric(out["chi_pred_target"], errors="coerce")
     out["soluble_ok"] = (out["class_prob"] >= 0.5).fillna(False).astype(int)
+    effective_bounds = [
+        resolve_effective_chi_bounds(
+            row=row,
+            chi_target=float(row["chi_target"]),
+            property_rule=str(row.get("property_rule", "upper_bound")),
+            epsilon=chi_band_epsilon,
+            step6_cfg=evaluator.resolved.step6_2,
+        )
+        for row in out.to_dict(orient="records")
+    ]
+    effective_bounds_df = pd.DataFrame(effective_bounds, index=out.index)
+    for column in effective_bounds_df.columns:
+        out[column] = effective_bounds_df[column]
     out["chi_ok"] = [
-        _compute_chi_ok(chi_pred, chi_target, property_rule, chi_band_epsilon)
-        for chi_pred, chi_target, property_rule in zip(
+        compute_chi_ok_from_bounds(
+            chi_pred,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+        )
+        for chi_pred, lower_bound, upper_bound in zip(
             out["chi_pred_target"],
-            out["chi_target"],
-            out["property_rule"],
+            out["chi_target_effective_lower"],
+            out["chi_target_effective_upper"],
         )
     ]
     out["chi_band_ok"] = [

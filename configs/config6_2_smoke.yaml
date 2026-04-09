@@ -39,6 +39,7 @@ step6_2:
   conditional_cfg_scale_retry_multiplier_overrides:
     polystyrene: 1.25
   chi_band_epsilon: 0.25
+  chi_target_bound_mode: point_estimate
   target_sa_max: 4.0
   reporting_target_sa_max_by_class:
     polyacrylate: 3.5
@@ -71,6 +72,7 @@ step6_2:
 
   s2:
     variant: pure
+    checkpoint_selection_metric: auto
     finetune_last_layers: null
     optimizer: adamw
     learning_rate: 3.0e-4
@@ -95,17 +97,23 @@ step6_2:
       soluble_loss_weight: 0.1
       chi_loss_weight: 0.1
     cfg_scale: 0.5
+    cfg_scale_by_class_overrides:
+      polyamide: 2.0
 
   s3:
     supervised_train_config_source: s2
     best_of_k: 2
     guidance_start_frac: 0.5
+    guidance_start_frac_by_class_overrides:
+      polyamide: 0.5
     sol_log_prob_floor: -5.0
     w_sol: 1.0
     w_chi: 2.0
     invalid_reward_penalty: -10.0
     embedding_timestep: 1
     cfg_scale: 1.0
+    cfg_scale_by_class_overrides:
+      polyamide: 2.0
 
   s4:
     alignment_mode: rl
@@ -147,6 +155,8 @@ step6_2:
     trajectories_per_batch: 8
     dpo:
       offline_pair_budget: 64
+      offline_pair_budget_by_class_overrides:
+        polyether: 256
       d_water_budget_fraction: 0.2
       val_pair_fraction: 0.2
       beta: 0.02
@@ -161,6 +171,8 @@ step6_2:
       pair_refresh_mode: offline_fixed
       logprob_mode: single_step_t1
       checkpoint_selection_mode: val_dpo_loss
+      checkpoint_selection_mode_by_class_overrides:
+        polyether: proxy_property_success_hit_rate
       num_epochs: 2
       synthetic_candidates_per_target: 4
 
@@ -198,6 +210,23 @@ step6_2:
           chi_loss_weight: 0.05
       s3:
         cfg_scale: 2.0
+    S4_rl_finetuned:
+      canonical_family: S4
+      s4:
+        cfg_scale_by_class_overrides:
+          polyamide: 2.0
+        sol_log_prob_floor_by_class_overrides:
+          polyamide: -12.0
+        reward_weights_by_class_overrides:
+          polyamide:
+            w_success: 2.0
+            w_valid: 1.0
+            w_novel: 0.0
+            w_star: 1.0
+            w_sa: 1.0
+            w_sa_continuous: 0.5
+            w_sol: 2.0
+            w_chi: 2.0
     S4_dpo:
       canonical_family: S4
       s4:

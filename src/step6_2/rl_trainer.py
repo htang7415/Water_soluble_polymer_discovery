@@ -20,6 +20,7 @@ from .config import select_step62_proxy_target_rows
 from .dataset import (
     ConditionScaler,
     build_inference_condition_bundle,
+    build_inference_condition_bundle_from_target_row,
     build_step62_supervised_frames,
 )
 from .evaluation import evaluate_generated_samples
@@ -80,6 +81,10 @@ def _build_rollout_frame(
             "property_rule": str(prompt_row.get("property_rule", "upper_bound")),
             "smiles": str(smiles_value),
         }
+        for optional_col in ("chi_target_boot_q025", "chi_target_boot_q975"):
+            optional_value = pd.to_numeric(prompt_row.get(optional_col, np.nan), errors="coerce")
+            if np.isfinite(optional_value):
+                row[optional_col] = float(optional_value)
         if "prompt_group_id" in prompt_row:
             row["prompt_group_id"] = int(prompt_row["prompt_group_id"])
         if "prompt_member_id" in prompt_row:
@@ -120,9 +125,21 @@ def _build_generic_prompt_source_df(
         out["step3_chi_target"].astype(float) if exact_step3_targets else out["chi"].astype(float)
     )
     out["property_rule"] = "upper_bound"
-    return out[
-        ["target_row_id", "target_row_key", "c_target", "temperature", "phi", "chi_target", "property_rule"]
-    ].copy()
+    if exact_step3_targets:
+        step3_bounds = resolved.target_base_df[["temperature", "phi"]].copy()
+        for optional_col in ("chi_target_boot_q025", "chi_target_boot_q975"):
+            if optional_col in resolved.target_base_df.columns:
+                step3_bounds[optional_col] = pd.to_numeric(
+                    resolved.target_base_df[optional_col],
+                    errors="coerce",
+                )
+        step3_bounds = step3_bounds.drop_duplicates(["temperature", "phi"]).reset_index(drop=True)
+        out = out.merge(step3_bounds, on=["temperature", "phi"], how="left")
+    keep_cols = ["target_row_id", "target_row_key", "c_target", "temperature", "phi", "chi_target", "property_rule"]
+    keep_cols.extend(
+        [optional_col for optional_col in ("chi_target_boot_q025", "chi_target_boot_q975") if optional_col in out.columns]
+    )
+    return out[keep_cols].copy()
 
 
 def _build_prompt_source_df(resolved, run_cfg: Dict[str, object]) -> pd.DataFrame:
@@ -220,6 +237,9 @@ def _prompt_df_to_condition_tensor(
             soluble=1,
             available_target_classes=available_target_classes,
             c_target=str(row.get("c_target", "")),
+            property_rule=str(row.get("property_rule", "upper_bound")),
+            chi_goal_lower=pd.to_numeric(row.get("chi_target_boot_q025", np.nan), errors="coerce"),
+            chi_goal_upper=pd.to_numeric(row.get("chi_target_boot_q975", np.nan), errors="coerce"),
         )
         for row in prompt_df.to_dict(orient="records")
     ]
@@ -583,10 +603,8 @@ def _evaluate_proxy_success_metrics(
     )
     for _, target_row in proxy_target_df.iterrows():
         condition_bundle = torch.tensor(
-            build_inference_condition_bundle(
-                temperature=float(target_row["temperature"]),
-                phi=float(target_row["phi"]),
-                chi_goal=float(target_row["chi_target"]),
+            build_inference_condition_bundle_from_target_row(
+                target_row.to_dict(),
                 scaler=scaler,
                 soluble=1,
                 available_target_classes=resolved.available_target_classes,
@@ -630,6 +648,10 @@ def _evaluate_proxy_success_metrics(
                 "smiles": smiles,
             }
         )
+        for optional_col in ("chi_target_boot_q025", "chi_target_boot_q975"):
+            optional_value = pd.to_numeric(target_row.get(optional_col, np.nan), errors="coerce")
+            if np.isfinite(optional_value):
+                sample_df[optional_col] = float(optional_value)
         sample_id_start += len(smiles)
         rows.append(evaluate_generated_samples(sample_df, evaluator))
     if not rows:

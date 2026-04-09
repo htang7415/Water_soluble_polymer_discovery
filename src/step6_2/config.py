@@ -157,6 +157,9 @@ class ExactChiTargetLookup:
 
     mapping: Dict[Tuple[str, str], float]
     source_path: Path
+    property_rule_mapping: Dict[Tuple[str, str], str]
+    q025_mapping: Dict[Tuple[str, str], float]
+    q975_mapping: Dict[Tuple[str, str], float]
 
     def lookup(
         self,
@@ -176,6 +179,35 @@ class ExactChiTargetLookup:
                 stacklevel=2,
             )
         return value
+
+    def lookup_row(
+        self,
+        temperature: float,
+        phi: float,
+        *,
+        warn_on_missing: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        key = _condition_key(temperature, phi)
+        chi_target = self.mapping.get(key)
+        if chi_target is None:
+            if warn_on_missing:
+                warnings.warn(
+                    (
+                        "Missing exact Step 3 chi_target lookup for "
+                        f"(T={temperature}, phi={phi}) in {self.source_path}"
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return None
+        q025 = self.q025_mapping.get(key, np.nan)
+        q975 = self.q975_mapping.get(key, np.nan)
+        return {
+            "chi_target": float(chi_target),
+            "property_rule": str(self.property_rule_mapping.get(key, "upper_bound")).strip().lower(),
+            "chi_target_boot_q025": float(q025) if np.isfinite(q025) else np.nan,
+            "chi_target_boot_q975": float(q975) if np.isfinite(q975) else np.nan,
+        }
 
 
 @dataclass(frozen=True)
@@ -367,6 +399,24 @@ def _build_lookup_and_target_tables(
             for _, row in target_base_df.iterrows()
         },
         source_path=Path(path_used),
+        property_rule_mapping={
+            _condition_key(float(row["temperature"]), float(row["phi"])): str(
+                row.get("property_rule", "upper_bound")
+            ).strip().lower()
+            for _, row in target_base_df.iterrows()
+        },
+        q025_mapping={
+            _condition_key(float(row["temperature"]), float(row["phi"])): float(value)
+            for _, row in target_base_df.iterrows()
+            for value in [pd.to_numeric(row.get("chi_target_boot_q025", np.nan), errors="coerce")]
+            if np.isfinite(value)
+        },
+        q975_mapping={
+            _condition_key(float(row["temperature"]), float(row["phi"])): float(value)
+            for _, row in target_base_df.iterrows()
+            for value in [pd.to_numeric(row.get("chi_target_boot_q975", np.nan), errors="coerce")]
+            if np.isfinite(value)
+        },
     )
 
     c_target = str(step6_cfg["c_target"]).strip().lower()
@@ -378,20 +428,22 @@ def _build_lookup_and_target_tables(
         property_rule = str(row.get("property_rule", "upper_bound")).strip().lower()
         target_row_id = int(idx + 1)
         target_row_key = _build_target_row_key(c_target, temperature, phi, chi_target)
-        rows.append(
-            {
-                "target_row_id": target_row_id,
-                "target_id": target_row_id,
-                "target_row_key": target_row_key,
-                "c_target": c_target,
-                "target_polymer_class": c_target,
-                "temperature": temperature,
-                "phi": phi,
-                "chi_target": chi_target,
-                "target_chi": chi_target,
-                "property_rule": property_rule,
-            }
-        )
+        row_payload = {
+            "target_row_id": target_row_id,
+            "target_id": target_row_id,
+            "target_row_key": target_row_key,
+            "c_target": c_target,
+            "target_polymer_class": c_target,
+            "temperature": temperature,
+            "phi": phi,
+            "chi_target": chi_target,
+            "target_chi": chi_target,
+            "property_rule": property_rule,
+        }
+        for optional_col in ("chi_target_boot_q025", "chi_target_boot_q975"):
+            optional_value = pd.to_numeric(row.get(optional_col, np.nan), errors="coerce")
+            row_payload[optional_col] = float(optional_value) if np.isfinite(optional_value) else np.nan
+        rows.append(row_payload)
     target_family_df = pd.DataFrame(rows)
     return Path(path_used), lookup, target_base_df, target_family_df
 
@@ -633,7 +685,25 @@ def build_run_config(resolved: ResolvedStep62Config, run_name: str) -> Dict[str,
     run_cfg["run_name"] = run_name
     run_cfg["canonical_family"] = canonical_family
     run_cfg["c_target"] = resolved.c_target
-    return run_cfg
+    return _apply_step62_class_overrides(run_cfg, c_target=resolved.c_target)
+
+
+def _apply_step62_class_overrides(value: Any, *, c_target: str) -> Any:
+    if isinstance(value, dict):
+        resolved = {
+            str(key): _apply_step62_class_overrides(item, c_target=c_target)
+            for key, item in value.items()
+        }
+        for key, item in list(resolved.items()):
+            if not key.endswith("_by_class_overrides") or not isinstance(item, dict):
+                continue
+            base_key = key[: -len("_by_class_overrides")]
+            if c_target in item:
+                resolved[base_key] = _apply_step62_class_overrides(item[c_target], c_target=c_target)
+        return resolved
+    if isinstance(value, list):
+        return [_apply_step62_class_overrides(item, c_target=c_target) for item in value]
+    return value
 
 
 def _build_snapshot(

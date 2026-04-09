@@ -187,6 +187,31 @@ def _evaluate_validation(
     }
 
 
+def _resolve_checkpoint_selection_metric(s2_cfg: Dict[str, object], *, aux_heads: Optional[Step62AuxHeads]) -> str:
+    metric = str(s2_cfg.get("checkpoint_selection_metric", "auto")).strip().lower()
+    if metric == "auto":
+        return "val_total_loss" if aux_heads is not None else "val_diffusion_loss"
+    allowed = {
+        "val_diffusion_loss",
+        "val_total_loss",
+        "val_aux_soluble_loss",
+        "val_aux_chi_loss",
+    }
+    if metric not in allowed:
+        raise ValueError(
+            "Unsupported Step 6_2 s2.checkpoint_selection_metric="
+            f"{metric!r}. Allowed values are {sorted(allowed | {'auto'})}."
+        )
+    if aux_heads is None and metric in {"val_total_loss", "val_aux_soluble_loss", "val_aux_chi_loss"}:
+        if metric == "val_total_loss":
+            return "val_diffusion_loss"
+        raise ValueError(
+            f"Step 6_2 checkpoint_selection_metric={metric!r} requires MT aux heads, "
+            "but this run uses the pure S2 variant."
+        )
+    return metric
+
+
 def _save_supervised_checkpoint(
     *,
     checkpoint_path: Path,
@@ -196,6 +221,8 @@ def _save_supervised_checkpoint(
     scheduler,
     global_step: int,
     best_val_diffusion_loss: float,
+    checkpoint_selection_metric: str,
+    best_checkpoint_metric_value: float,
     resolved: ResolvedStep62Config,
     run_cfg: Dict[str, object],
     scaler,
@@ -210,6 +237,8 @@ def _save_supervised_checkpoint(
         "scheduler_state_dict": scheduler.state_dict(),
         "global_step": int(global_step),
         "best_val_diffusion_loss": float(best_val_diffusion_loss),
+        "checkpoint_selection_metric": str(checkpoint_selection_metric),
+        "best_checkpoint_metric_value": float(best_checkpoint_metric_value),
         "model_size": resolved.model_size,
         "split_mode": resolved.split_mode,
         "run_name": str(run_cfg["run_name"]),
@@ -351,6 +380,8 @@ def train_s2_supervised_run(
     best_checkpoint_path = run_dirs["checkpoints_dir"] / "conditional_diffusion_best.pt"
     last_checkpoint_path = run_dirs["checkpoints_dir"] / "conditional_diffusion_last.pt"
     best_val_diffusion_loss = float("inf")
+    checkpoint_selection_metric = _resolve_checkpoint_selection_metric(s2_cfg, aux_heads=aux_heads)
+    best_checkpoint_metric_value = float("inf")
     patience_counter = 0
     rng = np.random.default_rng(int(resolved.step6_2["random_seed"]))
     history_rows: List[Dict[str, float]] = []
@@ -421,18 +452,22 @@ def train_s2_supervised_run(
         history_rows.append(history_row)
         running_train = []
 
+        current_selection_value = float(val_metrics[checkpoint_selection_metric])
         if pruning_callback is not None:
             pruning_callback(
                 stage=str(pruning_stage),
                 step=int(global_step),
-                value=-float(val_metrics["val_diffusion_loss"]),
+                value=-float(current_selection_value),
                 metrics=history_row,
             )
 
         current_val = float(val_metrics["val_diffusion_loss"])
-        improved = current_val < (best_val_diffusion_loss - float(s2_cfg["early_stopping_min_delta"]))
+        improved = current_selection_value < (
+            best_checkpoint_metric_value - float(s2_cfg["early_stopping_min_delta"])
+        )
         if improved:
             best_val_diffusion_loss = current_val
+            best_checkpoint_metric_value = current_selection_value
             patience_counter = 0
             if skip_disk_checkpoints:
                 best_diffusion_state = _clone_module_state_dict(diffusion_model)
@@ -446,6 +481,8 @@ def train_s2_supervised_run(
                     scheduler=scheduler,
                     global_step=global_step,
                     best_val_diffusion_loss=best_val_diffusion_loss,
+                    checkpoint_selection_metric=checkpoint_selection_metric,
+                    best_checkpoint_metric_value=best_checkpoint_metric_value,
                     resolved=resolved,
                     run_cfg=run_cfg,
                     scaler=scaler,
@@ -460,7 +497,9 @@ def train_s2_supervised_run(
             (
                 f"S2 val | run={run_cfg['run_name']} step={int(global_step)}/{int(s2_cfg['max_steps'])} "
                 f"train_loss={float(history_row['train_diffusion_loss_window']):.4f} "
-                f"val_loss={float(current_val):.4f} best_val={float(best_val_diffusion_loss):.4f} "
+                f"val_diffusion={float(current_val):.4f} "
+                f"{checkpoint_selection_metric}={float(current_selection_value):.4f} "
+                f"best_{checkpoint_selection_metric}={float(best_checkpoint_metric_value):.4f} "
                 f"improved={int(improved)} patience={int(patience_counter)}/{int(s2_cfg['early_stopping_patience_checks'])}"
             ),
             echo=True,
@@ -486,6 +525,8 @@ def train_s2_supervised_run(
             scheduler=scheduler,
             global_step=(history_rows[-1]["global_step"] if history_rows else 0),
             best_val_diffusion_loss=best_val_diffusion_loss,
+            checkpoint_selection_metric=checkpoint_selection_metric,
+            best_checkpoint_metric_value=best_checkpoint_metric_value,
             resolved=resolved,
             run_cfg=run_cfg,
             scaler=scaler,
@@ -498,6 +539,8 @@ def train_s2_supervised_run(
     summary = {
         "run_name": str(run_cfg["run_name"]),
         "variant": str(s2_cfg["variant"]),
+        "checkpoint_selection_metric": checkpoint_selection_metric,
+        "best_checkpoint_metric_value": float(best_checkpoint_metric_value),
         "best_val_diffusion_loss": float(best_val_diffusion_loss),
         "num_validation_checks": int(len(history_df)),
         "batch_mix_counts": batch_mix_counts,
@@ -512,6 +555,8 @@ def train_s2_supervised_run(
         run_dirs["run_dir"],
         (
             f"S2 train complete | run={run_cfg['run_name']} "
+            f"checkpoint_metric={checkpoint_selection_metric} "
+            f"best_checkpoint_metric_value={float(best_checkpoint_metric_value):.4f} "
             f"best_val_diffusion_loss={float(best_val_diffusion_loss):.4f} "
             f"validation_checks={int(len(history_df))}"
         ),
