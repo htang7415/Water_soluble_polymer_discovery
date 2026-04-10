@@ -45,13 +45,12 @@ Euler submits Step4_1, Step4_2, and Step4_3 together, then Step4_4 after all thr
 ```bash
 # Euler
 bash scripts/submit_step4_euler.sh "$MODEL_SIZE"
-# bash scripts/submit_step4_euler.sh "$MODEL_SIZE" 0  # Step4_1/2/3 only
 
 # NREL
 sbatch scripts/submit_step4_only_nrel.sh "$MODEL_SIZE"
 ```
 
-## Slurm Step 5
+## Slurm Step 5: No HPO
 
 Run only after Step 4 succeeds.
 
@@ -77,7 +76,7 @@ bash scripts/run_step5_1.sh "$MODEL_SIZE" "$POLYMER_FAMILY" "$RUNS"
 
 ## Step 5 HPO
 
-Defaults to all study families: `S0`,`S1`, `S2`, `S3`, `S4_rl`, `S4_ppo`, `S4_grpo`, `S4_dpo`.
+Defaults to the fixed `S0` baseline plus HPO study families: `S1`, `S2`, `S3`, `S4_rl`, `S4_ppo`, `S4_grpo`, `S4_dpo`.
 
 ```bash
 bash scripts/run_step5_hpo_and_5_1.sh "$MODEL_SIZE" "$POLYMER_FAMILY"
