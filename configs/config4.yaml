@@ -1,0 +1,79 @@
+# Step 4: physics-guided chi(T,phi) model training
+# Step4_1: chi(T,phi) regression
+# Step4_2: water-miscible classification
+# Shared settings (paths, model_sizes, backbone, etc.) are in configs/config.yaml.
+
+step4_1_regression:
+  dataset_path: "Data/chi/polymers_T_phi.csv"
+  batch_size: 128
+  num_epochs: 500
+  patience: 20
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  use_scheduler: true
+  scheduler_min_lr: 1.0e-6
+  hidden_sizes: [256, 512, 128]
+  dropout: 0.1
+  finetune_last_layers: 0  # integer in [0, num_layers(model_size)]; 0=freeze backbone
+
+  tune: true
+  n_trials: 300
+  tuning_epochs: 60
+  tuning_patience: 10
+  tuning_objective: "val_poly_nrmse"  # val_r2 | val_poly_nrmse
+  tuning_cv_folds: 5
+  budget_search_epochs: 250  # capped post-Optuna CV used to derive final-fit epochs
+  budget_search_patience: 20
+  epoch_selection_metric: "val_poly_nrmse"  # val_rmse | val_poly_nrmse
+  loss_weighting: "polymer_balanced"  # uniform | polymer_balanced
+  loss_weight_clip_ratio: 10.0
+  scheduler_t_max: null  # null => use num_epochs; final fit overrides to preserve LR schedule shape
+  nrmse_std_floor: 0.02
+  nrmse_clip: 10.0
+  optuna_search_space:
+    # If list has exactly 2 values, it is treated as a continuous range [min, max].
+    # If list has >2 values, it is treated as categorical choices.
+    # finetune_last_layers defaults to dynamic range [0, num_layers(model_size)] if omitted.
+    num_layers: [2, 3, 4, 5]
+    hidden_units: [64, 128, 256, 512, 1024]
+    dropout: [0.0, 0.1, 0.2, 0.3]
+    learning_rate: [1.0e-4, 5.0e-3]
+    learning_rate_log: true
+    weight_decay: [1.0e-7, 1.0e-3]
+    weight_decay_log: true
+    batch_size: [4, 8, 16, 32, 64, 128]
+
+step4_2_classification:
+  dataset_path:
+    - "Data/water_solvent/water_miscible_polymer.csv"
+    - "Data/water_solvent/water_immiscible_polymer.csv"
+  batch_size: 128
+  num_epochs: 500
+  patience: 20
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  use_scheduler: true
+  scheduler_min_lr: 1.0e-6
+  hidden_sizes: [256, 512, 128]
+  dropout: 0.1
+  finetune_last_layers: 0  # integer in [0, num_layers(model_size)]; 0=freeze backbone
+
+  tune: true
+  n_trials: 200
+  tuning_epochs: 60
+  tuning_patience: 10
+  tuning_cv_folds: 5
+  optuna_search_space:
+    # If list has exactly 2 values, it is treated as a continuous range [min, max].
+    # If list has >2 values, it is treated as categorical choices.
+    # finetune_last_layers defaults to dynamic range [0, num_layers(model_size)] if omitted.
+    num_layers: [2, 3, 4, 5]
+    hidden_units: [64, 128, 256, 512, 1024]
+    dropout: [0.0, 0.1, 0.2, 0.3]
+    learning_rate: [1.0e-4, 5.0e-3]
+    learning_rate_log: true
+    weight_decay: [1.0e-7, 1.0e-3]
+    weight_decay_log: true
+    batch_size: [4, 8, 16, 32, 64]

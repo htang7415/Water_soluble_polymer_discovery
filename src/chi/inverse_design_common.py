@@ -66,13 +66,8 @@ def default_chi_config(config: Dict, step: str | None = None) -> Dict:
     shared = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared", {}), dict) else {}
     shared_embedding = shared.get("embedding", {}) if isinstance(shared.get("embedding", {}), dict) else {}
     step5_cfg = (
-        chi_cfg.get("step5_inverse_design", {})
-        if isinstance(chi_cfg.get("step5_inverse_design", {}), dict)
-        else {}
-    )
-    step6_cfg = (
-        chi_cfg.get("step6_class_inverse_design", {})
-        if isinstance(chi_cfg.get("step6_class_inverse_design", {}), dict)
+        chi_cfg.get("step5_class_inverse_design", {})
+        if isinstance(chi_cfg.get("step5_class_inverse_design", {}), dict)
         else {}
     )
 
@@ -110,12 +105,9 @@ def default_chi_config(config: Dict, step: str | None = None) -> Dict:
 
     if step == "step5":
         out.update(step5_cfg)
-    elif step == "step6":
-        out.update(step6_cfg)
     else:
         # Backward-compatible union if caller does not specify a step.
         out.update(step5_cfg)
-        out.update(step6_cfg)
 
     # Legacy flat keys still override defaults when present.
     for key in [
@@ -528,7 +520,7 @@ def resolve_training_smiles(results_dir: Path, base_results_dir: Path) -> set[st
         rows_seen += int(len(chunk_df))
         if verbose_progress and (chunk_index == 1 or chunk_index % 10 == 0):
             print(
-                "[step6_2_evaluator_load] "
+                "[step5_evaluator_load] "
                 f"stage=novelty_cache_build rows_seen={rows_seen} unique_canonical={len(canonical_set)}",
                 flush=True,
             )
@@ -769,7 +761,7 @@ def prepare_novel_inference_cache(
     def _log_progress(stage: str) -> None:
         if verbose_progress:
             elapsed = time.perf_counter() - load_start
-            print(f"[step6_2_evaluator_load] stage={stage} elapsed_s={elapsed:.2f}", flush=True)
+            print(f"[step5_evaluator_load] stage={stage} elapsed_s={elapsed:.2f}", flush=True)
 
     uncertainty_enabled = bool(getattr(args, "uncertainty_enabled", chi_cfg.get("uncertainty_enabled", False)))
     uncertainty_mc_samples = int(

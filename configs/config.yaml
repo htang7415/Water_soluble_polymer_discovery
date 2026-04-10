@@ -5,8 +5,7 @@
 # Step 2: sampling and generative evaluation
 # Step 3: chi_target learning from labeled chi(T,phi) dataset
 # Step 4: physics-guided chi(T,phi) model training (+ Optuna)
-# Step 5: water-soluble inverse design
-# Step 6: polymer-family class + water-soluble inverse design
+# Step 5: polymer-family class + water-soluble inverse design
 
 paths:
   data_dir: "Data"
@@ -227,37 +226,17 @@ chi_training:
       weight_decay_log: true
       batch_size: [4, 8, 16, 32, 64]
 
-  # Step 5 inverse-design scoring
-  step5_inverse_design:
-    target_temperature: 293.15  # room temperature (K)
-    target_phi: 0.2             # polymer fraction
-    epsilon: 0.05  # tolerance for property hit when property_rule=band
-    # ranking uses independent hard filters (soluble_hit and property_hit) first
-    target_polymer_count: 100  # final total number of exported target polymers across all Step 5 resampling attempts
-    target_sa_max: 3.6  # SA upper bound for final target polymer export
-    candidate_source: "novel"  # fresh Step 2 resampling only
-    resampling_target_polymer_count: 100  # accepted Step 2 candidates requested per fresh attempt before Step 5 scoring
-    sampling_attempts_max: 5000  # stop early once 100 final Step 5 targets are found; otherwise keep resampling until the max is reached
-    property_rule: "upper_bound"  # band | upper_bound | lower_bound
-    coverage_topk: 5  # top-k used in coverage/frequency summaries
-    uncertainty_enabled: false  # if true, use MC-dropout uncertainty-aware ranking
-    uncertainty_mc_samples: 20  # number of stochastic forward passes when enabled
-    uncertainty_class_z: 1.0  # conservative class confidence: class_prob - z*std
-    uncertainty_property_z: 1.0  # conservative property bound via chi_pred +/- z*std
-    uncertainty_score_weight: 0.0  # optional score penalty multiplier for chi uncertainty
-    uncertainty_seed: 42  # random seed for MC-dropout inference
-
-  # Step 6 inverse-design scoring (class + property)
-  step6_class_inverse_design:
+  # Step 5 inverse-design scoring (class + property)
+  step5_class_inverse_design:
     target_temperature: 293.15  # room temperature (K)
     target_phi: 0.2             # polymer fraction
     epsilon: 0.05
     # ranking uses independent hard filters (soluble_hit, property_hit, polymer_class_hit) first
-    target_polymer_count: 100  # final total number of exported target polymers across all Step 6 resampling attempts
+    target_polymer_count: 100  # final total number of exported target polymers across all Step 5 resampling attempts
     target_sa_max: 4.0
     candidate_source: "novel"  # fresh Step 2 resampling only
-    resampling_target_polymer_count: 512  # accepted Step 2 candidates requested per fresh attempt before Step 6 scoring
-    sampling_attempts_max: 5000  # stop early once 100 final Step 6 targets are found; otherwise keep resampling until the max is reached
+    resampling_target_polymer_count: 512  # accepted Step 2 candidates requested per fresh attempt before Step 5 scoring
+    sampling_attempts_max: 5000  # stop early once 100 final Step 5 targets are found; otherwise keep resampling until the max is reached
     property_rule: "upper_bound"
     coverage_topk: 5
     target_polymer_class: "polyimide"  # all | * | or any key defined under polymer_classes below
@@ -267,19 +246,19 @@ chi_training:
     uncertainty_property_z: 1.0
     uncertainty_score_weight: 0.0
     uncertainty_seed: 42
-    decode_constraint_enabled: true  # Step 6 only: inject class-specific token motifs during fresh Step 2 resampling
-    decode_constraint_family_sampling_default_mode: "motif"  # Step 6 only: default family-aware decoding mode when no class override is provided
-    decode_constraint_family_sampling_scope: "final_only"  # Step 6 only: current class-family decoding is applied to final inverse-design generation, not RL rollouts
+    decode_constraint_enabled: true  # Step 5 only: inject class-specific token motifs during fresh Step 2 resampling
+    decode_constraint_family_sampling_default_mode: "motif"  # Step 5 only: default family-aware decoding mode when no class override is provided
+    decode_constraint_family_sampling_scope: "final_only"  # Step 5 only: current class-family decoding is applied to final inverse-design generation, not RL rollouts
     decode_constraint_family_sampling_mode_overrides:
       polyimide: "backbone_template"
-      polyamide: "motif"  # polyamide backbone templates over-bias long hydrophobic scaffolds and suppress soluble hits in Step 6_2
+      polyamide: "motif"  # polyamide backbone templates over-bias long hydrophobic scaffolds and suppress soluble hits in Step 5
       polyester: "backbone_template"
-      polyether: "motif"  # polyether motif decoding improves soluble hits in Step 6_2 more reliably than the old backbone-template prior
+      polyether: "motif"  # polyether motif decoding improves soluble hits in Step 5 more reliably than the old backbone-template prior
       polysulfone: "backbone_template"
     decode_constraint_motif_bank_json: null  # optional JSON mapping class -> list of p-SMILES motif fragments
-    decode_constraint_resolution_strategy: "configured_or_defaults"  # Step 6 only: safer default than local auto-mined motifs; can override to configured_or_local_mined_or_defaults
+    decode_constraint_resolution_strategy: "configured_or_defaults"  # Step 5 only: safer default than local auto-mined motifs; can override to configured_or_local_mined_or_defaults
     decode_constraint_max_motifs: 6
-    decode_constraint_spans_per_sample: 2  # Step 6 only: fix multiple class motifs per sequence to raise rare-class hit rate
+    decode_constraint_spans_per_sample: 2  # Step 5 only: fix multiple class motifs per sequence to raise rare-class hit rate
     decode_constraint_center_min_frac: 0.25  # motif center placement lower bound as a fraction of sequence length
     decode_constraint_center_max_frac: 0.75  # motif center placement upper bound as a fraction of sequence length
     decode_constraint_center_min_frac_overrides:
@@ -288,8 +267,8 @@ chi_training:
     decode_constraint_center_max_frac_overrides:
       polyimide: 0.65
       polysulfone: 0.65
-    decode_constraint_backbone_template_enabled: true  # Step 6 only: global switch for backbone-template family decoding
-    decode_constraint_backbone_template_classes: ["polyimide", "polyamide", "polyester", "polyether", "polysulfone"]  # Step 6 only: backbone-template mode for current backbone target classes
+    decode_constraint_backbone_template_enabled: true  # Step 5 only: global switch for backbone-template family decoding
+    decode_constraint_backbone_template_classes: ["polyimide", "polyamide", "polyester", "polyether", "polysulfone"]  # Step 5 only: backbone-template mode for current backbone target classes
     decode_constraint_backbone_template_max_templates: 3
     decode_constraint_backbone_template_max_templates_overrides:
       polyamide: 6
@@ -349,11 +328,11 @@ chi_training:
       polysulfone: ["C", "O", "S", "*"]
       polyacrylate: ["C", "N", "O", "*"]
       polystyrene: ["C", "N", "O", "*"]
-    decode_constraint_use_class_length_prior: true  # Step 6 only: sample token lengths from local target-class polymers when available
+    decode_constraint_use_class_length_prior: true  # Step 5 only: sample token lengths from local target-class polymers when available
     decode_constraint_length_prior_max_tokens_overrides:
       polyimide: 29
-    resampling_skip_novelty_filter: false  # Step 6 only: keep valid class-matched proposals first; novelty is re-applied downstream
-    resampling_skip_sa_filter: false  # Step 6 only: defer SA screening until after Step 2 proposal generation
+    resampling_skip_novelty_filter: false  # Step 5 only: keep valid class-matched proposals first; novelty is re-applied downstream
+    resampling_skip_sa_filter: false  # Step 5 only: defer SA screening until after Step 2 proposal generation
 
 checkpointing:
   save_best_only: true
@@ -390,7 +369,7 @@ sampling:
   valid_only_fail_on_shortfall: false  # if true, Step 2 exits when rounds cannot hit target count
   use_constraints: true  # enable constrained sampler checks (syntax/ring/star constraints)
 
-# SMARTS-like family tags used in Step 6.
+# SMARTS-like family tags used in Step 5.
 # These are motif tags for screening, not strict mutually exclusive polymer taxonomy.
 polymer_classes:
   polyimide: "[#6][CX3](=[OX1])[NX3][CX3](=[OX1])[#6]"

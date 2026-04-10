@@ -1,4 +1,4 @@
-"""Utilities for Step 6 decode-time polymer-class constraints."""
+"""Utilities for Step 5 decode-time polymer-class constraints."""
 
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ DEFAULT_CLASS_MOTIFS: Dict[str, List[str]] = {
     ],
 }
 
-# Backbone-template core fragments used by Step 6_2 constrained sampling.
+# Backbone-template core fragments used by Step 5 constrained sampling.
 # These are inserted into a fixed ``*...core...*`` scaffold so the defining
 # backbone linkage is already present before diffusion infills the remaining
 # context. Side-chain classes intentionally do not use this path.

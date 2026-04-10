@@ -982,7 +982,7 @@ def main(args):
         device=device
     )
 
-    # Apply class-enriched token logit bias if provided (Step 6 decode constraints)
+    # Apply class-enriched token logit bias if provided (Step 5 decode constraints)
     if getattr(args, "decode_constraint_class_token_bias_json", None):
         _bias_json_path = Path(args.decode_constraint_class_token_bias_json)
         if _bias_json_path.exists():
@@ -1581,7 +1581,7 @@ if __name__ == '__main__':
     parser.add_argument('--samples_per_length', type=int, default=None,
                         help='Samples per length in variable length mode (default: sampling.variable_length_samples_per_length)')
     parser.add_argument('--decode_constraint_class', type=str, default=None,
-                        help='Optional decode-time polymer class constraint (used by Step 6 only)')
+                        help='Optional decode-time polymer class constraint (used by Step 5 only)')
     parser.add_argument('--decode_constraint_motif_bank_json', type=str, default=None,
                         help='JSON file containing decode-time motif fragments for the target class')
     parser.add_argument('--decode_constraint_length_prior_json', type=str, default=None,
