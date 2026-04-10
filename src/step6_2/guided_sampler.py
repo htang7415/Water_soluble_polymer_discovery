@@ -365,7 +365,7 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
                     timesteps,
                     attention_mask,
                     condition_bundle=cond,
-                    cfg_scale=self.cfg_scale,
+                    cfg_scale=self._effective_cfg_scale(step_progress),
                 )
 
             logits = logits / self.temperature
@@ -378,6 +378,7 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
             logits = self._apply_class_token_bias(logits, fixed_mask=fixed_mask, step_progress=step_progress)
             logits = self._apply_sampling_filters(logits)
             logits = self._apply_special_token_constraints(logits, ids)
+            logits = self._ensure_valid_logits(logits)
             probs = self._logits_to_probs(logits)
 
             is_masked = (ids == self.mask_id) & (~fixed_mask)

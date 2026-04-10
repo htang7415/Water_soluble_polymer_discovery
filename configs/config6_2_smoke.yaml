@@ -28,7 +28,15 @@ step6_2:
   raw_generation_valid_only: false
   class_decode_prior_mode: "on"
   class_token_bias_start_frac: 0.5
+  class_token_bias_start_frac_by_class_overrides:
+    polyester: 0.25
+    polystyrene: 0.25
+    polysulfone: 0.25
   class_token_bias_strength: 1.5
+  class_token_bias_strength_by_class_overrides:
+    polyester: 2.5
+    polystyrene: 2.5
+    polysulfone: 2.5
   conditional_cfg_scale_early_frac: 1.0
   conditional_cfg_scale_ramp_start_frac: 0.0
   conditional_cfg_scale_retry_multiplier: 1.0
@@ -98,7 +106,9 @@ step6_2:
       chi_loss_weight: 0.1
     cfg_scale: 0.5
     cfg_scale_by_class_overrides:
+      polyacrylate: 1.0
       polyamide: 2.0
+      polyester: 1.0
 
   s3:
     supervised_train_config_source: s2
@@ -107,6 +117,7 @@ step6_2:
     guidance_start_frac_by_class_overrides:
       polyamide: 0.5
       polyimide: 0.1
+      polyester: 0.5
     sol_log_prob_floor: -5.0
     sol_log_prob_floor_by_class_overrides:
       polyimide: -12.0
@@ -122,6 +133,7 @@ step6_2:
     cfg_scale_by_class_overrides:
       polyamide: 2.0
       polyimide: 1.0
+      polyester: 1.0
 
   s4:
     alignment_mode: rl
