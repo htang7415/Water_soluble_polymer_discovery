@@ -97,6 +97,7 @@ def resolve_effective_chi_bounds(
 ) -> Dict[str, Any]:
     mode = resolve_step62_chi_target_bound_mode(step6_cfg)
     rule = str(property_rule).strip().lower()
+    chi_target = float(chi_target)
 
     # Step 3 bootstrap quantiles are uncertainty metadata, not acceptance bounds.
     if rule == "lower_bound":
@@ -107,7 +108,10 @@ def resolve_effective_chi_bounds(
         upper_bound = float(chi_target) + float(epsilon)
     else:
         lower_bound = float("-inf")
-        upper_bound = float(chi_target)
+        # The water-miscible Step 6_2 benchmark uses a strict upper-bound requirement:
+        # chi_pred(T, phi) < chi_target(T, phi). We encode that open interval by
+        # tightening the effective upper bound to the previous representable float.
+        upper_bound = float(np.nextafter(chi_target, float("-inf")))
     return {
         "chi_target_effective_lower": float(lower_bound),
         "chi_target_effective_upper": float(upper_bound),
@@ -399,7 +403,7 @@ def _compute_chi_ok(
         return int(chi_pred >= chi_target)
     if rule == "band":
         return int(abs(chi_pred - chi_target) <= float(epsilon))
-    return int(chi_pred <= chi_target)
+    return int(chi_pred < chi_target)
 
 
 def evaluate_generated_samples(

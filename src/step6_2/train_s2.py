@@ -289,7 +289,6 @@ def train_s2_supervised_run(
         supervised_frames["d_chi"],
         scaler=scaler,
         chi_lookup=resolved.chi_lookup,
-        available_target_classes=resolved.available_target_classes,
     )
     augmentation_diag_path = run_dirs["metrics_dir"] / "chi_target_augmentation_eligibility.csv"
     augmentation_diag_df.to_csv(augmentation_diag_path, index=False)
@@ -306,7 +305,6 @@ def train_s2_supervised_run(
             tokenizer=tokenizer,
             scaler=scaler,
             chi_lookup=resolved.chi_lookup,
-            available_target_classes=resolved.available_target_classes,
             split="train",
             chi_target_augmentation_rate=float(s2_cfg["chi_target_augmentation_rate"]),
             train=True,
@@ -317,7 +315,6 @@ def train_s2_supervised_run(
             tokenizer=tokenizer,
             scaler=scaler,
             chi_lookup=resolved.chi_lookup,
-            available_target_classes=resolved.available_target_classes,
             split="train",
             chi_target_augmentation_rate=0.0,
             train=True,
@@ -331,7 +328,6 @@ def train_s2_supervised_run(
                 tokenizer=tokenizer,
                 scaler=scaler,
                 chi_lookup=resolved.chi_lookup,
-                available_target_classes=resolved.available_target_classes,
                 split="val",
                 chi_target_augmentation_rate=0.0,
                 train=False,
@@ -345,7 +341,6 @@ def train_s2_supervised_run(
                 tokenizer=tokenizer,
                 scaler=scaler,
                 chi_lookup=resolved.chi_lookup,
-                available_target_classes=resolved.available_target_classes,
                 split="val",
                 chi_target_augmentation_rate=0.0,
                 train=False,

@@ -28,7 +28,6 @@ from .dataset import (
     build_inference_condition_bundle,
     build_inference_condition_bundle_from_target_row,
     build_step62_supervised_frames,
-    get_step62_family_condition_columns,
 )
 from .evaluation import build_generated_samples_frame, evaluate_generated_samples
 from .frozen_sampling import ResolvedClassSamplingPrior
@@ -115,20 +114,6 @@ def _bundle_to_row(bundle: np.ndarray) -> Dict[str, float]:
     return {f"{COND_COL_PREFIX}{idx}": float(bundle_arr[idx]) for idx in range(int(bundle_arr.shape[0]))}
 
 
-def _family_vector_from_row(
-    row: pd.Series | Dict[str, Any],
-    *,
-    available_target_classes: List[str],
-) -> np.ndarray:
-    family_cols = get_step62_family_condition_columns(available_target_classes)
-    if not family_cols:
-        return np.zeros(0, dtype=np.float32)
-    return np.asarray(
-        [float(pd.to_numeric(row.get(column, 0.0), errors="coerce")) for column in family_cols],
-        dtype=np.float32,
-    )
-
-
 def _build_pair_condition_bundle(
     *,
     temperature: float,
@@ -138,27 +123,16 @@ def _build_pair_condition_bundle(
     chi_goal_lower: float,
     chi_goal_upper: float,
     scaler: ConditionScaler,
-    available_target_classes: List[str],
     chosen_row: pd.Series | Dict[str, Any],
 ) -> np.ndarray:
+    del property_rule, chi_goal_lower, chi_goal_upper, chosen_row
     bundle = build_inference_condition_bundle(
         temperature=float(temperature),
         phi=float(phi),
         chi_goal=float(chi_goal),
         scaler=scaler,
         soluble=1,
-        available_target_classes=available_target_classes,
-        c_target=None,
-        property_rule=str(property_rule),
-        chi_goal_lower=chi_goal_lower,
-        chi_goal_upper=chi_goal_upper,
     )
-    family_vector = _family_vector_from_row(
-        chosen_row,
-        available_target_classes=available_target_classes,
-    )
-    if family_vector.size > 0:
-        bundle[-family_vector.size :] = family_vector
     return bundle
 
 
@@ -226,7 +200,6 @@ def _build_d_water_pairs(
     train_d_water: pd.DataFrame,
     *,
     scaler: ConditionScaler,
-    available_target_classes: List[str],
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     filtered, star_stats = _filter_star_ok_rows(train_d_water)
     positives = filtered.loc[filtered["water_miscible"].astype(int) == 1].copy()
@@ -249,7 +222,6 @@ def _build_d_water_pairs(
             chi_goal_lower=np.nan,
             chi_goal_upper=np.nan,
             scaler=scaler,
-            available_target_classes=available_target_classes,
             chosen_row=chosen_row,
         )
         for _, rejected_row in negatives.iterrows():
@@ -279,7 +251,6 @@ def _build_d_chi_pairs(
     scaler: ConditionScaler,
     chi_lookup,
     pair_source: str,
-    available_target_classes: List[str],
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
     work, star_stats = _filter_star_ok_rows(train_d_chi)
     work["canonical_smiles"] = work["SMILES"].astype(str).map(_canonical_sort_key)
@@ -302,7 +273,7 @@ def _build_d_chi_pairs(
             rejected_df = bucket.loc[bucket["water_miscible"].astype(int) == 0].copy()
         elif pair_source == "chi_aware_label_bucketed":
             chosen_mask = (bucket["water_miscible"].astype(int) == 1) & (
-                bucket["chi"].astype(float) <= float(chi_target)
+                bucket["chi"].astype(float) < float(chi_target)
             )
             chosen_df = bucket.loc[chosen_mask].copy()
             rejected_df = bucket.loc[~chosen_mask].copy()
@@ -336,7 +307,6 @@ def _build_d_chi_pairs(
                 chi_goal_lower=chi_target_lower,
                 chi_goal_upper=chi_target_upper,
                 scaler=scaler,
-                available_target_classes=available_target_classes,
                 chosen_row=chosen_row,
             )
             for _, rejected_row in rejected_df.iterrows():
@@ -443,8 +413,6 @@ def _build_target_row_synthetic_pairs(
                 target_row.to_dict(),
                 scaler=warm_start.scaler,
                 soluble=1,
-                available_target_classes=resolved.available_target_classes,
-                c_target=str(target_row.get("c_target", resolved.c_target)),
             ),
             dtype=torch.float32,
             device=device,
@@ -497,8 +465,6 @@ def _build_target_row_synthetic_pairs(
             target_row.to_dict(),
             scaler=warm_start.scaler,
             soluble=1,
-            available_target_classes=resolved.available_target_classes,
-            c_target=str(target_row.get("c_target", resolved.c_target)),
         )
         for chosen_idx in range(len(eval_df)):
             chosen_row = eval_df.iloc[chosen_idx]
@@ -732,7 +698,6 @@ def build_dpo_pair_splits(
         d_water_pairs, d_water_star_stats = _build_d_water_pairs(
             frames["train_d_water"],
             scaler=scaler,
-            available_target_classes=resolved.available_target_classes,
         )
         d_chi_pair_source = pair_source if pair_source == "chi_aware_label_bucketed" else "label_water_miscibility"
         d_chi_pairs, chi_prompt_gap_df, d_chi_star_stats = _build_d_chi_pairs(
@@ -740,7 +705,6 @@ def build_dpo_pair_splits(
             scaler=scaler,
             chi_lookup=resolved.chi_lookup,
             pair_source=d_chi_pair_source,
-            available_target_classes=resolved.available_target_classes,
         )
         selected_pairs = _take_budgeted_pairs(
             d_water_pairs=d_water_pairs,
@@ -973,8 +937,6 @@ def _evaluate_dpo_proxy_success_metrics(
                 target_row.to_dict(),
                 scaler=warm_start.scaler,
                 soluble=1,
-                available_target_classes=resolved.available_target_classes,
-                c_target=str(target_row.get("c_target", resolved.c_target)),
             ),
             dtype=torch.float32,
             device=device,

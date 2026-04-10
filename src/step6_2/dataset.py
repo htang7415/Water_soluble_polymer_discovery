@@ -13,7 +13,6 @@ from torch.utils.data import Dataset
 
 from src.chi.data import SplitConfig, add_split_column, make_split_assignments
 from src.data.tokenizer import PSmilesTokenizer
-from src.evaluation.polymer_class import BACKBONE_CLASS_MATCH_CLASSES, PolymerClassifier
 
 from .config import ResolvedStep62Config, _resolve_split_ratios
 
@@ -22,78 +21,10 @@ DEFAULT_WATER_TEMPERATURE = 293.15
 DEFAULT_WATER_PHI = 0.2
 DEFAULT_WATER_CHI = 0.0
 BASE_CONDITION_BUNDLE_DIM = 7
-FAMILY_CONDITION_PREFIX = "family_cond_"
 
 
-def _normalize_available_target_classes(available_target_classes: List[str]) -> List[str]:
-    return [str(value).strip().lower() for value in list(available_target_classes) if str(value).strip()]
-
-
-def get_step62_family_condition_columns(available_target_classes: List[str]) -> List[str]:
-    normalized = _normalize_available_target_classes(available_target_classes)
-    return [f"{FAMILY_CONDITION_PREFIX}{family}" for family in normalized]
-
-
-def get_step62_condition_dim(available_target_classes: List[str]) -> int:
-    return int(BASE_CONDITION_BUNDLE_DIM + len(_normalize_available_target_classes(available_target_classes)))
-
-
-def _extract_row_family_condition_vector(
-    row: Dict[str, Any],
-    *,
-    available_target_classes: List[str],
-) -> np.ndarray:
-    normalized = _normalize_available_target_classes(available_target_classes)
-    family_cols = get_step62_family_condition_columns(normalized)
-    if all(column in row for column in family_cols):
-        return np.asarray(
-            [float(pd.to_numeric(row.get(column, 0.0), errors="coerce")) for column in family_cols],
-            dtype=np.float32,
-        )
-
-    out = np.zeros(len(normalized), dtype=np.float32)
-    target_class = str(row.get("c_target", row.get("target_polymer_class", ""))).strip().lower()
-    if target_class in normalized:
-        out[normalized.index(target_class)] = 1.0
-    return out
-
-
-def annotate_step62_family_condition_features(
-    df: pd.DataFrame,
-    *,
-    available_target_classes: List[str],
-    polymer_patterns: Dict[str, str],
-) -> pd.DataFrame:
-    """Annotate each row with strict family-condition features used by Step 6_2."""
-
-    normalized = _normalize_available_target_classes(available_target_classes)
-    family_cols = get_step62_family_condition_columns(normalized)
-    out = df.copy()
-    if out.empty:
-        for column in family_cols:
-            out[column] = pd.Series(dtype=np.float32)
-        return out
-
-    classifier = PolymerClassifier(patterns=polymer_patterns)
-    unique_smiles = sorted(out["SMILES"].astype(str).unique())
-    feature_rows: Dict[str, Dict[str, float]] = {}
-    for smiles in unique_smiles:
-        loose_matches = classifier.classify(smiles)
-        backbone_matches = classifier.classify_backbone(smiles)
-        feature_rows[smiles] = {
-            column: float(
-                bool(backbone_matches.get(family, False))
-                if family in BACKBONE_CLASS_MATCH_CLASSES
-                else bool(loose_matches.get(family, False))
-            )
-            for family, column in zip(normalized, family_cols)
-        }
-
-    features = out["SMILES"].astype(str).map(feature_rows)
-    feature_df = pd.DataFrame(features.tolist(), index=out.index)
-    for column in family_cols:
-        out[column] = pd.to_numeric(feature_df.get(column, 0.0), errors="coerce").fillna(0.0).astype(np.float32)
-    return out
+def get_step62_condition_dim() -> int:
+    return int(BASE_CONDITION_BUNDLE_DIM)
 
 
 def _build_step62_condition_bundle_from_values(
@@ -105,7 +36,6 @@ def _build_step62_condition_bundle_from_values(
     chi_goal_lower: float,
     chi_goal_upper: float,
     scaler: ConditionScaler,
-    family_vector: np.ndarray,
 ) -> np.ndarray:
     t_present = float(np.isfinite(temperature))
     phi_present = float(np.isfinite(phi))
@@ -123,7 +53,7 @@ def _build_step62_condition_bundle_from_values(
         ],
         dtype=np.float32,
     )
-    return np.concatenate([base_bundle, np.asarray(family_vector, dtype=np.float32)], axis=0)
+    return base_bundle
 
 
 def _normalize_water_miscible_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -278,18 +208,6 @@ def build_step62_supervised_frames(resolved: ResolvedStep62Config) -> Dict[str, 
         split_mode=resolved.classification_split_mode,
         random_seed=int(resolved.step6_2["random_seed"]),
     )
-    chi_df = annotate_step62_family_condition_features(
-        chi_df,
-        available_target_classes=resolved.available_target_classes,
-        polymer_patterns=resolved.polymer_patterns,
-    )
-    water_df = annotate_step62_family_condition_features(
-        water_df,
-        available_target_classes=resolved.available_target_classes,
-        polymer_patterns=resolved.polymer_patterns,
-    )
-    family_cols = get_step62_family_condition_columns(resolved.available_target_classes)
-
     unified_cols = [
         "row_id",
         "polymer_id",
@@ -301,7 +219,7 @@ def build_step62_supervised_frames(resolved: ResolvedStep62Config) -> Dict[str, 
         "chi",
         "split",
         "condition_source",
-    ] + family_cols
+    ]
     return {
         "d_chi": chi_df[unified_cols].copy(),
         "d_water": water_df[unified_cols].copy(),
@@ -338,7 +256,6 @@ def build_condition_bundle(
     scaler: ConditionScaler,
     chi_lookup,
     augment_with_step3_target: bool,
-    available_target_classes: List[str],
 ) -> Dict[str, Any]:
     """Build the raw Step 6_2 condition vector and metadata."""
 
@@ -361,16 +278,12 @@ def build_condition_bundle(
         step3_target = float(step3_target_row["chi_target"])
     if step3_target is not None and np.isfinite(chi_observed):
         augmentation_eligible = bool(
-            int(row["water_miscible"]) == 1 and float(chi_observed) <= float(step3_target)
+            int(row["water_miscible"]) == 1 and float(chi_observed) < float(step3_target)
         )
     if augment_with_step3_target and augmentation_eligible and step3_target is not None:
         chi_goal = float(step3_target)
         augmented = True
 
-    family_vector = _extract_row_family_condition_vector(
-        row,
-        available_target_classes=available_target_classes,
-    )
     bundle = _build_step62_condition_bundle_from_values(
         soluble=int(soluble),
         temperature=float(temperature) if np.isfinite(temperature) else np.nan,
@@ -379,7 +292,6 @@ def build_condition_bundle(
         chi_goal_lower=float(chi_goal_lower) if np.isfinite(chi_goal_lower) else np.nan,
         chi_goal_upper=float(chi_goal_upper) if np.isfinite(chi_goal_upper) else np.nan,
         scaler=scaler,
-        family_vector=family_vector,
     )
     return {
         "condition_bundle": bundle,
@@ -401,18 +313,8 @@ def build_inference_condition_bundle(
     chi_goal: float,
     scaler: ConditionScaler,
     soluble: int = 1,
-    available_target_classes: List[str],
-    c_target: str | None = None,
-    property_rule: str = "upper_bound",
-    chi_goal_lower: float = np.nan,
-    chi_goal_upper: float = np.nan,
 ) -> np.ndarray:
     """Build the canonical Step 6_2 inference condition bundle."""
-
-    family_vector = _extract_row_family_condition_vector(
-        {"c_target": c_target or ""},
-        available_target_classes=available_target_classes,
-    )
     return _build_step62_condition_bundle_from_values(
         soluble=int(soluble),
         temperature=float(temperature),
@@ -421,7 +323,6 @@ def build_inference_condition_bundle(
         chi_goal_lower=np.nan,
         chi_goal_upper=np.nan,
         scaler=scaler,
-        family_vector=family_vector,
     )
 
 
@@ -429,9 +330,7 @@ def build_inference_condition_bundle_from_target_row(
     target_row: Mapping[str, Any],
     *,
     scaler: ConditionScaler,
-    available_target_classes: List[str],
     soluble: int = 1,
-    c_target: str | None = None,
 ) -> np.ndarray:
     """Build the canonical Step 6_2 inference condition bundle from a target-row mapping."""
 
@@ -441,11 +340,6 @@ def build_inference_condition_bundle_from_target_row(
         chi_goal=float(target_row["chi_target"]),
         scaler=scaler,
         soluble=int(soluble),
-        available_target_classes=available_target_classes,
-        c_target=str(target_row.get("c_target", c_target or "")),
-        property_rule=str(target_row.get("property_rule", "upper_bound")),
-        chi_goal_lower=pd.to_numeric(target_row.get("chi_target_boot_q025", np.nan), errors="coerce"),
-        chi_goal_upper=pd.to_numeric(target_row.get("chi_target_boot_q975", np.nan), errors="coerce"),
     )
 
 
@@ -454,7 +348,6 @@ def summarize_chi_augmentation_eligibility(
     *,
     scaler: ConditionScaler,
     chi_lookup,
-    available_target_classes: List[str],
 ) -> pd.DataFrame:
     """Summarize exact-bucket Step 3 augmentation eligibility on D_chi rows."""
 
@@ -479,7 +372,6 @@ def summarize_chi_augmentation_eligibility(
             scaler=scaler,
             chi_lookup=chi_lookup,
             augment_with_step3_target=False,
-            available_target_classes=available_target_classes,
         )
         annotated_rows.append(
             {
@@ -520,7 +412,6 @@ class Step62ConditionalDataset(Dataset):
         tokenizer: PSmilesTokenizer,
         scaler: ConditionScaler,
         chi_lookup,
-        available_target_classes: List[str],
         split: str,
         chi_target_augmentation_rate: float,
         train: bool,
@@ -530,7 +421,6 @@ class Step62ConditionalDataset(Dataset):
         self.tokenizer = tokenizer
         self.scaler = scaler
         self.chi_lookup = chi_lookup
-        self.available_target_classes = _normalize_available_target_classes(available_target_classes)
         self.split = str(split)
         self.train = bool(train)
         self.chi_target_augmentation_rate = float(chi_target_augmentation_rate)
@@ -561,7 +451,6 @@ class Step62ConditionalDataset(Dataset):
             scaler=self.scaler,
             chi_lookup=self.chi_lookup,
             augment_with_step3_target=self._should_augment(row),
-            available_target_classes=self.available_target_classes,
         )
         return {
             "input_ids": torch.tensor(encoded["input_ids"], dtype=torch.long),

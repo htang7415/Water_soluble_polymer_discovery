@@ -434,7 +434,7 @@ def main(args):
     if n_bootstrap < 0:
         raise ValueError("bootstrap_repeats must be >= 0")
 
-    positive_when_low = True  # physical rule requested by user: soluble if chi <= chi_target
+    positive_when_low = True  # physical rule requested by user: soluble if chi < chi_target
 
     results_dir = Path(config["paths"]["results_dir"])
     step_dir = results_dir / "step3_chi_target_learning" / split_mode

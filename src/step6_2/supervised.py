@@ -71,7 +71,7 @@ def build_s2_components_from_step1(
             f"Original error: {exc}"
         ) from exc
     hidden_size = int(pretrained_backbone.hidden_size)
-    condition_dim = get_step62_condition_dim(resolved.available_target_classes)
+    condition_dim = get_step62_condition_dim()
     condition_encoder = ConditionEncoder(
         input_dim=condition_dim,
         hidden_dim=hidden_size,
@@ -110,7 +110,18 @@ def load_step62_checkpoint_into_modules(
     """Restore Step 6_2 supervised or aligned weights into live modules."""
 
     payload = torch.load(checkpoint_path, map_location=device)
-    diffusion_model.load_state_dict(payload["model_state_dict"])
+    model_state = payload["model_state_dict"]
+    live_state = diffusion_model.state_dict()
+    cond_key = "backbone.condition_encoder.mlp.0.weight"
+    if cond_key in model_state and cond_key in live_state and tuple(model_state[cond_key].shape) != tuple(live_state[cond_key].shape):
+        saved_weight = model_state[cond_key]
+        target_weight = live_state[cond_key]
+        adapted = target_weight.clone()
+        copy_in = min(int(saved_weight.shape[1]), int(target_weight.shape[1]))
+        adapted[:, :copy_in] = saved_weight[:, :copy_in]
+        model_state = dict(model_state)
+        model_state[cond_key] = adapted
+    diffusion_model.load_state_dict(model_state)
     aux_state = payload.get("aux_state_dict")
     if aux_heads is not None and aux_state is not None:
         aux_heads.load_state_dict(aux_state)

@@ -225,7 +225,6 @@ def _prompt_df_to_condition_tensor(
     prompt_df: pd.DataFrame,
     *,
     scaler: ConditionScaler,
-    available_target_classes: list[str],
     device: str,
 ) -> torch.Tensor:
     bundles = [
@@ -235,11 +234,6 @@ def _prompt_df_to_condition_tensor(
             chi_goal=float(row["chi_target"]),
             scaler=scaler,
             soluble=1,
-            available_target_classes=available_target_classes,
-            c_target=str(row.get("c_target", "")),
-            property_rule=str(row.get("property_rule", "upper_bound")),
-            chi_goal_lower=pd.to_numeric(row.get("chi_target_boot_q025", np.nan), errors="coerce"),
-            chi_goal_upper=pd.to_numeric(row.get("chi_target_boot_q975", np.nan), errors="coerce"),
         )
         for row in prompt_df.to_dict(orient="records")
     ]
@@ -338,7 +332,6 @@ def _sample_on_policy_rollouts(
         condition_bundle = _prompt_df_to_condition_tensor(
             expanded_prompt_df,
             scaler=scaler,
-            available_target_classes=resolved.available_target_classes,
             device=device,
         )
         trajectory_sampler = _create_trajectory_sampler(
@@ -607,8 +600,6 @@ def _evaluate_proxy_success_metrics(
                 target_row.to_dict(),
                 scaler=scaler,
                 soluble=1,
-                available_target_classes=resolved.available_target_classes,
-                c_target=str(target_row.get("c_target", resolved.c_target)),
             ),
             dtype=torch.float32,
             device=device,

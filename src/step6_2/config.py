@@ -765,6 +765,7 @@ def load_step6_2_config(
     split_mode = str(step6_cfg["split_mode"]).strip().lower()
     classification_split_mode = str(step6_cfg["classification_split_mode"]).strip().lower()
     c_target = str(step6_cfg["c_target"]).strip().lower()
+    step6_cfg = _apply_step62_class_overrides(step6_cfg, c_target=c_target)
     enabled_runs = [str(name) for name in step6_cfg["enabled_runs"]]
     available_target_classes = [str(x).strip().lower() for x in step6_cfg["available_target_classes"]]
 
