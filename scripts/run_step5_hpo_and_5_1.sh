@@ -3,7 +3,8 @@
 
 set -e
 MODEL_SIZE=${1:-small}
-STUDY_FAMILIES=${2:-S1,S2,S3,S4_rl,S4_dpo}
+POLYMER_FAMILY=${2:-}
+STUDY_FAMILIES=${3:-S1,S2,S3,S4_rl,S4_ppo,S4_grpo,S4_dpo}
 INCLUDE_S0=${INCLUDE_S0:-1}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -11,10 +12,10 @@ PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 cd "$PROJECT_ROOT"
 
 if [ "$INCLUDE_S0" = "1" ]; then
-  bash scripts/run_step5.sh "$MODEL_SIZE" "S0_raw_unconditional"
+  bash scripts/run_step5.sh "$MODEL_SIZE" "$POLYMER_FAMILY" "S0_raw_unconditional"
 fi
 
-bash scripts/run_step5_hpo.sh "$MODEL_SIZE" "$STUDY_FAMILIES"
+bash scripts/run_step5_hpo.sh "$MODEL_SIZE" "$POLYMER_FAMILY" "$STUDY_FAMILIES"
 
 COMPARE_RUNS=$(INCLUDE_S0="$INCLUDE_S0" STUDY_FAMILIES="$STUDY_FAMILIES" python - <<'PY'
 import os
@@ -35,6 +36,6 @@ PY
 )
 
 echo "Step 5_1 compare runs: ${COMPARE_RUNS}"
-bash scripts/run_step5_1.sh "$MODEL_SIZE" "$COMPARE_RUNS"
+bash scripts/run_step5_1.sh "$MODEL_SIZE" "$POLYMER_FAMILY" "$COMPARE_RUNS"
 
 echo "Done!"

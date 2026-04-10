@@ -11,7 +11,12 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from src.chi.data import SplitConfig, add_split_column, make_split_assignments
+from src.chi.data import (
+    SplitConfig,
+    add_split_column,
+    fill_missing_polymer_names_from_smiles,
+    make_split_assignments,
+)
 from src.data.tokenizer import PSmilesTokenizer
 
 from .config import ResolvedStep5Config, _resolve_split_ratios
@@ -120,6 +125,7 @@ def load_step5_water_dataset(
         raise ValueError(f"Step 5 D_water dataset missing required columns: {sorted(missing)}")
 
     out = df.copy()
+    out = fill_missing_polymer_names_from_smiles(out, source_name="Step 5 D_water dataset")
     polymer_order = sorted(out["Polymer"].astype(str).unique())
     polymer_to_id = {polymer: idx for idx, polymer in enumerate(polymer_order)}
     out["polymer_id"] = out["Polymer"].map(polymer_to_id).astype(int)

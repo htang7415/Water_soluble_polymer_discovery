@@ -749,6 +749,7 @@ def load_step5_config(
     base_config_path: str = "configs/config.yaml",
     model_size: Optional[str] = None,
     force_hpo_enabled: bool = False,
+    c_target_override: Optional[str] = None,
 ) -> ResolvedStep5Config:
     base_config = load_config(base_config_path)
     step5_bundle = load_config(config_path)
@@ -759,6 +760,8 @@ def load_step5_config(
         hpo_cfg["enabled"] = True
     if not step5_cfg:
         raise ValueError(f"No step5 block found in {config_path}")
+    if c_target_override:
+        step5_cfg["c_target"] = str(c_target_override).strip().lower()
 
     polymer_patterns = {
         str(key).strip().lower(): str(value)

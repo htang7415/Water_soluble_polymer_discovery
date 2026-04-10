@@ -523,6 +523,13 @@ def main() -> None:
     parser.add_argument("--config", default="configs/config5.yaml")
     parser.add_argument("--base_config", default="configs/config.yaml")
     parser.add_argument("--model_size", default=None)
+    parser.add_argument(
+        "--c_target",
+        "--polymer_family",
+        dest="c_target",
+        default=None,
+        help="Override step5.c_target polymer-family target.",
+    )
     parser.add_argument("--runs", default=None, help="Comma-separated subset of enabled runs to compare.")
     parser.add_argument("--allow_partial", action="store_true", help="Skip missing/incomplete runs for development.")
     args = parser.parse_args()
@@ -531,6 +538,7 @@ def main() -> None:
         config_path=args.config,
         base_config_path=args.base_config,
         model_size=args.model_size,
+        c_target_override=args.c_target,
     )
     selected_runs = _resolve_selected_runs(resolved, args.runs)
 

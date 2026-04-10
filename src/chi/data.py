@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Dict, Tuple
 import warnings
@@ -113,6 +114,48 @@ def _standardize_water_soluble_column(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def fill_missing_polymer_names_from_smiles(
+    df: pd.DataFrame,
+    *,
+    polymer_col: str = "Polymer",
+    smiles_col: str = "SMILES",
+    source_name: str = "dataset",
+) -> pd.DataFrame:
+    """Use stable SMILES-derived identifiers when polymer names are missing."""
+    if polymer_col not in df.columns or smiles_col not in df.columns:
+        return df
+
+    out = df.copy()
+    polymer_values = out[polymer_col]
+    missing_polymer = polymer_values.isna() | polymer_values.astype(str).str.strip().eq("")
+    if not bool(missing_polymer.any()):
+        out[polymer_col] = polymer_values.astype(str).str.strip()
+        return out
+
+    smiles_values = out[smiles_col].astype("string").str.strip()
+    missing_smiles = missing_polymer & (smiles_values.isna() | smiles_values.eq(""))
+    if bool(missing_smiles.any()):
+        example_rows = (out.index[missing_smiles][:5] + 2).astype(int).tolist()
+        raise ValueError(
+            f"{source_name} has {int(missing_smiles.sum())} rows with missing "
+            f"{polymer_col} and {smiles_col}; example CSV rows: {example_rows}"
+        )
+
+    def fallback_name(smiles: str) -> str:
+        digest = hashlib.sha1(smiles.encode("utf-8")).hexdigest()[:12]
+        return f"unnamed_polymer_{digest}"
+
+    out.loc[missing_polymer, polymer_col] = smiles_values.loc[missing_polymer].map(fallback_name)
+    out[polymer_col] = out[polymer_col].astype(str).str.strip()
+    warnings.warn(
+        f"{source_name} has {int(missing_polymer.sum())} rows without {polymer_col}; "
+        f"using stable {smiles_col}-derived identifiers so all rows are retained.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return out
+
+
 
 def load_chi_dataset(csv_path: str | Path) -> pd.DataFrame:
     """Load chi dataset and add stable polymer ids.
@@ -131,6 +174,7 @@ def load_chi_dataset(csv_path: str | Path) -> pd.DataFrame:
         raise ValueError(f"Missing required chi columns: {missing}")
 
     out = df.copy()
+    out = fill_missing_polymer_names_from_smiles(out, source_name=str(csv_path))
     out["temperature"] = out["temperature"].astype(float)
     out["phi"] = out["phi"].astype(float)
     out["chi"] = out["chi"].astype(float)

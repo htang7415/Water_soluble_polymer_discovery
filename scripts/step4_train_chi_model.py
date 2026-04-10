@@ -24,7 +24,14 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.chi.data import COEFF_NAMES, SplitConfig, add_split_column, load_chi_dataset, make_split_assignments
+from src.chi.data import (
+    COEFF_NAMES,
+    SplitConfig,
+    add_split_column,
+    fill_missing_polymer_names_from_smiles,
+    load_chi_dataset,
+    make_split_assignments,
+)
 from src.chi.embeddings import (
     build_or_load_embedding_cache,
     embedding_table_from_cache,
@@ -462,6 +469,7 @@ def _load_step42_classification_dataset(
         )
 
     out = df.copy()
+    out = fill_missing_polymer_names_from_smiles(out, source_name="Step4_2 classification dataset")
     if "temperature" not in out.columns:
         out["temperature"] = float(default_temperature)
     if "phi" not in out.columns:

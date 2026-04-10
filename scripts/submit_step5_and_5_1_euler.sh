@@ -1,5 +1,9 @@
 #!/bin/bash
 # Submit Step 5 runs plus dependent Step 5_1 comparison on Euler.
+# Usage:
+#   bash scripts/submit_step5_and_5_1_euler.sh <model_size> <polymer_family> [runs_csv]
+# Optional env:
+#   STEP5_DEPENDENCY=afterok:<jobid> to wait for upstream Step 4.
 
 set -e
 
@@ -10,9 +14,11 @@ cd "$PROJECT_ROOT"
 mkdir -p logs
 
 MODEL_SIZE=${1:-small}
-RUNS=${2:-}
+POLYMER_FAMILY=${2:-}
+RUNS=${3:-}
 STEP5_CONFIG=${STEP5_CONFIG:-configs/config5.yaml}
 BASE_CONFIG=${BASE_CONFIG:-configs/config.yaml}
+STEP5_DEPENDENCY=${STEP5_DEPENDENCY:-}
 
 if command -v conda >/dev/null 2>&1; then
   eval "$(conda shell.bash hook)"
@@ -34,7 +40,7 @@ case "$MODEL_SIZE" in
   *) SIZE_TAG="$MODEL_SIZE" ;;
 esac
 
-readarray -t META_LINES < <(MODEL_SIZE="$MODEL_SIZE" RUNS="$RUNS" STEP5_CONFIG="$STEP5_CONFIG" BASE_CONFIG="$BASE_CONFIG" python - <<'PY'
+readarray -t META_LINES < <(MODEL_SIZE="$MODEL_SIZE" POLYMER_FAMILY="$POLYMER_FAMILY" RUNS="$RUNS" STEP5_CONFIG="$STEP5_CONFIG" BASE_CONFIG="$BASE_CONFIG" python - <<'PY'
 import os
 from pathlib import Path
 import sys
@@ -46,6 +52,7 @@ resolved = load_step5_config(
     config_path=os.environ["STEP5_CONFIG"],
     base_config_path=os.environ["BASE_CONFIG"],
     model_size=os.environ.get("MODEL_SIZE") or None,
+    c_target_override=os.environ.get("POLYMER_FAMILY") or None,
 )
 runs_csv = os.environ.get("RUNS", "").strip()
 if runs_csv:
@@ -98,20 +105,26 @@ for run_name in "${RUN_NAMES[@]}"; do
     continue
   fi
   safe_run_name=$(echo "$run_name" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '_')
+  STEP5_JOB_ARGS=(
+    --parsable
+    --job-name "smi_${SIZE_TAG}_5_${safe_run_name}"
+    --output "logs/%x_%j.out"
+    --error "logs/%x_%j.err"
+    --time=8-00:00:00
+    --mem=164G
+    --nodes=1
+    --ntasks=1
+    --cpus-per-task=16
+    --partition=research
+    --gres=gpu:1
+    --chdir "$PROJECT_ROOT"
+  )
+  if [ -n "$STEP5_DEPENDENCY" ]; then
+    STEP5_JOB_ARGS+=(--dependency "$STEP5_DEPENDENCY")
+  fi
   jid=$(sbatch \
-    --parsable \
-    --job-name "smi_${SIZE_TAG}_5_${safe_run_name}" \
-    --output "logs/%x_%j.out" \
-    --error "logs/%x_%j.err" \
-    --time=8-00:00:00 \
-    --mem=256G \
-    --nodes=1 \
-    --ntasks=1 \
-    --cpus-per-task=16 \
-    --partition=pdelab \
-    --gres=gpu:1 \
-    --chdir "$PROJECT_ROOT" \
-    --wrap "bash scripts/run_step5_euler.sh \"$MODEL_SIZE\" \"$run_name\"")
+    "${STEP5_JOB_ARGS[@]}" \
+    --wrap "bash scripts/run_step5_euler.sh \"$MODEL_SIZE\" \"$POLYMER_FAMILY\" \"$run_name\"")
   submitted_job_ids+=("$jid")
   echo "Submitted Step 5 run ${run_name}: ${jid}"
 done
@@ -122,21 +135,23 @@ STEP51_ARGS=(
   --output "logs/%x_%j.out"
   --error "logs/%x_%j.err"
   --time=1-00:00:00
-  --mem=128G
+  --mem=164G
   --nodes=1
   --ntasks=1
   --cpus-per-task=16
-  --partition=pdelab
+  --partition=research
   --chdir "$PROJECT_ROOT"
 )
 if [ ${#submitted_job_ids[@]} -gt 0 ]; then
   dependency="afterok:$(IFS=:; echo "${submitted_job_ids[*]}")"
   STEP51_ARGS+=(--dependency "$dependency")
+elif [ -n "$STEP5_DEPENDENCY" ]; then
+  STEP51_ARGS+=(--dependency "$STEP5_DEPENDENCY")
 fi
 
 jid51=$(sbatch \
   "${STEP51_ARGS[@]}" \
-  --wrap "bash scripts/run_step5_1_euler.sh \"$MODEL_SIZE\" \"$RUNS\"")
+  --wrap "bash scripts/run_step5_1_euler.sh \"$MODEL_SIZE\" \"$POLYMER_FAMILY\" \"$RUNS\"")
 
 echo "Submitted Step 5 + Step 5_1 chain on Euler:"
 if [ ${#submitted_job_ids[@]} -gt 0 ]; then
@@ -145,4 +160,5 @@ else
   echo "  Step 5 jobs: none submitted (all selected runs already complete)"
 fi
 echo "  Step 5_1 job:  ${jid51}"
+echo "  Polymer family: ${POLYMER_FAMILY:-config5 default}"
 echo "  Compare root:  ${COMPARE_ROOT}"

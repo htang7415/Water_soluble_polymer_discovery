@@ -20,10 +20,17 @@ def main() -> None:
     parser.add_argument("--config", default="configs/config5.yaml")
     parser.add_argument("--base_config", default="configs/config.yaml")
     parser.add_argument("--model_size", default=None)
+    parser.add_argument(
+        "--c_target",
+        "--polymer_family",
+        dest="c_target",
+        default=None,
+        help="Override step5.c_target polymer-family target.",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument(
         "--study_families",
-        default="S1,S2,S3,S4_rl,S4_dpo",
+        default="S1,S2,S3,S4_rl,S4_ppo,S4_grpo,S4_dpo",
         help="Comma-separated study families to run.",
     )
     parser.add_argument("--skip_refit", action="store_true", help="Skip the best-trial full-budget refit.")
@@ -43,6 +50,7 @@ def main() -> None:
         config_path=args.config,
         base_config_path=args.base_config,
         model_size=args.model_size,
+        c_target_override=args.c_target,
         force_hpo_enabled=bool(args.force_enable),
     )
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")

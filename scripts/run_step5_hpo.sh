@@ -3,7 +3,8 @@
 
 set -e
 MODEL_SIZE=${1:-small}
-STUDY_FAMILIES=${2:-S1,S2,S3,S4_rl,S4_dpo}
+POLYMER_FAMILY=${2:-}
+STUDY_FAMILIES=${3:-S1,S2,S3,S4_rl,S4_ppo,S4_grpo,S4_dpo}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
@@ -26,6 +27,9 @@ CMD=(
   --study_families "$STUDY_FAMILIES"
   --force_enable
 )
+if [ -n "$POLYMER_FAMILY" ]; then
+  CMD+=(--c_target "$POLYMER_FAMILY")
+fi
 if [ "$SKIP_REFIT" = "1" ]; then
   CMD+=(--skip_refit)
 fi
@@ -35,6 +39,11 @@ fi
 
 echo "Step 5 HPO: Optuna study + best-trial refit"
 echo "  Model size:     $MODEL_SIZE"
+if [ -n "$POLYMER_FAMILY" ]; then
+  echo "  Polymer family: $POLYMER_FAMILY"
+else
+  echo "  Polymer family: config5 default"
+fi
 echo "  Study families: $STUDY_FAMILIES"
 echo "  Config:         $STEP5_CONFIG"
 echo "  Fresh study:    $FRESH_STUDY"

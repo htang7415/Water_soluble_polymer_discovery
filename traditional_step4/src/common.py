@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+from src.chi.data import fill_missing_polymer_names_from_smiles
 from src.utils.config import load_config
 from src.utils.model_scales import get_results_dir
 
@@ -197,6 +198,7 @@ def load_classification_dataset(
         raise ValueError(f"classification dataset missing required columns: {missing_base}")
 
     out = df.copy()
+    out = fill_missing_polymer_names_from_smiles(out, source_name="traditional classification dataset")
     if "temperature" not in out.columns:
         out["temperature"] = float(default_temperature)
     if "phi" not in out.columns:

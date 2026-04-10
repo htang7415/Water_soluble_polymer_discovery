@@ -1,5 +1,7 @@
 #!/bin/bash
 # Submit S0 baseline + per-family Step 5 HPO jobs + dependent Step 5_1 compare on Euler.
+# Usage:
+#   bash scripts/submit_step5_hpo_and_5_1_euler.sh <model_size> <polymer_family> [study_families_csv]
 
 set -e
 
@@ -10,7 +12,8 @@ cd "$PROJECT_ROOT"
 mkdir -p logs
 
 MODEL_SIZE=${1:-small}
-STUDY_FAMILIES=${2:-S1,S2,S3,S4_rl,S4_dpo}
+POLYMER_FAMILY=${2:-}
+STUDY_FAMILIES=${3:-S1,S2,S3,S4_rl,S4_ppo,S4_grpo,S4_dpo}
 INCLUDE_S0=${INCLUDE_S0:-1}
 STEP5_CONFIG=${STEP5_CONFIG:-configs/config5.yaml}
 BASE_CONFIG=${BASE_CONFIG:-configs/config.yaml}
@@ -37,7 +40,7 @@ case "$MODEL_SIZE" in
   *) SIZE_TAG="$MODEL_SIZE" ;;
 esac
 
-readarray -t META_LINES < <(MODEL_SIZE="$MODEL_SIZE" STUDY_FAMILIES="$STUDY_FAMILIES" INCLUDE_S0="$INCLUDE_S0" STEP5_CONFIG="$STEP5_CONFIG" BASE_CONFIG="$BASE_CONFIG" python - <<'PY'
+readarray -t META_LINES < <(MODEL_SIZE="$MODEL_SIZE" POLYMER_FAMILY="$POLYMER_FAMILY" STUDY_FAMILIES="$STUDY_FAMILIES" INCLUDE_S0="$INCLUDE_S0" STEP5_CONFIG="$STEP5_CONFIG" BASE_CONFIG="$BASE_CONFIG" python - <<'PY'
 import os
 from pathlib import Path
 import sys
@@ -50,6 +53,7 @@ resolved = load_step5_config(
     config_path=os.environ["STEP5_CONFIG"],
     base_config_path=os.environ["BASE_CONFIG"],
     model_size=os.environ.get("MODEL_SIZE") or None,
+    c_target_override=os.environ.get("POLYMER_FAMILY") or None,
 )
 families = [item.strip() for item in os.environ.get("STUDY_FAMILIES", "").split(",") if item.strip()]
 unknown = [family for family in families if family not in STUDY_BASE_RUNS]
@@ -82,7 +86,7 @@ for line in "${META_LINES[@]}"; do
 done
 
 if [ -z "$BENCHMARK_ROOT" ] || [ -z "$COMPARE_ROOT" ] || [ -z "$COMPARE_RUNS" ]; then
-  echo "Failed to resolve Step 5/6_3 metadata on the login node."
+  echo "Failed to resolve Step 5/5_1 metadata on the login node."
   exit 2
 fi
 if [ -n "$STUDY_FAMILIES" ] && [ ${#FAMILIES[@]} -eq 0 ]; then
@@ -112,14 +116,14 @@ if [ "$INCLUDE_S0" = "1" ]; then
       --output "logs/%x_%j.out" \
       --error "logs/%x_%j.err" \
       --time=8-00:00:00 \
-      --mem=256G \
+      --mem=164G \
       --nodes=1 \
       --ntasks=1 \
       --cpus-per-task=16 \
-      --partition=pdelab \
+      --partition=research \
       --gres=gpu:1 \
       --chdir "$PROJECT_ROOT" \
-      --wrap "bash scripts/run_step5_euler.sh \"$MODEL_SIZE\" \"S0_raw_unconditional\"")
+      --wrap "bash scripts/run_step5_euler.sh \"$MODEL_SIZE\" \"$POLYMER_FAMILY\" \"S0_raw_unconditional\"")
     submitted_job_ids+=("$jid_s0")
     echo "Submitted Step 5 S0 baseline: ${jid_s0}"
   else
@@ -165,14 +169,14 @@ PY
     --output "logs/%x_%j.out" \
     --error "logs/%x_%j.err" \
     --time=8-00:00:00 \
-    --mem=256G \
+    --mem=164G \
     --nodes=1 \
     --ntasks=1 \
     --cpus-per-task=16 \
-    --partition=pdelab \
+    --partition=research \
     --gres=gpu:1 \
     --chdir "$PROJECT_ROOT" \
-    --wrap "FRESH_STUDY=\"$FRESH_STUDY\" bash scripts/run_step5_hpo_euler.sh \"$MODEL_SIZE\" \"$family\"")
+    --wrap "FRESH_STUDY=\"$FRESH_STUDY\" bash scripts/run_step5_hpo_euler.sh \"$MODEL_SIZE\" \"$POLYMER_FAMILY\" \"$family\"")
   submitted_job_ids+=("$jid")
   echo "Submitted Step 5 HPO family ${family}: ${jid}"
 done
@@ -183,11 +187,11 @@ STEP51_ARGS=(
   --output "logs/%x_%j.out"
   --error "logs/%x_%j.err"
   --time=1-00:00:00
-  --mem=128G
+  --mem=164G
   --nodes=1
   --ntasks=1
   --cpus-per-task=16
-  --partition=pdelab
+  --partition=research
   --chdir "$PROJECT_ROOT"
 )
 if [ ${#submitted_job_ids[@]} -gt 0 ]; then
@@ -197,7 +201,7 @@ fi
 
 jid51=$(sbatch \
   "${STEP51_ARGS[@]}" \
-  --wrap "ALLOW_PARTIAL=\"1\" bash scripts/run_step5_1_euler.sh \"$MODEL_SIZE\" \"$COMPARE_RUNS\"")
+  --wrap "ALLOW_PARTIAL=\"1\" bash scripts/run_step5_1_euler.sh \"$MODEL_SIZE\" \"$POLYMER_FAMILY\" \"$COMPARE_RUNS\"")
 
 echo "Submitted Step 5 HPO + Step 5_1 chain on Euler:"
 if [ ${#submitted_job_ids[@]} -gt 0 ]; then
@@ -206,5 +210,6 @@ else
   echo "  Producer jobs: none submitted (all selected outputs already complete)"
 fi
 echo "  Step 5_1 job: ${jid51}"
+echo "  Polymer family: ${POLYMER_FAMILY:-config5 default}"
 echo "  Compare runs: ${COMPARE_RUNS}"
 echo "  Compare root: ${COMPARE_ROOT}"

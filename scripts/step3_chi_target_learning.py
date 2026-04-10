@@ -150,13 +150,78 @@ def _threshold_candidates(values: np.ndarray) -> np.ndarray:
 
 
 def _scan_thresholds(x_chi: np.ndarray, y_label: np.ndarray, positive_when_low: bool) -> pd.DataFrame:
-    rows = []
-    for thr in _threshold_candidates(x_chi):
-        pred = (x_chi <= thr).astype(int) if positive_when_low else (x_chi >= thr).astype(int)
-        metric = _confusion_metrics(y_label, pred)
-        metric["threshold"] = float(thr)
-        rows.append(metric)
-    return pd.DataFrame(rows)
+    thresholds = _threshold_candidates(x_chi)
+    if thresholds.size == 0:
+        return pd.DataFrame()
+
+    x = np.asarray(x_chi, dtype=float)
+    y = np.asarray(y_label, dtype=int)
+    order = np.argsort(x, kind="mergesort")
+    sorted_x = x[order]
+    sorted_y = y[order]
+
+    pos_prefix = np.concatenate([[0], np.cumsum(sorted_y == 1)])
+    neg_prefix = np.concatenate([[0], np.cumsum(sorted_y == 0)])
+    total_pos = int(pos_prefix[-1])
+    total_neg = int(neg_prefix[-1])
+
+    if positive_when_low:
+        pred_pos_counts = np.searchsorted(sorted_x, thresholds, side="right")
+        tp = pos_prefix[pred_pos_counts]
+        fp = neg_prefix[pred_pos_counts]
+        fn = total_pos - tp
+        tn = total_neg - fp
+    else:
+        pred_pos_starts = np.searchsorted(sorted_x, thresholds, side="left")
+        tp = total_pos - pos_prefix[pred_pos_starts]
+        fp = total_neg - neg_prefix[pred_pos_starts]
+        fn = pos_prefix[pred_pos_starts]
+        tn = neg_prefix[pred_pos_starts]
+
+    n = max(len(y), 1)
+    acc = (tp + tn) / n
+    recall_denom = tp + fn
+    specificity_denom = tn + fp
+    precision_denom = tp + fp
+    recall = np.divide(tp, recall_denom, out=np.zeros_like(thresholds, dtype=float), where=recall_denom > 0)
+    specificity = np.divide(
+        tn,
+        specificity_denom,
+        out=np.zeros_like(thresholds, dtype=float),
+        where=specificity_denom > 0,
+    )
+    precision = np.divide(
+        tp,
+        precision_denom,
+        out=np.zeros_like(thresholds, dtype=float),
+        where=precision_denom > 0,
+    )
+    f1_denom = precision + recall
+    f1 = np.divide(
+        2.0 * precision * recall,
+        f1_denom,
+        out=np.zeros_like(thresholds, dtype=float),
+        where=f1_denom > 0,
+    )
+    balanced_acc = 0.5 * (recall + specificity)
+    youden_j = recall + specificity - 1.0
+
+    return pd.DataFrame(
+        {
+            "tp": tp.astype(int),
+            "tn": tn.astype(int),
+            "fp": fp.astype(int),
+            "fn": fn.astype(int),
+            "accuracy": acc.astype(float),
+            "balanced_accuracy": balanced_acc.astype(float),
+            "precision": precision.astype(float),
+            "recall": recall.astype(float),
+            "specificity": specificity.astype(float),
+            "f1": f1.astype(float),
+            "youden_j": youden_j.astype(float),
+            "threshold": thresholds.astype(float),
+        }
+    )
 
 
 def _pick_best_threshold(scan_df: pd.DataFrame, objective: str) -> pd.Series:

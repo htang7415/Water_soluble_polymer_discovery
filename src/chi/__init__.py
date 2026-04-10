@@ -4,6 +4,7 @@ from .model import PhysicsGuidedChiModel, predict_chi_from_coefficients, chi_for
 from .data import (
     COEFF_NAMES,
     REQUIRED_CHI_COLUMNS,
+    fill_missing_polymer_names_from_smiles,
     load_chi_dataset,
     make_split_assignments,
     add_split_column,
@@ -14,6 +15,7 @@ from .metrics import regression_metrics, classification_metrics
 __all__ = [
     "COEFF_NAMES",
     "REQUIRED_CHI_COLUMNS",
+    "fill_missing_polymer_names_from_smiles",
     "load_chi_dataset",
     "make_split_assignments",
     "add_split_column",

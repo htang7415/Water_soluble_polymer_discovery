@@ -3,7 +3,8 @@
 
 set -e
 MODEL_SIZE=${1:-small}
-RUNS=${2:-}
+POLYMER_FAMILY=${2:-}
+RUNS=${3:-}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
@@ -23,6 +24,9 @@ CMD=(
   --base_config "$BASE_CONFIG"
   --model_size "$MODEL_SIZE"
 )
+if [ -n "$POLYMER_FAMILY" ]; then
+  CMD+=(--c_target "$POLYMER_FAMILY")
+fi
 if [ -n "$RUNS" ]; then
   CMD+=(--runs "$RUNS")
 fi
@@ -31,14 +35,19 @@ if [ "$ALLOW_PARTIAL" = "1" ]; then
 fi
 
 echo "Step 5_1: cross-run inverse design comparison"
-echo "  Model size: $MODEL_SIZE"
-echo "  Config:     $STEP5_CONFIG"
+echo "  Model size:     $MODEL_SIZE"
+if [ -n "$POLYMER_FAMILY" ]; then
+  echo "  Polymer family: $POLYMER_FAMILY"
+else
+  echo "  Polymer family: config5 default"
+fi
+echo "  Config:         $STEP5_CONFIG"
 echo "  XDG_CACHE_HOME: $XDG_CACHE_HOME"
 echo "  MPLCONFIGDIR:   $MPLCONFIGDIR"
 if [ -n "$RUNS" ]; then
-  echo "  Runs:       $RUNS"
+  echo "  Runs:           $RUNS"
 else
-  echo "  Runs:       all enabled completed runs"
+  echo "  Runs:           all enabled completed runs"
 fi
 
 "${CMD[@]}"
