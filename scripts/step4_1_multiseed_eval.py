@@ -16,7 +16,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.utils.config import load_config, save_config
+from src.utils.config import load_step4_config, save_config
 from src.utils.model_scales import get_results_dir
 
 
@@ -62,7 +62,12 @@ def _extract_miscible_metrics(metrics_dir: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Step4_1 multi-seed evaluation")
-    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Base config path")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/config4.yaml",
+        help="Step 4 config path. Step 4-only overlays are merged onto configs/config.yaml.",
+    )
     parser.add_argument("--model_size", type=str, default="small", help="Step1 model size")
     parser.add_argument("--split_mode", type=str, default="polymer", choices=["polymer", "random"])
     parser.add_argument("--seeds", type=str, default="42,43,44,45,46", help="Comma-separated random seeds")
@@ -80,7 +85,7 @@ def main() -> None:
     temp_cfg_dir = output_dir / "temp_configs"
     temp_cfg_dir.mkdir(parents=True, exist_ok=True)
 
-    base_config = load_config(args.config)
+    base_config = load_step4_config(args.config)
     run_rows = []
 
     for seed in seeds:

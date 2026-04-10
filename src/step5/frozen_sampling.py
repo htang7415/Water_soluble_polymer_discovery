@@ -560,11 +560,16 @@ def resolve_class_sampling_prior(
 ) -> ResolvedClassSamplingPrior:
     """Resolve shared Step 5-style class-aware sampling priors."""
 
+    chi_cfg = resolved.base_config.get("chi_training", {})
     step5_cfg = (
-        resolved.base_config.get("chi_training", {}).get("step5_class_inverse_design", {})
-        if isinstance(resolved.base_config.get("chi_training", {}).get("step5_class_inverse_design", {}), dict)
+        chi_cfg.get("step5_inverse_design", {})
+        if isinstance(chi_cfg.get("step5_inverse_design", {}), dict)
         else {}
     )
+    if not step5_cfg:
+        legacy_step5_cfg = chi_cfg.get("step5_class_inverse_design", {})
+        if isinstance(legacy_step5_cfg, dict):
+            step5_cfg = legacy_step5_cfg
     target_class = resolved.c_target
     source_smiles = load_decode_constraint_source_smiles(Path(resolved.base_config["paths"]["data_dir"]))
     decode_constraint_enabled = bool(step5_cfg.get("decode_constraint_enabled", True))

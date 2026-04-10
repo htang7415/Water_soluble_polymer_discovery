@@ -40,7 +40,7 @@ backbone:
   dropout: 0.1
   max_position_embeddings: 256
 
-# Presets used by --model_size in Step 1/2/3/4/5/6
+# Presets used by --model_size in Step 1/2/3/4/5
 model_sizes:
   small:
     # Architecture (depth-driven)
@@ -128,7 +128,7 @@ training_property:
   finetune_last_layers: 6  # legacy property-head setting; Step 4 uses chi_training.finetune_last_layers (fallback here if missing)
   default_timestep: 1
 
-# Step 3-6 chi workflow config (per-step structure)
+# Step 3-5 chi workflow config (per-step structure)
 chi_training:
   shared:
     dataset_path: "Data/chi/polymers_T_phi.csv"  # labeled chi(T,phi) dataset (288 Polymer entries / 293 SMILES / 7,325 rows) used in Step 3 and Step4_1
@@ -227,7 +227,7 @@ chi_training:
       batch_size: [4, 8, 16, 32, 64]
 
   # Step 5 inverse-design scoring (class + property)
-  step5_class_inverse_design:
+  step5_inverse_design:
     target_temperature: 293.15  # room temperature (K)
     target_phi: 0.2             # polymer fraction
     epsilon: 0.05

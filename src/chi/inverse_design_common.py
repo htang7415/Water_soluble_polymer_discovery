@@ -66,10 +66,14 @@ def default_chi_config(config: Dict, step: str | None = None) -> Dict:
     shared = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared", {}), dict) else {}
     shared_embedding = shared.get("embedding", {}) if isinstance(shared.get("embedding", {}), dict) else {}
     step5_cfg = (
-        chi_cfg.get("step5_class_inverse_design", {})
-        if isinstance(chi_cfg.get("step5_class_inverse_design", {}), dict)
+        chi_cfg.get("step5_inverse_design", {})
+        if isinstance(chi_cfg.get("step5_inverse_design", {}), dict)
         else {}
     )
+    if not step5_cfg:
+        legacy_step5_cfg = chi_cfg.get("step5_class_inverse_design", {})
+        if isinstance(legacy_step5_cfg, dict):
+            step5_cfg = legacy_step5_cfg
 
     defaults = {
         "split_mode": "polymer",
@@ -218,7 +222,7 @@ def parse_candidate_source(value: str) -> str:
     raise ValueError(
         "candidate_source must be 'novel' for this workflow "
         "(aliases: generated/step2 -> novel). "
-        "Step 5/6 candidate pools are restricted to Step 2-generated polymers."
+        "Step 5 candidate pools are restricted to Step 2-generated polymers."
     )
 
 
@@ -680,7 +684,7 @@ def launch_fresh_step2_resampling(
         subprocess.run(cmd, cwd=str(repo_root), check=True)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
-            "Fresh Step 2 resampling failed during Step 5/6 candidate generation. "
+            "Fresh Step 2 resampling failed during Step 5 candidate generation. "
             f"Command: {' '.join(cmd)}"
         ) from exc
 
@@ -1273,7 +1277,7 @@ def build_candidate_pool(
     if source in {"novel", "hybrid"}:
         if getattr(args, "generated_csv", None):
             raise ValueError(
-                "--generated_csv is unsupported for Step 5/6. "
+                "--generated_csv is unsupported for Step 5. "
                 "These steps must launch a fresh Step 2 sampling run from the Step 1 checkpoint."
             )
         if resampling_step_dir is None:

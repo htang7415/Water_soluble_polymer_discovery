@@ -93,7 +93,7 @@ def _build_temp_base_config(
 ) -> str:
     payload = deepcopy(_load_yaml(base_config_path))
     chi_training_cfg = payload.setdefault("chi_training", {})
-    step5_cfg = chi_training_cfg.setdefault("step5_class_inverse_design", {})
+    step5_cfg = chi_training_cfg.setdefault("step5_inverse_design", {})
     target_key = str(c_target).strip().lower()
     if override_length_prior_min_tokens is not None:
         overrides = dict(step5_cfg.get("decode_constraint_length_prior_min_tokens_overrides", {}) or {})

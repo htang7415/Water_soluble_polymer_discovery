@@ -63,11 +63,16 @@ def _as_yamlable(value):
 
 
 def _resolve_cross_target_duplicate_rejection_enabled(resolved) -> bool:
+    chi_cfg = resolved.base_config.get("chi_training", {})
     decode_cfg = (
-        resolved.base_config.get("chi_training", {}).get("step5_class_inverse_design", {})
-        if isinstance(resolved.base_config.get("chi_training", {}).get("step5_class_inverse_design", {}), dict)
+        chi_cfg.get("step5_inverse_design", {})
+        if isinstance(chi_cfg.get("step5_inverse_design", {}), dict)
         else {}
     )
+    if not decode_cfg:
+        legacy_cfg = chi_cfg.get("step5_class_inverse_design", {})
+        if isinstance(legacy_cfg, dict):
+            decode_cfg = legacy_cfg
     default_value = bool(decode_cfg.get("decode_constraint_reject_duplicate_canonical_across_targets", False))
     overrides = decode_cfg.get("decode_constraint_reject_duplicate_canonical_across_targets_overrides", {})
     if not isinstance(overrides, dict):

@@ -1,8 +1,10 @@
 """Configuration loading utilities."""
 
-import yaml
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict
+
+import yaml
 
 
 def load_config(config_path: str = "configs/config.yaml") -> Dict[str, Any]:
@@ -22,6 +24,60 @@ def load_config(config_path: str = "configs/config.yaml") -> Dict[str, Any]:
         config = yaml.safe_load(f)
 
     return config
+
+
+def deep_merge_config(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge configuration dictionaries."""
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge_config(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def load_step4_config(
+    config_path: str = "configs/config4.yaml",
+    *,
+    base_config_path: str = "configs/config.yaml",
+) -> Dict[str, Any]:
+    """Load Step 4 config, optionally overlaying a Step 4-only file on the shared base config.
+
+    `configs/config4.yaml` stores only Step 4-specific overrides. The rest of the
+    project still relies on shared settings from `configs/config.yaml`, so this
+    helper merges the two when the supplied config file exposes top-level
+    `step4_1_regression` / `step4_2_classification` blocks.
+    """
+
+    raw_config = load_config(config_path)
+    if not isinstance(raw_config, dict):
+        return raw_config
+
+    is_step4_overlay = "chi_training" not in raw_config and (
+        "step4_1_regression" in raw_config or "step4_2_classification" in raw_config
+    )
+    if not is_step4_overlay:
+        return raw_config
+
+    merged = load_config(base_config_path)
+    shared_override = {
+        key: value
+        for key, value in raw_config.items()
+        if key not in {"step4_1_regression", "step4_2_classification"}
+    }
+    if shared_override:
+        merged = deep_merge_config(merged, shared_override)
+
+    merged.setdefault("chi_training", {})
+    for key in ("step4_1_regression", "step4_2_classification"):
+        if isinstance(raw_config.get(key), dict):
+            existing = merged["chi_training"].get(key, {})
+            if not isinstance(existing, dict):
+                existing = {}
+            merged["chi_training"][key] = deep_merge_config(existing, raw_config[key])
+
+    return merged
 
 
 def save_config(config: Dict[str, Any], config_path: str) -> None:

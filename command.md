@@ -115,7 +115,7 @@ python traditional_step4/scripts/step4_4_compare_dit_vs_traditional.py \
 
 ## Cluster submit (Euler, full chain)
 ```bash
-# submits Steps 1,2,4,5,6
+# submits Steps 1,2,4,5 and then Step 5_1 comparison
 # prerequisites: run Step 0 once and precompute Step 3 targets locally
 bash scripts/submit_all_euler.sh "$MODEL_SIZE"
 
@@ -126,22 +126,13 @@ sbatch scripts/submit_step4_4_euler.sh polymer
 
 ## Cluster submit (NREL, full chain)
 ```bash
-# submits Steps 1,2,4,5,6
+# submits Steps 1,2,4,5 and then Step 5_1 comparison
 # prerequisites: run Step 0 once and precompute Step 3 targets locally
 bash scripts/submit_all_nrel.sh "$MODEL_SIZE"
 
 # traditional baselines
 sbatch scripts/submit_step4_3_nrel.sh polymer
 sbatch scripts/submit_step4_4_nrel.sh polymer
-```
-
-## Cluster submit (Step 5 only)
-```bash
-# Euler
-bash scripts/submit_step5_and_5_1_euler.sh "$MODEL_SIZE"
-
-# NREL
-bash scripts/submit_step5_and_5_1_nrel.sh "$MODEL_SIZE"
 ```
 
 ## Cluster submit (Step 5 + Step 5_1)

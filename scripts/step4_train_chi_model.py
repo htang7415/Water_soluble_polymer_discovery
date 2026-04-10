@@ -39,7 +39,7 @@ from src.chi.metrics import (
     regression_metrics,
 )
 from src.chi.model import DirectChiRegressor, SolubilityClassifier
-from src.utils.config import load_config, save_config
+from src.utils.config import load_step4_config, save_config
 from src.utils.figure_style import apply_publication_figure_style
 from src.utils.model_scales import get_model_config, get_results_dir
 from src.utils.numerics import stable_sigmoid
@@ -3724,7 +3724,7 @@ def _save_combined_polymer_coefficients(
 
 
 def main(args):
-    config = load_config(args.config)
+    config = load_step4_config(args.config)
     train_cfg = build_train_config(args, config)
     chi_cfg = _default_chi_config(config)
     reg_split_mode = str(train_cfg.split_mode).strip().lower()
@@ -4595,7 +4595,12 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 4: train Step4_1 regression + Step4_2 classification models")
-    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Config path")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/config4.yaml",
+        help="Step 4 config path. Step 4-only overlays are merged onto configs/config.yaml.",
+    )
     parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large", "xl"], help="Step1 model size tag")
     parser.add_argument(
         "--split_mode",
