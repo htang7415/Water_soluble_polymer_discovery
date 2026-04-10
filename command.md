@@ -19,12 +19,6 @@ bash scripts/run_step0.sh
 bash scripts/run_step3.sh
 ```
 
-## Run Step 5-8 in terminal
-```bash
-# reuses existing Step 1-4 outputs for the same MODEL_SIZE
-bash scripts/run_steps5_8.sh "$MODEL_SIZE"
-```
-
 ## Run Step 6_2 and Step 6_3 in terminal
 ```bash
 # development / non-HPO path
@@ -81,13 +75,11 @@ bash scripts/run_step6_2_hpo_and_6_3.sh "$MODEL_SIZE"
 bash scripts/run_step6_2_hpo_and_6_3.sh "$MODEL_SIZE" "S2,S3,S4_rl"
 ```
 
-## Run Steps 5-8 separately in terminal
+## Run Steps 5-6 separately in terminal
 ```bash
 # reuses existing Step 1-4 outputs for the same MODEL_SIZE
 bash scripts/run_step5.sh "$MODEL_SIZE"
 bash scripts/run_step6.sh "$MODEL_SIZE"
-bash scripts/run_step7.sh "$MODEL_SIZE" polymer
-bash scripts/run_step8.sh "$MODEL_SIZE"
 ```
 
 ## Run Step 4_4 (polymer)
@@ -114,8 +106,8 @@ python traditional_step4/scripts/step4_4_compare_dit_vs_traditional.py \
 
 ## Fast local end-to-end
 ```bash
-# runs Steps 1-8 locally; Step 3 is included in this wrapper
-bash scripts/run_steps1_8.sh "$MODEL_SIZE"
+# runs Steps 1-6 locally; Step 3 is included in this wrapper
+bash scripts/run_steps1_6.sh "$MODEL_SIZE"
 python traditional_step4/scripts/step4_4_compare_dit_vs_traditional.py \
   --config traditional_step4/configs/config_traditional.yaml \
   --split_mode polymer \
@@ -124,7 +116,7 @@ python traditional_step4/scripts/step4_4_compare_dit_vs_traditional.py \
 
 ## Cluster submit (Euler, full chain)
 ```bash
-# submits Steps 1,2,4,5,6,7,8
+# submits Steps 1,2,4,5,6
 # prerequisites: run Step 0 once and precompute Step 3 targets locally
 bash scripts/submit_all_euler.sh "$MODEL_SIZE"
 
@@ -135,7 +127,7 @@ sbatch scripts/submit_step4_4_euler.sh polymer
 
 ## Cluster submit (NREL, full chain)
 ```bash
-# submits Steps 1,2,4,5,6,7,8
+# submits Steps 1,2,4,5,6
 # prerequisites: run Step 0 once and precompute Step 3 targets locally
 bash scripts/submit_all_nrel.sh "$MODEL_SIZE"
 
@@ -144,13 +136,13 @@ sbatch scripts/submit_step4_3_nrel.sh polymer
 sbatch scripts/submit_step4_4_nrel.sh polymer
 ```
 
-## Cluster submit (Steps 5-8 only)
+## Cluster submit (Steps 5-6 only)
 ```bash
 # Euler
-bash scripts/submit_steps5_8_euler.sh "$MODEL_SIZE"
+bash scripts/submit_steps5_6_euler.sh "$MODEL_SIZE"
 
 # NREL
-bash scripts/submit_steps5_8_nrel.sh "$MODEL_SIZE"
+bash scripts/submit_steps5_6_nrel.sh "$MODEL_SIZE"
 ```
 
 ## Cluster submit (Step 6_2 + Step 6_3)
@@ -196,18 +188,6 @@ bash scripts/run_step6_2_hpo_euler.sh "$MODEL_SIZE"
 bash scripts/run_step6_2_nrel.sh "$MODEL_SIZE"
 bash scripts/run_step6_3_nrel.sh "$MODEL_SIZE"
 bash scripts/run_step6_2_hpo_nrel.sh "$MODEL_SIZE"
-```
-
-## Run Step 8 only
-```bash
-# local direct terminal command
-python scripts/step8_build_paper_package.py --config configs/config.yaml --model_size "$MODEL_SIZE" --split_mode polymer
-
-# NREL (activates kl_active_learning + safe cache dirs)
-bash scripts/run_step8_nrel.sh "$MODEL_SIZE"
-
-# Euler (activates euler_active_learning + safe cache dirs)
-bash scripts/run_step8_euler.sh "$MODEL_SIZE"
 ```
 
 ## Monitor

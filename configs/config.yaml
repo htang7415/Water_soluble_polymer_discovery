@@ -355,18 +355,6 @@ chi_training:
     resampling_skip_novelty_filter: false  # Step 6 only: keep valid class-matched proposals first; novelty is re-applied downstream
     resampling_skip_sa_filter: false  # Step 6 only: defer SA screening until after Step 2 proposal generation
 
-  # Step 7 chemistry + physics analysis
-  step7_chem_physics:
-    baseline_max_samples: 500000  # max training polymers sampled for descriptor/novelty baseline
-    novelty_similarity_threshold: 0.40  # novelty cutoff on max Tanimoto to baseline
-    descriptor_top_k: 6  # number of top-shift descriptors shown in figure
-
-  # Step 8 manuscript + supporting information package
-  step8_paper_package:
-    split_mode: "polymer"  # fixed split mode for paper package curation
-    manuscript_main_figures: 6  # target number of main-text figures
-    only_png_outputs: true  # Step 8 writes PNG only
-
 checkpointing:
   save_best_only: true
   save_last: false
