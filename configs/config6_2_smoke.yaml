@@ -234,6 +234,11 @@ step6_2:
           soluble_loss_weight_by_class_overrides:
             polyimide: 0.75
           chi_loss_weight: 0.05
+      s2_by_class_overrides:
+        polyacrylate:
+          variant: pure
+        polyimide:
+          variant: pure
       s3:
         guidance_start_frac: 0.75
         cfg_scale: 0.5

@@ -699,7 +699,11 @@ def _apply_step62_class_overrides(value: Any, *, c_target: str) -> Any:
                 continue
             base_key = key[: -len("_by_class_overrides")]
             if c_target in item:
-                resolved[base_key] = _apply_step62_class_overrides(item[c_target], c_target=c_target)
+                override_value = _apply_step62_class_overrides(item[c_target], c_target=c_target)
+                if isinstance(resolved.get(base_key), dict) and isinstance(override_value, dict):
+                    resolved[base_key] = _deep_merge(resolved[base_key], override_value)
+                else:
+                    resolved[base_key] = override_value
         return resolved
     if isinstance(value, list):
         return [_apply_step62_class_overrides(item, c_target=c_target) for item in value]
