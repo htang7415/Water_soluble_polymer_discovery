@@ -170,13 +170,48 @@ def compute_success_shaped_rewards(
     *,
     reward_weights: Dict[str, float],
     sol_log_prob_floor: float,
+    reward_shaping: Dict[str, object] | None = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute the Step 6_2 success-shaped reward on completed samples."""
 
+    reward_shaping = dict(reward_shaping or {})
     class_prob = pd.to_numeric(evaluation_df["class_prob"], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
     class_prob_tensor = torch.tensor(class_prob.to_numpy(dtype=np.float32), dtype=torch.float32)
-    sol_term = torch.log(class_prob_tensor.clamp(min=float(np.exp(float(sol_log_prob_floor)))))
-    sol_term = torch.maximum(sol_term, torch.full_like(sol_term, float(sol_log_prob_floor)))
+    solubility_term_mode = str(reward_shaping.get("solubility_term_mode", "log_prob")).strip().lower()
+    if solubility_term_mode == "log_prob":
+        sol_term = torch.log(class_prob_tensor.clamp(min=float(np.exp(float(sol_log_prob_floor)))))
+        sol_term = torch.maximum(sol_term, torch.full_like(sol_term, float(sol_log_prob_floor)))
+    elif solubility_term_mode == "logit_margin":
+        logit_clip = float(reward_shaping.get("solubility_logit_clip", 6.0))
+        if "class_logit" in evaluation_df.columns:
+            class_logit = pd.to_numeric(evaluation_df["class_logit"], errors="coerce")
+        else:
+            eps = float(np.exp(float(sol_log_prob_floor)))
+            denom = (1.0 - class_prob).clip(lower=eps)
+            class_logit = np.log(class_prob.clip(lower=eps, upper=1.0 - eps) / denom)
+        class_logit_tensor = torch.tensor(
+            pd.Series(class_logit).fillna(float(-logit_clip)).to_numpy(dtype=np.float32),
+            dtype=torch.float32,
+        )
+        sol_term = torch.clamp(class_logit_tensor, min=-float(logit_clip), max=float(logit_clip))
+    else:
+        raise ValueError(
+            "Unsupported Step 6_2 reward_shaping.solubility_term_mode="
+            f"{solubility_term_mode!r}. Expected one of {{'log_prob', 'logit_margin'}}."
+        )
+    soluble_ok_tensor = torch.tensor(
+        evaluation_df["soluble_ok"].to_numpy(dtype=np.float32)
+        if "soluble_ok" in evaluation_df.columns
+        else (class_prob_tensor >= 0.5).to(dtype=torch.float32).cpu().numpy(),
+        dtype=torch.float32,
+    )
+    soluble_gate_bonus = float(reward_shaping.get("soluble_gate_bonus", 0.0))
+    insoluble_gate_penalty = float(reward_shaping.get("insoluble_gate_penalty", 0.0))
+    sol_gate_term = torch.where(
+        soluble_ok_tensor > 0.0,
+        torch.full_like(soluble_ok_tensor, soluble_gate_bonus),
+        torch.full_like(soluble_ok_tensor, insoluble_gate_penalty),
+    )
 
     chi_pred = pd.to_numeric(evaluation_df["chi_pred_target"], errors="coerce").to_numpy(dtype=np.float32)
     chi_target = pd.to_numeric(evaluation_df["chi_target"], errors="coerce").to_numpy(dtype=np.float32)
@@ -219,6 +254,15 @@ def compute_success_shaped_rewards(
             )
         )
     chi_term = torch.tensor(np.asarray(chi_term_values, dtype=np.float32), dtype=torch.float32)
+    chi_requires_soluble_ok = bool(reward_shaping.get("chi_requires_soluble_ok", False))
+    insoluble_chi_scale = float(reward_shaping.get("insoluble_chi_scale", 1.0))
+    if chi_requires_soluble_ok:
+        chi_scale = torch.where(
+            soluble_ok_tensor > 0.0,
+            torch.ones_like(soluble_ok_tensor),
+            torch.full_like(soluble_ok_tensor, insoluble_chi_scale),
+        )
+        chi_term = chi_term * chi_scale
 
     success_col = (
         "property_success_hit_discovery"
@@ -250,6 +294,7 @@ def compute_success_shaped_rewards(
         + float(reward_weights.get("w_sa", 0.0)) * torch.tensor(evaluation_df[sa_col].to_numpy(dtype=np.float32))
         + float(reward_weights.get("w_sa_continuous", 0.0)) * sa_continuous
         + float(reward_weights.get("w_sol", 0.0)) * sol_term
+        + sol_gate_term
         + float(reward_weights.get("w_chi", 0.0)) * chi_term
     )
 
@@ -260,6 +305,13 @@ def compute_success_shaped_rewards(
         "success_rate": float(evaluation_df[success_col].astype(float).mean()) if len(evaluation_df) else float("nan"),
         "reward_success_metric": str(success_col),
         "reward_sa_metric": str(sa_col),
+        "reward_solubility_term_mode": str(solubility_term_mode),
+        "soluble_ok_rate": float(soluble_ok_tensor.mean().item()) if len(soluble_ok_tensor) else float("nan"),
+        "sol_term_mean": float(sol_term.mean().item()) if len(sol_term) else float("nan"),
+        "sol_gate_term_mean": float(sol_gate_term.mean().item()) if len(sol_gate_term) else float("nan"),
+        "chi_term_mean": float(chi_term.mean().item()) if len(chi_term) else float("nan"),
+        "chi_requires_soluble_ok": int(chi_requires_soluble_ok),
+        "insoluble_chi_scale": float(insoluble_chi_scale),
         "sa_continuous_mean": float(sa_continuous.mean().item()) if len(sa_continuous) else float("nan"),
         "training_soluble_oracle_calls": valid_count,
         "training_chi_oracle_calls": valid_count,

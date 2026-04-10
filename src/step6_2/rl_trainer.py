@@ -180,6 +180,49 @@ def _resolve_policy_update_epochs(s4_cfg: Dict[str, object], *, mode: str) -> in
     return max(1, int(s4_cfg.get("policy_update_epochs", default_epochs)))
 
 
+def _resolve_stepwise_reward_weights(
+    s4_cfg: Dict[str, object],
+    *,
+    step_idx: int,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    base_reward_weights = {
+        str(key): float(value)
+        for key, value in dict(s4_cfg.get("reward_weights", {})).items()
+    }
+    total_steps = max(1, int(s4_cfg.get("rl_num_steps", 1)))
+    schedule_cfg = s4_cfg.get("reward_curriculum", {})
+    if not isinstance(schedule_cfg, dict) or not bool(schedule_cfg.get("enabled", False)):
+        return base_reward_weights, {
+            "reward_curriculum_enabled": 0.0,
+            "reward_curriculum_progress": 0.0,
+            "reward_success_scale": 1.0,
+            "reward_dense_scale": 1.0,
+        }
+
+    progress = 1.0 if total_steps <= 1 else float(step_idx - 1) / float(total_steps - 1)
+    transition_frac = float(schedule_cfg.get("transition_frac", 0.4))
+    transition_frac = min(max(transition_frac, 1.0e-8), 1.0)
+    ramp = min(max(progress / transition_frac, 0.0), 1.0)
+    success_final_scale = max(0.0, float(schedule_cfg.get("success_final_scale", 1.0)))
+    dense_final_scale = max(0.0, float(schedule_cfg.get("dense_final_scale", 1.0)))
+    success_scale = 1.0 + (success_final_scale - 1.0) * ramp
+    dense_scale = 1.0 + (dense_final_scale - 1.0) * ramp
+
+    step_reward_weights = deepcopy(base_reward_weights)
+    if "w_success" in step_reward_weights:
+        step_reward_weights["w_success"] = float(step_reward_weights["w_success"]) * float(success_scale)
+    for key in ("w_sol", "w_chi", "w_sa", "w_sa_continuous"):
+        if key in step_reward_weights:
+            step_reward_weights[key] = float(step_reward_weights[key]) * float(dense_scale)
+
+    return step_reward_weights, {
+        "reward_curriculum_enabled": 1.0,
+        "reward_curriculum_progress": float(progress),
+        "reward_success_scale": float(success_scale),
+        "reward_dense_scale": float(dense_scale),
+    }
+
+
 def _expand_prompt_groups(prompt_df: pd.DataFrame, *, group_size: int) -> pd.DataFrame:
     if group_size < 2:
         raise ValueError("GRPO requires grpo_group_size >= 2.")
@@ -720,7 +763,6 @@ def train_s4_rl_alignment(
 
     rng = np.random.default_rng(int(resolved.step6_2["random_seed"]))
     prompt_source_df = _build_prompt_source_df(resolved, run_cfg)
-    reward_weights = dict(s4_cfg["reward_weights"])
     best_checkpoint_path = run_dirs["checkpoints_dir"] / f"aligned_{alignment_mode}_best.pt"
     last_checkpoint_path = run_dirs["checkpoints_dir"] / f"aligned_{alignment_mode}_last.pt"
     history_rows: List[Dict[str, Any]] = []
@@ -773,10 +815,15 @@ def train_s4_rl_alignment(
         )
         sample_id_start += len(rollout_df)
         evaluation_df = evaluate_generated_samples(rollout_df, evaluator).sort_values("sample_id").reset_index(drop=True)
+        reward_weights, reward_schedule_metrics = _resolve_stepwise_reward_weights(
+            s4_cfg,
+            step_idx=int(step_idx),
+        )
         rewards, reward_metrics = compute_success_shaped_rewards(
             evaluation_df,
             reward_weights=reward_weights,
             sol_log_prob_floor=float(s4_cfg["sol_log_prob_floor"]),
+            reward_shaping=s4_cfg.get("reward_shaping", {}),
         )
         advantages, advantage_metrics = _compute_on_policy_advantages(
             rewards,
@@ -881,10 +928,15 @@ def train_s4_rl_alignment(
             "clip_fraction": float(np.mean(epoch_clip_fractions)) if epoch_clip_fractions else 0.0,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "w_success": float(reward_weights.get("w_success", 0.0)),
+            "w_sol": float(reward_weights.get("w_sol", 0.0)),
+            "w_chi": float(reward_weights.get("w_chi", 0.0)),
+            "w_sa": float(reward_weights.get("w_sa", 0.0)),
+            "w_sa_continuous": float(reward_weights.get("w_sa_continuous", 0.0)),
             "kl_weight": float(s4_cfg["kl_weight"]),
             "ppo_clip_eps": (float(clip_eps) if alignment_mode in {"ppo", "grpo"} else float("nan")),
             "normalize_advantages": int(bool(normalize_advantages)),
             "grpo_group_size": (int(grpo_group_size) if alignment_mode == "grpo" else 1),
+            **reward_schedule_metrics,
             **reward_metrics,
             **advantage_metrics,
             **{

@@ -449,6 +449,7 @@ def _build_target_row_synthetic_pairs(
             eval_df,
             reward_weights=reward_weights,
             sol_log_prob_floor=float(run_cfg["s4"]["sol_log_prob_floor"]),
+            reward_shaping=run_cfg["s4"].get("reward_shaping", {}),
         )
         eval_df["reward_score"] = reward_tensor.detach().cpu().numpy()
         eval_df["reward_rank_key"] = (

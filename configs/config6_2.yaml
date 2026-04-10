@@ -160,6 +160,12 @@ step6_2:
       w_sa_continuous: 0.5
       w_sol: 1.0
       w_chi: 2.0
+    reward_shaping:
+      solubility_term_mode: log_prob
+      soluble_gate_bonus: 0.0
+      insoluble_gate_penalty: 0.0
+      chi_requires_soluble_ok: false
+      insoluble_chi_scale: 1.0
     reward_weights_by_class_overrides:
       polyimide:
         w_success: 2.0
@@ -168,15 +174,28 @@ step6_2:
         w_star: 1.0
         w_sa: 1.0
         w_sa_continuous: 0.5
-        w_sol: 4.0
+        w_sol: 2.0
         w_chi: 0.5
+    reward_shaping_by_class_overrides:
+      polyimide:
+        solubility_term_mode: logit_margin
+        solubility_logit_clip: 6.0
+        soluble_gate_bonus: 2.0
+        insoluble_gate_penalty: -2.0
+        chi_requires_soluble_ok: true
+        insoluble_chi_scale: 0.0
     supervised_train_override_by_class_overrides:
       polyimide:
         s2:
           variant: mt
+          checkpoint_selection_metric: val_aux_soluble_loss
+          condition_dropout_rate: 0.05
+          train_batch_mix:
+            d_chi: 0.7
+            d_water: 0.3
           mt_aux:
             head_type: linear
-            soluble_loss_weight: 0.75
+            soluble_loss_weight: 1.25
             chi_loss_weight: 0.05
     learning_rate: 1.0e-5
     weight_decay: 0.01
@@ -265,6 +284,13 @@ step6_2:
     S4_rl_finetuned:
       canonical_family: S4
       s4:
+        rl_prompt_source: benchmark_target_rows
+        normalize_advantages: true
+        reward_curriculum:
+          enabled: true
+          transition_frac: 0.4
+          success_final_scale: 2.0
+          dense_final_scale: 0.5
         cfg_scale_by_class_overrides:
           polyamide: 2.0
         sol_log_prob_floor_by_class_overrides:
