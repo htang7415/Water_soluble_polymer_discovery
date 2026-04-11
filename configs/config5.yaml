@@ -18,12 +18,12 @@ step5:
     - S4_dpo
   generation_budget: 512
   generation_budget_by_class:
-    polyacrylate: 512
+    polyacrylate: 1024
     polyether: 1024
     polyamide: 1024
-    polyester: 2048
-    polyimide: 4096
-    polysulfone: 2048
+    polyester: 1024
+    polyimide: 1024
+    polysulfone: 1024
     polystyrene: 1024
   sampling_temperature: 1.0
   inference_batch_size: 128
