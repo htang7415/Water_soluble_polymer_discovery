@@ -142,13 +142,15 @@ step5:
     warm_start_producer_name: S4_supervised_warm_start
     optimizer: adamw
     cfg_scale: 1.0
+    cfg_scale_by_class_overrides:
+      polyamide: 2.0
     count_training_oracle_calls_separately: true
     rl_checkpoint_selection_mode: proxy_property_success_hit_rate
-    rl_prompt_source: train_exact_step3_distribution
+    rl_prompt_source: benchmark_target_rows
     rl_diffusion_num_steps: 25
     sol_log_prob_floor: -5.0
     sol_log_prob_floor_by_class_overrides:
-      polyimide: -12.0
+      polyamide: -12.0
     reward_weights:
       w_success: 2.0
       w_valid: 1.0
@@ -158,14 +160,8 @@ step5:
       w_sa_continuous: 0.5
       w_sol: 1.0
       w_chi: 2.0
-    reward_shaping:
-      solubility_term_mode: log_prob
-      soluble_gate_bonus: 0.0
-      insoluble_gate_penalty: 0.0
-      chi_requires_soluble_ok: false
-      insoluble_chi_scale: 1.0
     reward_weights_by_class_overrides:
-      polyimide:
+      polyamide:
         w_success: 2.0
         w_valid: 1.0
         w_novel: 0.0
@@ -173,15 +169,19 @@ step5:
         w_sa: 1.0
         w_sa_continuous: 0.5
         w_sol: 2.0
-        w_chi: 0.5
-    reward_shaping_by_class_overrides:
-      polyimide:
-        solubility_term_mode: logit_margin
-        solubility_logit_clip: 6.0
-        soluble_gate_bonus: 2.0
-        insoluble_gate_penalty: -2.0
-        chi_requires_soluble_ok: true
-        insoluble_chi_scale: 0.0
+        w_chi: 2.0
+    reward_shaping:
+      solubility_term_mode: logit_margin
+      solubility_logit_clip: 30.0
+      soluble_gate_bonus: 2.0
+      insoluble_gate_penalty: -2.0
+      chi_requires_soluble_ok: true
+      insoluble_chi_scale: 0.0
+    reward_curriculum:
+      enabled: true
+      transition_frac: 0.4
+      success_final_scale: 2.0
+      dense_final_scale: 0.5
     supervised_train_override_by_class_overrides:
       polyimide:
         s2:
@@ -232,12 +232,11 @@ step5:
       warmup_steps: 0
       warmup_schedule: linear
       lr_schedule: constant_after_warmup
-      pair_source: label_water_miscibility
+      pair_source: chi_aware_plus_target_row_synthetic
       pair_refresh_mode: offline_fixed
       logprob_mode: single_step_t1
-      checkpoint_selection_mode: val_dpo_loss
+      checkpoint_selection_mode: proxy_property_success_hit_rate
       checkpoint_selection_mode_by_class_overrides:
-        polyimide: proxy_property_success_hit_rate
         polyether: proxy_property_success_hit_rate
       num_epochs: 2
       synthetic_candidates_per_target: 4
@@ -247,9 +246,14 @@ step5:
       canonical_family: S3
       s2:
         variant: mt
+        checkpoint_selection_metric: val_aux_soluble_loss
+        condition_dropout_rate: 0.05
+        train_batch_mix:
+          d_chi: 0.7
+          d_water: 0.3
         mt_aux:
           head_type: linear
-          soluble_loss_weight: 0.25
+          soluble_loss_weight: 1.25
           soluble_loss_weight_by_class_overrides:
             polyimide: 0.75
           chi_loss_weight: 0.05
@@ -257,7 +261,8 @@ step5:
         polyacrylate:
           variant: pure
         polyimide:
-          variant: pure
+          variant: mt
+          checkpoint_selection_metric: val_aux_soluble_loss
       s3:
         guidance_start_frac: 0.75
         cfg_scale: 0.5
@@ -286,27 +291,7 @@ step5:
     S4_rl_finetuned:
       canonical_family: S4
       s4:
-        rl_prompt_source: benchmark_target_rows
         normalize_advantages: true
-        reward_curriculum:
-          enabled: true
-          transition_frac: 0.4
-          success_final_scale: 2.0
-          dense_final_scale: 0.5
-        cfg_scale_by_class_overrides:
-          polyamide: 2.0
-        sol_log_prob_floor_by_class_overrides:
-          polyamide: -12.0
-        reward_weights_by_class_overrides:
-          polyamide:
-            w_success: 2.0
-            w_valid: 1.0
-            w_novel: 0.0
-            w_star: 1.0
-            w_sa: 1.0
-            w_sa_continuous: 0.5
-            w_sol: 2.0
-            w_chi: 2.0
     S4_dpo:
       canonical_family: S4
       s4:

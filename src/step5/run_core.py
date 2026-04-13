@@ -780,7 +780,10 @@ def execute_step5_run(
         )
         pair_source = str(run_cfg["s4"]["dpo"]["pair_source"]).strip().lower()
         checkpoint_mode = str(run_cfg["s4"]["dpo"].get("checkpoint_selection_mode", "val_dpo_loss")).strip().lower()
-        if (pair_source == "target_row_synthetic" or checkpoint_mode == "proxy_property_success_hit_rate") and evaluator is None:
+        if (
+            pair_source in {"target_row_synthetic", "chi_aware_plus_target_row_synthetic"}
+            or checkpoint_mode == "proxy_property_success_hit_rate"
+        ) and evaluator is None:
             evaluator = load_step5_evaluator(resolved, device=device)
         dpo_artifacts = train_s4_dpo_alignment(
             resolved=resolved,

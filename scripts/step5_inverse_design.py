@@ -243,7 +243,8 @@ def _run_requires_shared_evaluator(run_cfg: Dict[str, object]) -> bool:
     if alignment_mode in {"rl", "ppo", "grpo"}:
         return True
     if alignment_mode == "dpo":
-        return str(run_cfg.get("s4", {}).get("dpo", {}).get("pair_source", "")).strip().lower() == "target_row_synthetic"
+        pair_source = str(run_cfg.get("s4", {}).get("dpo", {}).get("pair_source", "")).strip().lower()
+        return pair_source in {"target_row_synthetic", "chi_aware_plus_target_row_synthetic"}
     return False
 
 

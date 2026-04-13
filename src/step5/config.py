@@ -311,19 +311,14 @@ def _resolve_split_ratios(base_config: Dict[str, Any]) -> Dict[str, float]:
     chi_cfg = base_config.get("chi_training", {})
     shared_cfg = chi_cfg.get("shared", {}) if isinstance(chi_cfg.get("shared"), dict) else {}
     split_cfg = shared_cfg.get("split", {}) if isinstance(shared_cfg.get("split"), dict) else {}
-    step41_cfg = (
-        chi_cfg.get("step4_1_regression", {})
-        if isinstance(chi_cfg.get("step4_1_regression"), dict)
-        else {}
-    )
-    tuning_cv_folds = int(step41_cfg.get("tuning_cv_folds", 5))
-    holdout_test_ratio = split_cfg.get("holdout_test_ratio")
-    if holdout_test_ratio is None:
-        holdout_test_ratio = 1.0 / float(max(2, tuning_cv_folds))
-    test_ratio = float(holdout_test_ratio)
-    dev_ratio = 1.0 - test_ratio
-    val_ratio = dev_ratio / float(max(2, tuning_cv_folds))
-    train_ratio = dev_ratio - val_ratio
+    train_ratio = float(split_cfg.get("train_ratio", 0.8))
+    val_ratio = float(split_cfg.get("val_ratio", 0.1))
+    test_ratio = float(split_cfg.get("test_ratio", 0.1))
+    total_ratio = train_ratio + val_ratio + test_ratio
+    if not np.isclose(total_ratio, 1.0):
+        raise ValueError(
+            f"Step 5 split ratios must sum to 1.0, got {train_ratio}+{val_ratio}+{test_ratio}={total_ratio}"
+        )
     return {
         "train_ratio": float(train_ratio),
         "val_ratio": float(val_ratio),
@@ -354,7 +349,7 @@ def _load_or_build_chi_split_df(
     warnings.warn(
         (
             "Step 4 split-aware chi dataset not found; rebuilding deterministic "
-            "Step 5 D_chi split locally from config."
+            "Step 5 D_chi split locally from the explicit 8:1:1 split ratios."
         ),
         RuntimeWarning,
         stacklevel=2,

@@ -135,11 +135,10 @@ chi_training:
     split_mode: "polymer"  # data split mode: polymer (hold out polymers) | random (row-wise random)
     classification_split_mode: "polymer"  # Step4_2 split mode (independent of split_mode used by Step4_1)
     split:
-      # Step 4 split is CV-driven by default:
-      # holdout_test_ratio defaults to 1 / tuning_cv_folds if omitted.
-      # internal val slicing is automatic from tuning_cv_folds (not user-configured).
-      # CV tuning uses all non-test rows; final Step 4 fit also uses all non-test rows (train+val).
-      holdout_test_ratio: 0.10
+      # Step 5 uses a fixed 8:1:1 train/val/test split.
+      train_ratio: 0.80
+      val_ratio: 0.10
+      test_ratio: 0.10
     embedding:
       timestep: 1  # diffusion timestep used for embedding extraction
       batch_size: 128  # batch size for embedding extraction
@@ -169,6 +168,7 @@ chi_training:
     tuning_epochs: 60
     tuning_patience: 10
     tuning_objective: "val_poly_nrmse"  # val_r2 | val_poly_nrmse
+    # Step 4 uses cross validation for tuning; Step 5 ignores these folds and uses the fixed split above.
     tuning_cv_folds: 5
     budget_search_epochs: 250  # capped post-Optuna CV used to derive final-fit epochs
     budget_search_patience: 20
@@ -212,6 +212,7 @@ chi_training:
     n_trials: 200
     tuning_epochs: 60
     tuning_patience: 10
+    # Step 4 uses cross validation for tuning; Step 5 ignores these folds and uses the fixed split above.
     tuning_cv_folds: 5
     optuna_search_space:
       # If list has exactly 2 values, it is treated as a continuous range [min, max].

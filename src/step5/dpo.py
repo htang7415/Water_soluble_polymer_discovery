@@ -675,7 +675,10 @@ def build_dpo_pair_splits(
     pair_source = str(dpo_cfg["pair_source"]).strip().lower()
     candidate_df = pd.DataFrame()
     chi_prompt_gap_df = pd.DataFrame()
-    if pair_source == "target_row_synthetic":
+    d_water_star_stats = {"input_rows": 0, "star_ok_rows": 0}
+    d_chi_star_stats = {"input_rows": 0, "star_ok_rows": 0}
+    offline_pair_budget = int(dpo_cfg["offline_pair_budget"])
+    if pair_source in {"target_row_synthetic", "chi_aware_plus_target_row_synthetic"}:
         if warm_start is None or prior is None or evaluator is None or not device:
             raise ValueError(
                 "target_row_synthetic DPO pairs require warm_start, prior, evaluator, and device."
@@ -690,10 +693,39 @@ def build_dpo_pair_splits(
             metrics_dir=metrics_dir,
             target_rows_df=target_rows_df,
         )
-        selected_pairs = _take_budgeted_single_source_pairs(
+        selected_synthetic_pairs = _take_budgeted_single_source_pairs(
             pair_df=synthetic_pairs,
-            offline_pair_budget=int(dpo_cfg["offline_pair_budget"]),
+            offline_pair_budget=(
+                offline_pair_budget
+                if pair_source == "target_row_synthetic"
+                else max(0, offline_pair_budget - max(1, offline_pair_budget // 10))
+            ),
         )
+        if pair_source == "target_row_synthetic":
+            selected_pairs = selected_synthetic_pairs
+        else:
+            frames = build_step5_supervised_frames(resolved)
+            d_water_pairs, d_water_star_stats = _build_d_water_pairs(
+                frames["train_d_water"],
+                scaler=scaler,
+            )
+            d_chi_pairs, chi_prompt_gap_df, d_chi_star_stats = _build_d_chi_pairs(
+                frames["train_d_chi"],
+                scaler=scaler,
+                chi_lookup=resolved.chi_lookup,
+                pair_source="chi_aware_label_bucketed",
+            )
+            selected_static_pairs = _take_budgeted_pairs(
+                d_water_pairs=d_water_pairs,
+                d_chi_pairs=d_chi_pairs,
+                offline_pair_budget=max(0, offline_pair_budget - int(len(selected_synthetic_pairs))),
+                d_water_budget_fraction=float(dpo_cfg.get("d_water_budget_fraction", 0.5)),
+            )
+            selected_pairs = pd.concat(
+                [selected_synthetic_pairs, selected_static_pairs],
+                ignore_index=True,
+                sort=False,
+            )
     else:
         frames = build_step5_supervised_frames(resolved)
         d_water_pairs, d_water_star_stats = _build_d_water_pairs(
@@ -710,7 +742,7 @@ def build_dpo_pair_splits(
         selected_pairs = _take_budgeted_pairs(
             d_water_pairs=d_water_pairs,
             d_chi_pairs=d_chi_pairs,
-            offline_pair_budget=int(dpo_cfg["offline_pair_budget"]),
+            offline_pair_budget=offline_pair_budget,
             d_water_budget_fraction=float(dpo_cfg.get("d_water_budget_fraction", 0.5)),
         )
     if selected_pairs.empty:
@@ -748,27 +780,27 @@ def build_dpo_pair_splits(
     realized_total = int(len(selected_pairs))
     diagnostics = {
         "pair_source": pair_source,
-        "offline_pair_budget": int(dpo_cfg["offline_pair_budget"]),
+        "offline_pair_budget": offline_pair_budget,
         "d_water_budget_fraction": float(dpo_cfg.get("d_water_budget_fraction", 0.5)),
         "realized_total_pairs": realized_total,
         "realized_train_pairs": int(len(train_pairs)),
         "realized_val_pairs": int(len(val_pairs)),
-        "shortfall_pairs": max(0, int(dpo_cfg["offline_pair_budget"]) - realized_total),
+        "shortfall_pairs": max(0, offline_pair_budget - realized_total),
         "thin_signal_warning": bool(realized_total < 500),
         "realized_d_water_pairs": int((selected_pairs["source_name"] == "d_water").sum()),
         "realized_d_chi_pairs": int((selected_pairs["source_name"] == "d_chi").sum()),
         "realized_target_row_synthetic_pairs": int((selected_pairs["source_name"] == "target_row_synthetic").sum()),
         "synthetic_candidate_count": int(len(candidate_df)),
         "star_ok_pair_filter_enabled": bool(pair_source != "target_row_synthetic"),
-        "d_water_input_rows": int(d_water_star_stats["input_rows"]) if pair_source != "target_row_synthetic" else 0,
-        "d_water_star_ok_rows": int(d_water_star_stats["star_ok_rows"]) if pair_source != "target_row_synthetic" else 0,
-        "d_chi_input_rows": int(d_chi_star_stats["input_rows"]) if pair_source != "target_row_synthetic" else 0,
-        "d_chi_star_ok_rows": int(d_chi_star_stats["star_ok_rows"]) if pair_source != "target_row_synthetic" else 0,
+        "d_water_input_rows": int(d_water_star_stats["input_rows"]),
+        "d_water_star_ok_rows": int(d_water_star_stats["star_ok_rows"]),
+        "d_chi_input_rows": int(d_chi_star_stats["input_rows"]),
+        "d_chi_star_ok_rows": int(d_chi_star_stats["star_ok_rows"]),
     }
     if diagnostics["shortfall_pairs"] > 0:
         LOGGER.warning(
             "Step 5 DPO pair budget shortfall: requested=%s realized=%s shortfall=%s",
-            int(dpo_cfg["offline_pair_budget"]),
+            offline_pair_budget,
             realized_total,
             diagnostics["shortfall_pairs"],
         )

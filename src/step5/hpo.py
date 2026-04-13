@@ -91,6 +91,29 @@ def _update_s2_training_params(run_cfg: Dict[str, object], params: Dict[str, Any
         run_cfg["s2"].update(updates)
 
 
+def _update_s2_model_params(run_cfg: Dict[str, object], params: Dict[str, Any], *, prefix: str = "") -> None:
+    variant_key = f"{prefix}variant"
+    metric_key = f"{prefix}checkpoint_selection_metric"
+    soluble_weight_key = f"{prefix}mt_aux_soluble_loss_weight"
+    chi_weight_key = f"{prefix}mt_aux_chi_loss_weight"
+
+    if variant_key in params:
+        variant = str(params[variant_key])
+        run_cfg["s2"]["variant"] = variant
+        if variant != "mt":
+            run_cfg["s2"]["checkpoint_selection_metric"] = "auto"
+            return
+    if metric_key in params:
+        run_cfg["s2"]["checkpoint_selection_metric"] = str(params[metric_key])
+    if soluble_weight_key in params or chi_weight_key in params:
+        mt_aux = dict(run_cfg["s2"].get("mt_aux", {}))
+        if soluble_weight_key in params:
+            mt_aux["soluble_loss_weight"] = float(params[soluble_weight_key])
+        if chi_weight_key in params:
+            mt_aux["chi_loss_weight"] = float(params[chi_weight_key])
+        run_cfg["s2"]["mt_aux"] = mt_aux
+
+
 def _suggest_s2_training_params(trial, params: Dict[str, Any], *, prefix: str = "") -> None:
     params[f"{prefix}learning_rate"] = trial.suggest_float(
         f"{prefix}learning_rate", 1.0e-4, 6.0e-4, log=True
@@ -104,6 +127,27 @@ def _suggest_s2_training_params(trial, params: Dict[str, Any], *, prefix: str = 
     params[f"{prefix}train_batch_mix_d_chi"] = trial.suggest_float(
         f"{prefix}train_batch_mix_d_chi", 0.60, 0.90
     )
+
+
+def _suggest_s2_model_params(trial, params: Dict[str, Any], *, prefix: str = "") -> None:
+    params[f"{prefix}variant"] = trial.suggest_categorical(f"{prefix}variant", ["pure", "mt"])
+    if str(params[f"{prefix}variant"]) == "mt":
+        params[f"{prefix}checkpoint_selection_metric"] = trial.suggest_categorical(
+            f"{prefix}checkpoint_selection_metric",
+            ["val_total_loss", "val_aux_soluble_loss", "val_aux_chi_loss"],
+        )
+        params[f"{prefix}mt_aux_soluble_loss_weight"] = trial.suggest_float(
+            f"{prefix}mt_aux_soluble_loss_weight",
+            0.05,
+            1.5,
+            log=True,
+        )
+        params[f"{prefix}mt_aux_chi_loss_weight"] = trial.suggest_float(
+            f"{prefix}mt_aux_chi_loss_weight",
+            0.01,
+            0.25,
+            log=True,
+        )
 
 
 def _apply_hpo_runtime_overrides(resolved, run_cfg: Dict[str, object], *, study_family: str) -> Dict[str, object]:
@@ -147,7 +191,10 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
                 "w_chi": float(params["w_chi"]),
             }
         )
+        if "sol_log_prob_floor" in params:
+            run_cfg["s1"]["sol_log_prob_floor"] = float(params["sol_log_prob_floor"])
     elif family == "S2":
+        _update_s2_model_params(run_cfg, params)
         _update_s2_training_params(run_cfg, params)
         run_cfg["s2"].update(
             {
@@ -155,6 +202,7 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
             }
         )
     elif family == "S3":
+        _update_s2_model_params(run_cfg, params, prefix="s2_")
         _update_s2_training_params(run_cfg, params, prefix="s2_")
         run_cfg["s3"].update(
             {
@@ -165,11 +213,13 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
                 "w_chi": float(params["w_chi"]),
             }
         )
+        if "sol_log_prob_floor" in params:
+            run_cfg["s3"]["sol_log_prob_floor"] = float(params["sol_log_prob_floor"])
     elif family == "S4":
-        if any(str(key).startswith("s2_") for key in params):
-            _update_s2_training_params(run_cfg, params, prefix="s2_")
         alignment_mode = str(run_cfg["s4"]["alignment_mode"]).strip().lower()
         run_cfg["s4"]["cfg_scale"] = float(params["cfg_scale"])
+        if "rl_prompt_source" in params:
+            run_cfg["s4"]["rl_prompt_source"] = str(params["rl_prompt_source"])
         if alignment_mode in {"rl", "ppo", "grpo"}:
             reward_weights = deepcopy(run_cfg["s4"]["reward_weights"])
             reward_weights.update(
@@ -182,6 +232,21 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
                 }
             )
             run_cfg["s4"]["reward_weights"] = reward_weights
+            if "reward_curriculum_transition_frac" in params:
+                reward_curriculum = deepcopy(run_cfg["s4"].get("reward_curriculum", {}))
+                reward_curriculum["enabled"] = True
+                reward_curriculum["transition_frac"] = float(params["reward_curriculum_transition_frac"])
+                reward_curriculum["success_final_scale"] = float(params["reward_curriculum_success_final_scale"])
+                reward_curriculum["dense_final_scale"] = float(params["reward_curriculum_dense_final_scale"])
+                run_cfg["s4"]["reward_curriculum"] = reward_curriculum
+            reward_shaping = deepcopy(run_cfg["s4"].get("reward_shaping", {}))
+            if "reward_shaping_mode" in params:
+                mode = str(params["reward_shaping_mode"])
+                reward_shaping["solubility_term_mode"] = mode
+            run_cfg["s4"]["reward_shaping"] = reward_shaping
+            if "sol_log_prob_floor" in params:
+                sol_log_prob_floor = float(params["sol_log_prob_floor"])
+                run_cfg["s4"]["sol_log_prob_floor"] = sol_log_prob_floor
             run_cfg["s4"]["kl_weight"] = float(params["kl_weight"])
             run_cfg["s4"]["learning_rate"] = float(params["rl_learning_rate"])
             if alignment_mode in {"ppo", "grpo"}:
@@ -201,6 +266,10 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
                     "num_epochs": int(params["num_epochs"]),
                 }
             )
+            if "d_water_budget_fraction" in params:
+                dpo_cfg["d_water_budget_fraction"] = float(params["d_water_budget_fraction"])
+            if "pair_source" in params:
+                dpo_cfg["pair_source"] = str(params["pair_source"])
             if "synthetic_candidates_per_target" in params:
                 dpo_cfg["synthetic_candidates_per_target"] = int(params["synthetic_candidates_per_target"])
             run_cfg["s4"]["dpo"] = dpo_cfg
@@ -214,25 +283,40 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
 
     if study_family == "S1":
         params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 6, 8])
-        params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.0, 0.65)
+        params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.0, 0.85)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
+        params["sol_log_prob_floor"] = trial.suggest_float("sol_log_prob_floor", -12.0, -4.0)
     elif study_family == "S2":
+        params["variant"] = trial.suggest_categorical("variant", ["pure", "mt"])
+        if params["variant"] == "mt":
+            params["checkpoint_selection_metric"] = trial.suggest_categorical(
+                "checkpoint_selection_metric",
+                ["val_total_loss", "val_aux_soluble_loss", "val_aux_chi_loss"],
+            )
+            params["mt_aux_soluble_loss_weight"] = trial.suggest_float(
+                "mt_aux_soluble_loss_weight", 0.05, 1.5, log=True
+            )
+            params["mt_aux_chi_loss_weight"] = trial.suggest_float(
+                "mt_aux_chi_loss_weight", 0.01, 0.25, log=True
+            )
         params["finetune_last_layers"] = trial.suggest_categorical(
             "finetune_last_layers", _finetune_last_layer_choices(resolved)
         )
         _suggest_s2_training_params(trial, params)
-        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 3.0)
+        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.0, 3.0)
     elif study_family == "S3":
+        _suggest_s2_model_params(trial, params, prefix="s2_")
         params["finetune_last_layers"] = trial.suggest_categorical(
             "finetune_last_layers", _finetune_last_layer_choices(resolved)
         )
         _suggest_s2_training_params(trial, params, prefix="s2_")
-        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 3.0)
+        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.0, 3.0)
         params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 6, 8])
-        params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.0, 0.65)
+        params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.0, 0.85)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
+        params["sol_log_prob_floor"] = trial.suggest_float("sol_log_prob_floor", -12.0, -4.0)
     elif study_family == "S4_rl":
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
@@ -241,7 +325,25 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)
         params["kl_weight"] = trial.suggest_float("kl_weight", 1.0e-3, 5.0e-2, log=True)
         params["rl_learning_rate"] = trial.suggest_float("rl_learning_rate", 1.0e-6, 1.0e-4, log=True)
-        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
+        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.0, 2.0)
+        params["rl_prompt_source"] = trial.suggest_categorical(
+            "rl_prompt_source",
+            ["benchmark_target_rows", "train_exact_step3_distribution"],
+        )
+        params["reward_shaping_mode"] = trial.suggest_categorical(
+            "reward_shaping_mode",
+            ["log_prob", "logit_margin"],
+        )
+        params["sol_log_prob_floor"] = trial.suggest_float("sol_log_prob_floor", -12.0, -4.0)
+        params["reward_curriculum_transition_frac"] = trial.suggest_float(
+            "reward_curriculum_transition_frac", 0.2, 0.6
+        )
+        params["reward_curriculum_success_final_scale"] = trial.suggest_float(
+            "reward_curriculum_success_final_scale", 1.0, 3.0
+        )
+        params["reward_curriculum_dense_final_scale"] = trial.suggest_float(
+            "reward_curriculum_dense_final_scale", 0.25, 1.0
+        )
     elif study_family == "S4_ppo":
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
@@ -250,8 +352,26 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)
         params["kl_weight"] = trial.suggest_float("kl_weight", 1.0e-3, 5.0e-2, log=True)
         params["rl_learning_rate"] = trial.suggest_float("rl_learning_rate", 1.0e-6, 1.0e-4, log=True)
-        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
-        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2])
+        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.0, 2.0)
+        params["rl_prompt_source"] = trial.suggest_categorical(
+            "rl_prompt_source",
+            ["benchmark_target_rows", "train_exact_step3_distribution"],
+        )
+        params["reward_shaping_mode"] = trial.suggest_categorical(
+            "reward_shaping_mode",
+            ["log_prob", "logit_margin"],
+        )
+        params["sol_log_prob_floor"] = trial.suggest_float("sol_log_prob_floor", -12.0, -4.0)
+        params["reward_curriculum_transition_frac"] = trial.suggest_float(
+            "reward_curriculum_transition_frac", 0.2, 0.6
+        )
+        params["reward_curriculum_success_final_scale"] = trial.suggest_float(
+            "reward_curriculum_success_final_scale", 1.0, 3.0
+        )
+        params["reward_curriculum_dense_final_scale"] = trial.suggest_float(
+            "reward_curriculum_dense_final_scale", 0.25, 1.0
+        )
+        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2, 4])
         params["ppo_clip_eps"] = trial.suggest_float("ppo_clip_eps", 0.10, 0.30)
     elif study_family == "S4_grpo":
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
@@ -261,10 +381,28 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)
         params["kl_weight"] = trial.suggest_float("kl_weight", 1.0e-3, 5.0e-2, log=True)
         params["rl_learning_rate"] = trial.suggest_float("rl_learning_rate", 1.0e-6, 1.0e-4, log=True)
-        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
-        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2])
+        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.0, 2.0)
+        params["rl_prompt_source"] = trial.suggest_categorical(
+            "rl_prompt_source",
+            ["benchmark_target_rows", "train_exact_step3_distribution"],
+        )
+        params["reward_shaping_mode"] = trial.suggest_categorical(
+            "reward_shaping_mode",
+            ["log_prob", "logit_margin"],
+        )
+        params["sol_log_prob_floor"] = trial.suggest_float("sol_log_prob_floor", -12.0, -4.0)
+        params["reward_curriculum_transition_frac"] = trial.suggest_float(
+            "reward_curriculum_transition_frac", 0.2, 0.6
+        )
+        params["reward_curriculum_success_final_scale"] = trial.suggest_float(
+            "reward_curriculum_success_final_scale", 1.0, 3.0
+        )
+        params["reward_curriculum_dense_final_scale"] = trial.suggest_float(
+            "reward_curriculum_dense_final_scale", 0.25, 1.0
+        )
+        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2, 4])
         params["ppo_clip_eps"] = trial.suggest_float("ppo_clip_eps", 0.10, 0.30)
-        params["grpo_group_size"] = trial.suggest_categorical("grpo_group_size", [8, 16])
+        params["grpo_group_size"] = trial.suggest_categorical("grpo_group_size", [4, 8, 16, 32])
     elif study_family == "S4_dpo":
         params["offline_pair_budget"] = trial.suggest_categorical("offline_pair_budget", [5000, 10000, 20000])
         params["beta"] = trial.suggest_float("beta", 0.01, 0.2, log=True)
@@ -272,8 +410,15 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["batch_size"] = trial.suggest_categorical("batch_size", [32, 64])
         params["num_epochs"] = trial.suggest_categorical("num_epochs", [4, 6, 8, 10])
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
-        pair_source = str(run_cfg["s4"]["dpo"]["pair_source"]).strip().lower()
-        if pair_source == "target_row_synthetic":
+        params["d_water_budget_fraction"] = trial.suggest_categorical(
+            "d_water_budget_fraction", [0.2, 0.3, 0.5]
+        )
+        params["pair_source"] = trial.suggest_categorical(
+            "pair_source",
+            ["chi_aware_label_bucketed", "chi_aware_plus_target_row_synthetic", "target_row_synthetic"],
+        )
+        pair_source = str(params["pair_source"]).strip().lower()
+        if pair_source in {"target_row_synthetic", "chi_aware_plus_target_row_synthetic"}:
             params["synthetic_candidates_per_target"] = trial.suggest_categorical(
                 "synthetic_candidates_per_target", [8, 16, 32]
             )
