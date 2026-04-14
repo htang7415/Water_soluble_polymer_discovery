@@ -33,7 +33,7 @@ traditional_step4:
   # Main pipeline uses one random_seed per run; optional multi-seed evaluation is handled by traditional_step4/scripts/step4_3_1_multiseed_eval.py.
   step4_3_1_regression:
     tune: true
-    n_trials: 120
+    n_trials: 50
     tuning_cv_folds: 5
     tuning_objective: "val_poly_nrmse"  # "val_r2" | "val_poly_nrmse"
     nrmse_std_floor: 0.02
@@ -85,7 +85,7 @@ traditional_step4:
 
   step4_3_2_classification:
     tune: true
-    n_trials: 120
+    n_trials: 50
     tuning_cv_folds: 5
     tuning_objective: "val_balanced_accuracy"
     models:
