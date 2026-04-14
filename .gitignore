@@ -20,7 +20,7 @@ Experiments*/
 
 *.md
 !README.md
-!command.md
+command.md
 
 *.txt
 *.csv
