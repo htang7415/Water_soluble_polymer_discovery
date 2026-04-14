@@ -47,7 +47,7 @@ Euler submits Step4_1, Step4_2, and Step4_3 together, then Step4_4 after all thr
 bash scripts/submit_step4_euler.sh "$MODEL_SIZE"
 
 # NREL
-sbatch scripts/submit_step4_only_nrel.sh "$MODEL_SIZE"
+bash scripts/submit_step4_only_nrel.sh "$MODEL_SIZE"
 ```
 
 ## Slurm Step 5: No HPO
