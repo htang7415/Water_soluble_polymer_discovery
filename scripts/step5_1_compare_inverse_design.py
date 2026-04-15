@@ -7,7 +7,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import yaml
@@ -17,13 +17,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.step5.config import load_step5_config
 from src.step5.study_families import STUDY_BASE_RUNS
 from src.step5.plotting import (
+    plot_alignment_training_curves,
+    plot_chi_vs_target_compare,
+    plot_dpo_training_curves,
     plot_overall_success_all_runs,
     plot_overall_success_by_family,
     plot_per_target_difficulty_ranked,
     plot_per_target_success_compare,
+    plot_supervised_training_curves,
     plot_success_gate_funnel_compare,
     plot_success_vs_oracle_budget,
 )
+from src.utils.config import as_yamlable
 from src.utils.reporting import save_artifact_manifest, write_initial_log
 
 
@@ -35,9 +40,30 @@ REQUIRED_RUN_FILES = [
 ]
 OPTIONAL_RUN_FILES = {
     "sampling_metadata_df": "metrics/sampling_metadata.csv",
+    "supervised_history_df": "metrics/supervised_training_history.csv",
+    "rl_history_df": "metrics/rl_training_history.csv",
+    "ppo_history_df": "metrics/ppo_training_history.csv",
+    "grpo_history_df": "metrics/grpo_training_history.csv",
+    "dpo_history_df": "metrics/dpo_training_history.csv",
 }
 
 COMPARE_METRIC_REGISTRY = {
+    "full_discovery_success_hit_rate": {
+        "method_mean": "mean_success_hit_rate_discovery",
+        "method_std": "std_success_hit_rate_discovery",
+        "method_macro": "macro_average_row_mean_success_hit_rate_discovery",
+        "target_mean": "mean_success_hit_discovery_rate",
+        "target_std": "std_success_hit_discovery_rate",
+        "label": "Full discovery success hit rate",
+    },
+    "full_reporting_success_hit_rate": {
+        "method_mean": "mean_success_hit_rate",
+        "method_std": "std_success_hit_rate",
+        "method_macro": "macro_average_row_mean_success_hit_rate",
+        "target_mean": "mean_success_hit_rate",
+        "target_std": "std_success_hit_rate",
+        "label": "Full reporting success hit rate",
+    },
     "property_discovery_success_hit_rate": {
         "method_mean": "mean_property_success_hit_rate_discovery",
         "method_std": "std_property_success_hit_rate_discovery",
@@ -55,16 +81,6 @@ COMPARE_METRIC_REGISTRY = {
         "label": "Property reporting success hit rate",
     },
 }
-
-
-def _as_yamlable(value):
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(k): _as_yamlable(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_as_yamlable(v) for v in value]
-    return value
 
 
 def _resolve_selected_runs(resolved, runs_arg: str | None) -> List[str]:
@@ -105,8 +121,159 @@ def _safe_float(value: object, default: float = float("nan")) -> float:
         return float(default)
 
 
+def _base_run_label(run_name: str, canonical_family: str) -> str:
+    name = str(run_name)
+    if name.startswith("S0"):
+        return "S0"
+    if name.startswith("S1"):
+        return "S1"
+    if "S4_rl" in name:
+        return "S4r"
+    if "S4_ppo" in name:
+        return "S4p"
+    if "S4_grpo" in name:
+        return "S4g"
+    if "S4_dpo" in name:
+        return "S4d"
+    if name.startswith("S3"):
+        return "S3"
+    if name.startswith("S2"):
+        return "S2"
+    return str(canonical_family) or "Run"
+
+
+def _build_run_label_map(run_comparison_df: pd.DataFrame) -> pd.DataFrame:
+    if run_comparison_df.empty:
+        return pd.DataFrame(columns=["run_name", "canonical_family", "run_label"])
+    rows = []
+    for _, row in run_comparison_df.sort_values(["canonical_family", "run_name"], kind="mergesort").iterrows():
+        rows.append(
+            {
+                "run_name": str(row["run_name"]),
+                "canonical_family": str(row["canonical_family"]),
+                "base_label": _base_run_label(str(row["run_name"]), str(row["canonical_family"])),
+            }
+        )
+    label_df = pd.DataFrame(rows)
+    counts = label_df["base_label"].value_counts().to_dict()
+    seen: Dict[str, int] = {}
+    labels: List[str] = []
+    for base_label in label_df["base_label"].astype(str).tolist():
+        seen[base_label] = int(seen.get(base_label, 0)) + 1
+        if int(counts.get(base_label, 0)) > 1:
+            suffix = chr(ord("a") + seen[base_label] - 1)
+            labels.append(f"{base_label}{suffix}")
+        else:
+            labels.append(base_label)
+    label_df["run_label"] = labels
+    return label_df[["run_name", "canonical_family", "run_label"]].copy()
+
+
+def _attach_run_labels(df: pd.DataFrame, run_label_map_df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or run_label_map_df.empty or "run_name" not in df.columns:
+        return df
+    return df.drop(columns=["run_label"], errors="ignore").merge(
+        run_label_map_df[["run_name", "run_label"]],
+        on="run_name",
+        how="left",
+    )
+
+
+def _build_target_label_map(per_target_run_df: pd.DataFrame) -> pd.DataFrame:
+    if per_target_run_df.empty:
+        return pd.DataFrame(columns=["target_row_id", "target_row_key", "target_label"])
+    target_cols = [
+        col
+        for col in ["target_row_id", "target_row_key", "c_target", "temperature", "phi", "chi_target"]
+        if col in per_target_run_df.columns
+    ]
+    target_df = per_target_run_df[target_cols].drop_duplicates("target_row_id")
+    sort_cols = [col for col in ["temperature", "phi", "target_row_id"] if col in target_df.columns]
+    target_df = target_df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+    width = max(2, len(str(max(1, len(target_df)))))
+    target_df["target_label"] = [f"T{idx + 1:0{width}d}" for idx in range(len(target_df))]
+    return target_df
+
+
+def _attach_target_labels(df: pd.DataFrame, target_label_map_df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or target_label_map_df.empty or "target_row_id" not in df.columns:
+        return df
+    return df.drop(columns=["target_label"], errors="ignore").merge(
+        target_label_map_df[["target_row_id", "target_label"]],
+        on="target_row_id",
+        how="left",
+    )
+
+
+def _attach_best_run_labels(canonical_family_df: pd.DataFrame, run_label_map_df: pd.DataFrame) -> pd.DataFrame:
+    if canonical_family_df.empty or run_label_map_df.empty:
+        return canonical_family_df
+    best_label_map = run_label_map_df[["run_name", "run_label"]].rename(
+        columns={"run_name": "best_run_name", "run_label": "best_run_label"}
+    )
+    return canonical_family_df.drop(columns=["best_run_label"], errors="ignore").merge(
+        best_label_map,
+        on="best_run_name",
+        how="left",
+    )
+
+
+def _collect_evaluation_compare_df(
+    run_payloads: List[Dict[str, object]],
+    run_label_map_df: pd.DataFrame,
+    target_label_map_df: pd.DataFrame,
+) -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+    keep_cols = [
+        "run_name",
+        "canonical_family",
+        "target_row_id",
+        "target_row_key",
+        "c_target",
+        "temperature",
+        "phi",
+        "chi_target",
+        "chi_pred_target",
+        "success_hit",
+        "property_success_hit",
+    ]
+    for payload in run_payloads:
+        df = payload["evaluation_results_df"]
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        sub = df[[col for col in keep_cols if col in df.columns]].copy()
+        frames.append(sub)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    out = _attach_run_labels(out, run_label_map_df)
+    out = _attach_target_labels(out, target_label_map_df)
+    return out
+
+
+def _collect_history_df(
+    run_payloads: List[Dict[str, object]],
+    run_label_map_df: pd.DataFrame,
+    history_keys: List[str],
+) -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+    label_map = run_label_map_df.set_index("run_name")["run_label"].to_dict() if not run_label_map_df.empty else {}
+    for payload in run_payloads:
+        run_name = str(payload["run_name"])
+        run_label = str(label_map.get(run_name, run_name))
+        for key in history_keys:
+            df = payload.get(key, pd.DataFrame())
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            sub = df.copy()
+            sub["run_name"] = run_name
+            sub["run_label"] = run_label
+            frames.append(sub)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def _resolve_compare_metric(resolved, run_payloads: List[Dict[str, object]]) -> Tuple[str, Dict[str, str]]:
-    requested = str(resolved.step5_1.get("compare_metric", "property_discovery_success_hit_rate")).strip().lower()
+    requested = str(resolved.step5_1.get("compare_metric", "full_discovery_success_hit_rate")).strip().lower()
     metric = COMPARE_METRIC_REGISTRY.get(requested)
     if metric is None:
         raise ValueError(
@@ -121,7 +288,9 @@ def _resolve_compare_metric(resolved, run_payloads: List[Dict[str, object]]) -> 
     if run_payloads and all(_payload_has_metric(payload, metric) for payload in run_payloads):
         return requested, metric
 
-    fallback_name = "property_reporting_success_hit_rate"
+    fallback_name = "full_reporting_success_hit_rate"
+    if not all(_payload_has_metric(payload, COMPARE_METRIC_REGISTRY[fallback_name]) for payload in run_payloads):
+        fallback_name = "property_reporting_success_hit_rate"
     return fallback_name, COMPARE_METRIC_REGISTRY[fallback_name]
 
 
@@ -228,6 +397,9 @@ def _build_run_comparison_row(
         "sa_ok_discovery",
         "sa_ok",
         "soluble_ok",
+        "class_ok",
+        "class_ok_loose",
+        "class_ok_strict",
         "chi_ok",
         "chi_band_ok",
     ]:
@@ -408,6 +580,12 @@ def _write_compare_outputs(
     per_target_run_df: pd.DataFrame,
     difficulty_df: pd.DataFrame,
     canonical_family_df: pd.DataFrame,
+    run_label_map_df: pd.DataFrame,
+    target_label_map_df: pd.DataFrame,
+    evaluation_compare_df: pd.DataFrame,
+    supervised_history_df: pd.DataFrame,
+    alignment_history_df: pd.DataFrame,
+    dpo_history_df: pd.DataFrame,
     partial_compare: bool,
     skipped_runs: List[str],
     config_path: str,
@@ -421,6 +599,10 @@ def _write_compare_outputs(
     per_target_run_df.to_csv(metrics_dir / "per_target_run_comparison.csv", index=False)
     difficulty_df.to_csv(metrics_dir / "per_target_difficulty_summary.csv", index=False)
     canonical_family_df.to_csv(metrics_dir / "canonical_family_comparison.csv", index=False)
+    run_label_map_df.to_csv(metrics_dir / "run_label_map.csv", index=False)
+    target_label_map_df.to_csv(metrics_dir / "target_label_map.csv", index=False)
+    if not evaluation_compare_df.empty:
+        evaluation_compare_df.to_csv(metrics_dir / "chi_vs_target_compare_points.csv", index=False)
 
     best_run = run_comparison_df.iloc[0].to_dict() if not run_comparison_df.empty else {}
     payload = {
@@ -432,16 +614,21 @@ def _write_compare_outputs(
         "compare_metric": (
             str(run_comparison_df["comparison_metric_name"].iloc[0])
             if "comparison_metric_name" in run_comparison_df.columns and not run_comparison_df.empty
-            else str(resolved.step5_1.get("compare_metric", "property_reporting_success_hit_rate"))
+            else str(resolved.step5_1.get("compare_metric", "full_reporting_success_hit_rate"))
         ),
         "compare_metric_label": (
             str(run_comparison_df["comparison_metric_label"].iloc[0])
             if "comparison_metric_label" in run_comparison_df.columns and not run_comparison_df.empty
-            else "Property reporting success hit rate"
+            else "Full reporting success hit rate"
         ),
         "partial_compare": bool(partial_compare),
         "selected_runs": selected_runs,
         "skipped_runs": skipped_runs,
+        "run_label_map": run_label_map_df.to_dict(orient="records"),
+        "method_independence_note": (
+            "S4_rl, S4_ppo, S4_grpo, and S4_dpo share the configured supervised S4 warm start "
+            "by design so the comparison isolates the alignment algorithm."
+        ),
         "best_run_overall": best_run,
         "best_run_by_family": canonical_family_df.to_dict(orient="records"),
     }
@@ -456,7 +643,7 @@ def _write_compare_outputs(
         "config_path": config_path,
         "compare_all_enabled_runs": bool(resolved.step5_1.get("compare_all_enabled_runs", True)),
         "summarize_by_canonical_family": bool(resolved.step5_1.get("summarize_by_canonical_family", True)),
-        "compare_metric": str(resolved.step5_1.get("compare_metric", "property_discovery_success_hit_rate")),
+        "compare_metric": str(resolved.step5_1.get("compare_metric", "full_discovery_success_hit_rate")),
         "selected_runs": selected_runs,
         "skipped_runs": skipped_runs,
         "partial_compare": bool(partial_compare),
@@ -464,7 +651,7 @@ def _write_compare_outputs(
         "compare_root": str(compare_root),
     }
     with open(compare_root / "config_snapshot.yaml", "w", encoding="utf-8") as handle:
-        yaml.safe_dump(_as_yamlable(snapshot), handle, sort_keys=False)
+        yaml.safe_dump(as_yamlable(snapshot), handle, sort_keys=False)
 
     font_size = int(resolved.step5["figure_font_size"])
     if not run_comparison_df.empty:
@@ -483,6 +670,12 @@ def _write_compare_outputs(
             figures_dir / "success_hit_vs_oracle_budget_all_runs.png",
             font_size=font_size,
         )
+        if not evaluation_compare_df.empty:
+            plot_chi_vs_target_compare(
+                evaluation_compare_df,
+                figures_dir / "chi_vs_target_compare_all_runs.png",
+                font_size=font_size,
+            )
     if not canonical_family_df.empty:
         plot_overall_success_by_family(
             canonical_family_df,
@@ -499,6 +692,24 @@ def _write_compare_outputs(
         plot_per_target_difficulty_ranked(
             difficulty_df,
             figures_dir / "per_target_difficulty_ranked.png",
+            font_size=font_size,
+        )
+    if not supervised_history_df.empty:
+        plot_supervised_training_curves(
+            supervised_history_df,
+            figures_dir / "supervised_training_curves.png",
+            font_size=font_size,
+        )
+    if not alignment_history_df.empty:
+        plot_alignment_training_curves(
+            alignment_history_df,
+            figures_dir / "s4_alignment_training_curves.png",
+            font_size=font_size,
+        )
+    if not dpo_history_df.empty:
+        plot_dpo_training_curves(
+            dpo_history_df,
+            figures_dir / "dpo_training_curves.png",
             font_size=font_size,
         )
 
@@ -570,14 +781,41 @@ def main() -> None:
         kind="mergesort",
     ).reset_index(drop=True)
     run_comparison_df["rank"] = range(1, len(run_comparison_df) + 1)
+    run_label_map_df = _build_run_label_map(run_comparison_df)
+    run_comparison_df = _attach_run_labels(run_comparison_df, run_label_map_df)
 
     per_target_run_df = _build_per_target_run_comparison(
         run_payloads,
         compare_metric_name=compare_metric_name,
         compare_metric=compare_metric,
     )
+    per_target_run_df = _attach_run_labels(per_target_run_df, run_label_map_df)
+    target_label_map_df = _build_target_label_map(per_target_run_df)
+    per_target_run_df = _attach_target_labels(per_target_run_df, target_label_map_df)
     difficulty_df = _build_difficulty_summary(per_target_run_df)
+    difficulty_df = _attach_target_labels(difficulty_df, target_label_map_df)
     canonical_family_df = _build_canonical_family_comparison(run_comparison_df)
+    canonical_family_df = _attach_best_run_labels(canonical_family_df, run_label_map_df)
+    evaluation_compare_df = _collect_evaluation_compare_df(
+        run_payloads,
+        run_label_map_df,
+        target_label_map_df,
+    )
+    supervised_history_df = _collect_history_df(
+        run_payloads,
+        run_label_map_df,
+        ["supervised_history_df"],
+    )
+    alignment_history_df = _collect_history_df(
+        run_payloads,
+        run_label_map_df,
+        ["rl_history_df", "ppo_history_df", "grpo_history_df"],
+    )
+    dpo_history_df = _collect_history_df(
+        run_payloads,
+        run_label_map_df,
+        ["dpo_history_df"],
+    )
 
     compare_root = resolved.compare_root
     _write_compare_outputs(
@@ -588,6 +826,12 @@ def main() -> None:
         per_target_run_df=per_target_run_df,
         difficulty_df=difficulty_df,
         canonical_family_df=canonical_family_df,
+        run_label_map_df=run_label_map_df,
+        target_label_map_df=target_label_map_df,
+        evaluation_compare_df=evaluation_compare_df,
+        supervised_history_df=supervised_history_df,
+        alignment_history_df=alignment_history_df,
+        dpo_history_df=dpo_history_df,
         partial_compare=bool(args.allow_partial and skipped_runs),
         skipped_runs=skipped_runs,
         config_path=args.config,

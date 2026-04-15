@@ -35,6 +35,7 @@ from .plotting import plot_generated_chi_vs_target, plot_per_target_success, plo
 from .rl_trainer import train_s4_rl_alignment
 from .supervised import build_s2_components_from_step1, load_step5_checkpoint_into_modules
 from .train_s2 import S2TrainingArtifacts, train_s2_supervised_run
+from src.utils.config import as_yamlable
 from src.utils.reproducibility import save_run_metadata, seed_everything
 from src.utils.reporting import append_log_message, save_artifact_manifest, write_initial_log
 
@@ -50,16 +51,6 @@ def _write_json(payload: Dict[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
-
-
-def _as_yamlable(value):
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(k): _as_yamlable(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_as_yamlable(v) for v in value]
-    return value
 
 
 def _resolve_cross_target_duplicate_rejection_enabled(resolved) -> bool:
@@ -125,7 +116,7 @@ def save_run_config_snapshot(
     if extra_context:
         snapshot["extra_context"] = extra_context
     with open(run_dirs["run_dir"] / "config_snapshot.yaml", "w", encoding="utf-8") as handle:
-        yaml.safe_dump(_as_yamlable(snapshot), handle, sort_keys=False)
+        yaml.safe_dump(as_yamlable(snapshot), handle, sort_keys=False)
 
     seed_info = seed_everything(int(resolved.step5["random_seed"]), deterministic=True)
     save_run_metadata(run_dirs["run_dir"], config_path, seed_info)
@@ -192,7 +183,7 @@ def _shared_s4_warm_start_cache_key(
         "split_mode": str(resolved.split_mode),
         "c_target": str(resolved.c_target),
         "device": str(device),
-        "s2_cfg": _as_yamlable(dict(warm_run_cfg.get("s2", {}))),
+        "s2_cfg": as_yamlable(dict(warm_run_cfg.get("s2", {}))),
     }
     return json.dumps(payload, sort_keys=True)
 

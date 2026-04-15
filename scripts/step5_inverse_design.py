@@ -18,8 +18,10 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.step5.config import _deep_merge, build_run_config, load_step5_config
+from src.step5.dataset import build_step5_split_leakage_audit
 from src.step5.evaluation import load_step5_evaluator
 from src.step5.run_core import execute_step5_run
+from src.utils.config import as_yamlable
 
 
 SUPPORTED_RUNS = {
@@ -92,7 +94,7 @@ def _apply_cli_resolved_overrides(resolved, *, training_override: Dict[str, obje
         compare_root = compare_root.parent / f"{compare_root.name}{suffix}"
 
     snapshot = deepcopy(resolved.config_snapshot)
-    snapshot["step5"] = _as_yamlable(step5_cfg)
+    snapshot["step5"] = as_yamlable(step5_cfg)
     if "paths" not in snapshot or not isinstance(snapshot["paths"], dict):
         snapshot["paths"] = {}
     snapshot["paths"]["benchmark_root"] = str(benchmark_root)
@@ -118,16 +120,6 @@ def _write_json(payload: Dict, path: Path) -> None:
         json.dump(payload, handle, indent=2)
 
 
-def _as_yamlable(value):
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(k): _as_yamlable(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_as_yamlable(v) for v in value]
-    return value
-
-
 def _prepare_shared_artifacts(resolved, *, config_path: str) -> None:
     shared_dir = resolved.benchmark_root / "_shared"
     metrics_dir = shared_dir / "metrics"
@@ -135,7 +127,7 @@ def _prepare_shared_artifacts(resolved, *, config_path: str) -> None:
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
     with open(shared_dir / "config_snapshot.yaml", "w", encoding="utf-8") as handle:
-        yaml.safe_dump(_as_yamlable(resolved.config_snapshot), handle, sort_keys=False)
+        yaml.safe_dump(as_yamlable(resolved.config_snapshot), handle, sort_keys=False)
 
     _write_frame(resolved.target_base_df, metrics_dir / "d_target_base.csv")
     _write_frame(resolved.target_family_df, metrics_dir / "d_target_family.csv")
@@ -143,6 +135,23 @@ def _prepare_shared_artifacts(resolved, *, config_path: str) -> None:
     if not resolved.hpo_target_df.empty:
         _write_frame(resolved.hpo_target_df, metrics_dir / "d_hpo_family.csv")
     _write_frame(resolved.chi_split_df, metrics_dir / "d_chi_with_split.csv")
+    validation_diagnostics = (
+        resolved.config_snapshot.get("derived", {}).get("validation_bucket_diagnostics", {})
+        if isinstance(resolved.config_snapshot.get("derived", {}), dict)
+        else {}
+    )
+    _write_json(validation_diagnostics, metrics_dir / "validation_target_diagnostics.json")
+    split_audit_df, split_audit_summary = build_step5_split_leakage_audit(resolved)
+    _write_frame(split_audit_df, metrics_dir / "split_consistency_audit.csv")
+    _write_json(split_audit_summary, metrics_dir / "split_consistency_audit_summary.json")
+    if (
+        bool(resolved.step5.get("fail_on_split_leakage", True))
+        and int(split_audit_summary.get("train_eval_leakage_key_count", 0)) > 0
+    ):
+        raise ValueError(
+            "Step 5 split consistency audit found cross-source train/eval leakage. "
+            f"See {metrics_dir / 'split_consistency_audit.csv'}."
+        )
 
     run_rows = [build_run_config(resolved, run_name) for run_name in resolved.enabled_runs]
     run_manifest = pd.DataFrame(

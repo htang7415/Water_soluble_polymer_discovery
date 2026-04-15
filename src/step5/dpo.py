@@ -200,6 +200,8 @@ def _build_d_water_pairs(
     train_d_water: pd.DataFrame,
     *,
     scaler: ConditionScaler,
+    max_pairs: Optional[int] = None,
+    random_seed: int = 42,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     filtered, star_stats = _filter_star_ok_rows(train_d_water)
     positives = filtered.loc[filtered["water_miscible"].astype(int) == 1].copy()
@@ -212,31 +214,54 @@ def _build_d_water_pairs(
     positives = positives.sort_values(["canonical_smiles", "Polymer", "row_id"]).reset_index(drop=True)
     negatives = negatives.sort_values(["canonical_smiles", "Polymer", "row_id"]).reset_index(drop=True)
 
-    rows: List[Dict[str, Any]] = []
-    for _, chosen_row in positives.iterrows():
-        condition_bundle = _build_pair_condition_bundle(
-            temperature=np.nan,
-            phi=np.nan,
-            chi_goal=np.nan,
-            property_rule="upper_bound",
-            chi_goal_lower=np.nan,
-            chi_goal_upper=np.nan,
-            scaler=scaler,
-            chosen_row=chosen_row,
+    possible_pair_count = int(len(positives) * len(negatives))
+    pair_limit = possible_pair_count if max_pairs is None else max(0, min(int(max_pairs), possible_pair_count))
+    star_stats = {
+        **star_stats,
+        "possible_pair_count": possible_pair_count,
+        "selected_pair_count": int(pair_limit),
+        "sampled_pair_selection": int(pair_limit < possible_pair_count),
+    }
+    if pair_limit <= 0:
+        return pd.DataFrame(), star_stats
+
+    if pair_limit < possible_pair_count:
+        rng = np.random.default_rng(int(random_seed))
+        flat_indices = np.sort(
+            rng.choice(possible_pair_count, size=int(pair_limit), replace=False)
         )
-        for _, rejected_row in negatives.iterrows():
-            rows.append(
-                _base_pair_record(
-                    source_name="d_water",
-                    bucket_key="d_water|missing_fields",
-                    prompt_temperature=np.nan,
-                    prompt_phi=np.nan,
-                    prompt_chi_goal=np.nan,
-                    condition_bundle=condition_bundle,
-                    chosen_row=chosen_row,
-                    rejected_row=rejected_row,
-                )
+    else:
+        flat_indices = np.arange(possible_pair_count, dtype=int)
+
+    rows: List[Dict[str, Any]] = []
+    n_negatives = int(len(negatives))
+    condition_bundle = _build_pair_condition_bundle(
+        temperature=np.nan,
+        phi=np.nan,
+        chi_goal=np.nan,
+        property_rule="upper_bound",
+        chi_goal_lower=np.nan,
+        chi_goal_upper=np.nan,
+        scaler=scaler,
+        chosen_row=positives.iloc[0],
+    )
+    for flat_idx in flat_indices.tolist():
+        chosen_idx = int(flat_idx // n_negatives)
+        rejected_idx = int(flat_idx % n_negatives)
+        chosen_row = positives.iloc[chosen_idx]
+        rejected_row = negatives.iloc[rejected_idx]
+        rows.append(
+            _base_pair_record(
+                source_name="d_water",
+                bucket_key="d_water|missing_fields",
+                prompt_temperature=np.nan,
+                prompt_phi=np.nan,
+                prompt_chi_goal=np.nan,
+                condition_bundle=condition_bundle,
+                chosen_row=chosen_row,
+                rejected_row=rejected_row,
             )
+        )
     if not rows:
         return pd.DataFrame(), star_stats
     pair_df = pd.DataFrame(rows).sort_values(
@@ -708,6 +733,8 @@ def build_dpo_pair_splits(
             d_water_pairs, d_water_star_stats = _build_d_water_pairs(
                 frames["train_d_water"],
                 scaler=scaler,
+                max_pairs=max(0, offline_pair_budget - int(len(selected_synthetic_pairs))),
+                random_seed=int(resolved.step5["random_seed"]),
             )
             d_chi_pairs, chi_prompt_gap_df, d_chi_star_stats = _build_d_chi_pairs(
                 frames["train_d_chi"],
@@ -731,6 +758,8 @@ def build_dpo_pair_splits(
         d_water_pairs, d_water_star_stats = _build_d_water_pairs(
             frames["train_d_water"],
             scaler=scaler,
+            max_pairs=offline_pair_budget,
+            random_seed=int(resolved.step5["random_seed"]),
         )
         d_chi_pair_source = pair_source if pair_source == "chi_aware_label_bucketed" else "label_water_miscibility"
         d_chi_pairs, chi_prompt_gap_df, d_chi_star_stats = _build_d_chi_pairs(

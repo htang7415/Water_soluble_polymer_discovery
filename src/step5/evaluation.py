@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -346,14 +347,15 @@ def _infer_step4_scores(
         .rename(columns={"target_row_id": "target_id", "chi_target": "target_chi"})
         .copy()
     )
+    class_checkpoint_raw = evaluator.inference_cache.get("class_checkpoint_path")
     inferred = infer_coefficients_for_novel_candidates(
         novel_df=novel_df[["polymer_id", "Polymer", "SMILES", "canonical_smiles"]],
         target_df=target_df,
         config=evaluator.resolved.base_config,
         model_size=evaluator.resolved.model_size,
         split_mode=evaluator.resolved.split_mode,
-        chi_checkpoint_path=PathLikeShim(evaluator.inference_cache["chi_checkpoint_path"]),
-        class_checkpoint_path=PathLikeShim(evaluator.inference_cache["class_checkpoint_path"]),
+        chi_checkpoint_path=Path(evaluator.inference_cache["chi_checkpoint_path"]),
+        class_checkpoint_path=Path(class_checkpoint_raw) if class_checkpoint_raw else None,
         backbone_checkpoint_path=None,
         device=evaluator.device,
         timestep=int(
@@ -381,13 +383,6 @@ def _infer_step4_scores(
         "chi_pred_std_target",
     ]
     return inferred[keep_cols].copy()
-
-
-class PathLikeShim(str):
-    """String subclass that behaves as a simple path-like placeholder."""
-
-    def __new__(cls, value: str):
-        return str.__new__(cls, value)
 
 
 def _compute_chi_ok(
@@ -664,6 +659,8 @@ def build_method_metrics(
             "std_success_hit_rate_strict": np.nan,
             "macro_average_row_mean_success_hit_rate": np.nan,
             "macro_average_row_mean_success_hit_rate_discovery": np.nan,
+            "macro_average_row_mean_property_success_hit_rate": np.nan,
+            "macro_average_row_mean_property_success_hit_rate_discovery": np.nan,
             "macro_average_row_mean_success_hit_rate_discovery_loose": np.nan,
             "macro_average_row_mean_success_hit_rate_discovery_strict": np.nan,
             "macro_average_row_mean_success_hit_rate_loose": np.nan,
@@ -732,6 +729,8 @@ def build_method_metrics(
         ),
         "mean_benchmark_soluble_oracle_calls": float(round_metrics_df["benchmark_soluble_oracle_calls"].mean()),
         "mean_benchmark_chi_oracle_calls": float(round_metrics_df["benchmark_chi_oracle_calls"].mean()),
-        "success_metric_mode": "property_only_reporting",
-        "discovery_success_metric_mode": "property_only_discovery",
+        "success_metric_mode": "class_aware_reporting",
+        "discovery_success_metric_mode": "class_aware_discovery",
+        "property_success_metric_mode": "property_only_reporting",
+        "property_discovery_success_metric_mode": "property_only_discovery",
     }

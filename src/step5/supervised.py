@@ -109,7 +109,7 @@ def load_step5_checkpoint_into_modules(
 ) -> Dict[str, object]:
     """Restore Step 5 supervised or aligned weights into live modules."""
 
-    payload = torch.load(checkpoint_path, map_location=device)
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model_state = payload["model_state_dict"]
     live_state = diffusion_model.state_dict()
     cond_key = "backbone.condition_encoder.mlp.0.weight"

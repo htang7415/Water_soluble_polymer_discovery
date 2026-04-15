@@ -592,6 +592,47 @@ def _build_validation_target_tables(
     return rl_proxy_df, hpo_target_df, diagnostics, drift_df
 
 
+def _condition_key_set(df: pd.DataFrame) -> set[tuple[float, float]]:
+    if df.empty or not {"temperature", "phi"}.issubset(df.columns):
+        return set()
+    return {
+        (round(float(row["temperature"]), 8), round(float(row["phi"]), 8))
+        for row in df[["temperature", "phi"]].dropna().to_dict(orient="records")
+    }
+
+
+def _build_hpo_target_overlap_diagnostics(
+    *,
+    target_family_df: pd.DataFrame,
+    rl_proxy_df: pd.DataFrame,
+    hpo_target_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    benchmark_keys = _condition_key_set(target_family_df)
+    rl_proxy_keys = _condition_key_set(rl_proxy_df)
+    hpo_keys = _condition_key_set(hpo_target_df)
+    hpo_benchmark_overlap = hpo_keys & benchmark_keys
+    hpo_rl_proxy_overlap = hpo_keys & rl_proxy_keys
+    hpo_count = int(len(hpo_keys))
+    benchmark_count = int(len(benchmark_keys))
+    return {
+        "benchmark_condition_count": benchmark_count,
+        "hpo_condition_count": hpo_count,
+        "rl_proxy_condition_count": int(len(rl_proxy_keys)),
+        "hpo_benchmark_overlap_count": int(len(hpo_benchmark_overlap)),
+        "hpo_benchmark_overlap_fraction": (
+            float(len(hpo_benchmark_overlap)) / float(hpo_count) if hpo_count else 0.0
+        ),
+        "hpo_rl_proxy_overlap_count": int(len(hpo_rl_proxy_overlap)),
+        "hpo_targets_disjoint_from_rl_proxy": bool(len(hpo_rl_proxy_overlap) == 0),
+        "target_overlap_policy": (
+            "HPO targets are selected from validation buckets disjoint from the RL proxy buckets. "
+            "They are not automatically removed from the final benchmark target table; overlap with "
+            "benchmark conditions is documented here so small target tables are not split artificially."
+        ),
+        "benchmark_has_more_conditions_than_hpo": bool(benchmark_count > hpo_count),
+    }
+
+
 def _compute_chi_train_stats(chi_split_df: pd.DataFrame) -> Dict[str, float]:
     train_df = chi_split_df.loc[chi_split_df["split"].astype(str) == "train"].copy()
     if train_df.empty:
@@ -808,6 +849,11 @@ def load_step5_config(
         rl_proxy_num_targets=int(step5_cfg["s4"]["rl_proxy_num_targets"]),
         hpo_enabled=bool(hpo_cfg.get("enabled", False)),
         hpo_num_targets=int(hpo_cfg.get("hpo_num_targets", 0)),
+    )
+    diagnostics["hpo_target_overlap"] = _build_hpo_target_overlap_diagnostics(
+        target_family_df=target_family_df,
+        rl_proxy_df=rl_proxy_df,
+        hpo_target_df=hpo_target_df,
     )
     chi_train_stats = _compute_chi_train_stats(chi_split_df)
     training_source_smiles = load_decode_constraint_source_smiles(Path(base_config["paths"]["data_dir"]))

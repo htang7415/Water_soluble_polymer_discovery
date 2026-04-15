@@ -7,6 +7,7 @@ import math
 import shutil
 import tempfile
 import time
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict
@@ -557,6 +558,13 @@ def run_optuna_study(
         pair_source=str(base_run_cfg.get("s4", {}).get("dpo", {}).get("pair_source", "")),
     )
     resolved.hpo_target_df.to_csv(study_root / "d_hpo_family.csv", index=False)
+    validation_diagnostics = (
+        resolved.config_snapshot.get("derived", {}).get("validation_bucket_diagnostics", {})
+        if isinstance(resolved.config_snapshot.get("derived", {}), dict)
+        else {}
+    )
+    with open(study_root / "hpo_target_overlap_diagnostics.json", "w", encoding="utf-8") as handle:
+        json.dump(validation_diagnostics.get("hpo_target_overlap", {}), handle, indent=2)
 
     sampler_name = str(resolved.step5_hpo.get("sampler", "tpe")).strip().lower()
     pruner_name = str(resolved.step5_hpo.get("pruner", "median")).strip().lower()
@@ -588,7 +596,20 @@ def run_optuna_study(
     hpo_num_rounds = int(resolved.step5_hpo["hpo_num_rounds"])
     hpo_sampling_seeds = [int(x) for x in resolved.step5_hpo["hpo_sampling_seeds"]]
     tie_epsilon = float(resolved.step5_hpo.get("tie_epsilon", 1.0e-4))
-    objective_metric_name = "mean_property_success_hit_rate_discovery"
+    objective_metric_name = str(
+        resolved.step5_hpo.get("objective_metric", "mean_success_hit_rate_discovery")
+    ).strip()
+    supported_objective_metrics = {
+        "mean_success_hit_rate_discovery",
+        "mean_success_hit_rate",
+        "mean_property_success_hit_rate_discovery",
+        "mean_property_success_hit_rate",
+    }
+    if objective_metric_name not in supported_objective_metrics:
+        raise ValueError(
+            "Unsupported step5_hpo.objective_metric="
+            f"{objective_metric_name!r}. Choose from: {sorted(supported_objective_metrics)}"
+        )
     share_s4_warm_start_in_hpo = bool(resolved.step5_hpo.get("reuse_shared_s4_warm_start", True))
     skip_disk_checkpoints_in_hpo = bool(resolved.step5_hpo.get("skip_disk_checkpoints", True))
     stage_offsets = {
@@ -668,13 +689,31 @@ def run_optuna_study(
         eval_df = result["evaluation_results_df"]
         mean_property_success_hit_rate = float(metrics.get("mean_property_success_hit_rate", float("nan")))
         mean_property_success_hit_rate_discovery = float(
-            metrics.get(objective_metric_name, mean_property_success_hit_rate)
+            metrics.get("mean_property_success_hit_rate_discovery", mean_property_success_hit_rate)
         )
         mean_success_hit_rate = float(metrics["mean_success_hit_rate"])
         mean_success_hit_rate_discovery = float(
             metrics.get("mean_success_hit_rate_discovery", mean_success_hit_rate)
         )
-        trial.report(mean_property_success_hit_rate_discovery, step=9_999_999)
+        if objective_metric_name not in metrics:
+            warnings.warn(
+                f"Step 5 HPO objective metric {objective_metric_name!r} is missing from method_metrics; "
+                "recording this trial as -inf.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            objective_value = float("nan")
+        else:
+            objective_value = float(metrics.get(objective_metric_name, float("nan")))
+        if not math.isfinite(objective_value):
+            warnings.warn(
+                f"Step 5 HPO objective metric {objective_metric_name!r} is non-finite; "
+                "recording this trial as -inf.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            objective_value = float("-inf")
+        trial.report(objective_value, step=9_999_999)
         trial.set_user_attr("mean_chi_ok", float(eval_df["chi_ok"].astype(float).mean()) if not eval_df.empty else float("nan"))
         trial.set_user_attr(
             "mean_chi_band_ok",
@@ -706,7 +745,7 @@ def run_optuna_study(
             study_family=study_family,
             run_name=str(run_cfg["run_name"]),
             params=params,
-            objective_value=mean_property_success_hit_rate_discovery,
+            objective_value=objective_value,
             objective_metric=objective_metric_name,
             mean_property_success_hit_rate=mean_property_success_hit_rate,
             mean_property_success_hit_rate_discovery=mean_property_success_hit_rate_discovery,
@@ -716,7 +755,7 @@ def run_optuna_study(
             mean_total_raw_samples_drawn=float(metrics.get("mean_total_raw_samples_drawn", float("nan"))),
             state="COMPLETE",
         )
-        return mean_property_success_hit_rate_discovery
+        return objective_value
 
     if remaining_trials > 0:
         study.optimize(objective, n_trials=remaining_trials, timeout=None)

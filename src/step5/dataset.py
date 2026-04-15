@@ -18,6 +18,7 @@ from src.chi.data import (
     make_split_assignments,
 )
 from src.data.tokenizer import PSmilesTokenizer
+from src.utils.chemistry import canonicalize_smiles
 
 from .config import ResolvedStep5Config, _resolve_split_ratios
 
@@ -234,6 +235,82 @@ def build_step5_supervised_frames(resolved: ResolvedStep5Config) -> Dict[str, pd
         "train_d_water": water_df.loc[water_df["split"] == "train", unified_cols].copy(),
         "val_d_water": water_df.loc[water_df["split"] == "val", unified_cols].copy(),
     }
+
+
+def build_step5_split_leakage_audit(resolved: ResolvedStep5Config) -> tuple[pd.DataFrame, Dict[str, int]]:
+    """Audit split consistency for polymers shared by D_chi and D_water."""
+
+    frames = build_step5_supervised_frames(resolved)
+    rows: List[Dict[str, Any]] = []
+    for source_name in ("d_chi", "d_water"):
+        source_df = frames[source_name].copy()
+        for row in source_df.to_dict(orient="records"):
+            smiles = str(row.get("SMILES", ""))
+            canonical = canonicalize_smiles(smiles) or smiles
+            rows.append(
+                {
+                    "source_name": source_name,
+                    "split": str(row.get("split", "")),
+                    "polymer": str(row.get("Polymer", "")),
+                    "canonical_smiles": str(canonical),
+                    "row_id": int(row.get("row_id", -1)),
+                }
+            )
+    if not rows:
+        summary = {
+            "audit_rows": 0,
+            "overlap_key_count": 0,
+            "split_mismatch_key_count": 0,
+            "train_eval_leakage_key_count": 0,
+        }
+        return pd.DataFrame(), summary
+
+    audit_input = pd.DataFrame(rows)
+    audit_rows: List[Dict[str, Any]] = []
+    for canonical_smiles, sub in audit_input.groupby("canonical_smiles", sort=True):
+        sources = sorted(sub["source_name"].astype(str).unique().tolist())
+        if not {"d_chi", "d_water"}.issubset(set(sources)):
+            continue
+        d_chi_splits = sorted(
+            sub.loc[sub["source_name"] == "d_chi", "split"].astype(str).unique().tolist()
+        )
+        d_water_splits = sorted(
+            sub.loc[sub["source_name"] == "d_water", "split"].astype(str).unique().tolist()
+        )
+        all_splits = sorted(set(d_chi_splits) | set(d_water_splits))
+        split_mismatch = int(d_chi_splits != d_water_splits)
+        train_eval_leakage = int(
+            ("train" in d_chi_splits and any(split in {"val", "test"} for split in d_water_splits))
+            or ("train" in d_water_splits and any(split in {"val", "test"} for split in d_chi_splits))
+        )
+        audit_rows.append(
+            {
+                "canonical_smiles": str(canonical_smiles),
+                "d_chi_splits": ",".join(d_chi_splits),
+                "d_water_splits": ",".join(d_water_splits),
+                "all_splits": ",".join(all_splits),
+                "split_mismatch": split_mismatch,
+                "train_eval_leakage": train_eval_leakage,
+                "d_chi_rows": int((sub["source_name"] == "d_chi").sum()),
+                "d_water_rows": int((sub["source_name"] == "d_water").sum()),
+                "example_polymers": ";".join(sorted(sub["polymer"].astype(str).unique().tolist())[:5]),
+            }
+        )
+
+    audit_df = pd.DataFrame(audit_rows)
+    if not audit_df.empty:
+        audit_df = audit_df.sort_values(
+            ["train_eval_leakage", "split_mismatch", "canonical_smiles"],
+            ascending=[False, False, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+    summary = {
+        "audit_rows": int(len(audit_input)),
+        "overlap_key_count": int(len(audit_df)),
+        "split_mismatch_key_count": int(audit_df["split_mismatch"].sum()) if not audit_df.empty else 0,
+        "train_eval_leakage_key_count": int(audit_df["train_eval_leakage"].sum()) if not audit_df.empty else 0,
+    }
+    return audit_df, summary
 
 
 def build_source_batch_counts(batch_size: int, source_mix: Dict[str, float]) -> Dict[str, int]:

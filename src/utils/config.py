@@ -37,6 +37,18 @@ def deep_merge_config(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[st
     return merged
 
 
+def as_yamlable(value: Any) -> Any:
+    """Convert common path containers into YAML-safe primitives."""
+
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): as_yamlable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [as_yamlable(item) for item in value]
+    return value
+
+
 def load_step4_config(
     config_path: str = "configs/config4.yaml",
     *,
