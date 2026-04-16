@@ -2608,7 +2608,7 @@ def _plot_parity_panel(ax, sub: pd.DataFrame, split: str, show_legend: bool) -> 
                 handles=handles,
                 labels=_class_display_labels([0, 1]),
                 title=CLASS_DISPLAY_LEGEND_TITLE,
-                loc="upper right",
+                loc="lower right",
                 frameon=True,
                 fancybox=True,
                 framealpha=0.92,
@@ -2696,24 +2696,15 @@ def _make_figures(history: Dict[str, List[float]], pred_df: pd.DataFrame, fig_di
     # Loss curve
     has_val_curve = _has_finite_history_values(history, "val_loss")
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(history["epoch"], history["train_loss"], label="Train loss")
+    ax.plot(history["epoch"], history["train_loss"], label="Train")
     if has_val_curve:
-        ax.plot(history["epoch"], history["val_loss"], label="Val loss")
+        ax.plot(history["epoch"], history["val_loss"], label="Val")
         ax.set_title("Step4 chi training loss")
     else:
         ax.set_title("Step4 chi training loss (final fit: train+val)")
-        ax.text(
-            0.03,
-            0.97,
-            "No validation split in final fit",
-            transform=ax.transAxes,
-            va="top",
-            ha="left",
-            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
-        )
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    ax.legend(loc="upper right")
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_loss_curve.png", dpi=dpi)
     plt.close(fig)
@@ -3510,24 +3501,15 @@ def _make_regression_figures(
 
     has_val_curve = _has_finite_history_values(history, "val_loss")
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(history["epoch"], history["train_loss"], label="Train loss")
+    ax.plot(history["epoch"], history["train_loss"], label="Train")
     if has_val_curve:
-        ax.plot(history["epoch"], history["val_loss"], label="Val loss")
+        ax.plot(history["epoch"], history["val_loss"], label="Val")
         ax.set_title("Step4_1 regression loss")
     else:
         ax.set_title("Step4_1 regression loss (final fit: train+val)")
-        ax.text(
-            0.03,
-            0.97,
-            "No validation split in final fit",
-            transform=ax.transAxes,
-            va="top",
-            ha="left",
-            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
-        )
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    ax.legend(loc="upper right")
     fig.tight_layout()
     fig.savefig(fig_dir / "chi_loss_curve.png", dpi=dpi)
     plt.close(fig)
@@ -3535,14 +3517,14 @@ def _make_regression_figures(
     train = pred_df[pred_df["split"] == "train"].copy()
     fig, ax = plt.subplots(figsize=(6, 5))
     _plot_parity_panel(ax, sub=train, split="train", show_legend=True)
-    fig.tight_layout(rect=(0, 0, 0.82, 1))
+    fig.tight_layout()
     fig.savefig(fig_dir / "chi_parity_train.png", dpi=dpi)
     plt.close(fig)
 
     test = pred_df[pred_df["split"] == "test"].copy()
     fig, ax = plt.subplots(figsize=(6, 5))
     _plot_parity_panel(ax, sub=test, split="test", show_legend=True)
-    fig.tight_layout(rect=(0, 0, 0.82, 1))
+    fig.tight_layout()
     fig.savefig(fig_dir / "chi_parity_test.png", dpi=dpi)
     plt.close(fig)
 
