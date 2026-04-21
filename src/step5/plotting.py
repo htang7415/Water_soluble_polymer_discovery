@@ -42,6 +42,49 @@ def _run_label(row: pd.Series) -> str:
     return str(row.get("run_label", row.get("run_name", "")))
 
 
+def _add_summary_box(ax, text: str, *, loc: tuple[float, float] = (0.03, 0.97)) -> None:
+    if not str(text).strip():
+        return
+    ax.text(
+        float(loc[0]),
+        float(loc[1]),
+        str(text),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#666666", "alpha": 0.92},
+    )
+
+
+def _apply_parity_axis(ax, x: pd.Series, y: pd.Series) -> None:
+    x_vals = pd.to_numeric(x, errors="coerce").to_numpy(dtype=float)
+    y_vals = pd.to_numeric(y, errors="coerce").to_numpy(dtype=float)
+    finite_x = x_vals[np.isfinite(x_vals)]
+    finite_y = y_vals[np.isfinite(y_vals)]
+    if finite_x.size == 0 or finite_y.size == 0:
+        return
+    lo = float(min(finite_x.min(), finite_y.min()))
+    hi = float(max(finite_x.max(), finite_y.max()))
+    span = max(hi - lo, 1.0e-8)
+    pad = 0.04 * span
+    lo_plot = lo - pad
+    hi_plot = hi + pad
+    ax.plot([lo_plot, hi_plot], [lo_plot, hi_plot], linestyle="--", color="#222222", linewidth=1.2)
+    ax.set_xlim(lo_plot, hi_plot)
+    ax.set_ylim(lo_plot, hi_plot)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
+
+
+def _safe_series_correlation(x: pd.Series, y: pd.Series) -> float:
+    x_num = pd.to_numeric(x, errors="coerce")
+    y_num = pd.to_numeric(y, errors="coerce")
+    valid = x_num.notna() & y_num.notna()
+    if int(valid.sum()) < 2:
+        return float("nan")
+    return float(x_num.loc[valid].corr(y_num.loc[valid]))
+
+
 def _comparison_success_columns(df: pd.DataFrame) -> tuple[str, str, str]:
     mean_col = "comparison_mean_success_hit_rate" if "comparison_mean_success_hit_rate" in df.columns else "mean_success_hit_rate"
     std_col = "comparison_std_success_hit_rate" if "comparison_std_success_hit_rate" in df.columns else "std_success_hit_rate"
@@ -97,6 +140,7 @@ def plot_per_target_success(
     ax.set_ylabel(ylabel)
     ax.set_xticks(range(len(ordered)))
     ax.set_xticklabels(ordered["target_label"].tolist(), rotation=90)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
     fig.tight_layout()
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
@@ -143,6 +187,7 @@ def plot_success_gate_funnel(
     ax.set_xlabel("Gate")
     ax.set_ylabel("Pass rate")
     ax.tick_params(axis="x", rotation=45)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
     fig.tight_layout()
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
@@ -170,9 +215,12 @@ def plot_generated_chi_vs_target(
             alpha=0.6,
             color="#0C5DA5",
         )
-        lower = min(valid["chi_target"].min(), valid["chi_pred_target"].min())
-        upper = max(valid["chi_target"].max(), valid["chi_pred_target"].max())
-        ax.plot([lower, upper], [lower, upper], linestyle="--", color="#222222", linewidth=1.2)
+        _apply_parity_axis(ax, valid["chi_target"], valid["chi_pred_target"])
+        corr = _safe_series_correlation(valid["chi_target"], valid["chi_pred_target"])
+        _add_summary_box(
+            ax,
+            f"n={len(valid)}\nr={corr:.3f}" if np.isfinite(corr) else f"n={len(valid)}",
+        )
     ax.set_xlabel("Target chi")
     ax.set_ylabel("Predicted chi")
     fig.tight_layout()
@@ -207,6 +255,13 @@ def plot_overall_success_all_runs(
     ax.set_xticks(range(len(ordered)))
     ax.set_xticklabels([_run_label(row) for _, row in ordered.iterrows()], rotation=0)
     ax.set_ylim(0.0, max(1.0, float(np.nanmax(ordered[mean_col].to_numpy(dtype=float))) * 1.1))
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
+    if not ordered.empty:
+        best_row = ordered.iloc[0]
+        _add_summary_box(
+            ax,
+            f"best={_run_label(best_row)}\nvalue={float(best_row[mean_col]):.3f}\nruns={len(ordered)}",
+        )
     fig.tight_layout()
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
@@ -237,6 +292,7 @@ def plot_overall_success_by_family(
     ax.set_ylabel(label)
     ax.set_xticks(range(len(ordered)))
     ax.set_xticklabels(ordered["canonical_family"].tolist())
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
     for idx, bar in enumerate(bars):
         ax.text(
             bar.get_x() + bar.get_width() / 2.0,
@@ -303,6 +359,7 @@ def plot_hpo_best_success_curve(
         )
         ymax = float(np.nanmax(ordered["best_success_hit_rate_so_far"].to_numpy(dtype=float)))
         ax.set_ylim(0.0, max(1.0, min(1.02, ymax * 1.05 if ymax > 0.0 else 1.0)))
+        ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
     else:
         ax.text(0.5, 0.5, "No completed trials", ha="center", va="center", transform=ax.transAxes)
         ax.set_ylim(0.0, 1.0)
@@ -350,8 +407,9 @@ def plot_per_target_success_compare(
         target_order = _add_compact_target_labels(target_order)
     ax.set_xticklabels(target_order["target_label"].tolist(), rotation=90)
     ax.set_ylim(0.0, 1.0)
-    ax.legend(loc="best", fontsize=max(8, font_size - 4), ncol=2)
-    fig.tight_layout()
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, fontsize=max(8, font_size - 4), ncol=1)
+    fig.tight_layout(rect=(0, 0, 0.84, 1))
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -389,6 +447,7 @@ def plot_per_target_difficulty_ranked(
     ax.set_xticks(range(len(ordered)))
     ax.set_xticklabels(ordered["target_label"].tolist(), rotation=90)
     ax.set_ylim(0.0, 1.0)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
     fig.tight_layout()
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
@@ -434,8 +493,9 @@ def plot_success_gate_funnel_compare(
     ax.set_xlabel("Gate")
     ax.set_ylabel("Mean pass rate")
     ax.tick_params(axis="x", rotation=45)
-    ax.legend(loc="best", fontsize=max(8, font_size - 4), ncol=2)
-    fig.tight_layout()
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, fontsize=max(8, font_size - 4), ncol=1)
+    fig.tight_layout(rect=(0, 0, 0.84, 1))
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -467,6 +527,7 @@ def plot_success_vs_oracle_budget(
         )
     ax.set_xlabel("Mean total oracle calls")
     ax.set_ylabel(f"Mean {label.lower()}")
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
     fig.tight_layout()
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
@@ -496,8 +557,10 @@ def plot_supervised_training_curves(
     axes[0].set_ylabel("Train diffusion loss")
     axes[1].set_xlabel("Step")
     axes[1].set_ylabel("Val diffusion loss")
-    axes[1].legend(loc="best", fontsize=max(8, font_size - 4), ncol=2)
-    fig.tight_layout()
+    for ax in axes:
+        ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
+    axes[1].legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, fontsize=max(8, font_size - 4), ncol=1)
+    fig.tight_layout(rect=(0, 0, 0.84, 1))
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -530,8 +593,9 @@ def plot_alignment_training_curves(
                 ax.plot(x, sub[column].astype(float), linewidth=1.4, label=label)
             ax.set_xlabel("Step")
             ax.set_ylabel(ylabel)
-    axes_flat[-1].legend(loc="best", fontsize=max(8, font_size - 4), ncol=2)
-    fig.tight_layout()
+            ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
+    axes_flat[-1].legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, fontsize=max(8, font_size - 4), ncol=1)
+    fig.tight_layout(rect=(0, 0, 0.84, 1))
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -562,8 +626,9 @@ def plot_dpo_training_curves(
                 ax.plot(x, sub[column].astype(float), linewidth=1.5, label=label)
             ax.set_xlabel("Epoch")
             ax.set_ylabel(ylabel)
-    axes[-1].legend(loc="best", fontsize=max(8, font_size - 4))
-    fig.tight_layout()
+            ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
+    axes[-1].legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, fontsize=max(8, font_size - 4))
+    fig.tight_layout(rect=(0, 0, 0.84, 1))
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -593,12 +658,15 @@ def plot_chi_vs_target_compare(
                 alpha=0.45,
                 label=label,
             )
-        lower = min(valid["chi_target"].min(), valid["chi_pred_target"].min())
-        upper = max(valid["chi_target"].max(), valid["chi_pred_target"].max())
-        ax.plot([lower, upper], [lower, upper], linestyle="--", color="#222222", linewidth=1.2)
-        ax.legend(loc="best", fontsize=max(8, font_size - 5), ncol=2)
+        _apply_parity_axis(ax, valid["chi_target"], valid["chi_pred_target"])
+        corr = _safe_series_correlation(valid["chi_target"], valid["chi_pred_target"])
+        _add_summary_box(
+            ax,
+            f"n={len(valid)}\nr={corr:.3f}" if np.isfinite(corr) else f"n={len(valid)}",
+        )
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, fontsize=max(8, font_size - 5), ncol=1)
     ax.set_xlabel("Target chi")
     ax.set_ylabel("Predicted chi")
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 0.84, 1))
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)

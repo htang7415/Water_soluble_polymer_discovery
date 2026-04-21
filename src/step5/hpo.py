@@ -67,7 +67,11 @@ def _resolve_optuna_timeout_seconds(budgets: Dict[str, Any]) -> int | None:
     timeout_hours = float(raw_timeout_hours)
     if not math.isfinite(timeout_hours) or timeout_hours <= 0.0:
         return None
-    timeout_hours = min(timeout_hours, 30.0)
+    if timeout_hours > 30.0:
+        raise ValueError(
+            "Step 5 HPO timeout_hours_medium exceeds the supported 30-hour limit. "
+            f"Received {timeout_hours}."
+        )
     return max(1, int(round(timeout_hours * 3600.0)))
 
 
