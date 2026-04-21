@@ -46,6 +46,32 @@ class SamplingTrajectoryRecord:
     steps: List[TrajectoryStepRecord]
 
 
+def _clone_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.detach().to(device="cpu").clone()
+
+
+def _trajectory_step_record_to_cpu(record: TrajectoryStepRecord) -> TrajectoryStepRecord:
+    return TrajectoryStepRecord(
+        timestep=int(record.timestep),
+        ids_before=_clone_tensor_to_cpu(record.ids_before),
+        attention_mask=_clone_tensor_to_cpu(record.attention_mask),
+        fixed_mask=_clone_tensor_to_cpu(record.fixed_mask),
+        unmask_positions=_clone_tensor_to_cpu(record.unmask_positions),
+        sampled_token_ids=_clone_tensor_to_cpu(record.sampled_token_ids),
+        unmask_counts=_clone_tensor_to_cpu(record.unmask_counts),
+    )
+
+
+def _sampling_trajectory_record_to_cpu(record: SamplingTrajectoryRecord) -> SamplingTrajectoryRecord:
+    return SamplingTrajectoryRecord(
+        condition_bundle=_clone_tensor_to_cpu(record.condition_bundle),
+        cfg_scale=float(record.cfg_scale),
+        final_ids=_clone_tensor_to_cpu(record.final_ids),
+        final_attention_mask=_clone_tensor_to_cpu(record.final_attention_mask),
+        steps=[_trajectory_step_record_to_cpu(step) for step in record.steps],
+    )
+
+
 def _slice_sampling_trajectory(record: SamplingTrajectoryRecord, keep_rows: Sequence[int]) -> SamplingTrajectoryRecord:
     keep = list(int(idx) for idx in keep_rows)
     index_tensor = torch.tensor(keep, dtype=torch.long, device=record.final_ids.device)
@@ -442,7 +468,7 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
                         max_length=int(seq_length),
                         show_progress=False,
                     )
-            all_ids.append(ids)
+            all_ids.append(ids.detach().to(device="cpu"))
             all_smiles.extend(smiles)
             all_trajectories.append(trajectory)
             sample_idx += current_batch_size
@@ -491,7 +517,7 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
                     lengths=batch_lengths,
                     show_progress=False,
                 )
-            all_ids.append(ids)
+            all_ids.append(ids.detach().to(device="cpu"))
             all_smiles.extend(smiles)
             all_trajectories.append(trajectory)
             sample_idx += current_batch_size
@@ -540,7 +566,7 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
                     lengths=batch_lengths,
                     show_progress=False,
                 )
-            all_ids.append(ids)
+            all_ids.append(ids.detach().to(device="cpu"))
             all_smiles.extend(smiles)
             all_trajectories.append(trajectory)
             sample_idx += current_batch_size
@@ -622,14 +648,16 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
             padded_positions, unmask_counts = _pad_event_matrix(step_positions, device=self.device)
             padded_tokens, _ = _pad_event_matrix(step_tokens, device=self.device)
             records.append(
-                TrajectoryStepRecord(
-                    timestep=int(t),
-                    ids_before=ids_before.detach().clone(),
-                    attention_mask=attention_mask.detach().clone(),
-                    fixed_mask=fixed_mask.detach().clone(),
-                    unmask_positions=padded_positions.detach().clone(),
-                    sampled_token_ids=padded_tokens.detach().clone(),
-                    unmask_counts=unmask_counts.detach().clone(),
+                _trajectory_step_record_to_cpu(
+                    TrajectoryStepRecord(
+                        timestep=int(t),
+                        ids_before=ids_before,
+                        attention_mask=attention_mask,
+                        fixed_mask=fixed_mask,
+                        unmask_positions=padded_positions,
+                        sampled_token_ids=padded_tokens,
+                        unmask_counts=unmask_counts,
+                    )
                 )
             )
             if t == 1:
@@ -644,12 +672,14 @@ class TrajectoryConditionalSampler(ConditionalConstrainedSampler):
             ids = self._fix_paren_balance(ids, final_logits, fixed_mask=fixed_mask)
 
         smiles_list = self.tokenizer.batch_decode(ids.cpu().tolist(), skip_special_tokens=True)
-        trajectory = SamplingTrajectoryRecord(
-            condition_bundle=self._condition_for_batch(batch_size).detach().clone(),
-            cfg_scale=float(self.cfg_scale),
-            final_ids=ids.detach().clone(),
-            final_attention_mask=attention_mask.detach().clone(),
-            steps=records,
+        trajectory = _sampling_trajectory_record_to_cpu(
+            SamplingTrajectoryRecord(
+                condition_bundle=self._condition_for_batch(batch_size),
+                cfg_scale=float(self.cfg_scale),
+                final_ids=ids,
+                final_attention_mask=attention_mask,
+                steps=records,
+            )
         )
         return ids, smiles_list, trajectory
 

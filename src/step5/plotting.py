@@ -252,6 +252,67 @@ def plot_overall_success_by_family(
     plt.close(fig)
 
 
+def plot_hpo_best_success_curve(
+    trials_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    font_size: int = 16,
+    dpi: int = 600,
+) -> None:
+    """Plot running-best success hit rate across HPO trials."""
+
+    apply_step5_plot_style(font_size=font_size, dpi=dpi)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = trials_df.copy()
+    if "trial_number" not in ordered.columns:
+        ordered["trial_number"] = np.arange(len(ordered), dtype=int)
+    ordered["trial_number"] = pd.to_numeric(ordered["trial_number"], errors="coerce")
+    ordered = ordered.loc[ordered["trial_number"].notna()].sort_values("trial_number", kind="mergesort").reset_index(drop=True)
+
+    metric_col = "mean_success_hit_rate_discovery"
+    ylabel = "Best success hit rate so far (discovery)"
+    if metric_col not in ordered.columns:
+        metric_col = "mean_success_hit_rate"
+        ylabel = "Best success hit rate so far"
+    metric_values = (
+        pd.to_numeric(ordered[metric_col], errors="coerce")
+        if metric_col in ordered.columns
+        else pd.Series(np.nan, index=ordered.index, dtype=float)
+    )
+
+    running_best: list[float] = []
+    best_so_far = float("nan")
+    for value in metric_values.tolist():
+        if np.isfinite(value):
+            if not np.isfinite(best_so_far):
+                best_so_far = float(value)
+            else:
+                best_so_far = max(float(best_so_far), float(value))
+        running_best.append(float(best_so_far) if np.isfinite(best_so_far) else float("nan"))
+    ordered["best_success_hit_rate_so_far"] = running_best
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    if not ordered.empty and np.isfinite(np.asarray(running_best, dtype=float)).any():
+        ax.plot(
+            ordered["trial_number"].astype(int),
+            ordered["best_success_hit_rate_so_far"].astype(float),
+            color="#d62728",
+            linewidth=2.0,
+            marker="o",
+            markersize=4.5,
+        )
+        ymax = float(np.nanmax(ordered["best_success_hit_rate_so_far"].to_numpy(dtype=float)))
+        ax.set_ylim(0.0, max(1.0, min(1.02, ymax * 1.05 if ymax > 0.0 else 1.0)))
+    else:
+        ax.text(0.5, 0.5, "No completed trials", ha="center", va="center", transform=ax.transAxes)
+        ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("Trial")
+    ax.set_ylabel(ylabel)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+
+
 def plot_per_target_success_compare(
     per_target_run_df: pd.DataFrame,
     output_path: Path,

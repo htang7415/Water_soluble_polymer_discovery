@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import math
 import shutil
@@ -10,11 +11,13 @@ import time
 import warnings
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
+import torch
 import yaml
 
 from .config import build_run_config, resolve_step5_hpo_generation_budget
+from .plotting import plot_hpo_best_success_curve
 from .run_core import execute_step5_run
 from .study_families import STUDY_BASE_RUNS
 from src.utils.model_scales import get_model_config
@@ -32,6 +35,62 @@ def _require_optuna():
 
 def _hpo_root(resolved) -> Path:
     return resolved.results_dir / "step5_hpo" / resolved.split_mode / resolved.c_target
+
+
+def _study_root(resolved, *, study_family: str) -> Path:
+    return _hpo_root(resolved) / str(study_family)
+
+
+def _best_params_path(resolved, *, study_family: str) -> Path:
+    return _study_root(resolved, study_family=study_family) / "best_params.yaml"
+
+
+def _resolve_hpo_runtime_config(resolved, *, study_family: str) -> Dict[str, Any]:
+    hpo_cfg = dict(resolved.step5_hpo)
+    runtime_overrides = dict(hpo_cfg.get("method_runtime_overrides", {}).get(study_family, {}) or {})
+    if runtime_overrides:
+        hpo_cfg.update(runtime_overrides)
+    return hpo_cfg
+
+
+def _resolve_optuna_timeout_seconds(budgets: Dict[str, Any]) -> int | None:
+    if "timeout_hours_medium" not in budgets:
+        raise KeyError(
+            "Missing method_budgets.<study_family>.timeout_hours_medium for Step 5 HPO. "
+            "Set it explicitly in configs/config5.yaml."
+        )
+    raw_timeout_hours = budgets.get("timeout_hours_medium")
+    if raw_timeout_hours is None:
+        raise ValueError(
+            "Step 5 HPO timeout_hours_medium must be set explicitly per study family; null is not allowed."
+        )
+    timeout_hours = float(raw_timeout_hours)
+    if not math.isfinite(timeout_hours) or timeout_hours <= 0.0:
+        return None
+    timeout_hours = min(timeout_hours, 30.0)
+    return max(1, int(round(timeout_hours * 3600.0)))
+
+
+def _build_optuna_pruner(resolved):
+    pruner_name = str(resolved.step5_hpo.get("pruner", "median")).strip().lower()
+    if pruner_name == "median":
+        return optuna.pruners.MedianPruner(
+            n_startup_trials=int(resolved.step5_hpo.get("pruner_n_startup_trials", 2)),
+            n_warmup_steps=int(resolved.step5_hpo.get("pruner_n_warmup_steps", 1)),
+        )
+    if pruner_name == "successive_halving":
+        return optuna.pruners.SuccessiveHalvingPruner(
+            min_resource=int(resolved.step5_hpo.get("pruner_min_resource", 1)),
+            reduction_factor=int(resolved.step5_hpo.get("pruner_reduction_factor", 2)),
+            min_early_stopping_rate=int(resolved.step5_hpo.get("pruner_min_early_stopping_rate", 0)),
+        )
+    if pruner_name == "hyperband":
+        return optuna.pruners.HyperbandPruner(
+            min_resource=int(resolved.step5_hpo.get("pruner_min_resource", 1)),
+            max_resource=str(resolved.step5_hpo.get("pruner_max_resource", "auto")),
+            reduction_factor=int(resolved.step5_hpo.get("pruner_reduction_factor", 2)),
+        )
+    raise ValueError(f"Unsupported Step 5 HPO pruner: {pruner_name}")
 
 
 def _storage_uri(resolved, *, study_family: str | None = None) -> str:
@@ -151,29 +210,81 @@ def _suggest_s2_model_params(trial, params: Dict[str, Any], *, prefix: str = "")
         )
 
 
-def _apply_hpo_runtime_overrides(resolved, run_cfg: Dict[str, object], *, study_family: str) -> Dict[str, object]:
-    hpo_cfg = dict(resolved.step5_hpo)
+def _apply_hpo_runtime_overrides(
+    resolved,
+    run_cfg: Dict[str, object],
+    *,
+    study_family: str,
+) -> Tuple[object, Dict[str, object]]:
+    hpo_cfg = _resolve_hpo_runtime_config(resolved, study_family=study_family)
+    resolved = replace(resolved, base_config=deepcopy(resolved.base_config))
+    sampling_cfg = resolved.base_config.setdefault("sampling", {})
+    chi_cfg = resolved.base_config.setdefault("chi_training", {})
+    step5_decode_cfg = chi_cfg.setdefault("step5_inverse_design", {})
     s2_hpo_max_steps = int(hpo_cfg.get("hpo_s2_max_steps", 0) or 0)
     rl_hpo_num_steps = int(hpo_cfg.get("hpo_rl_num_steps", 0) or 0)
+    hpo_sampling_batch_size = int(hpo_cfg.get("hpo_sampling_batch_size", 0) or 0)
+    hpo_class_match_attempts_max = int(hpo_cfg.get("hpo_decode_class_match_sampling_attempts_max", 0) or 0)
+    hpo_class_match_oversample_factor = float(
+        hpo_cfg.get("hpo_decode_class_match_oversample_factor", 0.0) or 0.0
+    )
+    hpo_s4_trajectories_per_batch = int(hpo_cfg.get("hpo_s4_trajectories_per_batch", 0) or 0)
+    hpo_s4_rl_diffusion_num_steps = int(hpo_cfg.get("hpo_s4_rl_diffusion_num_steps", 0) or 0)
+    hpo_s4_replay_batch_size = int(hpo_cfg.get("hpo_s4_replay_batch_size", 0) or 0)
+    hpo_s2_val_checks = int(hpo_cfg.get("hpo_s2_val_checks", 0) or 0)
+    hpo_rl_proxy_eval_checks = int(hpo_cfg.get("hpo_rl_proxy_eval_checks", 0) or 0)
+
+    if hpo_sampling_batch_size > 0:
+        current_batch_size = int(sampling_cfg.get("batch_size", hpo_sampling_batch_size))
+        sampling_cfg["batch_size"] = int(min(current_batch_size, hpo_sampling_batch_size))
+
+    if hpo_class_match_attempts_max > 0:
+        step5_decode_cfg["decode_constraint_class_match_sampling_attempts_max"] = int(
+            max(int(step5_decode_cfg.get("decode_constraint_class_match_sampling_attempts_max", 1)), hpo_class_match_attempts_max)
+        )
+
+    if hpo_class_match_oversample_factor > 0.0:
+        step5_decode_cfg["decode_constraint_class_match_oversample_factor"] = float(
+            max(
+                float(step5_decode_cfg.get("decode_constraint_class_match_oversample_factor", 1.0)),
+                hpo_class_match_oversample_factor,
+            )
+        )
 
     if "s2" in run_cfg and s2_hpo_max_steps > 0:
         capped_steps = min(int(run_cfg["s2"]["max_steps"]), int(s2_hpo_max_steps))
         run_cfg["s2"]["max_steps"] = int(capped_steps)
+        target_s2_val_checks = int(hpo_s2_val_checks if hpo_s2_val_checks > 0 else 4)
         run_cfg["s2"]["val_check_interval_steps"] = int(
-            min(int(run_cfg["s2"]["val_check_interval_steps"]), max(100, capped_steps // 10))
+            min(
+                int(run_cfg["s2"]["val_check_interval_steps"]),
+                max(100, capped_steps // max(1, target_s2_val_checks)),
+            )
         )
 
     if study_family in {"S4_rl", "S4_ppo", "S4_grpo"} and rl_hpo_num_steps > 0:
         capped_rl_steps = int(min(int(run_cfg["s4"]["rl_num_steps"]), int(rl_hpo_num_steps)))
         run_cfg["s4"]["rl_num_steps"] = int(capped_rl_steps)
+        target_rl_proxy_eval_checks = int(
+            hpo_rl_proxy_eval_checks if hpo_rl_proxy_eval_checks > 0 else 1
+        )
         run_cfg["s4"]["rl_proxy_eval_interval_steps"] = int(
             min(
                 int(run_cfg["s4"]["rl_proxy_eval_interval_steps"]),
-                max(1, capped_rl_steps // 2),
+                max(1, capped_rl_steps // max(1, target_rl_proxy_eval_checks)),
             )
         )
+    if study_family in {"S4_rl", "S4_ppo", "S4_grpo"} and hpo_s4_trajectories_per_batch > 0:
+        current_trajectories = int(run_cfg["s4"].get("trajectories_per_batch", hpo_s4_trajectories_per_batch))
+        run_cfg["s4"]["trajectories_per_batch"] = int(min(current_trajectories, hpo_s4_trajectories_per_batch))
+    if study_family in {"S4_rl", "S4_ppo", "S4_grpo"} and hpo_s4_rl_diffusion_num_steps > 0:
+        current_diffusion_steps = int(run_cfg["s4"].get("rl_diffusion_num_steps", hpo_s4_rl_diffusion_num_steps))
+        run_cfg["s4"]["rl_diffusion_num_steps"] = int(min(current_diffusion_steps, hpo_s4_rl_diffusion_num_steps))
+    if study_family in {"S4_rl", "S4_ppo", "S4_grpo"} and hpo_s4_replay_batch_size > 0:
+        current_replay_batch_size = int(run_cfg["s4"].get("replay_batch_size", hpo_s4_replay_batch_size))
+        run_cfg["s4"]["replay_batch_size"] = int(min(current_replay_batch_size, hpo_s4_replay_batch_size))
 
-    return run_cfg
+    return resolved, run_cfg
 
 
 def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, Any]):
@@ -283,7 +394,7 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
     params: Dict[str, Any] = {}
 
     if study_family == "S1":
-        params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 6, 8])
+        params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4])
         params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.0, 0.85)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
@@ -313,7 +424,7 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         )
         _suggest_s2_training_params(trial, params, prefix="s2_")
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.0, 3.0)
-        params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4, 6, 8])
+        params["best_of_k"] = trial.suggest_categorical("best_of_k", [2, 4])
         params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.0, 0.85)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
@@ -372,7 +483,7 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["reward_curriculum_dense_final_scale"] = trial.suggest_float(
             "reward_curriculum_dense_final_scale", 0.25, 1.0
         )
-        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2, 4])
+        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2])
         params["ppo_clip_eps"] = trial.suggest_float("ppo_clip_eps", 0.10, 0.30)
     elif study_family == "S4_grpo":
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
@@ -401,15 +512,15 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["reward_curriculum_dense_final_scale"] = trial.suggest_float(
             "reward_curriculum_dense_final_scale", 0.25, 1.0
         )
-        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2, 4])
+        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2])
         params["ppo_clip_eps"] = trial.suggest_float("ppo_clip_eps", 0.10, 0.30)
-        params["grpo_group_size"] = trial.suggest_categorical("grpo_group_size", [4, 8, 16, 32])
+        params["grpo_group_size"] = trial.suggest_categorical("grpo_group_size", [4, 8, 16])
     elif study_family == "S4_dpo":
-        params["offline_pair_budget"] = trial.suggest_categorical("offline_pair_budget", [5000, 10000, 20000])
+        params["offline_pair_budget"] = trial.suggest_categorical("offline_pair_budget", [5000, 10000])
         params["beta"] = trial.suggest_float("beta", 0.01, 0.2, log=True)
         params["learning_rate"] = trial.suggest_float("learning_rate", 1.0e-5, 1.0e-4, log=True)
         params["batch_size"] = trial.suggest_categorical("batch_size", [32, 64])
-        params["num_epochs"] = trial.suggest_categorical("num_epochs", [4, 6, 8, 10])
+        params["num_epochs"] = trial.suggest_categorical("num_epochs", [4, 6])
         params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
         params["d_water_budget_fraction"] = trial.suggest_categorical(
             "d_water_budget_fraction", [0.2, 0.3, 0.5]
@@ -421,7 +532,7 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         pair_source = str(params["pair_source"]).strip().lower()
         if pair_source in {"target_row_synthetic", "chi_aware_plus_target_row_synthetic"}:
             params["synthetic_candidates_per_target"] = trial.suggest_categorical(
-                "synthetic_candidates_per_target", [8, 16, 32]
+                "synthetic_candidates_per_target", [8, 16]
             )
     else:
         raise ValueError(f"Unsupported Step 5 HPO study family: {study_family}")
@@ -539,8 +650,10 @@ def run_optuna_study(
 
     base_run_name = STUDY_BASE_RUNS[study_family]
     base_run_cfg = build_run_config(resolved, base_run_name)
+    family_hpo_cfg = _resolve_hpo_runtime_config(resolved, study_family=study_family)
     budgets = dict(resolved.step5_hpo.get("method_budgets", {}).get(study_family, {}))
     n_trials = int(budgets.get("n_trials", 120))
+    timeout_seconds = _resolve_optuna_timeout_seconds(budgets)
     default_startup_trials = int(resolved.step5_hpo.get("n_startup_trials", 20))
     effective_startup_trials = int(
         min(
@@ -548,7 +661,7 @@ def run_optuna_study(
             max(1, n_trials - 1) if n_trials > 1 else 1,
         )
     )
-    study_root = _hpo_root(resolved) / study_family
+    study_root = _study_root(resolved, study_family=study_family)
     if fresh_study and study_root.exists():
         shutil.rmtree(study_root)
     study_root.mkdir(parents=True, exist_ok=True)
@@ -567,18 +680,15 @@ def run_optuna_study(
         json.dump(validation_diagnostics.get("hpo_target_overlap", {}), handle, indent=2)
 
     sampler_name = str(resolved.step5_hpo.get("sampler", "tpe")).strip().lower()
-    pruner_name = str(resolved.step5_hpo.get("pruner", "median")).strip().lower()
     if sampler_name != "tpe":
         raise ValueError(f"Unsupported Step 5 HPO sampler: {sampler_name}")
-    if pruner_name != "median":
-        raise ValueError(f"Unsupported Step 5 HPO pruner: {pruner_name}")
 
     sampler = optuna.samplers.TPESampler(
         multivariate=True,
         seed=int(resolved.step5_hpo.get("sampler_seed", 42)),
         n_startup_trials=int(effective_startup_trials),
     )
-    pruner = optuna.pruners.MedianPruner()
+    pruner = _build_optuna_pruner(resolved)
     study_name = f"step5_{study_family}_{resolved.c_target}_{resolved.model_size}"
     storage_uri = _storage_uri(resolved, study_family=study_family)
     study = optuna.create_study(
@@ -592,9 +702,9 @@ def run_optuna_study(
 
     existing_trial_count = int(len(study.trials))
     remaining_trials = max(0, int(n_trials) - existing_trial_count)
-    hpo_generation_budget = int(resolve_step5_hpo_generation_budget(resolved.step5_hpo, resolved.c_target))
-    hpo_num_rounds = int(resolved.step5_hpo["hpo_num_rounds"])
-    hpo_sampling_seeds = [int(x) for x in resolved.step5_hpo["hpo_sampling_seeds"]]
+    hpo_generation_budget = int(resolve_step5_hpo_generation_budget(family_hpo_cfg, resolved.c_target))
+    hpo_num_rounds = int(family_hpo_cfg["hpo_num_rounds"])
+    hpo_sampling_seeds = [int(x) for x in family_hpo_cfg["hpo_sampling_seeds"]]
     tie_epsilon = float(resolved.step5_hpo.get("tie_epsilon", 1.0e-4))
     objective_metric_name = str(
         resolved.step5_hpo.get("objective_metric", "mean_success_hit_rate_discovery")
@@ -632,7 +742,7 @@ def run_optuna_study(
         run_cfg = deepcopy(base_run_cfg)
         params = suggest_trial_params(trial, study_family=study_family, resolved=resolved, run_cfg=run_cfg)
         resolved_trial, run_cfg = _apply_trial_params(resolved, run_cfg, params)
-        run_cfg = _apply_hpo_runtime_overrides(resolved_trial, run_cfg, study_family=study_family)
+        resolved_trial, run_cfg = _apply_hpo_runtime_overrides(resolved_trial, run_cfg, study_family=study_family)
         run_cfg["run_name"] = f"{base_run_cfg['run_name']}__trial_{int(trial.number):04d}"
         start = time.time()
         try:
@@ -683,6 +793,26 @@ def run_optuna_study(
                 mean_total_raw_samples_drawn=None,
                 state="PRUNED",
             )
+            raise
+        except Exception:
+            _write_trial_summary(
+                study_root,
+                trial_number=int(trial.number),
+                study_family=study_family,
+                run_name=str(run_cfg["run_name"]),
+                params=params,
+                objective_value=None,
+                objective_metric=objective_metric_name,
+                mean_property_success_hit_rate=None,
+                mean_property_success_hit_rate_discovery=None,
+                mean_success_hit_rate=None,
+                mean_success_hit_rate_discovery=None,
+                mean_class_match_acceptance_rate=None,
+                mean_total_raw_samples_drawn=None,
+                state="FAIL",
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             raise
         wall_time = time.time() - start
         metrics = result["method_metrics"]
@@ -758,8 +888,16 @@ def run_optuna_study(
         return objective_value
 
     if remaining_trials > 0:
-        study.optimize(objective, n_trials=remaining_trials, timeout=None)
-    best_trial = _select_best_completed_trial(study, tie_epsilon=tie_epsilon)
+        study.optimize(
+            objective,
+            n_trials=remaining_trials,
+            timeout=timeout_seconds,
+            catch=(RuntimeError,),
+        )
+    try:
+        best_trial = _select_best_completed_trial(study, tie_epsilon=tie_epsilon)
+    except ValueError:
+        best_trial = None
 
     trials_df = study.trials_dataframe(attrs=("number", "value", "state", "params"))
     trials_df = trials_df.rename(columns={"number": "trial_number", "value": "objective_value"})
@@ -779,6 +917,10 @@ def run_optuna_study(
     if attr_rows:
         trials_df = trials_df.merge(trials_df.__class__(attr_rows), on="trial_number", how="left")
     trials_df.to_csv(study_root / "trials.csv", index=False)
+    plot_hpo_best_success_curve(
+        trials_df,
+        study_root / "figures" / "hpo_best_success_hit_rate.png",
+    )
     trial_records = [
         {
             "trial_number": int(trial.number),
@@ -821,40 +963,46 @@ def run_optuna_study(
     ]
     with open(study_root / "trials.json", "w", encoding="utf-8") as handle:
         json.dump(trial_records, handle, indent=2)
-    with open(study_root / "best_params.yaml", "w", encoding="utf-8") as handle:
-        yaml.safe_dump(
-            {
-                "study_family": study_family,
-                "configured_n_trials": int(n_trials),
-                "existing_trial_count_at_start": int(existing_trial_count),
-                "remaining_trials_executed": int(remaining_trials),
-                "objective_metric": objective_metric_name,
-                "best_trial_number": int(best_trial.number),
-                "best_objective_value": float(best_trial.value),
-                "best_mean_property_success_hit_rate": float(
-                    best_trial.user_attrs.get("mean_property_success_hit_rate_reporting", best_trial.value)
-                ),
-                "best_mean_property_success_hit_rate_discovery": float(
-                    best_trial.user_attrs.get("mean_property_success_hit_rate_discovery", best_trial.value)
-                ),
-                "best_mean_success_hit_rate": float(best_trial.user_attrs.get("mean_success_hit_rate_reporting", best_trial.value)),
-                "best_mean_success_hit_rate_discovery": float(
-                    best_trial.user_attrs.get("mean_success_hit_rate_discovery", best_trial.value)
-                ),
-                "best_mean_class_match_acceptance_rate": float(
-                    best_trial.user_attrs.get("mean_class_match_acceptance_rate", float("nan"))
-                ),
-                "best_mean_total_raw_samples_drawn": float(
-                    best_trial.user_attrs.get("mean_total_raw_samples_drawn", float("nan"))
-                ),
-                "best_params": dict(best_trial.params),
-            },
-            handle,
-            sort_keys=False,
-        )
+    if best_trial is not None:
+        with open(study_root / "best_params.yaml", "w", encoding="utf-8") as handle:
+            yaml.safe_dump(
+                {
+                    "study_family": study_family,
+                    "configured_n_trials": int(n_trials),
+                    "effective_timeout_hours": (
+                        float(timeout_seconds) / 3600.0 if timeout_seconds is not None else None
+                    ),
+                    "existing_trial_count_at_start": int(existing_trial_count),
+                    "remaining_trials_executed": int(remaining_trials),
+                    "objective_metric": objective_metric_name,
+                    "best_trial_number": int(best_trial.number),
+                    "best_objective_value": float(best_trial.value),
+                    "best_mean_property_success_hit_rate": float(
+                        best_trial.user_attrs.get("mean_property_success_hit_rate_reporting", best_trial.value)
+                    ),
+                    "best_mean_property_success_hit_rate_discovery": float(
+                        best_trial.user_attrs.get("mean_property_success_hit_rate_discovery", best_trial.value)
+                    ),
+                    "best_mean_success_hit_rate": float(
+                        best_trial.user_attrs.get("mean_success_hit_rate_reporting", best_trial.value)
+                    ),
+                    "best_mean_success_hit_rate_discovery": float(
+                        best_trial.user_attrs.get("mean_success_hit_rate_discovery", best_trial.value)
+                    ),
+                    "best_mean_class_match_acceptance_rate": float(
+                        best_trial.user_attrs.get("mean_class_match_acceptance_rate", float("nan"))
+                    ),
+                    "best_mean_total_raw_samples_drawn": float(
+                        best_trial.user_attrs.get("mean_total_raw_samples_drawn", float("nan"))
+                    ),
+                    "best_params": dict(best_trial.params),
+                },
+                handle,
+                sort_keys=False,
+            )
 
     refit_result = None
-    if refit_best:
+    if refit_best and best_trial is not None:
         tuned_run_cfg = deepcopy(base_run_cfg)
         resolved_refit, tuned_run_cfg = _apply_trial_params(resolved, tuned_run_cfg, dict(best_trial.params))
         tuned_run_cfg["run_name"] = f"{base_run_cfg['run_name']}_optuna"
@@ -888,5 +1036,67 @@ def run_optuna_study(
         "study": study,
         "best_trial": best_trial,
         "study_root": study_root,
+        "refit_result": refit_result,
+    }
+
+
+def refit_best_trial(
+    *,
+    resolved,
+    study_family: str,
+    config_path: str,
+    base_config_path: str,
+    model_size: str | None,
+    device: str,
+    fresh_refit: bool = False,
+) -> Dict[str, Any] | None:
+    if study_family not in STUDY_BASE_RUNS:
+        raise ValueError(f"Unsupported Step 5 HPO study family: {study_family}")
+
+    best_params_path = _best_params_path(resolved, study_family=study_family)
+    if not best_params_path.exists():
+        return None
+
+    with open(best_params_path, "r", encoding="utf-8") as handle:
+        best_payload = yaml.safe_load(handle) or {}
+    best_params = dict(best_payload.get("best_params", {}) or {})
+    if not best_params:
+        return None
+
+    base_run_name = STUDY_BASE_RUNS[study_family]
+    base_run_cfg = build_run_config(resolved, base_run_name)
+    tuned_run_cfg = deepcopy(base_run_cfg)
+    resolved_refit, tuned_run_cfg = _apply_trial_params(resolved, tuned_run_cfg, best_params)
+    tuned_run_cfg["run_name"] = f"{base_run_cfg['run_name']}_optuna"
+    refit_run_dir = resolved_refit.benchmark_root / tuned_run_cfg["run_name"]
+    if fresh_refit and refit_run_dir.exists():
+        shutil.rmtree(refit_run_dir)
+
+    refit_result = execute_step5_run(
+        resolved=resolved_refit,
+        run_name=tuned_run_cfg["run_name"],
+        run_cfg=tuned_run_cfg,
+        device=device,
+        config_path=config_path,
+        run_dir=refit_run_dir,
+        shared_evaluator=None,
+        target_rows_df=None,
+        generation_budget=None,
+        sampling_seeds=None,
+        num_rounds=None,
+        save_figures=True,
+        extra_context={
+            "base_config_path": base_config_path,
+            "model_size": model_size,
+            "study_family": study_family,
+            "hpo_refit": True,
+            "source_trial_number": best_payload.get("best_trial_number"),
+            "source_trial_params": best_params,
+            "source_best_params_path": str(best_params_path),
+        },
+    )
+    return {
+        "study_family": study_family,
+        "best_params_path": best_params_path,
         "refit_result": refit_result,
     }

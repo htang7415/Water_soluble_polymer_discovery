@@ -602,14 +602,30 @@ def _precompute_old_logprob_chunks(
     trajectories: List,
     *,
     mode: str,
+    batch_chunk_size: int,
 ) -> List[Optional[torch.Tensor]]:
     if str(mode).strip().lower() not in {"ppo", "grpo"}:
         return [None] * len(trajectories)
     old_chunks: List[Optional[torch.Tensor]] = []
     with torch.no_grad():
         for trajectory in trajectories:
-            replay = trajectory_sampler.replay_trajectory_logprob(trajectory, grad_enabled=False)
-            old_chunks.append(replay["trajectory_logprob"].detach().clone())
+            batch_size = int(trajectory.final_ids.shape[0])
+            if batch_chunk_size > 0 and batch_size > batch_chunk_size:
+                chunk_logprobs: List[torch.Tensor] = []
+                for start_idx in range(0, batch_size, batch_chunk_size):
+                    end_idx = min(batch_size, start_idx + batch_chunk_size)
+                    chunk_list = select_sampling_trajectory_rows(
+                        [trajectory],
+                        keep_indices=range(start_idx, end_idx),
+                    )
+                    if len(chunk_list) != 1:
+                        raise ValueError("Expected exactly one chunk when slicing a single Step 5 trajectory batch.")
+                    replay = trajectory_sampler.replay_trajectory_logprob(chunk_list[0], grad_enabled=False)
+                    chunk_logprobs.append(replay["trajectory_logprob"].detach().to(device="cpu"))
+                old_chunks.append(torch.cat(chunk_logprobs, dim=0))
+            else:
+                replay = trajectory_sampler.replay_trajectory_logprob(trajectory, grad_enabled=False)
+                old_chunks.append(replay["trajectory_logprob"].detach().to(device="cpu"))
     return old_chunks
 
 
@@ -776,6 +792,7 @@ def train_s4_rl_alignment(
     normalize_advantages = bool(s4_cfg.get("normalize_advantages", alignment_mode in {"ppo", "grpo"}))
     grpo_group_size = int(s4_cfg.get("grpo_group_size", 4))
     grpo_advantage_epsilon = float(s4_cfg.get("grpo_advantage_epsilon", 1.0e-6))
+    replay_batch_size = int(s4_cfg.get("replay_batch_size", 0) or 0)
     append_log_message(
         run_dirs["run_dir"],
         (
@@ -851,6 +868,7 @@ def train_s4_rl_alignment(
             logprob_sampler,
             trajectories,
             mode=alignment_mode,
+            batch_chunk_size=int(replay_batch_size),
         )
 
         denom = max(1, len(evaluation_df))
@@ -872,32 +890,47 @@ def train_s4_rl_alignment(
             offset = 0
             for traj_idx, trajectory in enumerate(trajectories):
                 batch_size = int(trajectory.final_ids.shape[0])
-                advantage_chunk = advantages[offset : offset + batch_size].to(device=device, dtype=torch.float32)
-                replay = logprob_sampler.replay_trajectory_logprob(trajectory, grad_enabled=True)
-                current_logprob = replay["trajectory_logprob"]
-                kl_stats = logprob_sampler.compute_trajectory_kl(
-                    trajectory,
-                    reference_diffusion_model=reference_model,
-                )
-                total_logprob_sum = total_logprob_sum + current_logprob.sum()
-                if alignment_mode == "rl":
-                    policy_term_chunk = -(advantage_chunk.detach() * current_logprob).sum()
-                else:
-                    old_logprob = old_logprob_chunks[traj_idx]
-                    if old_logprob is None:
-                        raise ValueError(f"Missing old logprob chunk for alignment_mode={alignment_mode}.")
-                    old_logprob = old_logprob.to(device=device, dtype=torch.float32)
-                    log_ratio = torch.clamp(current_logprob - old_logprob, min=-20.0, max=20.0)
-                    ratio = torch.exp(log_ratio)
-                    clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-                    surrogate = ratio * advantage_chunk.detach()
-                    surrogate_clipped = clipped_ratio * advantage_chunk.detach()
-                    policy_term_chunk = -torch.minimum(surrogate, surrogate_clipped).sum()
-                    ratio_sum += float(ratio.detach().sum().item())
-                    ratio_count += int(ratio.numel())
-                    clipped_count += int((torch.abs(ratio.detach() - clipped_ratio.detach()) > 1.0e-8).sum().item())
-                total_policy_term = total_policy_term + policy_term_chunk
-                total_kl_term = total_kl_term + kl_stats["trajectory_kl"].sum()
+                old_logprob_full = old_logprob_chunks[traj_idx]
+                for start_idx in range(0, batch_size, batch_size if replay_batch_size <= 0 else replay_batch_size):
+                    end_idx = min(batch_size, start_idx + (batch_size if replay_batch_size <= 0 else replay_batch_size))
+                    chunk_list = select_sampling_trajectory_rows(
+                        [trajectory],
+                        keep_indices=range(start_idx, end_idx),
+                    )
+                    if len(chunk_list) != 1:
+                        raise ValueError("Expected exactly one chunk when slicing a single Step 5 trajectory batch.")
+                    trajectory_chunk = chunk_list[0]
+                    chunk_size = int(trajectory_chunk.final_ids.shape[0])
+                    advantage_chunk = advantages[offset + start_idx : offset + start_idx + chunk_size].to(
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    replay = logprob_sampler.replay_trajectory_logprob(trajectory_chunk, grad_enabled=True)
+                    current_logprob = replay["trajectory_logprob"]
+                    kl_stats = logprob_sampler.compute_trajectory_kl(
+                        trajectory_chunk,
+                        reference_diffusion_model=reference_model,
+                    )
+                    total_logprob_sum = total_logprob_sum + current_logprob.sum()
+                    if alignment_mode == "rl":
+                        policy_term_chunk = -(advantage_chunk.detach() * current_logprob).sum()
+                    else:
+                        if old_logprob_full is None:
+                            raise ValueError(f"Missing old logprob chunk for alignment_mode={alignment_mode}.")
+                        old_logprob = old_logprob_full[start_idx:end_idx].to(device=device, dtype=torch.float32)
+                        log_ratio = torch.clamp(current_logprob - old_logprob, min=-20.0, max=20.0)
+                        ratio = torch.exp(log_ratio)
+                        clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+                        surrogate = ratio * advantage_chunk.detach()
+                        surrogate_clipped = clipped_ratio * advantage_chunk.detach()
+                        policy_term_chunk = -torch.minimum(surrogate, surrogate_clipped).sum()
+                        ratio_sum += float(ratio.detach().sum().item())
+                        ratio_count += int(ratio.numel())
+                        clipped_count += int(
+                            (torch.abs(ratio.detach() - clipped_ratio.detach()) > 1.0e-8).sum().item()
+                        )
+                    total_policy_term = total_policy_term + policy_term_chunk
+                    total_kl_term = total_kl_term + kl_stats["trajectory_kl"].sum()
                 offset += batch_size
 
             loss = (total_policy_term + float(s4_cfg["kl_weight"]) * total_kl_term) / float(denom)

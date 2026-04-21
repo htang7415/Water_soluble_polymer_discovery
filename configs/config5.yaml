@@ -16,6 +16,17 @@ step5:
     - S4_ppo
     - S4_grpo
     - S4_dpo
+  enabled_runs_by_class_overrides:
+    polyamide:
+      - S0_raw_unconditional
+      - S1_guided_frozen
+      - S2_conditional
+      - S3_conditional_guided
+      - S3_cfg_2p0
+      - S4_rl_finetuned
+      - S4_ppo
+      - S4_grpo
+      - S4_dpo
   generation_budget: 512
   generation_budget_by_class:
     polyacrylate: 1024
@@ -215,6 +226,7 @@ step5:
     rl_proxy_num_targets: 5
     rl_proxy_generation_budget: 64
     trajectories_per_batch: 128
+    replay_batch_size: 32
     dpo:
       offline_pair_budget: 10000
       offline_pair_budget_by_class_overrides:
@@ -321,31 +333,107 @@ step5_hpo:
   objective_metric: mean_success_hit_rate_discovery
   sampler: tpe
   sampler_seed: 42
-  n_startup_trials: 20
-  pruner: median
+  n_startup_trials: 8
+  pruner: hyperband
+  pruner_min_resource: 1
+  pruner_max_resource: auto
+  pruner_reduction_factor: 2
   storage_uri: sqlite:///results_<model_size>/step5_hpo/<split_mode>/<c_target>/<study_family>/optuna.db
   reuse_shared_s4_warm_start: true
   skip_disk_checkpoints: true
-  hpo_s2_max_steps: 25000
-  hpo_rl_num_steps: 500
-  hpo_num_targets: 8
-  hpo_generation_budget: 128
+  hpo_s2_max_steps: 15000
+  hpo_s2_val_checks: 4
+  hpo_rl_num_steps: 250
+  hpo_rl_proxy_eval_checks: 1
+  hpo_sampling_batch_size: 64
+  hpo_decode_class_match_sampling_attempts_max: 24
+  hpo_decode_class_match_oversample_factor: 3.0
+  hpo_s4_trajectories_per_batch: 32
+  hpo_s4_rl_diffusion_num_steps: 16
+  hpo_s4_replay_batch_size: 16
+  hpo_num_targets: 6
+  hpo_generation_budget: 96
   hpo_generation_budget_by_class:
-    polyacrylate: 128
-    polyether: 256
-    polyamide: 256
-    polyester: 256
-    polyimide: 512
-    polysulfone: 384
-    polystyrene: 256
-  hpo_num_rounds: 2
-  hpo_sampling_seeds: [101, 102]
+    polyacrylate: 96
+    polyether: 128
+    polyamide: 128
+    polyester: 128
+    polyimide: 256
+    polysulfone: 192
+    polystyrene: 128
+  hpo_num_rounds: 1
+  hpo_sampling_seeds: [101]
+  method_runtime_overrides:
+    S3:
+      hpo_s2_max_steps: 10000
+      hpo_s2_val_checks: 3
+      hpo_generation_budget: 64
+      hpo_generation_budget_by_class:
+        polyacrylate: 64
+        polyether: 96
+        polyamide: 96
+        polyester: 96
+        polyimide: 128
+        polysulfone: 128
+        polystyrene: 96
+    S4_rl:
+      hpo_rl_num_steps: 128
+      hpo_rl_proxy_eval_checks: 1
+      hpo_s4_trajectories_per_batch: 16
+      hpo_s4_replay_batch_size: 8
+      hpo_generation_budget: 64
+      hpo_generation_budget_by_class:
+        polyacrylate: 64
+        polyether: 96
+        polyamide: 96
+        polyester: 96
+        polyimide: 128
+        polysulfone: 128
+        polystyrene: 96
+    S4_ppo:
+      hpo_rl_num_steps: 128
+      hpo_rl_proxy_eval_checks: 1
+      hpo_s4_trajectories_per_batch: 16
+      hpo_s4_replay_batch_size: 8
+      hpo_generation_budget: 64
+      hpo_generation_budget_by_class:
+        polyacrylate: 64
+        polyether: 96
+        polyamide: 96
+        polyester: 96
+        polyimide: 128
+        polysulfone: 128
+        polystyrene: 96
+    S4_grpo:
+      hpo_rl_num_steps: 128
+      hpo_rl_proxy_eval_checks: 1
+      hpo_s4_trajectories_per_batch: 16
+      hpo_s4_replay_batch_size: 8
+      hpo_generation_budget: 64
+      hpo_generation_budget_by_class:
+        polyacrylate: 64
+        polyether: 96
+        polyamide: 96
+        polyester: 96
+        polyimide: 128
+        polysulfone: 128
+        polystyrene: 96
+    S4_dpo:
+      hpo_generation_budget: 64
+      hpo_generation_budget_by_class:
+        polyacrylate: 64
+        polyether: 96
+        polyamide: 96
+        polyester: 96
+        polyimide: 128
+        polysulfone: 128
+        polystyrene: 96
   tie_epsilon: 1.0e-4
   method_budgets:
-    S1: {n_trials: 50, timeout_hours_medium: null}
-    S2: {n_trials: 50, timeout_hours_medium: null}
-    S3: {n_trials: 50, timeout_hours_medium: null}
-    S4_rl: {n_trials: 50, timeout_hours_medium: null}
-    S4_ppo: {n_trials: 50, timeout_hours_medium: null}
-    S4_grpo: {n_trials: 50, timeout_hours_medium: null}
-    S4_dpo: {n_trials: 50, timeout_hours_medium: null}
+    S1: {n_trials: 50, timeout_hours_medium: 30}
+    S2: {n_trials: 50, timeout_hours_medium: 30}
+    S3: {n_trials: 50, timeout_hours_medium: 30}
+    S4_rl: {n_trials: 50, timeout_hours_medium: 30}
+    S4_ppo: {n_trials: 50, timeout_hours_medium: 30}
+    S4_grpo: {n_trials: 50, timeout_hours_medium: 30}
+    S4_dpo: {n_trials: 50, timeout_hours_medium: 30}

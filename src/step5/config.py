@@ -52,6 +52,35 @@ def _condition_key(temperature: float, phi: float) -> Tuple[str, str]:
     return (_format_float(temperature), _format_float(phi))
 
 
+def _select_evenly_spaced_indices(total_count: int, select_count: int) -> List[int]:
+    total_count = int(total_count)
+    select_count = int(select_count)
+    if total_count <= 0 or select_count <= 0:
+        return []
+    if select_count >= total_count:
+        return list(range(total_count))
+    requested = np.rint(np.linspace(0, total_count - 1, num=select_count)).astype(int).tolist()
+    selected: List[int] = []
+    used: set[int] = set()
+    for target in requested:
+        if target not in used:
+            selected.append(int(target))
+            used.add(int(target))
+            continue
+        for delta in range(1, total_count):
+            left = int(target - delta)
+            if left >= 0 and left not in used:
+                selected.append(left)
+                used.add(left)
+                break
+            right = int(target + delta)
+            if right < total_count and right not in used:
+                selected.append(right)
+                used.add(right)
+                break
+    return sorted(selected)
+
+
 def _first_existing(paths: Iterable[Path]) -> Path:
     paths = list(paths)
     for path in paths:
@@ -493,15 +522,31 @@ def _build_validation_target_tables(
         .sort_values(["temperature", "phi"])
         .reset_index(drop=True)
     )
-    rl_bucket_count = min(int(rl_proxy_num_targets), int(len(ordered_buckets)))
+    total_bucket_count = int(len(ordered_buckets))
+    rl_bucket_count = min(int(rl_proxy_num_targets), total_bucket_count)
     hpo_bucket_count = (
-        min(int(hpo_num_targets), max(0, int(len(ordered_buckets)) - rl_bucket_count))
+        min(int(hpo_num_targets), max(0, total_bucket_count - rl_bucket_count))
         if hpo_enabled
         else 0
     )
+    combined_bucket_count = int(rl_bucket_count + hpo_bucket_count)
+    combined_bucket_indices = _select_evenly_spaced_indices(total_bucket_count, combined_bucket_count)
+    rl_selection_positions = set(
+        _select_evenly_spaced_indices(len(combined_bucket_indices), rl_bucket_count)
+    )
+    rl_bucket_indices = [
+        combined_bucket_indices[pos]
+        for pos in range(len(combined_bucket_indices))
+        if pos in rl_selection_positions
+    ]
+    hpo_bucket_indices = [
+        combined_bucket_indices[pos]
+        for pos in range(len(combined_bucket_indices))
+        if pos not in rl_selection_positions
+    ]
 
-    rl_buckets = ordered_buckets.iloc[:rl_bucket_count].copy()
-    hpo_buckets = ordered_buckets.iloc[rl_bucket_count : rl_bucket_count + hpo_bucket_count].copy()
+    rl_buckets = ordered_buckets.iloc[rl_bucket_indices].copy()
+    hpo_buckets = ordered_buckets.iloc[hpo_bucket_indices].copy()
 
     def _bucket_rows(bucket_df: pd.DataFrame, *, source_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         rows: List[Dict[str, Any]] = []
@@ -573,6 +618,7 @@ def _build_validation_target_tables(
         "rl_proxy_bucket_count": int(rl_bucket_count),
         "hpo_bucket_count": int(hpo_bucket_count),
         "hpo_enabled": bool(hpo_enabled),
+        "bucket_selection_policy": "evenly_spaced_disjoint_validation_buckets",
         "rl_proxy_mean_abs_step3_gap": rl_mean_gap,
         "rl_proxy_max_abs_step3_gap": rl_max_gap,
         "hpo_mean_abs_step3_gap": hpo_mean_gap,

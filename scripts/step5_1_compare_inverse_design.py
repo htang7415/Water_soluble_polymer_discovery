@@ -83,7 +83,7 @@ COMPARE_METRIC_REGISTRY = {
 }
 
 
-def _resolve_selected_runs(resolved, runs_arg: str | None) -> List[str]:
+def _resolve_selected_runs(resolved, runs_arg: str | None, *, allow_partial: bool = False) -> List[str]:
     existing_run_dirs = {
         path.name
         for path in resolved.benchmark_root.iterdir()
@@ -94,6 +94,8 @@ def _resolve_selected_runs(resolved, runs_arg: str | None) -> List[str]:
         allowed = set(resolved.enabled_runs) | existing_run_dirs
         unknown = [run for run in requested if run not in allowed]
         if unknown:
+            if allow_partial:
+                return requested
             raise ValueError(
                 "Requested Step 5_1 runs are neither enabled in config5 nor present under the "
                 f"Step 5 benchmark root: {unknown}"
@@ -751,7 +753,7 @@ def main() -> None:
         model_size=args.model_size,
         c_target_override=args.c_target,
     )
-    selected_runs = _resolve_selected_runs(resolved, args.runs)
+    selected_runs = _resolve_selected_runs(resolved, args.runs, allow_partial=bool(args.allow_partial))
 
     run_payloads: List[Dict[str, object]] = []
     skipped_runs: List[str] = []

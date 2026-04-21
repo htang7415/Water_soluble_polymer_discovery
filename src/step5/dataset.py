@@ -145,6 +145,7 @@ def add_d_water_split_column(
     base_config: Dict[str, Any],
     split_mode: str,
     random_seed: int,
+    chi_split_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build a split-consistent D_water split column."""
 
@@ -160,6 +161,28 @@ def add_d_water_split_column(
         ),
     )
     out = add_split_column(water_df, assignments)
+    if chi_split_df is not None and not chi_split_df.empty:
+        canonical_to_split: Dict[str, str] = {}
+        chi_rows = chi_split_df.loc[:, ["SMILES", "split"]].copy()
+        chi_rows["SMILES"] = chi_rows["SMILES"].astype(str).str.strip()
+        chi_rows["split"] = chi_rows["split"].astype(str).str.strip().str.lower()
+        for row in chi_rows.to_dict(orient="records"):
+            canonical_smiles = canonicalize_smiles(str(row["SMILES"])) or str(row["SMILES"])
+            split = str(row["split"])
+            existing = canonical_to_split.get(canonical_smiles)
+            if existing is not None and existing != split:
+                raise ValueError(
+                    "Step 5 D_chi split assignment is inconsistent for canonical polymer "
+                    f"{canonical_smiles!r}: {existing!r} vs {split!r}."
+                )
+            canonical_to_split[canonical_smiles] = split
+        out["canonical_smiles"] = out["SMILES"].astype(str).str.strip().map(
+            lambda smiles: canonicalize_smiles(smiles) or smiles
+        )
+        overlap_mask = out["canonical_smiles"].isin(canonical_to_split)
+        if bool(overlap_mask.any()):
+            out.loc[overlap_mask, "split"] = out.loc[overlap_mask, "canonical_smiles"].map(canonical_to_split)
+        out = out.drop(columns=["canonical_smiles"])
     out["condition_source"] = "d_water"
     return out
 
@@ -214,6 +237,7 @@ def build_step5_supervised_frames(resolved: ResolvedStep5Config) -> Dict[str, pd
         base_config=resolved.base_config,
         split_mode=resolved.classification_split_mode,
         random_seed=int(resolved.step5["random_seed"]),
+        chi_split_df=chi_df,
     )
     unified_cols = [
         "row_id",
