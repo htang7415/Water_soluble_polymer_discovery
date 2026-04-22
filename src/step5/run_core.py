@@ -108,7 +108,7 @@ def save_run_config_snapshot(
         "c_target": resolved.c_target,
         "run_config": run_cfg,
         "paths": {
-            "benchmark_root": str(resolved.benchmark_root),
+            "method_root": str(resolved.method_root),
             "step4_reg_metrics_dir": str(resolved.step4_reg_metrics_dir),
             "step4_cls_metrics_dir": str(resolved.step4_cls_metrics_dir),
         },
@@ -177,7 +177,7 @@ def _shared_s4_warm_start_cache_key(
     device: str,
 ) -> str:
     payload = {
-        "benchmark_root": str(resolved.benchmark_root),
+        "method_root": str(resolved.method_root),
         "warm_run_dir": str(warm_run_dir),
         "model_size": str(resolved.model_size),
         "split_mode": str(resolved.split_mode),
@@ -268,7 +268,7 @@ def _resolve_s4_warm_dirs(
     if _use_shared_s4_warm_start(run_cfg, extra_context=extra_context):
         producer_name = str(run_cfg["s4"].get("warm_start_producer_name", "S4_supervised_warm_start")).strip()
         return create_run_dirs(
-            resolved.benchmark_root / producer_name,
+            resolved.method_root / producer_name,
             create_checkpoints_dir=create_checkpoints_dir,
         )
     return create_run_dirs(local_run_dir / "_warm_start", create_checkpoints_dir=create_checkpoints_dir)
@@ -688,7 +688,7 @@ def execute_step5_run(
     pruning_callback: Optional[Callable[..., None]] = None,
 ) -> Dict[str, Any]:
     run_cfg = run_cfg or build_run_config(resolved, run_name)
-    run_dir = run_dir or (resolved.benchmark_root / str(run_cfg["run_name"]))
+    run_dir = run_dir or (resolved.method_root / str(run_cfg["run_name"]))
     target_rows_df = target_rows_df.copy() if target_rows_df is not None else resolved.target_family_df.copy()
     generation_budget = int(
         generation_budget

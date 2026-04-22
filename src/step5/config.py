@@ -257,7 +257,7 @@ class ResolvedStep5Config:
     results_dir: Path
     results_dir_nosplit: Path
     base_results_dir: Path
-    benchmark_root: Path
+    method_root: Path
     compare_root: Path
     step4_reg_dir: Path
     step4_cls_dir: Path
@@ -867,7 +867,7 @@ def load_step5_config(
         step4_reg_metrics_dir,
         step4_cls_metrics_dir,
     ) = _resolve_step4_metrics_dirs(base_config, model_size=model_size, split_mode=split_mode)
-    benchmark_root = (
+    method_root = (
         results_dir / "step5_inverse_design" / split_mode / c_target
     )
     compare_root = (
@@ -923,7 +923,7 @@ def load_step5_config(
         "results_dir": results_dir,
         "results_dir_nosplit": results_dir_nosplit,
         "base_results_dir": base_results_dir,
-        "benchmark_root": benchmark_root,
+        "method_root": method_root,
         "compare_root": compare_root,
         "step3_targets_path": step3_targets_path,
         "step4_reg_dir": step4_reg_dir,
@@ -968,7 +968,7 @@ def load_step5_config(
         results_dir=results_dir,
         results_dir_nosplit=results_dir_nosplit,
         base_results_dir=base_results_dir,
-        benchmark_root=benchmark_root,
+        method_root=method_root,
         compare_root=compare_root,
         step4_reg_dir=step4_reg_dir,
         step4_cls_dir=step4_cls_dir,

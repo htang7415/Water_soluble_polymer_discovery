@@ -78,32 +78,32 @@ def _build_training_override(args) -> Dict[str, object]:
     return override
 
 
-def _apply_cli_resolved_overrides(resolved, *, training_override: Dict[str, object], benchmark_root_suffix: str | None):
-    if not training_override and not benchmark_root_suffix:
+def _apply_cli_resolved_overrides(resolved, *, training_override: Dict[str, object], method_root_suffix: str | None):
+    if not training_override and not method_root_suffix:
         return resolved
 
     step5_cfg = deepcopy(resolved.step5)
     if training_override:
         step5_cfg = _deep_merge(step5_cfg, training_override)
 
-    benchmark_root = resolved.benchmark_root
+    method_root = resolved.method_root
     compare_root = resolved.compare_root
-    if benchmark_root_suffix:
-        suffix = str(benchmark_root_suffix)
-        benchmark_root = benchmark_root.parent / f"{benchmark_root.name}{suffix}"
+    if method_root_suffix:
+        suffix = str(method_root_suffix)
+        method_root = method_root.parent / f"{method_root.name}{suffix}"
         compare_root = compare_root.parent / f"{compare_root.name}{suffix}"
 
     snapshot = deepcopy(resolved.config_snapshot)
     snapshot["step5"] = as_yamlable(step5_cfg)
     if "paths" not in snapshot or not isinstance(snapshot["paths"], dict):
         snapshot["paths"] = {}
-    snapshot["paths"]["benchmark_root"] = str(benchmark_root)
+    snapshot["paths"]["method_root"] = str(method_root)
     snapshot["paths"]["compare_root"] = str(compare_root)
 
     return replace(
         resolved,
         step5=step5_cfg,
-        benchmark_root=benchmark_root,
+        method_root=method_root,
         compare_root=compare_root,
         config_snapshot=snapshot,
     )
@@ -121,7 +121,7 @@ def _write_json(payload: Dict, path: Path) -> None:
 
 
 def _prepare_shared_artifacts(resolved, *, config_path: str) -> None:
-    shared_dir = resolved.benchmark_root / "_shared"
+    shared_dir = resolved.method_root / "_shared"
     metrics_dir = shared_dir / "metrics"
     shared_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -180,7 +180,7 @@ def _prepare_shared_artifacts(resolved, *, config_path: str) -> None:
             "num_rl_proxy_rows": int(len(resolved.rl_proxy_df)),
             "num_hpo_rows": int(len(resolved.hpo_target_df)),
             "enabled_runs": resolved.enabled_runs,
-            "benchmark_root": str(resolved.benchmark_root),
+            "method_root": str(resolved.method_root),
         },
         metrics_dir / "prepare_summary.json",
     )
@@ -317,9 +317,15 @@ def main() -> None:
         help="Optional suffix appended to each run directory name to isolate smoke outputs.",
     )
     parser.add_argument(
-        "--benchmark_root_suffix",
+        "--method_root_suffix",
         default=None,
-        help="Optional suffix appended to the benchmark root so shared and run outputs stay isolated.",
+        help="Optional suffix appended to the Step 5 method root so shared and run outputs stay isolated.",
+    )
+    parser.add_argument(
+        "--benchmark_root_suffix",
+        dest="method_root_suffix",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
 
@@ -341,11 +347,11 @@ def main() -> None:
     resolved = _apply_cli_resolved_overrides(
         resolved,
         training_override=training_override,
-        benchmark_root_suffix=args.benchmark_root_suffix,
+        method_root_suffix=args.method_root_suffix,
     )
     _prepare_shared_artifacts(resolved, config_path=args.config)
 
-    print(f"Prepared Step 5 shared artifacts under: {resolved.benchmark_root / '_shared'}")
+    print(f"Prepared Step 5 shared artifacts under: {resolved.method_root / '_shared'}")
     print(f"c_target={resolved.c_target} | num_target_rows={len(resolved.target_family_df)}")
     print("Enabled runs:")
     for run_name in resolved.enabled_runs:
@@ -390,8 +396,8 @@ def main() -> None:
         extra_context["save_figures"] = False
     if args.run_dir_suffix:
         extra_context["run_dir_suffix"] = str(args.run_dir_suffix)
-    if args.benchmark_root_suffix:
-        extra_context["benchmark_root_suffix"] = str(args.benchmark_root_suffix)
+    if args.method_root_suffix:
+        extra_context["method_root_suffix"] = str(args.method_root_suffix)
     extra_context = extra_context or None
 
     selected_run_cfgs = [build_run_config(resolved, run_name) for run_name in selected_runs]
@@ -402,7 +408,7 @@ def main() -> None:
     for run_cfg in selected_run_cfgs:
         run_dir = None
         if args.run_dir_suffix:
-            run_dir = resolved.benchmark_root / f"{run_cfg['run_name']}{args.run_dir_suffix}"
+            run_dir = resolved.method_root / f"{run_cfg['run_name']}{args.run_dir_suffix}"
         _execute_run(
             resolved=resolved,
             run_name=str(run_cfg["run_name"]),

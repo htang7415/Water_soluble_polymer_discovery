@@ -86,9 +86,9 @@ COMPARE_METRIC_REGISTRY = {
 def _resolve_selected_runs(resolved, runs_arg: str | None, *, allow_partial: bool = False) -> List[str]:
     existing_run_dirs = {
         path.name
-        for path in resolved.benchmark_root.iterdir()
+        for path in resolved.method_root.iterdir()
         if path.is_dir() and path.name != "_shared"
-    } if resolved.benchmark_root.exists() else set()
+    } if resolved.method_root.exists() else set()
     if runs_arg:
         requested = [item.strip() for item in str(runs_arg).split(",") if item.strip()]
         allowed = set(resolved.enabled_runs) | existing_run_dirs
@@ -98,7 +98,7 @@ def _resolve_selected_runs(resolved, runs_arg: str | None, *, allow_partial: boo
                 return requested
             raise ValueError(
                 "Requested Step 5_1 runs are neither enabled in config5 nor present under the "
-                f"Step 5 benchmark root: {unknown}"
+                f"Step 5 method root: {unknown}"
             )
         return requested
     if bool(resolved.step5_1.get("compare_all_enabled_runs", True)):
@@ -113,7 +113,7 @@ def _resolve_selected_runs(resolved, runs_arg: str | None, *, allow_partial: boo
             if preferred_runs:
                 return preferred_runs
         return [run for run in resolved.enabled_runs if run in existing_run_dirs]
-    return [run for run in resolved.enabled_runs if (resolved.benchmark_root / run).exists()]
+    return [run for run in resolved.enabled_runs if (resolved.method_root / run).exists()]
 
 
 def _safe_float(value: object, default: float = float("nan")) -> float:
@@ -301,7 +301,7 @@ def _load_run_outputs(
     *,
     run_name: str,
 ) -> Dict[str, object]:
-    run_dir = resolved.benchmark_root / run_name
+    run_dir = resolved.method_root / run_name
     missing = [path for path in REQUIRED_RUN_FILES if not (run_dir / path).is_file()]
     if missing:
         raise FileNotFoundError(f"Run {run_name} is missing required Step 5 outputs: {missing}")
@@ -649,7 +649,7 @@ def _write_compare_outputs(
         "selected_runs": selected_runs,
         "skipped_runs": skipped_runs,
         "partial_compare": bool(partial_compare),
-        "benchmark_root": str(resolved.benchmark_root),
+        "method_root": str(resolved.method_root),
         "compare_root": str(compare_root),
     }
     with open(compare_root / "config_snapshot.yaml", "w", encoding="utf-8") as handle:

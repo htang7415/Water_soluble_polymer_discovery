@@ -27,6 +27,7 @@ from .evaluation import evaluate_generated_samples
 from .frozen_sampling import (
     ResolvedClassSamplingPrior,
     _accepted_target_class_indices,
+    _quota_shortfall_is_tolerable,
     _resolve_class_match_request_size,
 )
 from .rewards import compute_success_shaped_rewards
@@ -351,6 +352,12 @@ def _sample_on_policy_rollouts(
     while not pending_prompt_df.empty:
         attempts += 1
         if attempts > int(prior.class_match_sampling_attempts_max):
+            if _quota_shortfall_is_tolerable(
+                prior=prior,
+                accepted_count=len(accepted_smiles),
+                requested_count=len(prompt_df),
+            ):
+                break
             raise RuntimeError(
                 "Step 5 on-policy sampling could not satisfy the target-class quota. "
                 f"target_class={prior.target_class!r} accepted={len(accepted_smiles)} requested={len(prompt_df)} "
@@ -451,6 +458,17 @@ def _sample_on_policy_rollouts(
     )
     metadata = {
         "num_samples": int(len(prompt_df)),
+        "returned_num_samples": int(len(accepted_smiles)),
+        "remaining_num_samples": max(0, int(len(prompt_df)) - int(len(accepted_smiles))),
+        "quota_satisfied": bool(len(accepted_smiles) == len(prompt_df)),
+        "quota_shortfall_tolerated": bool(
+            len(accepted_smiles) < len(prompt_df)
+            and _quota_shortfall_is_tolerable(
+                prior=prior,
+                accepted_count=len(accepted_smiles),
+                requested_count=len(prompt_df),
+            )
+        ),
         "num_trajectory_batches": int(len(accepted_trajectories)),
         "total_raw_samples_drawn": int(total_drawn),
         "accepted_raw_target_class_samples": int(accepted_raw_count),
@@ -891,26 +909,48 @@ def train_s4_rl_alignment(
             for traj_idx, trajectory in enumerate(trajectories):
                 batch_size = int(trajectory.final_ids.shape[0])
                 old_logprob_full = old_logprob_chunks[traj_idx]
-                for start_idx in range(0, batch_size, batch_size if replay_batch_size <= 0 else replay_batch_size):
-                    end_idx = min(batch_size, start_idx + (batch_size if replay_batch_size <= 0 else replay_batch_size))
-                    chunk_list = select_sampling_trajectory_rows(
-                        [trajectory],
-                        keep_indices=range(start_idx, end_idx),
-                    )
-                    if len(chunk_list) != 1:
-                        raise ValueError("Expected exactly one chunk when slicing a single Step 5 trajectory batch.")
-                    trajectory_chunk = chunk_list[0]
-                    chunk_size = int(trajectory_chunk.final_ids.shape[0])
-                    advantage_chunk = advantages[offset + start_idx : offset + start_idx + chunk_size].to(
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                    replay = logprob_sampler.replay_trajectory_logprob(trajectory_chunk, grad_enabled=True)
-                    current_logprob = replay["trajectory_logprob"]
-                    kl_stats = logprob_sampler.compute_trajectory_kl(
-                        trajectory_chunk,
-                        reference_diffusion_model=reference_model,
-                    )
+                start_idx = 0
+                base_chunk_size = batch_size if replay_batch_size <= 0 else replay_batch_size
+                while start_idx < batch_size:
+                    current_chunk_size = min(batch_size - start_idx, base_chunk_size)
+                    while True:
+                        end_idx = min(batch_size, start_idx + current_chunk_size)
+                        chunk_list = select_sampling_trajectory_rows(
+                            [trajectory],
+                            keep_indices=range(start_idx, end_idx),
+                        )
+                        if len(chunk_list) != 1:
+                            raise ValueError("Expected exactly one chunk when slicing a single Step 5 trajectory batch.")
+                        trajectory_chunk = chunk_list[0]
+                        chunk_size = int(trajectory_chunk.final_ids.shape[0])
+                        advantage_chunk = advantages[offset + start_idx : offset + start_idx + chunk_size].to(
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        try:
+                            replay = logprob_sampler.replay_trajectory_logprob(trajectory_chunk, grad_enabled=True)
+                            current_logprob = replay["trajectory_logprob"]
+                            kl_stats = logprob_sampler.compute_trajectory_kl(
+                                trajectory_chunk,
+                                reference_diffusion_model=reference_model,
+                            )
+                            break
+                        except torch.cuda.OutOfMemoryError:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            if current_chunk_size <= 1:
+                                raise
+                            reduced_chunk_size = max(1, current_chunk_size // 2)
+                            append_log_message(
+                                run_dirs["run_dir"],
+                                (
+                                    "RL replay/KL OOM; reducing replay chunk size "
+                                    f"from {int(current_chunk_size)} to {int(reduced_chunk_size)} "
+                                    f"at step={int(step_idx)} trajectory_batch={int(traj_idx)}."
+                                ),
+                                echo=True,
+                            )
+                            current_chunk_size = reduced_chunk_size
                     total_logprob_sum = total_logprob_sum + current_logprob.sum()
                     if alignment_mode == "rl":
                         policy_term_chunk = -(advantage_chunk.detach() * current_logprob).sum()
@@ -931,6 +971,7 @@ def train_s4_rl_alignment(
                         )
                     total_policy_term = total_policy_term + policy_term_chunk
                     total_kl_term = total_kl_term + kl_stats["trajectory_kl"].sum()
+                    start_idx = end_idx
                 offset += batch_size
 
             loss = (total_policy_term + float(s4_cfg["kl_weight"]) * total_kl_term) / float(denom)

@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument(
         "--fresh_refit",
         action="store_true",
-        help="Delete existing tuned benchmark outputs before rerunning the refit.",
+        help="Delete existing tuned Step 5 method outputs before rerunning the refit.",
     )
     args = parser.parse_args()
 

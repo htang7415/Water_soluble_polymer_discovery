@@ -64,6 +64,8 @@ class ResolvedClassSamplingPrior:
     class_match_sampling_attempts_max: int
     class_match_oversample_factor: float
     class_match_min_request_size: int
+    allow_partial_quota_return: bool
+    partial_quota_min_fill_ratio: float
     enforce_star_ok_acceptance: bool
     reject_duplicate_canonical_acceptance: bool
     reject_sidechain_backbone_hybrids: bool
@@ -655,6 +657,18 @@ def resolve_class_sampling_prior(
         default_value=int(step5_cfg.get("decode_constraint_class_match_min_request_size", 1)),
         cast=int,
     )
+    allow_partial_quota_return = _resolve_class_override(
+        step5_cfg.get("decode_constraint_allow_partial_quota_return_overrides", {}),
+        target_class=target_class,
+        default_value=bool(step5_cfg.get("decode_constraint_allow_partial_quota_return", False)),
+        cast=bool,
+    )
+    partial_quota_min_fill_ratio = _resolve_class_override(
+        step5_cfg.get("decode_constraint_partial_quota_min_fill_ratio_overrides", {}),
+        target_class=target_class,
+        default_value=float(step5_cfg.get("decode_constraint_partial_quota_min_fill_ratio", 1.0)),
+        cast=float,
+    )
     enforce_star_ok_acceptance = _resolve_class_override(
         step5_cfg.get("decode_constraint_enforce_star_ok_acceptance_overrides", {}),
         target_class=target_class,
@@ -815,6 +829,8 @@ def resolve_class_sampling_prior(
         class_match_sampling_attempts_max=int(class_match_sampling_attempts_max),
         class_match_oversample_factor=float(class_match_oversample_factor),
         class_match_min_request_size=max(1, int(class_match_min_request_size)),
+        allow_partial_quota_return=bool(allow_partial_quota_return),
+        partial_quota_min_fill_ratio=float(partial_quota_min_fill_ratio),
         enforce_star_ok_acceptance=bool(enforce_star_ok_acceptance),
         reject_duplicate_canonical_acceptance=bool(reject_duplicate_canonical_acceptance),
         reject_sidechain_backbone_hybrids=bool(reject_sidechain_backbone_hybrids),
@@ -1216,6 +1232,8 @@ def _build_class_sampling_metadata(
             else None
         ),
         "class_match_min_request_size": int(prior.class_match_min_request_size),
+        "allow_partial_quota_return": bool(prior.allow_partial_quota_return),
+        "partial_quota_min_fill_ratio": float(prior.partial_quota_min_fill_ratio),
         "enforce_star_ok_acceptance": bool(prior.enforce_star_ok_acceptance),
         "reject_duplicate_canonical_acceptance": bool(prior.reject_duplicate_canonical_acceptance),
         "reject_sidechain_backbone_hybrids": bool(prior.reject_sidechain_backbone_hybrids),
@@ -1284,6 +1302,23 @@ def _smoothed_class_match_acceptance_rate(
     """Conservative smoothed acceptance estimate for adaptive class-match retries."""
 
     return float(accepted_raw_count + 0.5) / float(total_drawn + 1.0)
+
+
+def _quota_shortfall_is_tolerable(
+    *,
+    prior: ResolvedClassSamplingPrior,
+    accepted_count: int,
+    requested_count: int,
+) -> bool:
+    """Allow near-complete batches to return partial results instead of hard-failing."""
+
+    if not bool(prior.allow_partial_quota_return):
+        return False
+    if int(requested_count) <= 0:
+        return True
+    min_fill_ratio = min(max(float(prior.partial_quota_min_fill_ratio), 0.0), 1.0)
+    min_accepted = int(np.ceil(float(requested_count) * min_fill_ratio))
+    return int(accepted_count) >= max(1, min_accepted)
 
 
 def _resolve_class_match_request_size(
@@ -1402,6 +1437,14 @@ def sample_with_class_prior(
                 total_raw_sampling_wall_time_seconds=total_raw_sampling_wall_time_seconds,
                 total_filter_wall_time_seconds=total_filter_wall_time_seconds,
             )
+            if _quota_shortfall_is_tolerable(
+                prior=prior,
+                accepted_count=len(accepted_smiles),
+                requested_count=int(num_samples),
+            ):
+                metadata["quota_shortfall_tolerated"] = True
+                metadata["quota_shortfall_count"] = max(0, int(num_samples) - int(len(accepted_smiles)))
+                return list(accepted_smiles), metadata
             raise ClassConstrainedSamplingQuotaError(
                 target_class=prior.target_class,
                 accepted_smiles=accepted_smiles,

@@ -1010,7 +1010,7 @@ def run_optuna_study(
         tuned_run_cfg = deepcopy(base_run_cfg)
         resolved_refit, tuned_run_cfg = _apply_trial_params(resolved, tuned_run_cfg, dict(best_trial.params))
         tuned_run_cfg["run_name"] = f"{base_run_cfg['run_name']}_optuna"
-        refit_run_dir = resolved_refit.benchmark_root / tuned_run_cfg["run_name"]
+        refit_run_dir = resolved_refit.method_root / tuned_run_cfg["run_name"]
         if fresh_study and refit_run_dir.exists():
             shutil.rmtree(refit_run_dir)
         refit_result = execute_step5_run(
@@ -1072,7 +1072,7 @@ def refit_best_trial(
     tuned_run_cfg = deepcopy(base_run_cfg)
     resolved_refit, tuned_run_cfg = _apply_trial_params(resolved, tuned_run_cfg, best_params)
     tuned_run_cfg["run_name"] = f"{base_run_cfg['run_name']}_optuna"
-    refit_run_dir = resolved_refit.benchmark_root / tuned_run_cfg["run_name"]
+    refit_run_dir = resolved_refit.method_root / tuned_run_cfg["run_name"]
     if fresh_refit and refit_run_dir.exists():
         shutil.rmtree(refit_run_dir)
 

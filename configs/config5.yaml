@@ -225,8 +225,8 @@ step5:
     rl_proxy_eval_interval_steps: 1000
     rl_proxy_num_targets: 5
     rl_proxy_generation_budget: 64
-    trajectories_per_batch: 128
-    replay_batch_size: 32
+    trajectories_per_batch: 64
+    replay_batch_size: 16
     dpo:
       offline_pair_budget: 10000
       offline_pair_budget_by_class_overrides:
