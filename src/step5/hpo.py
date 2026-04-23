@@ -17,7 +17,7 @@ import torch
 import yaml
 
 from .config import build_run_config, resolve_step5_hpo_generation_budget
-from .plotting import plot_hpo_best_success_curve
+from .plotting import plot_hpo_best_metric_curve, plot_hpo_best_success_curve
 from .run_core import execute_step5_run
 from .study_families import STUDY_BASE_RUNS
 from src.utils.model_scales import get_model_config
@@ -924,6 +924,23 @@ def run_optuna_study(
     plot_hpo_best_success_curve(
         trials_df,
         study_root / "figures" / "hpo_best_success_hit_rate.png",
+    )
+    plot_hpo_best_metric_curve(
+        trials_df,
+        study_root / "figures" / "hpo_best_property_success_hit_rate.png",
+        metric_candidates=[
+            "mean_property_success_hit_rate_discovery",
+            "mean_property_success_hit_rate",
+        ],
+        output_column="best_property_success_hit_rate_so_far",
+        ylabel="Best property success hit rate so far",
+    )
+    plot_hpo_best_metric_curve(
+        trials_df,
+        study_root / "figures" / "hpo_best_objective_value.png",
+        metric_candidates=["objective_value"],
+        output_column="best_objective_value_so_far",
+        ylabel="Best objective value so far",
     )
     trial_records = [
         {

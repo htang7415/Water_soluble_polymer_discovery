@@ -308,14 +308,17 @@ def plot_overall_success_by_family(
     plt.close(fig)
 
 
-def plot_hpo_best_success_curve(
+def plot_hpo_best_metric_curve(
     trials_df: pd.DataFrame,
     output_path: Path,
     *,
+    metric_candidates: list[str],
+    output_column: str,
+    ylabel: str,
     font_size: int = 16,
     dpi: int = 600,
 ) -> None:
-    """Plot running-best success hit rate across HPO trials."""
+    """Plot a running-best HPO metric across trials."""
 
     apply_step5_plot_style(font_size=font_size, dpi=dpi)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -325,14 +328,10 @@ def plot_hpo_best_success_curve(
     ordered["trial_number"] = pd.to_numeric(ordered["trial_number"], errors="coerce")
     ordered = ordered.loc[ordered["trial_number"].notna()].sort_values("trial_number", kind="mergesort").reset_index(drop=True)
 
-    metric_col = "mean_success_hit_rate_discovery"
-    ylabel = "Best success hit rate so far (discovery)"
-    if metric_col not in ordered.columns:
-        metric_col = "mean_success_hit_rate"
-        ylabel = "Best success hit rate so far"
+    metric_col = next((column for column in metric_candidates if column in ordered.columns), None)
     metric_values = (
         pd.to_numeric(ordered[metric_col], errors="coerce")
-        if metric_col in ordered.columns
+        if metric_col is not None
         else pd.Series(np.nan, index=ordered.index, dtype=float)
     )
 
@@ -345,19 +344,21 @@ def plot_hpo_best_success_curve(
             else:
                 best_so_far = max(float(best_so_far), float(value))
         running_best.append(float(best_so_far) if np.isfinite(best_so_far) else float("nan"))
-    ordered["best_success_hit_rate_so_far"] = running_best
+    ordered[output_column] = running_best
 
     fig, ax = plt.subplots(figsize=(7, 5))
     if not ordered.empty and np.isfinite(np.asarray(running_best, dtype=float)).any():
+        x_values = ordered["trial_number"].to_numpy(dtype=int)
+        y_values = ordered[output_column].to_numpy(dtype=float)
         ax.plot(
-            ordered["trial_number"].astype(int),
-            ordered["best_success_hit_rate_so_far"].astype(float),
+            x_values,
+            y_values,
             color="#d62728",
             linewidth=2.0,
             marker="o",
             markersize=4.5,
         )
-        ymax = float(np.nanmax(ordered["best_success_hit_rate_so_far"].to_numpy(dtype=float)))
+        ymax = float(np.nanmax(ordered[output_column].to_numpy(dtype=float)))
         ax.set_ylim(0.0, max(1.0, min(1.02, ymax * 1.05 if ymax > 0.0 else 1.0)))
         ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
     else:
@@ -368,6 +369,26 @@ def plot_hpo_best_success_curve(
     fig.tight_layout()
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
+
+
+def plot_hpo_best_success_curve(
+    trials_df: pd.DataFrame,
+    output_path: Path,
+    *,
+    font_size: int = 16,
+    dpi: int = 600,
+) -> None:
+    """Plot running-best success hit rate across HPO trials."""
+
+    plot_hpo_best_metric_curve(
+        trials_df,
+        output_path,
+        metric_candidates=["mean_success_hit_rate_discovery", "mean_success_hit_rate"],
+        output_column="best_success_hit_rate_so_far",
+        ylabel="Best success hit rate so far",
+        font_size=font_size,
+        dpi=dpi,
+    )
 
 
 def plot_per_target_success_compare(
@@ -548,11 +569,13 @@ def plot_supervised_training_curves(
     ordered = history_df.sort_values(["run_label", "global_step"], kind="mergesort")
     for _run_name, sub in ordered.groupby("run_name", sort=True):
         label = str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else str(_run_name)
-        x = sub["global_step"].astype(float)
+        x = pd.to_numeric(sub["global_step"], errors="coerce").to_numpy(dtype=float)
         if "train_diffusion_loss_window" in sub.columns:
-            axes[0].plot(x, sub["train_diffusion_loss_window"].astype(float), linewidth=1.5, label=label)
+            y_train = pd.to_numeric(sub["train_diffusion_loss_window"], errors="coerce").to_numpy(dtype=float)
+            axes[0].plot(x, y_train, linewidth=1.5, label=label)
         if "val_diffusion_loss" in sub.columns:
-            axes[1].plot(x, sub["val_diffusion_loss"].astype(float), linewidth=1.5, label=label)
+            y_val = pd.to_numeric(sub["val_diffusion_loss"], errors="coerce").to_numpy(dtype=float)
+            axes[1].plot(x, y_val, linewidth=1.5, label=label)
     axes[0].set_xlabel("Step")
     axes[0].set_ylabel("Train diffusion loss")
     axes[1].set_xlabel("Step")
@@ -587,10 +610,11 @@ def plot_alignment_training_curves(
     ordered = history_df.sort_values(["run_label", "step_idx"], kind="mergesort")
     for _run_name, sub in ordered.groupby("run_name", sort=True):
         label = str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else str(_run_name)
-        x = sub["step_idx"].astype(float)
+        x = pd.to_numeric(sub["step_idx"], errors="coerce").to_numpy(dtype=float)
         for ax, (column, ylabel) in zip(axes_flat, plot_specs):
             if column in sub.columns and sub[column].notna().any():
-                ax.plot(x, sub[column].astype(float), linewidth=1.4, label=label)
+                y = pd.to_numeric(sub[column], errors="coerce").to_numpy(dtype=float)
+                ax.plot(x, y, linewidth=1.4, label=label)
             ax.set_xlabel("Step")
             ax.set_ylabel(ylabel)
             ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
@@ -620,10 +644,11 @@ def plot_dpo_training_curves(
     ordered = history_df.sort_values(["run_label", "epoch_idx"], kind="mergesort")
     for _run_name, sub in ordered.groupby("run_name", sort=True):
         label = str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else str(_run_name)
-        x = sub["epoch_idx"].astype(float)
+        x = pd.to_numeric(sub["epoch_idx"], errors="coerce").to_numpy(dtype=float)
         for ax, (column, ylabel) in zip(axes, plot_specs):
             if column in sub.columns and sub[column].notna().any():
-                ax.plot(x, sub[column].astype(float), linewidth=1.5, label=label)
+                y = pd.to_numeric(sub[column], errors="coerce").to_numpy(dtype=float)
+                ax.plot(x, y, linewidth=1.5, label=label)
             ax.set_xlabel("Epoch")
             ax.set_ylabel(ylabel)
             ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.5)
