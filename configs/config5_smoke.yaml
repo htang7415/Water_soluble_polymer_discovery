@@ -330,6 +330,7 @@ step5_hpo:
   hpo_rl_num_steps: 5
   hpo_num_targets: 2
   hpo_generation_budget: 4
+  hpo_decode_partial_quota_min_fill_ratio: 0.85
   hpo_generation_budget_by_class:
     polyacrylate: 4
     polyether: 6
@@ -342,10 +343,10 @@ step5_hpo:
   hpo_sampling_seeds: [101]
   tie_epsilon: 1.0e-4
   method_budgets:
-    S1: {n_trials: 2, timeout_hours_medium: null}
-    S2: {n_trials: 2, timeout_hours_medium: null}
-    S3: {n_trials: 2, timeout_hours_medium: null}
-    S4_rl: {n_trials: 2, timeout_hours_medium: null}
-    S4_ppo: {n_trials: 2, timeout_hours_medium: null}
-    S4_grpo: {n_trials: 2, timeout_hours_medium: null}
-    S4_dpo: {n_trials: 2, timeout_hours_medium: null}
+    S1: {n_trials: 2, timeout_hours_medium: 2}
+    S2: {n_trials: 2, timeout_hours_medium: 2}
+    S3: {n_trials: 2, timeout_hours_medium: 2}
+    S4_rl: {n_trials: 2, timeout_hours_medium: 2}
+    S4_ppo: {n_trials: 2, timeout_hours_medium: 2}
+    S4_grpo: {n_trials: 2, timeout_hours_medium: 2}
+    S4_dpo: {n_trials: 2, timeout_hours_medium: 2}

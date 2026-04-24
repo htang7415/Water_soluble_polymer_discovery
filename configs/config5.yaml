@@ -348,6 +348,7 @@ step5_hpo:
   hpo_sampling_batch_size: 64
   hpo_decode_class_match_sampling_attempts_max: 48
   hpo_decode_class_match_oversample_factor: 4.0
+  hpo_decode_partial_quota_min_fill_ratio: 0.85
   hpo_s4_trajectories_per_batch: 32
   hpo_s4_rl_diffusion_num_steps: 16
   hpo_s4_replay_batch_size: 16

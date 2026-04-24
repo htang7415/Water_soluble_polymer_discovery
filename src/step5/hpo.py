@@ -225,12 +225,19 @@ def _apply_hpo_runtime_overrides(
     sampling_cfg = resolved.base_config.setdefault("sampling", {})
     chi_cfg = resolved.base_config.setdefault("chi_training", {})
     step5_decode_cfg = chi_cfg.setdefault("step5_inverse_design", {})
+    target_class = str(resolved.c_target).strip().lower()
     s2_hpo_max_steps = int(hpo_cfg.get("hpo_s2_max_steps", 0) or 0)
     rl_hpo_num_steps = int(hpo_cfg.get("hpo_rl_num_steps", 0) or 0)
     hpo_sampling_batch_size = int(hpo_cfg.get("hpo_sampling_batch_size", 0) or 0)
     hpo_class_match_attempts_max = int(hpo_cfg.get("hpo_decode_class_match_sampling_attempts_max", 0) or 0)
     hpo_class_match_oversample_factor = float(
         hpo_cfg.get("hpo_decode_class_match_oversample_factor", 0.0) or 0.0
+    )
+    raw_hpo_partial_fill_ratio = hpo_cfg.get("hpo_decode_partial_quota_min_fill_ratio", None)
+    hpo_partial_fill_ratio = (
+        None
+        if raw_hpo_partial_fill_ratio in {None, "", "null"}
+        else float(raw_hpo_partial_fill_ratio)
     )
     hpo_s4_trajectories_per_batch = int(hpo_cfg.get("hpo_s4_trajectories_per_batch", 0) or 0)
     hpo_s4_rl_diffusion_num_steps = int(hpo_cfg.get("hpo_s4_rl_diffusion_num_steps", 0) or 0)
@@ -246,6 +253,13 @@ def _apply_hpo_runtime_overrides(
         step5_decode_cfg["decode_constraint_class_match_sampling_attempts_max"] = int(
             max(int(step5_decode_cfg.get("decode_constraint_class_match_sampling_attempts_max", 1)), hpo_class_match_attempts_max)
         )
+        attempts_overrides = dict(
+            step5_decode_cfg.get("decode_constraint_class_match_sampling_attempts_max_overrides", {}) or {}
+        )
+        attempts_overrides[target_class] = int(
+            max(int(attempts_overrides.get(target_class, 1)), hpo_class_match_attempts_max)
+        )
+        step5_decode_cfg["decode_constraint_class_match_sampling_attempts_max_overrides"] = attempts_overrides
 
     if hpo_class_match_oversample_factor > 0.0:
         step5_decode_cfg["decode_constraint_class_match_oversample_factor"] = float(
@@ -253,6 +267,41 @@ def _apply_hpo_runtime_overrides(
                 float(step5_decode_cfg.get("decode_constraint_class_match_oversample_factor", 1.0)),
                 hpo_class_match_oversample_factor,
             )
+        )
+        oversample_overrides = dict(
+            step5_decode_cfg.get("decode_constraint_class_match_oversample_factor_overrides", {}) or {}
+        )
+        oversample_overrides[target_class] = float(
+            max(float(oversample_overrides.get(target_class, 1.0)), hpo_class_match_oversample_factor)
+        )
+        step5_decode_cfg["decode_constraint_class_match_oversample_factor_overrides"] = oversample_overrides
+
+    if hpo_partial_fill_ratio is not None:
+        step5_decode_cfg["decode_constraint_allow_partial_quota_return"] = True
+        allow_partial_overrides = dict(
+            step5_decode_cfg.get("decode_constraint_allow_partial_quota_return_overrides", {}) or {}
+        )
+        allow_partial_overrides[target_class] = True
+        step5_decode_cfg["decode_constraint_allow_partial_quota_return_overrides"] = allow_partial_overrides
+        current_fill_ratio = step5_decode_cfg.get("decode_constraint_partial_quota_min_fill_ratio", None)
+        if current_fill_ratio in {None, "", "null"}:
+            step5_decode_cfg["decode_constraint_partial_quota_min_fill_ratio"] = float(hpo_partial_fill_ratio)
+        else:
+            step5_decode_cfg["decode_constraint_partial_quota_min_fill_ratio"] = float(
+                min(float(current_fill_ratio), float(hpo_partial_fill_ratio))
+            )
+        partial_fill_ratio_overrides = dict(
+            step5_decode_cfg.get("decode_constraint_partial_quota_min_fill_ratio_overrides", {}) or {}
+        )
+        current_target_fill_ratio = partial_fill_ratio_overrides.get(target_class, None)
+        if current_target_fill_ratio in {None, "", "null"}:
+            partial_fill_ratio_overrides[target_class] = float(hpo_partial_fill_ratio)
+        else:
+            partial_fill_ratio_overrides[target_class] = float(
+                min(float(current_target_fill_ratio), float(hpo_partial_fill_ratio))
+            )
+        step5_decode_cfg["decode_constraint_partial_quota_min_fill_ratio_overrides"] = (
+            partial_fill_ratio_overrides
         )
 
     if "s2" in run_cfg and s2_hpo_max_steps > 0:

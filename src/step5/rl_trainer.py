@@ -25,6 +25,7 @@ from .dataset import (
 )
 from .evaluation import evaluate_generated_samples
 from .frozen_sampling import (
+    ClassConstrainedSamplingQuotaError,
     ResolvedClassSamplingPrior,
     _accepted_target_class_indices,
     _quota_shortfall_is_tolerable,
@@ -358,6 +359,16 @@ def _sample_on_policy_rollouts(
                 requested_count=len(prompt_df),
             ):
                 break
+            # RL can safely continue with a slightly underfilled rollout batch because
+            # reward computation, replay slicing, and GRPO grouping all operate on the
+            # realized accepted rows rather than assuming a fixed batch size.
+            relaxed_training_fill_ratio = min(
+                max(float(prior.partial_quota_min_fill_ratio), 0.0),
+                0.90,
+            )
+            min_training_accepts = int(np.ceil(float(len(prompt_df)) * relaxed_training_fill_ratio))
+            if len(accepted_smiles) >= max(1, min_training_accepts):
+                break
             raise RuntimeError(
                 "Step 5 on-policy sampling could not satisfy the target-class quota. "
                 f"target_class={prior.target_class!r} accepted={len(accepted_smiles)} requested={len(prompt_df)} "
@@ -464,6 +475,25 @@ def _sample_on_policy_rollouts(
         "quota_shortfall_tolerated": bool(
             len(accepted_smiles) < len(prompt_df)
             and _quota_shortfall_is_tolerable(
+                prior=prior,
+                accepted_count=len(accepted_smiles),
+                requested_count=len(prompt_df),
+            )
+        ),
+        "quota_shortfall_relaxed_for_training": bool(
+            len(accepted_smiles) < len(prompt_df)
+            and len(prompt_df) > 0
+            and len(accepted_smiles)
+            >= max(
+                1,
+                int(
+                    np.ceil(
+                        float(len(prompt_df))
+                        * min(max(float(prior.partial_quota_min_fill_ratio), 0.0), 0.90)
+                    )
+                ),
+            )
+            and not _quota_shortfall_is_tolerable(
                 prior=prior,
                 accepted_count=len(accepted_smiles),
                 requested_count=len(prompt_df),
@@ -691,14 +721,21 @@ def _evaluate_proxy_success_metrics(
             device=device,
             num_steps=int(num_steps),
         )
-        smiles, _metadata = sample_conditional_with_class_prior(
-            sampler=sampler,
-            tokenizer=tokenizer,
-            prior=prior,
-            resolved=resolved,
-            num_samples=int(run_cfg["s4"]["rl_proxy_generation_budget"]),
-            show_progress=False,
-        )
+        try:
+            smiles, _metadata = sample_conditional_with_class_prior(
+                sampler=sampler,
+                tokenizer=tokenizer,
+                prior=prior,
+                resolved=resolved,
+                num_samples=int(run_cfg["s4"]["rl_proxy_generation_budget"]),
+                show_progress=False,
+            )
+        except ClassConstrainedSamplingQuotaError as exc:
+            smiles = list(exc.partial_smiles)
+            _metadata = dict(exc.metadata)
+            _metadata["quota_shortfall_exception_fallback"] = True
+        if not smiles:
+            continue
         sample_df = pd.DataFrame(
             {
                 "sample_id": np.arange(sample_id_start, sample_id_start + len(smiles), dtype=int),

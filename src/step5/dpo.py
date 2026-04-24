@@ -30,7 +30,7 @@ from .dataset import (
     build_step5_supervised_frames,
 )
 from .evaluation import build_generated_samples_frame, evaluate_generated_samples
-from .frozen_sampling import ResolvedClassSamplingPrior
+from .frozen_sampling import ClassConstrainedSamplingQuotaError, ResolvedClassSamplingPrior
 from .rewards import compute_success_shaped_rewards
 from .supervised import build_optimizer_and_scheduler, load_step5_checkpoint_into_modules
 from .train_s2 import S2TrainingArtifacts
@@ -1012,14 +1012,21 @@ def _evaluate_dpo_proxy_success_metrics(
             cfg_scale=float(run_cfg["s4"]["cfg_scale"]),
             device=device,
         )
-        smiles, _metadata = sample_conditional_with_class_prior(
-            sampler=sampler,
-            tokenizer=warm_start.tokenizer,
-            prior=prior,
-            resolved=resolved,
-            num_samples=int(run_cfg["s4"]["rl_proxy_generation_budget"]),
-            show_progress=False,
-        )
+        try:
+            smiles, _metadata = sample_conditional_with_class_prior(
+                sampler=sampler,
+                tokenizer=warm_start.tokenizer,
+                prior=prior,
+                resolved=resolved,
+                num_samples=int(run_cfg["s4"]["rl_proxy_generation_budget"]),
+                show_progress=False,
+            )
+        except ClassConstrainedSamplingQuotaError as exc:
+            smiles = list(exc.partial_smiles)
+            _metadata = dict(exc.metadata)
+            _metadata["quota_shortfall_exception_fallback"] = True
+        if not smiles:
+            continue
         sample_df = build_generated_samples_frame(
             smiles,
             target_row=target_row,
