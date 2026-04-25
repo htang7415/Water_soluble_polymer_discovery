@@ -1132,6 +1132,7 @@ def train_s4_dpo_alignment(
             "Step 5 DPO currently supports only dpo.checkpoint_selection_mode in "
             "{'val_dpo_loss', 'proxy_property_success_hit_rate'}."
         )
+    proxy_eval_interval_epochs = max(1, int(dpo_cfg.get("proxy_eval_interval_epochs", 1)))
     if checkpoint_mode == "proxy_property_success_hit_rate" and (prior is None or evaluator is None):
         raise ValueError("Step 5 DPO proxy checkpoint selection requires prior and evaluator.")
     train_pairs_df, val_pairs_df, _pair_summary_df, diagnostics = build_dpo_pair_splits(
@@ -1205,6 +1206,9 @@ def train_s4_dpo_alignment(
     best_checkpoint_metric_name = "val_dpo_loss" if checkpoint_mode == "val_dpo_loss" else proxy_objective_metric
     best_checkpoint_metric_value = float("inf") if checkpoint_mode == "val_dpo_loss" else float("-inf")
 
+    def _should_run_proxy_eval(epoch_idx: int, total_epochs: int) -> bool:
+        return int(epoch_idx) == int(total_epochs) or (int(epoch_idx) % int(proxy_eval_interval_epochs)) == 0
+
     if checkpoint_mode == "proxy_property_success_hit_rate":
         proxy_metrics, proxy_eval_df = _evaluate_dpo_proxy_success_metrics(
             resolved=resolved,
@@ -1228,7 +1232,20 @@ def train_s4_dpo_alignment(
         if np.isfinite(proxy_objective_value):
             best_proxy_success = float(proxy_objective_value)
             best_checkpoint_metric_value = float(proxy_objective_value)
-            best_policy_state = _clone_policy_state_dict(policy_model)
+            if skip_disk_checkpoints:
+                best_policy_state = _clone_policy_state_dict(policy_model)
+            else:
+                _save_dpo_checkpoint(
+                    checkpoint_path=best_checkpoint_path,
+                    policy_model=policy_model,
+                    reference_checkpoint_path=warm_start.checkpoint_path,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch_idx=0,
+                    best_val_dpo_loss=best_val_dpo_loss,
+                    run_cfg=run_cfg,
+                    warm_start=warm_start,
+                )
 
     epoch_counter = 0
     epoch_idx = 1
@@ -1279,6 +1296,8 @@ def train_s4_dpo_alignment(
             "effective_num_epochs": int(effective_num_epochs),
             "saturation_guard_triggered": 0,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "proxy_eval_interval_epochs": int(proxy_eval_interval_epochs),
+            "proxy_eval_skipped": 0,
             **val_metrics,
         }
         epoch_counter = epoch_idx
@@ -1288,50 +1307,54 @@ def train_s4_dpo_alignment(
         if np.isfinite(current_val):
             best_val_dpo_loss = min(best_val_dpo_loss, current_val)
         if checkpoint_mode == "proxy_property_success_hit_rate":
-            proxy_metrics, proxy_eval_df = _evaluate_dpo_proxy_success_metrics(
-                resolved=resolved,
-                run_cfg=run_cfg,
-                policy_model=policy_model,
-                warm_start=warm_start,
-                prior=prior,
-                evaluator=evaluator,
-                device=device,
-                eval_step=int(epoch_idx),
-                target_rows_df=target_rows_df,
+            history_row["proxy_eval_skipped"] = int(
+                not _should_run_proxy_eval(int(epoch_idx), int(effective_num_epochs))
             )
-            proxy_objective_value = float(proxy_metrics.get(proxy_objective_metric, float("nan")))
-            proxy_rows.append(
-                {
-                    "epoch_idx": int(epoch_idx),
-                    "proxy_num_samples": int(len(proxy_eval_df)),
-                    **proxy_metrics,
-                }
-            )
-            history_row.update(proxy_metrics)
-            if np.isfinite(proxy_objective_value) and proxy_objective_value > best_proxy_success:
-                best_proxy_success = float(proxy_objective_value)
-                best_checkpoint_metric_value = float(proxy_objective_value)
-                if skip_disk_checkpoints:
-                    best_policy_state = _clone_policy_state_dict(policy_model)
-                else:
-                    _save_dpo_checkpoint(
-                        checkpoint_path=best_checkpoint_path,
-                        policy_model=policy_model,
-                        reference_checkpoint_path=warm_start.checkpoint_path,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        epoch_idx=epoch_idx,
-                        best_val_dpo_loss=current_val,
-                        run_cfg=run_cfg,
-                        warm_start=warm_start,
-                    )
-            if pruning_callback is not None and np.isfinite(proxy_objective_value):
-                pruning_callback(
-                    stage="dpo",
-                    step=int(epoch_idx),
-                    value=float(proxy_objective_value),
-                    metrics={**history_row, proxy_objective_metric: float(proxy_objective_value)},
+            if not bool(history_row["proxy_eval_skipped"]):
+                proxy_metrics, proxy_eval_df = _evaluate_dpo_proxy_success_metrics(
+                    resolved=resolved,
+                    run_cfg=run_cfg,
+                    policy_model=policy_model,
+                    warm_start=warm_start,
+                    prior=prior,
+                    evaluator=evaluator,
+                    device=device,
+                    eval_step=int(epoch_idx),
+                    target_rows_df=target_rows_df,
                 )
+                proxy_objective_value = float(proxy_metrics.get(proxy_objective_metric, float("nan")))
+                proxy_rows.append(
+                    {
+                        "epoch_idx": int(epoch_idx),
+                        "proxy_num_samples": int(len(proxy_eval_df)),
+                        **proxy_metrics,
+                    }
+                )
+                history_row.update(proxy_metrics)
+                if np.isfinite(proxy_objective_value) and proxy_objective_value > best_proxy_success:
+                    best_proxy_success = float(proxy_objective_value)
+                    best_checkpoint_metric_value = float(proxy_objective_value)
+                    if skip_disk_checkpoints:
+                        best_policy_state = _clone_policy_state_dict(policy_model)
+                    else:
+                        _save_dpo_checkpoint(
+                            checkpoint_path=best_checkpoint_path,
+                            policy_model=policy_model,
+                            reference_checkpoint_path=warm_start.checkpoint_path,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            epoch_idx=epoch_idx,
+                            best_val_dpo_loss=current_val,
+                            run_cfg=run_cfg,
+                            warm_start=warm_start,
+                        )
+                if pruning_callback is not None and np.isfinite(proxy_objective_value):
+                    pruning_callback(
+                        stage="dpo",
+                        step=int(epoch_idx),
+                        value=float(proxy_objective_value),
+                        metrics={**history_row, proxy_objective_metric: float(proxy_objective_value)},
+                    )
         else:
             if pruning_callback is not None and np.isfinite(current_val):
                 pruning_callback(
@@ -1439,6 +1462,7 @@ def train_s4_dpo_alignment(
                 ),
                 "proxy_objective_metric": proxy_objective_metric,
                 "checkpoint_selection_mode": checkpoint_mode,
+                "proxy_eval_interval_epochs": int(proxy_eval_interval_epochs),
                 "num_epochs": int(effective_num_epochs),
                 "configured_num_epochs": int(configured_num_epochs),
                 "configured_beta": float(dpo_cfg["beta"]),

@@ -75,6 +75,33 @@ def _resolve_optuna_timeout_seconds(budgets: Dict[str, Any]) -> int | None:
     return max(1, int(round(timeout_hours * 3600.0)))
 
 
+def _resolve_optional_positive_int(raw_value: Any) -> int | None:
+    if raw_value in {None, "", "null"}:
+        return None
+    value = int(raw_value)
+    return int(value) if value > 0 else None
+
+
+def _tighten_step5_decode_class_cap(
+    step5_decode_cfg: Dict[str, Any],
+    *,
+    key: str,
+    target_class: str,
+    cap_value: int,
+) -> None:
+    overrides_key = f"{key}_overrides"
+    current_cap = _resolve_optional_positive_int(step5_decode_cfg.get(key))
+    step5_decode_cfg[key] = int(
+        cap_value if current_cap is None else min(int(current_cap), int(cap_value))
+    )
+    class_overrides = dict(step5_decode_cfg.get(overrides_key, {}) or {})
+    current_target_cap = _resolve_optional_positive_int(class_overrides.get(target_class))
+    class_overrides[target_class] = int(
+        cap_value if current_target_cap is None else min(int(current_target_cap), int(cap_value))
+    )
+    step5_decode_cfg[overrides_key] = class_overrides
+
+
 def _build_optuna_pruner(resolved):
     pruner_name = str(resolved.step5_hpo.get("pruner", "median")).strip().lower()
     if pruner_name == "median":
@@ -233,6 +260,12 @@ def _apply_hpo_runtime_overrides(
     hpo_class_match_oversample_factor = float(
         hpo_cfg.get("hpo_decode_class_match_oversample_factor", 0.0) or 0.0
     )
+    hpo_class_match_max_request_size = _resolve_optional_positive_int(
+        hpo_cfg.get("hpo_decode_class_match_max_request_size")
+    )
+    hpo_class_match_max_total_raw_samples = _resolve_optional_positive_int(
+        hpo_cfg.get("hpo_decode_class_match_max_total_raw_samples")
+    )
     raw_hpo_partial_fill_ratio = hpo_cfg.get("hpo_decode_partial_quota_min_fill_ratio", None)
     hpo_partial_fill_ratio = (
         None
@@ -275,6 +308,22 @@ def _apply_hpo_runtime_overrides(
             max(float(oversample_overrides.get(target_class, 1.0)), hpo_class_match_oversample_factor)
         )
         step5_decode_cfg["decode_constraint_class_match_oversample_factor_overrides"] = oversample_overrides
+
+    if hpo_class_match_max_request_size is not None:
+        _tighten_step5_decode_class_cap(
+            step5_decode_cfg,
+            key="decode_constraint_class_match_max_request_size",
+            target_class=target_class,
+            cap_value=int(hpo_class_match_max_request_size),
+        )
+
+    if hpo_class_match_max_total_raw_samples is not None:
+        _tighten_step5_decode_class_cap(
+            step5_decode_cfg,
+            key="decode_constraint_class_match_max_total_raw_samples",
+            target_class=target_class,
+            cap_value=int(hpo_class_match_max_total_raw_samples),
+        )
 
     if hpo_partial_fill_ratio is not None:
         step5_decode_cfg["decode_constraint_allow_partial_quota_return"] = True
@@ -336,6 +385,17 @@ def _apply_hpo_runtime_overrides(
     if study_family in {"S4_rl", "S4_ppo", "S4_grpo"} and hpo_s4_replay_batch_size > 0:
         current_replay_batch_size = int(run_cfg["s4"].get("replay_batch_size", hpo_s4_replay_batch_size))
         run_cfg["s4"]["replay_batch_size"] = int(min(current_replay_batch_size, hpo_s4_replay_batch_size))
+    if study_family == "S4_dpo":
+        dpo_cfg = dict(run_cfg["s4"].get("dpo", {}))
+        raw_hpo_dpo_checkpoint_mode = hpo_cfg.get("hpo_s4_dpo_checkpoint_selection_mode", None)
+        if raw_hpo_dpo_checkpoint_mode not in {None, "", "null"}:
+            dpo_cfg["checkpoint_selection_mode"] = str(raw_hpo_dpo_checkpoint_mode).strip().lower()
+        hpo_dpo_proxy_eval_interval_epochs = _resolve_optional_positive_int(
+            hpo_cfg.get("hpo_s4_dpo_proxy_eval_interval_epochs")
+        )
+        if hpo_dpo_proxy_eval_interval_epochs is not None:
+            dpo_cfg["proxy_eval_interval_epochs"] = int(hpo_dpo_proxy_eval_interval_epochs)
+        run_cfg["s4"]["dpo"] = dpo_cfg
 
     return resolved, run_cfg
 
@@ -574,7 +634,13 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["learning_rate"] = trial.suggest_float("learning_rate", 1.0e-5, 1.0e-4, log=True)
         params["batch_size"] = trial.suggest_categorical("batch_size", [32, 64])
         params["num_epochs"] = trial.suggest_categorical("num_epochs", [4, 6])
-        params["cfg_scale"] = trial.suggest_float("cfg_scale", 0.5, 2.0)
+        dpo_hpo_cfg = _resolve_hpo_runtime_config(resolved, study_family=study_family)
+        dpo_cfg_scale_min = float(dpo_hpo_cfg.get("hpo_s4_dpo_cfg_scale_min", 0.5) or 0.5)
+        if dpo_cfg_scale_min >= 2.0:
+            raise ValueError(
+                "step5_hpo.hpo_s4_dpo_cfg_scale_min must be < 2.0 for the current DPO search space."
+            )
+        params["cfg_scale"] = trial.suggest_float("cfg_scale", dpo_cfg_scale_min, 2.0)
         params["d_water_budget_fraction"] = trial.suggest_categorical(
             "d_water_budget_fraction", [0.2, 0.3, 0.5]
         )
@@ -594,8 +660,17 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
 
 def _trial_tie_break_key(trial, *, tie_epsilon: float) -> tuple:
     attrs = trial.user_attrs
+    selection_objective = float(attrs.get("selection_objective_value", trial.value or float("-inf")))
+    raw_objective = float(trial.value or float("-inf"))
+
+    def _tie_bucket(value: float) -> float:
+        if not math.isfinite(float(value)):
+            return float("-inf")
+        return float(round(float(value) / max(tie_epsilon, 1.0e-12)))
+
     return (
-        round(float(trial.value or float("-inf")) / max(tie_epsilon, 1.0e-12)),
+        _tie_bucket(selection_objective),
+        _tie_bucket(raw_objective),
         float(attrs.get("mean_soluble_ok", float("-inf"))),
         float(attrs.get("mean_chi_ok", float("-inf"))),
         float(attrs.get("mean_chi_band_ok", float("-inf"))),
@@ -608,10 +683,69 @@ def _select_best_completed_trial(study, *, tie_epsilon: float):
     completed = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None]
     if not completed:
         raise ValueError("No completed Optuna trials are available for Step 5 HPO.")
-    best_value = max(float(trial.value) for trial in completed)
-    contenders = [trial for trial in completed if abs(float(trial.value) - best_value) <= float(tie_epsilon)]
+    effective_values = [
+        float(trial.user_attrs.get("selection_objective_value", trial.value))
+        for trial in completed
+    ]
+    best_value = max(effective_values)
+    if not math.isfinite(best_value):
+        contenders = list(completed)
+    else:
+        contenders = [
+            trial
+            for trial in completed
+            if abs(float(trial.user_attrs.get("selection_objective_value", trial.value)) - best_value)
+            <= float(tie_epsilon)
+        ]
     contenders.sort(key=lambda trial: _trial_tie_break_key(trial, tie_epsilon=float(tie_epsilon)), reverse=True)
     return contenders[0]
+
+
+def _compute_selection_objective_value(
+    *,
+    objective_value: float,
+    mean_class_match_acceptance_rate: float,
+    mean_total_raw_samples_drawn: float,
+    hpo_cfg: Dict[str, Any],
+) -> tuple[float, bool, list[str]]:
+    selection_value = float(objective_value)
+    notes: list[str] = []
+    raw_min_acceptance = hpo_cfg.get("efficiency_min_class_match_acceptance_rate", None)
+    if raw_min_acceptance not in {None, "", "null"}:
+        min_acceptance = float(raw_min_acceptance)
+        if min_acceptance > 0.0:
+            if (
+                not math.isfinite(float(mean_class_match_acceptance_rate))
+                or float(mean_class_match_acceptance_rate) <= 0.0
+            ):
+                selection_value = float("-inf")
+                notes.append("class_match_acceptance_rate_missing_or_nonpositive")
+            elif float(mean_class_match_acceptance_rate) < float(min_acceptance):
+                selection_value *= max(
+                    0.0,
+                    float(mean_class_match_acceptance_rate) / float(min_acceptance),
+                )
+                notes.append(
+                    "class_match_acceptance_rate_below_floor:"
+                    f"{float(mean_class_match_acceptance_rate):.6g}<{float(min_acceptance):.6g}"
+                )
+    raw_max_total = hpo_cfg.get("efficiency_max_mean_total_raw_samples_drawn", None)
+    if raw_max_total not in {None, "", "null"}:
+        max_total_raw_samples = float(raw_max_total)
+        if (
+            max_total_raw_samples > 0.0
+            and math.isfinite(float(mean_total_raw_samples_drawn))
+            and float(mean_total_raw_samples_drawn) > max_total_raw_samples
+        ):
+            selection_value *= max(
+                0.0,
+                float(max_total_raw_samples) / float(mean_total_raw_samples_drawn),
+            )
+            notes.append(
+                "mean_total_raw_samples_drawn_above_ceiling:"
+                f"{float(mean_total_raw_samples_drawn):.6g}>{float(max_total_raw_samples):.6g}"
+            )
+    return float(selection_value), len(notes) == 0, notes
 
 
 def _trial_summary_path(study_root: Path, trial_number: int) -> Path:
@@ -633,6 +767,9 @@ def _write_trial_summary(
     mean_success_hit_rate_discovery: float | None,
     mean_class_match_acceptance_rate: float | None = None,
     mean_total_raw_samples_drawn: float | None = None,
+    selection_objective_value: float | None = None,
+    selection_efficiency_eligible: bool | None = None,
+    selection_efficiency_notes: list[str] | None = None,
     state: str,
 ) -> None:
     payload = {
@@ -659,6 +796,19 @@ def _write_trial_summary(
         ),
         "mean_total_raw_samples_drawn": (
             float(mean_total_raw_samples_drawn) if mean_total_raw_samples_drawn is not None else None
+        ),
+        "selection_objective_value": (
+            float(selection_objective_value) if selection_objective_value is not None else None
+        ),
+        "selection_efficiency_eligible": (
+            bool(selection_efficiency_eligible)
+            if selection_efficiency_eligible is not None
+            else None
+        ),
+        "selection_efficiency_notes": (
+            [str(note) for note in selection_efficiency_notes]
+            if selection_efficiency_notes is not None
+            else None
         ),
         "hyperparameters": dict(params),
     }
@@ -844,6 +994,9 @@ def run_optuna_study(
                 mean_success_hit_rate_discovery=None,
                 mean_class_match_acceptance_rate=None,
                 mean_total_raw_samples_drawn=None,
+                selection_objective_value=None,
+                selection_efficiency_eligible=None,
+                selection_efficiency_notes=None,
                 state="PRUNED",
             )
             raise
@@ -862,6 +1015,9 @@ def run_optuna_study(
                 mean_success_hit_rate_discovery=None,
                 mean_class_match_acceptance_rate=None,
                 mean_total_raw_samples_drawn=None,
+                selection_objective_value=None,
+                selection_efficiency_eligible=None,
+                selection_efficiency_notes=None,
                 state="FAIL",
             )
             if torch.cuda.is_available():
@@ -897,6 +1053,20 @@ def run_optuna_study(
             )
             objective_value = float("-inf")
         trial.report(objective_value, step=9_999_999)
+        mean_class_match_acceptance_rate = float(
+            metrics.get("mean_class_match_acceptance_rate", float("nan"))
+        )
+        mean_total_raw_samples_drawn = float(
+            metrics.get("mean_total_raw_samples_drawn", float("nan"))
+        )
+        selection_objective_value, selection_efficiency_eligible, selection_efficiency_notes = (
+            _compute_selection_objective_value(
+                objective_value=float(objective_value),
+                mean_class_match_acceptance_rate=mean_class_match_acceptance_rate,
+                mean_total_raw_samples_drawn=mean_total_raw_samples_drawn,
+                hpo_cfg=family_hpo_cfg,
+            )
+        )
         trial.set_user_attr("mean_chi_ok", float(eval_df["chi_ok"].astype(float).mean()) if not eval_df.empty else float("nan"))
         trial.set_user_attr(
             "mean_chi_band_ok",
@@ -914,12 +1084,15 @@ def run_optuna_study(
         trial.set_user_attr("mean_success_hit_rate_discovery", mean_success_hit_rate_discovery)
         trial.set_user_attr(
             "mean_class_match_acceptance_rate",
-            float(metrics.get("mean_class_match_acceptance_rate", float("nan"))),
+            mean_class_match_acceptance_rate,
         )
         trial.set_user_attr(
             "mean_total_raw_samples_drawn",
-            float(metrics.get("mean_total_raw_samples_drawn", float("nan"))),
+            mean_total_raw_samples_drawn,
         )
+        trial.set_user_attr("selection_objective_value", float(selection_objective_value))
+        trial.set_user_attr("selection_efficiency_eligible", bool(selection_efficiency_eligible))
+        trial.set_user_attr("selection_efficiency_notes", list(selection_efficiency_notes))
         trial.set_user_attr("wall_time_sec", float(wall_time))
         trial.set_user_attr("run_name", str(run_cfg["run_name"]))
         _write_trial_summary(
@@ -934,8 +1107,11 @@ def run_optuna_study(
             mean_property_success_hit_rate_discovery=mean_property_success_hit_rate_discovery,
             mean_success_hit_rate=mean_success_hit_rate,
             mean_success_hit_rate_discovery=mean_success_hit_rate_discovery,
-            mean_class_match_acceptance_rate=float(metrics.get("mean_class_match_acceptance_rate", float("nan"))),
-            mean_total_raw_samples_drawn=float(metrics.get("mean_total_raw_samples_drawn", float("nan"))),
+            mean_class_match_acceptance_rate=mean_class_match_acceptance_rate,
+            mean_total_raw_samples_drawn=mean_total_raw_samples_drawn,
+            selection_objective_value=float(selection_objective_value),
+            selection_efficiency_eligible=bool(selection_efficiency_eligible),
+            selection_efficiency_notes=list(selection_efficiency_notes),
             state="COMPLETE",
         )
         return objective_value
@@ -964,6 +1140,8 @@ def run_optuna_study(
             "mean_success_hit_rate_discovery": trial.user_attrs.get("mean_success_hit_rate_discovery"),
             "mean_class_match_acceptance_rate": trial.user_attrs.get("mean_class_match_acceptance_rate"),
             "mean_total_raw_samples_drawn": trial.user_attrs.get("mean_total_raw_samples_drawn"),
+            "selection_objective_value": trial.user_attrs.get("selection_objective_value"),
+            "selection_efficiency_eligible": trial.user_attrs.get("selection_efficiency_eligible"),
         }
         for trial in study.trials
     ]
@@ -1027,6 +1205,21 @@ def run_optuna_study(
                 if "mean_total_raw_samples_drawn" in trial.user_attrs
                 else None
             ),
+            "selection_objective_value": (
+                float(trial.user_attrs["selection_objective_value"])
+                if "selection_objective_value" in trial.user_attrs
+                else None
+            ),
+            "selection_efficiency_eligible": (
+                bool(trial.user_attrs["selection_efficiency_eligible"])
+                if "selection_efficiency_eligible" in trial.user_attrs
+                else None
+            ),
+            "selection_efficiency_notes": (
+                [str(note) for note in trial.user_attrs["selection_efficiency_notes"]]
+                if "selection_efficiency_notes" in trial.user_attrs
+                else None
+            ),
             "hyperparameters": dict(trial.params),
         }
         for trial in study.trials
@@ -1047,6 +1240,16 @@ def run_optuna_study(
                     "objective_metric": objective_metric_name,
                     "best_trial_number": int(best_trial.number),
                     "best_objective_value": float(best_trial.value),
+                    "best_selection_objective_value": float(
+                        best_trial.user_attrs.get("selection_objective_value", best_trial.value)
+                    ),
+                    "selection_efficiency_eligible": bool(
+                        best_trial.user_attrs.get("selection_efficiency_eligible", True)
+                    ),
+                    "selection_efficiency_notes": [
+                        str(note)
+                        for note in best_trial.user_attrs.get("selection_efficiency_notes", [])
+                    ],
                     "best_mean_property_success_hit_rate": float(
                         best_trial.user_attrs.get("mean_property_success_hit_rate_reporting", best_trial.value)
                     ),

@@ -249,6 +249,7 @@ step5:
       checkpoint_selection_mode: proxy_property_success_hit_rate
       checkpoint_selection_mode_by_class_overrides:
         polyether: proxy_property_success_hit_rate
+      proxy_eval_interval_epochs: 2
       num_epochs: 10
       synthetic_candidates_per_target: 16
 
@@ -429,6 +430,11 @@ step5_hpo:
         polyimide: 128
         polysulfone: 128
         polystyrene: 96
+      hpo_s4_dpo_checkpoint_selection_mode: val_dpo_loss
+      hpo_decode_class_match_max_request_size: 4096
+      hpo_decode_class_match_max_total_raw_samples: 32768
+      hpo_s4_dpo_cfg_scale_min: 1.0
+      efficiency_min_class_match_acceptance_rate: 0.01
   tie_epsilon: 1.0e-4
   method_budgets:
     S1: {n_trials: 50, timeout_hours_medium: 30}

@@ -64,6 +64,8 @@ class ResolvedClassSamplingPrior:
     class_match_sampling_attempts_max: int
     class_match_oversample_factor: float
     class_match_min_request_size: int
+    class_match_max_request_size: Optional[int]
+    class_match_max_total_raw_samples: Optional[int]
     allow_partial_quota_return: bool
     partial_quota_min_fill_ratio: float
     enforce_star_ok_acceptance: bool
@@ -657,6 +659,30 @@ def resolve_class_sampling_prior(
         default_value=int(step5_cfg.get("decode_constraint_class_match_min_request_size", 1)),
         cast=int,
     )
+    raw_class_match_max_request_size = step5_cfg.get("decode_constraint_class_match_max_request_size")
+    class_match_max_request_size_default = (
+        None
+        if raw_class_match_max_request_size in {None, "", "null"}
+        else int(raw_class_match_max_request_size)
+    )
+    class_match_max_request_size = _resolve_optional_class_int_override(
+        step5_cfg.get("decode_constraint_class_match_max_request_size_overrides", {}),
+        target_class=target_class,
+        default_value=class_match_max_request_size_default,
+    )
+    raw_class_match_max_total_raw_samples = step5_cfg.get(
+        "decode_constraint_class_match_max_total_raw_samples"
+    )
+    class_match_max_total_raw_samples_default = (
+        None
+        if raw_class_match_max_total_raw_samples in {None, "", "null"}
+        else int(raw_class_match_max_total_raw_samples)
+    )
+    class_match_max_total_raw_samples = _resolve_optional_class_int_override(
+        step5_cfg.get("decode_constraint_class_match_max_total_raw_samples_overrides", {}),
+        target_class=target_class,
+        default_value=class_match_max_total_raw_samples_default,
+    )
     allow_partial_quota_return = _resolve_class_override(
         step5_cfg.get("decode_constraint_allow_partial_quota_return_overrides", {}),
         target_class=target_class,
@@ -829,6 +855,16 @@ def resolve_class_sampling_prior(
         class_match_sampling_attempts_max=int(class_match_sampling_attempts_max),
         class_match_oversample_factor=float(class_match_oversample_factor),
         class_match_min_request_size=max(1, int(class_match_min_request_size)),
+        class_match_max_request_size=(
+            max(1, int(class_match_max_request_size))
+            if class_match_max_request_size is not None
+            else None
+        ),
+        class_match_max_total_raw_samples=(
+            max(1, int(class_match_max_total_raw_samples))
+            if class_match_max_total_raw_samples is not None
+            else None
+        ),
         allow_partial_quota_return=bool(allow_partial_quota_return),
         partial_quota_min_fill_ratio=float(partial_quota_min_fill_ratio),
         enforce_star_ok_acceptance=bool(enforce_star_ok_acceptance),
@@ -1232,6 +1268,16 @@ def _build_class_sampling_metadata(
             else None
         ),
         "class_match_min_request_size": int(prior.class_match_min_request_size),
+        "class_match_max_request_size": (
+            int(prior.class_match_max_request_size)
+            if prior.class_match_max_request_size is not None
+            else None
+        ),
+        "class_match_max_total_raw_samples": (
+            int(prior.class_match_max_total_raw_samples)
+            if prior.class_match_max_total_raw_samples is not None
+            else None
+        ),
         "allow_partial_quota_return": bool(prior.allow_partial_quota_return),
         "partial_quota_min_fill_ratio": float(prior.partial_quota_min_fill_ratio),
         "enforce_star_ok_acceptance": bool(prior.enforce_star_ok_acceptance),
@@ -1321,6 +1367,63 @@ def _quota_shortfall_is_tolerable(
     return int(accepted_count) >= max(1, min_accepted)
 
 
+def _handle_class_sampling_quota_shortfall(
+    *,
+    tokenizer: PSmilesTokenizer,
+    prior: ResolvedClassSamplingPrior,
+    num_samples: int,
+    accepted_smiles: List[str],
+    total_drawn: int,
+    accepted_raw_count: int,
+    attempts: int,
+    last_raw_meta: Dict[str, object],
+    attempt_log: List[Dict[str, object]],
+    last_raw_smiles: List[str],
+    last_raw_accepted_indices: List[int],
+    filter_rejection_counts: Dict[str, int],
+    total_wall_time_seconds: float,
+    total_raw_sampling_wall_time_seconds: float,
+    total_filter_wall_time_seconds: float,
+    exhaustion_reason: str,
+):
+    metadata = _build_class_sampling_metadata(
+        tokenizer=tokenizer,
+        prior=prior,
+        num_samples=int(num_samples),
+        returned_smiles=accepted_smiles,
+        accepted_smiles=accepted_smiles,
+        total_drawn=total_drawn,
+        accepted_raw_count=accepted_raw_count,
+        attempts=attempts,
+        last_raw_meta=last_raw_meta,
+        quota_satisfied=False,
+        attempt_log=attempt_log,
+        last_raw_smiles=last_raw_smiles,
+        last_raw_accepted_indices=last_raw_accepted_indices,
+        filter_rejection_counts=filter_rejection_counts,
+        total_wall_time_seconds=total_wall_time_seconds,
+        total_raw_sampling_wall_time_seconds=total_raw_sampling_wall_time_seconds,
+        total_filter_wall_time_seconds=total_filter_wall_time_seconds,
+    )
+    metadata["quota_exhaustion_reason"] = str(exhaustion_reason)
+    if _quota_shortfall_is_tolerable(
+        prior=prior,
+        accepted_count=len(accepted_smiles),
+        requested_count=int(num_samples),
+    ):
+        metadata["quota_shortfall_tolerated"] = True
+        metadata["quota_shortfall_count"] = max(0, int(num_samples) - int(len(accepted_smiles)))
+        return list(accepted_smiles), metadata
+    raise ClassConstrainedSamplingQuotaError(
+        target_class=prior.target_class,
+        accepted_smiles=accepted_smiles,
+        requested_num_samples=int(num_samples),
+        attempts_max=max(1, int(attempts)),
+        metadata=metadata,
+        last_raw_smiles=last_raw_smiles,
+    )
+
+
 def _resolve_class_match_request_size(
     *,
     prior: ResolvedClassSamplingPrior,
@@ -1337,6 +1440,7 @@ def _resolve_class_match_request_size(
     )
     target_accepts_this_attempt = int(remaining)
     smoothed_acceptance_rate = float("nan")
+    clipped_by_max_request_size = False
 
     if prior.enforce_class_match:
         base_request_size = max(
@@ -1367,12 +1471,28 @@ def _resolve_class_match_request_size(
             request_size = max(int(base_request_size), int(adaptive_request_size))
             request_strategy = "adaptive_acceptance_tail"
 
+    if prior.class_match_max_request_size is not None:
+        capped_request_size = min(int(request_size), int(prior.class_match_max_request_size))
+        clipped_by_max_request_size = int(capped_request_size) < int(request_size)
+        request_size = int(capped_request_size)
+
     return int(request_size), {
         "base_request_size": int(base_request_size),
         "request_strategy": str(request_strategy),
         "attempts_left_including_current": int(attempts_left_including_current),
         "target_accepts_this_attempt": int(target_accepts_this_attempt),
         "smoothed_acceptance_rate": float(smoothed_acceptance_rate),
+        "max_request_size": (
+            int(prior.class_match_max_request_size)
+            if prior.class_match_max_request_size is not None
+            else None
+        ),
+        "max_total_raw_samples": (
+            int(prior.class_match_max_total_raw_samples)
+            if prior.class_match_max_total_raw_samples is not None
+            else None
+        ),
+        "clipped_by_max_request_size": bool(clipped_by_max_request_size),
     }
 
 
@@ -1418,17 +1538,15 @@ def sample_with_class_prior(
         attempt_start_time = time.perf_counter()
         attempts += 1
         if attempts > int(prior.class_match_sampling_attempts_max):
-            metadata = _build_class_sampling_metadata(
+            return _handle_class_sampling_quota_shortfall(
                 tokenizer=tokenizer,
                 prior=prior,
                 num_samples=int(num_samples),
-                returned_smiles=accepted_smiles,
                 accepted_smiles=accepted_smiles,
                 total_drawn=total_drawn,
                 accepted_raw_count=accepted_raw_count,
                 attempts=int(prior.class_match_sampling_attempts_max),
                 last_raw_meta=last_raw_meta,
-                quota_satisfied=False,
                 attempt_log=attempt_log,
                 last_raw_smiles=last_raw_smiles,
                 last_raw_accepted_indices=last_raw_accepted_indices,
@@ -1436,24 +1554,34 @@ def sample_with_class_prior(
                 total_wall_time_seconds=(time.perf_counter() - sampling_start_time),
                 total_raw_sampling_wall_time_seconds=total_raw_sampling_wall_time_seconds,
                 total_filter_wall_time_seconds=total_filter_wall_time_seconds,
-            )
-            if _quota_shortfall_is_tolerable(
-                prior=prior,
-                accepted_count=len(accepted_smiles),
-                requested_count=int(num_samples),
-            ):
-                metadata["quota_shortfall_tolerated"] = True
-                metadata["quota_shortfall_count"] = max(0, int(num_samples) - int(len(accepted_smiles)))
-                return list(accepted_smiles), metadata
-            raise ClassConstrainedSamplingQuotaError(
-                target_class=prior.target_class,
-                accepted_smiles=accepted_smiles,
-                requested_num_samples=int(num_samples),
-                attempts_max=int(prior.class_match_sampling_attempts_max),
-                metadata=metadata,
-                last_raw_smiles=last_raw_smiles,
+                exhaustion_reason="attempts_max",
             )
         remaining = int(num_samples) - len(accepted_smiles)
+        remaining_raw_budget = None
+        if prior.class_match_max_total_raw_samples is not None:
+            remaining_raw_budget = max(
+                0,
+                int(prior.class_match_max_total_raw_samples) - int(total_drawn),
+            )
+            if remaining_raw_budget <= 0:
+                return _handle_class_sampling_quota_shortfall(
+                    tokenizer=tokenizer,
+                    prior=prior,
+                    num_samples=int(num_samples),
+                    accepted_smiles=accepted_smiles,
+                    total_drawn=total_drawn,
+                    accepted_raw_count=accepted_raw_count,
+                    attempts=max(0, int(attempts - 1)),
+                    last_raw_meta=last_raw_meta,
+                    attempt_log=attempt_log,
+                    last_raw_smiles=last_raw_smiles,
+                    last_raw_accepted_indices=last_raw_accepted_indices,
+                    filter_rejection_counts=filter_rejection_counts,
+                    total_wall_time_seconds=(time.perf_counter() - sampling_start_time),
+                    total_raw_sampling_wall_time_seconds=total_raw_sampling_wall_time_seconds,
+                    total_filter_wall_time_seconds=total_filter_wall_time_seconds,
+                    exhaustion_reason="max_total_raw_samples",
+                )
         request_size, request_debug = _resolve_class_match_request_size(
             prior=prior,
             remaining=int(remaining),
@@ -1461,6 +1589,30 @@ def sample_with_class_prior(
             total_drawn=int(total_drawn),
             accepted_raw_count=int(accepted_raw_count),
         )
+        clipped_by_remaining_raw_budget = False
+        if remaining_raw_budget is not None:
+            bounded_request_size = min(int(request_size), int(remaining_raw_budget))
+            clipped_by_remaining_raw_budget = int(bounded_request_size) < int(request_size)
+            request_size = int(bounded_request_size)
+        if request_size <= 0:
+            return _handle_class_sampling_quota_shortfall(
+                tokenizer=tokenizer,
+                prior=prior,
+                num_samples=int(num_samples),
+                accepted_smiles=accepted_smiles,
+                total_drawn=total_drawn,
+                accepted_raw_count=accepted_raw_count,
+                attempts=max(0, int(attempts - 1)),
+                last_raw_meta=last_raw_meta,
+                attempt_log=attempt_log,
+                last_raw_smiles=last_raw_smiles,
+                last_raw_accepted_indices=last_raw_accepted_indices,
+                filter_rejection_counts=filter_rejection_counts,
+                total_wall_time_seconds=(time.perf_counter() - sampling_start_time),
+                total_raw_sampling_wall_time_seconds=total_raw_sampling_wall_time_seconds,
+                total_filter_wall_time_seconds=total_filter_wall_time_seconds,
+                exhaustion_reason="max_total_raw_samples",
+            )
         retry_context_setter = getattr(sampler, "set_retry_sampling_context", None)
         if callable(retry_context_setter):
             retry_context_setter(
@@ -1523,6 +1675,15 @@ def sample_with_class_prior(
                 "attempts_left_including_current": int(request_debug["attempts_left_including_current"]),
                 "target_accepts_this_attempt": int(request_debug["target_accepts_this_attempt"]),
                 "smoothed_acceptance_rate": float(request_debug["smoothed_acceptance_rate"]),
+                "max_request_size": request_debug["max_request_size"],
+                "max_total_raw_samples": request_debug["max_total_raw_samples"],
+                "remaining_raw_budget_before_attempt": (
+                    int(remaining_raw_budget) if remaining_raw_budget is not None else None
+                ),
+                "request_size_clipped_by_max_request_size": bool(
+                    request_debug["clipped_by_max_request_size"]
+                ),
+                "request_size_clipped_by_raw_budget": bool(clipped_by_remaining_raw_budget),
                 "raw_draw_count": int(len(raw_smiles)),
                 "target_class_candidates_in_attempt": int(attempt_filter_stats.get("target_class_candidate_count", 0)),
                 "accepted_in_attempt": int(len(accepted_batch)),

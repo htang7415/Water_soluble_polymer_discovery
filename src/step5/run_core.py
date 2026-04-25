@@ -995,6 +995,37 @@ def execute_step5_run(
 
     generated_samples_df = pd.concat(generated_frames, ignore_index=True) if generated_frames else pd.DataFrame()
     evaluation_results_df = pd.concat(evaluation_frames, ignore_index=True) if evaluation_frames else pd.DataFrame()
+    if "success_hit" in evaluation_results_df.columns:
+        success_hit_mask = evaluation_results_df["success_hit"].astype(int) == 1
+        success_hit_polymers_df = evaluation_results_df.loc[success_hit_mask].copy()
+    else:
+        success_hit_polymers_df = evaluation_results_df.iloc[0:0].copy()
+    success_hit_column_renames = {
+        "chi_pred_target": "predicted_chi",
+        "chi_pred_std_target": "predicted_chi_std",
+        "class_prob": "predicted_water_soluble_probability",
+        "class_prob_std": "predicted_water_soluble_probability_std",
+        "class_logit": "predicted_water_soluble_logit",
+        "soluble_ok": "predicted_water_soluble_label",
+        "chi_ok": "predicted_chi_ok",
+        "class_ok": "predicted_class_match_label",
+        "property_success_hit": "property_success_hit_label",
+        "property_success_hit_discovery": "property_success_hit_discovery_label",
+        "success_hit": "success_hit_label",
+    }
+    applicable_success_hit_renames = {
+        source_col: renamed_col
+        for source_col, renamed_col in success_hit_column_renames.items()
+        if source_col in success_hit_polymers_df.columns and renamed_col not in success_hit_polymers_df.columns
+    }
+    if applicable_success_hit_renames:
+        success_hit_polymers_df = success_hit_polymers_df.rename(
+            columns=applicable_success_hit_renames
+        )
+    success_hit_polymers_df = success_hit_polymers_df.drop(
+        columns=["success_hit_discovery"],
+        errors="ignore",
+    )
     target_row_metrics_df = aggregate_target_row_metrics(evaluation_results_df)
     target_row_summary_df = summarize_target_rows(target_row_metrics_df)
     round_metrics_df = aggregate_round_metrics(evaluation_results_df, target_row_metrics_df)
@@ -1058,6 +1089,7 @@ def execute_step5_run(
 
     _write_frame(generated_samples_df, run_dirs["metrics_dir"] / "generated_samples.csv")
     _write_frame(evaluation_results_df, run_dirs["metrics_dir"] / "evaluation_results.csv")
+    _write_frame(success_hit_polymers_df, run_dirs["metrics_dir"] / "success_hit_polymers.csv")
     _write_frame(round_metrics_df, run_dirs["metrics_dir"] / "round_metrics.csv")
     _write_frame(target_row_metrics_df, run_dirs["metrics_dir"] / "target_row_metrics.csv")
     _write_frame(target_row_summary_df, run_dirs["metrics_dir"] / "target_row_summary.csv")
