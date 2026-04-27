@@ -437,10 +437,10 @@ step5_hpo:
       efficiency_min_class_match_acceptance_rate: 0.01
   tie_epsilon: 1.0e-4
   method_budgets:
-    S1: {n_trials: 50, timeout_hours_medium: 30}
-    S2: {n_trials: 50, timeout_hours_medium: 30}
-    S3: {n_trials: 50, timeout_hours_medium: 30}
-    S4_rl: {n_trials: 50, timeout_hours_medium: 30}
-    S4_ppo: {n_trials: 50, timeout_hours_medium: 30}
-    S4_grpo: {n_trials: 50, timeout_hours_medium: 30}
-    S4_dpo: {n_trials: 50, timeout_hours_medium: 30}
+    S1: {n_trials: 50, timeout_hours_medium: 24}
+    S2: {n_trials: 50, timeout_hours_medium: 24}
+    S3: {n_trials: 50, timeout_hours_medium: 24}
+    S4_rl: {n_trials: 50, timeout_hours_medium: 24}
+    S4_ppo: {n_trials: 50, timeout_hours_medium: 24}
+    S4_grpo: {n_trials: 50, timeout_hours_medium: 24}
+    S4_dpo: {n_trials: 50, timeout_hours_medium: 24}
