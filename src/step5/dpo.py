@@ -682,6 +682,76 @@ def _stable_val_mask(df: pd.DataFrame, *, val_fraction: float) -> pd.Series:
     return marks
 
 
+def _unique_ratio(unique_count: int, total_count: int) -> float:
+    if int(total_count) <= 0:
+        return 0.0
+    return float(unique_count) / float(total_count)
+
+
+def _pair_source_bucket_counts(df: pd.DataFrame, *, prefix: str) -> pd.DataFrame:
+    columns = [
+        "source_name",
+        "bucket_key",
+        f"{prefix}_pair_count",
+        f"{prefix}_chosen_unique_count",
+        f"{prefix}_rejected_unique_count",
+        f"{prefix}_chosen_unique_ratio",
+        f"{prefix}_rejected_unique_ratio",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    grouped = (
+        df.groupby(["source_name", "bucket_key"], as_index=False)
+        .agg(
+            **{
+                f"{prefix}_pair_count": ("pair_key", "nunique"),
+                f"{prefix}_chosen_unique_count": ("chosen_canonical_smiles", "nunique"),
+                f"{prefix}_rejected_unique_count": ("rejected_canonical_smiles", "nunique"),
+            }
+        )
+        .sort_values(["source_name", "bucket_key"])
+        .reset_index(drop=True)
+    )
+    grouped[f"{prefix}_chosen_unique_ratio"] = [
+        _unique_ratio(unique_count, total_count)
+        for unique_count, total_count in zip(
+            grouped[f"{prefix}_chosen_unique_count"],
+            grouped[f"{prefix}_pair_count"],
+        )
+    ]
+    grouped[f"{prefix}_rejected_unique_ratio"] = [
+        _unique_ratio(unique_count, total_count)
+        for unique_count, total_count in zip(
+            grouped[f"{prefix}_rejected_unique_count"],
+            grouped[f"{prefix}_pair_count"],
+        )
+    ]
+    return grouped[columns]
+
+
+def _build_dpo_pair_source_bucket_diagnostics(
+    *,
+    available_pairs: pd.DataFrame,
+    selected_pairs: pd.DataFrame,
+    train_pairs: pd.DataFrame,
+    val_pairs: pd.DataFrame,
+) -> pd.DataFrame:
+    diagnostics = _pair_source_bucket_counts(available_pairs, prefix="raw")
+    for frame in (
+        _pair_source_bucket_counts(selected_pairs, prefix="selected"),
+        _pair_source_bucket_counts(train_pairs, prefix="train"),
+        _pair_source_bucket_counts(val_pairs, prefix="val"),
+    ):
+        diagnostics = diagnostics.merge(frame, on=["source_name", "bucket_key"], how="outer")
+    if diagnostics.empty:
+        return diagnostics
+    count_cols = [col for col in diagnostics.columns if col.endswith("_count")]
+    ratio_cols = [col for col in diagnostics.columns if col.endswith("_ratio")]
+    diagnostics[count_cols] = diagnostics[count_cols].fillna(0).astype(int)
+    diagnostics[ratio_cols] = diagnostics[ratio_cols].fillna(0.0).astype(float)
+    return diagnostics.sort_values(["source_name", "bucket_key"]).reset_index(drop=True)
+
+
 def build_dpo_pair_splits(
     *,
     resolved: ResolvedStep5Config,
@@ -703,6 +773,7 @@ def build_dpo_pair_splits(
     d_water_star_stats = {"input_rows": 0, "star_ok_rows": 0}
     d_chi_star_stats = {"input_rows": 0, "star_ok_rows": 0}
     offline_pair_budget = int(dpo_cfg["offline_pair_budget"])
+    available_pair_parts: List[pd.DataFrame] = []
     if pair_source in {"target_row_synthetic", "chi_aware_plus_target_row_synthetic"}:
         if warm_start is None or prior is None or evaluator is None or not device:
             raise ValueError(
@@ -718,6 +789,8 @@ def build_dpo_pair_splits(
             metrics_dir=metrics_dir,
             target_rows_df=target_rows_df,
         )
+        if not synthetic_pairs.empty:
+            available_pair_parts.append(synthetic_pairs)
         selected_synthetic_pairs = _take_budgeted_single_source_pairs(
             pair_df=synthetic_pairs,
             offline_pair_budget=(
@@ -736,12 +809,16 @@ def build_dpo_pair_splits(
                 max_pairs=max(0, offline_pair_budget - int(len(selected_synthetic_pairs))),
                 random_seed=int(resolved.step5["random_seed"]),
             )
+            if not d_water_pairs.empty:
+                available_pair_parts.append(d_water_pairs)
             d_chi_pairs, chi_prompt_gap_df, d_chi_star_stats = _build_d_chi_pairs(
                 frames["train_d_chi"],
                 scaler=scaler,
                 chi_lookup=resolved.chi_lookup,
                 pair_source="chi_aware_label_bucketed",
             )
+            if not d_chi_pairs.empty:
+                available_pair_parts.append(d_chi_pairs)
             selected_static_pairs = _take_budgeted_pairs(
                 d_water_pairs=d_water_pairs,
                 d_chi_pairs=d_chi_pairs,
@@ -761,6 +838,8 @@ def build_dpo_pair_splits(
             max_pairs=offline_pair_budget,
             random_seed=int(resolved.step5["random_seed"]),
         )
+        if not d_water_pairs.empty:
+            available_pair_parts.append(d_water_pairs)
         d_chi_pair_source = pair_source if pair_source == "chi_aware_label_bucketed" else "label_water_miscibility"
         d_chi_pairs, chi_prompt_gap_df, d_chi_star_stats = _build_d_chi_pairs(
             frames["train_d_chi"],
@@ -768,6 +847,8 @@ def build_dpo_pair_splits(
             chi_lookup=resolved.chi_lookup,
             pair_source=d_chi_pair_source,
         )
+        if not d_chi_pairs.empty:
+            available_pair_parts.append(d_chi_pairs)
         selected_pairs = _take_budgeted_pairs(
             d_water_pairs=d_water_pairs,
             d_chi_pairs=d_chi_pairs,
@@ -782,6 +863,11 @@ def build_dpo_pair_splits(
     val_mask = _stable_val_mask(selected_pairs, val_fraction=float(dpo_cfg["val_pair_fraction"]))
     train_pairs = selected_pairs.loc[~val_mask].reset_index(drop=True)
     val_pairs = selected_pairs.loc[val_mask].reset_index(drop=True)
+    available_pairs = (
+        pd.concat(available_pair_parts, ignore_index=True, sort=False)
+        if available_pair_parts
+        else selected_pairs.iloc[:0].copy()
+    )
 
     pair_summary = (
         selected_pairs.groupby(["source_name", "bucket_key"], as_index=False)
@@ -796,24 +882,46 @@ def build_dpo_pair_splits(
     pair_summary["val_pair_count"] = pair_summary["bucket_key"].map(
         val_pairs.groupby("bucket_key").size().to_dict()
     ).fillna(0).astype(int)
+    pair_source_bucket_diagnostics = _build_dpo_pair_source_bucket_diagnostics(
+        available_pairs=available_pairs,
+        selected_pairs=selected_pairs,
+        train_pairs=train_pairs,
+        val_pairs=val_pairs,
+    )
 
     selected_pairs.to_csv(metrics_dir / "dpo_pairs_selected.csv", index=False)
     train_pairs.to_csv(metrics_dir / "dpo_pairs_train.csv", index=False)
     val_pairs.to_csv(metrics_dir / "dpo_pairs_val.csv", index=False)
     pair_summary.to_csv(metrics_dir / "dpo_pair_counts_by_source_bucket.csv", index=False)
+    pair_source_bucket_diagnostics.to_csv(
+        metrics_dir / "dpo_pair_source_bucket_diagnostics.csv",
+        index=False,
+    )
     if not chi_prompt_gap_df.empty:
         chi_prompt_gap_df.to_csv(metrics_dir / "dpo_prompt_gap_d_chi_rows.csv", index=False)
     if not candidate_df.empty:
         candidate_df.to_csv(metrics_dir / "dpo_synthetic_candidates_selected.csv", index=False)
 
     realized_total = int(len(selected_pairs))
+    raw_total_pairs = int(available_pairs["pair_key"].nunique()) if not available_pairs.empty else 0
+    selected_chosen_unique_count = (
+        int(selected_pairs["chosen_canonical_smiles"].nunique()) if not selected_pairs.empty else 0
+    )
+    selected_rejected_unique_count = (
+        int(selected_pairs["rejected_canonical_smiles"].nunique()) if not selected_pairs.empty else 0
+    )
     diagnostics = {
         "pair_source": pair_source,
         "offline_pair_budget": offline_pair_budget,
+        "raw_total_pairs": raw_total_pairs,
         "d_water_budget_fraction": float(dpo_cfg.get("d_water_budget_fraction", 0.5)),
         "realized_total_pairs": realized_total,
         "realized_train_pairs": int(len(train_pairs)),
         "realized_val_pairs": int(len(val_pairs)),
+        "selected_chosen_unique_count": selected_chosen_unique_count,
+        "selected_rejected_unique_count": selected_rejected_unique_count,
+        "selected_chosen_unique_ratio": _unique_ratio(selected_chosen_unique_count, realized_total),
+        "selected_rejected_unique_ratio": _unique_ratio(selected_rejected_unique_count, realized_total),
         "shortfall_pairs": max(0, offline_pair_budget - realized_total),
         "thin_signal_warning": bool(realized_total < 500),
         "realized_d_water_pairs": int((selected_pairs["source_name"] == "d_water").sum()),
@@ -838,6 +946,17 @@ def build_dpo_pair_splits(
             "Step 5 DPO thin alignment signal: realized_total_pairs=%s (< 500).",
             realized_total,
         )
+    append_log_message(
+        metrics_dir.parent,
+        (
+            "DPO pair diagnostics | "
+            f"pair_source={pair_source} raw_pairs={raw_total_pairs} "
+            f"selected_pairs={realized_total} buckets={int(len(pair_source_bucket_diagnostics))} "
+            f"selected_chosen_unique_ratio={diagnostics['selected_chosen_unique_ratio']:.4f} "
+            f"selected_rejected_unique_ratio={diagnostics['selected_rejected_unique_ratio']:.4f}"
+        ),
+        echo=True,
+    )
     with open(metrics_dir / "dpo_pair_construction_summary.json", "w", encoding="utf-8") as handle:
         json.dump(diagnostics, handle, indent=2)
 

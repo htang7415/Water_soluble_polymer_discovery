@@ -349,7 +349,7 @@ step5_hpo:
   hpo_sampling_batch_size: 64
   hpo_decode_class_match_sampling_attempts_max: 48
   hpo_decode_class_match_oversample_factor: 4.0
-  hpo_decode_partial_quota_min_fill_ratio: 0.85
+  hpo_decode_partial_quota_min_fill_ratio: 0.60
   hpo_s4_trajectories_per_batch: 32
   hpo_s4_rl_diffusion_num_steps: 16
   hpo_s4_replay_batch_size: 16
@@ -389,7 +389,7 @@ step5_hpo:
         polyether: 96
         polyamide: 96
         polyester: 96
-        polyimide: 128
+        polyimide: 64
         polysulfone: 128
         polystyrene: 96
     S4_ppo:
@@ -403,7 +403,7 @@ step5_hpo:
         polyether: 96
         polyamide: 96
         polyester: 96
-        polyimide: 128
+        polyimide: 64
         polysulfone: 128
         polystyrene: 96
     S4_grpo:
@@ -417,7 +417,7 @@ step5_hpo:
         polyether: 96
         polyamide: 96
         polyester: 96
-        polyimide: 128
+        polyimide: 64
         polysulfone: 128
         polystyrene: 96
     S4_dpo:
@@ -427,7 +427,7 @@ step5_hpo:
         polyether: 96
         polyamide: 96
         polyester: 96
-        polyimide: 128
+        polyimide: 64
         polysulfone: 128
         polystyrene: 96
       hpo_s4_dpo_checkpoint_selection_mode: val_dpo_loss

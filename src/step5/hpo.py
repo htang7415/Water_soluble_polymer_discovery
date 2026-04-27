@@ -646,7 +646,7 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         )
         params["pair_source"] = trial.suggest_categorical(
             "pair_source",
-            ["chi_aware_label_bucketed", "chi_aware_plus_target_row_synthetic", "target_row_synthetic"],
+            ["chi_aware_plus_target_row_synthetic", "target_row_synthetic"],
         )
         pair_source = str(params["pair_source"]).strip().lower()
         if pair_source in {"target_row_synthetic", "chi_aware_plus_target_row_synthetic"}:
