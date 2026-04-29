@@ -34,7 +34,8 @@ def _require_optuna():
 
 
 def _hpo_root(resolved) -> Path:
-    return resolved.results_dir / "step5_hpo" / resolved.split_mode / resolved.c_target
+    root_dirname = str(resolved.step5_hpo.get("root_dirname", "step5_hpo")).strip() or "step5_hpo"
+    return resolved.results_dir / root_dirname / resolved.split_mode / resolved.c_target
 
 
 def _study_root(resolved, *, study_family: str) -> Path:
@@ -284,29 +285,22 @@ def _apply_hpo_runtime_overrides(
 
     if hpo_class_match_attempts_max > 0:
         step5_decode_cfg["decode_constraint_class_match_sampling_attempts_max"] = int(
-            max(int(step5_decode_cfg.get("decode_constraint_class_match_sampling_attempts_max", 1)), hpo_class_match_attempts_max)
+            hpo_class_match_attempts_max
         )
         attempts_overrides = dict(
             step5_decode_cfg.get("decode_constraint_class_match_sampling_attempts_max_overrides", {}) or {}
         )
-        attempts_overrides[target_class] = int(
-            max(int(attempts_overrides.get(target_class, 1)), hpo_class_match_attempts_max)
-        )
+        attempts_overrides[target_class] = int(hpo_class_match_attempts_max)
         step5_decode_cfg["decode_constraint_class_match_sampling_attempts_max_overrides"] = attempts_overrides
 
     if hpo_class_match_oversample_factor > 0.0:
         step5_decode_cfg["decode_constraint_class_match_oversample_factor"] = float(
-            max(
-                float(step5_decode_cfg.get("decode_constraint_class_match_oversample_factor", 1.0)),
-                hpo_class_match_oversample_factor,
-            )
+            hpo_class_match_oversample_factor
         )
         oversample_overrides = dict(
             step5_decode_cfg.get("decode_constraint_class_match_oversample_factor_overrides", {}) or {}
         )
-        oversample_overrides[target_class] = float(
-            max(float(oversample_overrides.get(target_class, 1.0)), hpo_class_match_oversample_factor)
-        )
+        oversample_overrides[target_class] = float(hpo_class_match_oversample_factor)
         step5_decode_cfg["decode_constraint_class_match_oversample_factor_overrides"] = oversample_overrides
 
     if hpo_class_match_max_request_size is not None:
@@ -503,6 +497,41 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
     return resolved_trial, run_cfg
 
 
+def _hpo_choice_list(hpo_cfg: Dict[str, Any], key: str, default: list[Any]) -> list[Any]:
+    raw_value = hpo_cfg.get(key, None)
+    if raw_value is None or raw_value == "" or raw_value == "null":
+        return list(default)
+    choices = list(raw_value) if isinstance(raw_value, (list, tuple)) else [raw_value]
+    if not choices:
+        raise ValueError(f"step5_hpo.{key} must contain at least one choice when set.")
+    return choices
+
+
+def _grpo_group_size_choices(
+    *,
+    resolved,
+    study_family: str,
+    run_cfg: Dict[str, object],
+) -> list[int]:
+    hpo_cfg = _resolve_hpo_runtime_config(resolved, study_family=study_family)
+    s4_cfg = dict(run_cfg.get("s4", {}) or {})
+    trajectories_per_batch = int(
+        hpo_cfg.get(
+            "hpo_s4_trajectories_per_batch",
+            s4_cfg.get("trajectories_per_batch", 8),
+        )
+        or 8
+    )
+    default_choices = [4, 8, 16]
+    choices = [
+        int(choice)
+        for choice in default_choices
+        if int(choice) <= int(trajectories_per_batch)
+        and int(trajectories_per_batch) % int(choice) == 0
+    ]
+    return choices if choices else [max(1, int(trajectories_per_batch))]
+
+
 def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[str, object]) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
 
@@ -627,14 +656,26 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         )
         params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2])
         params["ppo_clip_eps"] = trial.suggest_float("ppo_clip_eps", 0.10, 0.30)
-        params["grpo_group_size"] = trial.suggest_categorical("grpo_group_size", [4, 8, 16])
+        params["grpo_group_size"] = trial.suggest_categorical(
+            "grpo_group_size",
+            _grpo_group_size_choices(resolved=resolved, study_family=study_family, run_cfg=run_cfg),
+        )
     elif study_family == "S4_dpo":
-        params["offline_pair_budget"] = trial.suggest_categorical("offline_pair_budget", [5000, 10000])
+        dpo_hpo_cfg = _resolve_hpo_runtime_config(resolved, study_family=study_family)
+        params["offline_pair_budget"] = trial.suggest_categorical(
+            "offline_pair_budget",
+            _hpo_choice_list(dpo_hpo_cfg, "hpo_s4_dpo_offline_pair_budget_choices", [5000, 10000]),
+        )
         params["beta"] = trial.suggest_float("beta", 0.01, 0.2, log=True)
         params["learning_rate"] = trial.suggest_float("learning_rate", 1.0e-5, 1.0e-4, log=True)
-        params["batch_size"] = trial.suggest_categorical("batch_size", [32, 64])
-        params["num_epochs"] = trial.suggest_categorical("num_epochs", [4, 6])
-        dpo_hpo_cfg = _resolve_hpo_runtime_config(resolved, study_family=study_family)
+        params["batch_size"] = trial.suggest_categorical(
+            "batch_size",
+            _hpo_choice_list(dpo_hpo_cfg, "hpo_s4_dpo_batch_size_choices", [32, 64]),
+        )
+        params["num_epochs"] = trial.suggest_categorical(
+            "num_epochs",
+            _hpo_choice_list(dpo_hpo_cfg, "hpo_s4_dpo_num_epochs_choices", [4, 6]),
+        )
         dpo_cfg_scale_min = float(dpo_hpo_cfg.get("hpo_s4_dpo_cfg_scale_min", 0.5) or 0.5)
         if dpo_cfg_scale_min >= 2.0:
             raise ValueError(
@@ -642,16 +683,22 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
             )
         params["cfg_scale"] = trial.suggest_float("cfg_scale", dpo_cfg_scale_min, 2.0)
         params["d_water_budget_fraction"] = trial.suggest_categorical(
-            "d_water_budget_fraction", [0.2, 0.3, 0.5]
+            "d_water_budget_fraction",
+            _hpo_choice_list(dpo_hpo_cfg, "hpo_s4_dpo_d_water_budget_fraction_choices", [0.2, 0.3, 0.5]),
         )
         params["pair_source"] = trial.suggest_categorical(
             "pair_source",
-            ["chi_aware_plus_target_row_synthetic", "target_row_synthetic"],
+            _hpo_choice_list(
+                dpo_hpo_cfg,
+                "hpo_s4_dpo_pair_source_choices",
+                ["chi_aware_plus_target_row_synthetic", "target_row_synthetic"],
+            ),
         )
         pair_source = str(params["pair_source"]).strip().lower()
         if pair_source in {"target_row_synthetic", "chi_aware_plus_target_row_synthetic"}:
             params["synthetic_candidates_per_target"] = trial.suggest_categorical(
-                "synthetic_candidates_per_target", [8, 16]
+                "synthetic_candidates_per_target",
+                _hpo_choice_list(dpo_hpo_cfg, "hpo_s4_dpo_synthetic_candidates_per_target_choices", [8, 16]),
             )
     else:
         raise ValueError(f"Unsupported Step 5 HPO study family: {study_family}")
@@ -1121,7 +1168,7 @@ def run_optuna_study(
             objective,
             n_trials=remaining_trials,
             timeout=timeout_seconds,
-            catch=(RuntimeError,),
+            catch=(RuntimeError, ValueError),
         )
     try:
         best_trial = _select_best_completed_trial(study, tie_epsilon=tie_epsilon)

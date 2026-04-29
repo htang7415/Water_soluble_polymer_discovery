@@ -2,44 +2,30 @@ step5:
   split_mode: polymer
   classification_split_mode: polymer
   random_seed: 42
-  num_sampling_rounds: 5
-  sampling_seeds: [42, 43, 44, 45, 46]
+  num_sampling_rounds: 1
+  sampling_seeds: [42]
   canonical_families: [S0, S1, S2, S3, S4]
   enabled_runs:
     - S0_raw_unconditional
     - S1_guided_frozen
     - S2_conditional
-    - S2_cfg_2p0
     - S3_conditional_guided
-    - S3_cfg_2p0
     - S4_rl_finetuned
+    - S4_dpo
     - S4_ppo
     - S4_grpo
-    - S4_dpo
-  enabled_runs_by_class_overrides:
-    polyamide:
-      - S0_raw_unconditional
-      - S1_guided_frozen
-      - S2_conditional
-      - S3_conditional_guided
-      - S3_cfg_2p0
-      - S4_rl_finetuned
-      - S4_ppo
-      - S4_grpo
-      - S4_dpo
-  generation_budget: 512
+  generation_budget: 4
   generation_budget_by_class:
-    polyacrylate: 1024
-    polyether: 1024
-    polyamide: 1024
-    polyester: 1024
-    polyimide: 1024
-    polysulfone: 1024
-    polystyrene: 1024
+    polyacrylate: 4
+    polyether: 6
+    polyamide: 6
+    polyester: 8
+    polyimide: 4
+    polysulfone: 8
+    polystyrene: 6
   sampling_temperature: 1.0
-  inference_batch_size: 128
+  inference_batch_size: 32
   raw_generation_valid_only: false
-  fail_on_split_leakage: true
   class_decode_prior_mode: "on"
   class_token_bias_start_frac: 0.5
   class_token_bias_start_frac_by_class_overrides:
@@ -84,7 +70,7 @@ step5:
   c_target: polyimide
 
   s1:
-    best_of_k: 4
+    best_of_k: 2
     guidance_start_frac: 0.5
     sol_log_prob_floor: -5.0
     w_sol: 1.0
@@ -99,13 +85,13 @@ step5:
     optimizer: adamw
     learning_rate: 3.0e-4
     weight_decay: 0.01
-    batch_size: 128
-    warmup_steps: 1000
+    batch_size: 32
+    warmup_steps: 10
     warmup_schedule: linear
     lr_schedule: constant_after_warmup
-    max_steps: 50000
-    val_check_interval_steps: 500
-    early_stopping_patience_checks: 10
+    max_steps: 100
+    val_check_interval_steps: 10
+    early_stopping_patience_checks: 2
     early_stopping_min_delta: 1.0e-4
     max_grad_norm: 1.0
     condition_dropout_rate: 0.1
@@ -126,7 +112,7 @@ step5:
 
   s3:
     supervised_train_config_source: s2
-    best_of_k: 4
+    best_of_k: 2
     guidance_start_frac: 0.5
     guidance_start_frac_by_class_overrides:
       polyamide: 0.5
@@ -216,19 +202,22 @@ step5:
     lr_schedule: constant_after_warmup
     kl_weight: 0.01
     gradient_checkpointing: true
-    rl_num_steps: 5000
+    rl_num_steps: 10
     policy_update_epochs: 1
     normalize_advantages: false
     ppo_clip_eps: 0.2
     grpo_group_size: 8
     grpo_advantage_epsilon: 1.0e-6
-    rl_proxy_eval_interval_steps: 1000
-    rl_proxy_num_targets: 5
-    rl_proxy_generation_budget: 64
-    trajectories_per_batch: 64
-    replay_batch_size: 16
+    rl_proxy_eval_interval_steps: 5
+    rl_proxy_num_targets: 2
+    rl_proxy_num_targets_by_class_overrides:
+      polyimide: 1
+    rl_proxy_generation_budget: 4
+    rl_proxy_generation_budget_by_class_overrides:
+      polyimide: 4
+    trajectories_per_batch: 8
     dpo:
-      offline_pair_budget: 10000
+      offline_pair_budget: 64
       offline_pair_budget_by_class_overrides:
         polyether: 256
       d_water_budget_fraction: 0.2
@@ -237,7 +226,7 @@ step5:
       val_pair_fraction: 0.2
       beta: 0.02
       optimizer: adamw
-      batch_size: 64
+      batch_size: 16
       learning_rate: 3.0e-5
       weight_decay: 0.01
       warmup_steps: 0
@@ -250,8 +239,8 @@ step5:
       checkpoint_selection_mode_by_class_overrides:
         polyether: proxy_property_success_hit_rate
       proxy_eval_interval_epochs: 2
-      num_epochs: 10
-      synthetic_candidates_per_target: 16
+      num_epochs: 2
+      synthetic_candidates_per_target: 4
 
   run_overrides:
     S3_conditional_guided:
@@ -325,130 +314,73 @@ step5:
         grpo_group_size: 8
 
 step5_1:
-  compare_all_enabled_runs: true
+  compare_all_enabled_runs: false
   summarize_by_canonical_family: true
-  compare_metric: full_discovery_success_hit_rate
+  compare_metric: property_discovery_success_hit_rate
 
 step5_hpo:
   enabled: true
   objective_metric: mean_success_hit_rate_discovery
   sampler: tpe
   sampler_seed: 42
-  n_startup_trials: 8
-  pruner: hyperband
-  pruner_min_resource: 1
-  pruner_max_resource: auto
-  pruner_reduction_factor: 2
-  storage_uri: sqlite:///results_<model_size>/step5_hpo/<split_mode>/<c_target>/<study_family>/optuna.db
+  n_startup_trials: 1
+  pruner: median
+  root_dirname: step5_hpo_quick
   reuse_shared_s4_warm_start: true
   skip_disk_checkpoints: true
-  hpo_s2_max_steps: 8000
-  hpo_s2_val_checks: 3
-  hpo_rl_num_steps: 32
+  hpo_s2_max_steps: 40
+  hpo_s2_val_checks: 2
+  hpo_rl_num_steps: 3
   hpo_rl_proxy_eval_checks: 1
-  hpo_sampling_batch_size: 64
-  hpo_decode_class_match_sampling_attempts_max: 12
-  hpo_decode_class_match_oversample_factor: 2.0
-  hpo_decode_class_match_max_request_size: 512
-  hpo_decode_class_match_max_total_raw_samples: 2048
-  hpo_decode_partial_quota_min_fill_ratio: 0.40
-  hpo_s4_trajectories_per_batch: 8
-  hpo_s4_rl_diffusion_num_steps: 8
-  hpo_s4_replay_batch_size: 8
-  hpo_num_targets: 2
-  hpo_generation_budget: 32
+  hpo_sampling_batch_size: 16
+  hpo_decode_class_match_sampling_attempts_max: 4
+  hpo_decode_class_match_oversample_factor: 1.25
+  hpo_decode_class_match_max_request_size: 16
+  hpo_decode_class_match_max_total_raw_samples: 96
+  hpo_num_targets: 1
+  hpo_generation_budget: 4
+  hpo_decode_partial_quota_min_fill_ratio: 0.25
   hpo_generation_budget_by_class:
-    polyacrylate: 32
-    polyether: 48
-    polyamide: 48
-    polyester: 48
-    polyimide: 32
-    polysulfone: 48
-    polystyrene: 48
+    polyacrylate: 4
+    polyether: 6
+    polyamide: 6
+    polyester: 6
+    polyimide: 4
+    polysulfone: 8
+    polystyrene: 6
   hpo_num_rounds: 1
   hpo_sampling_seeds: [101]
-  method_runtime_overrides:
-    S3:
-      hpo_s2_max_steps: 6000
-      hpo_s2_val_checks: 3
-      hpo_generation_budget: 32
-      hpo_generation_budget_by_class:
-        polyacrylate: 32
-        polyether: 48
-        polyamide: 48
-        polyester: 48
-        polyimide: 32
-        polysulfone: 48
-        polystyrene: 48
-    S4_rl:
-      hpo_rl_num_steps: 32
-      hpo_rl_proxy_eval_checks: 1
-      hpo_s4_trajectories_per_batch: 8
-      hpo_s4_replay_batch_size: 8
-      hpo_generation_budget: 32
-      hpo_generation_budget_by_class:
-        polyacrylate: 32
-        polyether: 48
-        polyamide: 48
-        polyester: 48
-        polyimide: 32
-        polysulfone: 48
-        polystyrene: 48
-    S4_ppo:
-      hpo_rl_num_steps: 32
-      hpo_rl_proxy_eval_checks: 1
-      hpo_s4_trajectories_per_batch: 8
-      hpo_s4_replay_batch_size: 8
-      hpo_generation_budget: 32
-      hpo_generation_budget_by_class:
-        polyacrylate: 32
-        polyether: 48
-        polyamide: 48
-        polyester: 48
-        polyimide: 32
-        polysulfone: 48
-        polystyrene: 48
-    S4_grpo:
-      hpo_rl_num_steps: 32
-      hpo_rl_proxy_eval_checks: 1
-      hpo_s4_trajectories_per_batch: 8
-      hpo_s4_replay_batch_size: 8
-      hpo_generation_budget: 32
-      hpo_generation_budget_by_class:
-        polyacrylate: 32
-        polyether: 48
-        polyamide: 48
-        polyester: 48
-        polyimide: 32
-        polysulfone: 48
-        polystyrene: 48
-    S4_dpo:
-      hpo_generation_budget: 32
-      hpo_generation_budget_by_class:
-        polyacrylate: 32
-        polyether: 48
-        polyamide: 48
-        polyester: 48
-        polyimide: 32
-        polysulfone: 48
-        polystyrene: 48
-      hpo_s4_dpo_checkpoint_selection_mode: val_dpo_loss
-      hpo_decode_class_match_max_request_size: 512
-      hpo_decode_class_match_max_total_raw_samples: 2048
-      hpo_s4_dpo_cfg_scale_min: 1.0
-      hpo_s4_dpo_offline_pair_budget_choices: [256, 512]
-      hpo_s4_dpo_batch_size_choices: [16, 32]
-      hpo_s4_dpo_num_epochs_choices: [1, 2]
-      hpo_s4_dpo_d_water_budget_fraction_choices: [0.3, 0.5]
-      hpo_s4_dpo_pair_source_choices: [target_row_synthetic, chi_aware_plus_target_row_synthetic]
-      hpo_s4_dpo_synthetic_candidates_per_target_choices: [4, 8]
-      efficiency_min_class_match_acceptance_rate: 0.01
   tie_epsilon: 1.0e-4
+  method_runtime_overrides:
+    S4_rl:
+      hpo_s4_trajectories_per_batch: 4
+      hpo_s4_replay_batch_size: 4
+      hpo_s4_rl_diffusion_num_steps: 8
+    S4_ppo:
+      hpo_s4_trajectories_per_batch: 4
+      hpo_s4_replay_batch_size: 4
+      hpo_s4_rl_diffusion_num_steps: 8
+    S4_grpo:
+      hpo_s4_trajectories_per_batch: 4
+      hpo_s4_replay_batch_size: 4
+      hpo_s4_rl_diffusion_num_steps: 8
+    S4_dpo:
+      hpo_s4_dpo_checkpoint_selection_mode: val_dpo_loss
+      hpo_decode_class_match_max_request_size: 16
+      hpo_decode_class_match_max_total_raw_samples: 96
+      hpo_s4_dpo_cfg_scale_min: 1.0
+      hpo_s4_dpo_offline_pair_budget_choices: [64]
+      hpo_s4_dpo_batch_size_choices: [16]
+      hpo_s4_dpo_num_epochs_choices: [1]
+      hpo_s4_dpo_d_water_budget_fraction_choices: [0.5]
+      hpo_s4_dpo_pair_source_choices: [target_row_synthetic]
+      hpo_s4_dpo_synthetic_candidates_per_target_choices: [2]
+      efficiency_min_class_match_acceptance_rate: 0.01
   method_budgets:
-    S1: {n_trials: 50, timeout_hours_medium: 24}
-    S2: {n_trials: 50, timeout_hours_medium: 24}
-    S3: {n_trials: 50, timeout_hours_medium: 24}
-    S4_rl: {n_trials: 50, timeout_hours_medium: 24}
-    S4_ppo: {n_trials: 50, timeout_hours_medium: 24}
-    S4_grpo: {n_trials: 50, timeout_hours_medium: 24}
-    S4_dpo: {n_trials: 50, timeout_hours_medium: 24}
+    S1: {n_trials: 3, timeout_hours_medium: 1}
+    S2: {n_trials: 3, timeout_hours_medium: 1}
+    S3: {n_trials: 3, timeout_hours_medium: 1}
+    S4_rl: {n_trials: 3, timeout_hours_medium: 1}
+    S4_ppo: {n_trials: 3, timeout_hours_medium: 1}
+    S4_grpo: {n_trials: 3, timeout_hours_medium: 1}
+    S4_dpo: {n_trials: 3, timeout_hours_medium: 1}

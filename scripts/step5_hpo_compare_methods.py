@@ -150,7 +150,8 @@ def main() -> None:
             model_size=args.model_size,
             c_target_override=(args.c_target or None),
         )
-        study_root = (resolved.results_dir / "step5_hpo" / resolved.split_mode / resolved.c_target).resolve()
+        hpo_root_dirname = str(resolved.step5_hpo.get("root_dirname", "step5_hpo") or "step5_hpo")
+        study_root = (resolved.results_dir / hpo_root_dirname / resolved.split_mode / resolved.c_target).resolve()
     study_root.mkdir(parents=True, exist_ok=True)
 
     _plot_metric(
