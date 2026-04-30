@@ -83,6 +83,13 @@ def _resolve_optional_positive_int(raw_value: Any) -> int | None:
     return int(value) if value > 0 else None
 
 
+def _resolve_optional_positive_float(raw_value: Any) -> float | None:
+    if raw_value in {None, "", "null"}:
+        return None
+    value = float(raw_value)
+    return float(value) if math.isfinite(value) and value > 0.0 else None
+
+
 def _tighten_step5_decode_class_cap(
     step5_decode_cfg: Dict[str, Any],
     *,
@@ -817,7 +824,13 @@ def _write_trial_summary(
     selection_objective_value: float | None = None,
     selection_efficiency_eligible: bool | None = None,
     selection_efficiency_notes: list[str] | None = None,
-    state: str,
+    wall_time_sec: float | None = None,
+    model_setup_wall_time_sec: float | None = None,
+    sampling_wall_time_sec: float | None = None,
+    evaluation_wall_time_sec: float | None = None,
+    generated_samples: int | None = None,
+    target_rows: int | None = None,
+    state: str = "UNKNOWN",
 ) -> None:
     payload = {
         "trial_number": int(trial_number),
@@ -857,6 +870,18 @@ def _write_trial_summary(
             if selection_efficiency_notes is not None
             else None
         ),
+        "wall_time_sec": (float(wall_time_sec) if wall_time_sec is not None else None),
+        "model_setup_wall_time_sec": (
+            float(model_setup_wall_time_sec) if model_setup_wall_time_sec is not None else None
+        ),
+        "sampling_wall_time_sec": (
+            float(sampling_wall_time_sec) if sampling_wall_time_sec is not None else None
+        ),
+        "evaluation_wall_time_sec": (
+            float(evaluation_wall_time_sec) if evaluation_wall_time_sec is not None else None
+        ),
+        "generated_samples": (int(generated_samples) if generated_samples is not None else None),
+        "target_rows": (int(target_rows) if target_rows is not None else None),
         "hyperparameters": dict(params),
     }
     trial_path = _trial_summary_path(study_root, int(trial_number))
@@ -972,15 +997,28 @@ def run_optuna_study(
         )
     share_s4_warm_start_in_hpo = bool(resolved.step5_hpo.get("reuse_shared_s4_warm_start", True))
     skip_disk_checkpoints_in_hpo = bool(resolved.step5_hpo.get("skip_disk_checkpoints", True))
+    enable_sampling_pruning = bool(family_hpo_cfg.get("enable_sampling_pruning", True))
+    trial_wall_time_limit_seconds = _resolve_optional_positive_float(
+        family_hpo_cfg.get("trial_wall_time_limit_seconds", None)
+    )
     stage_offsets = {
         "s2": 0,
         "warm_start": 1_000_000,
         "dpo": 2_000_000,
         "rl": 3_000_000,
+        "sampling": 4_000_000,
     }
 
     def objective(trial) -> float:
         def pruning_callback(*, stage: str, step: int, value: float, metrics: Dict[str, Any]) -> None:
+            if (
+                trial_wall_time_limit_seconds is not None
+                and time.time() - start > float(trial_wall_time_limit_seconds)
+            ):
+                raise optuna.TrialPruned(
+                    f"Pruned Step 5 {study_family} trial {int(trial.number)} after "
+                    f"{float(trial_wall_time_limit_seconds):.1f}s wall-time limit"
+                )
             if not math.isfinite(float(value)):
                 return
             trial.report(float(value), step=stage_offsets.get(str(stage), 0) + int(step))
@@ -1020,6 +1058,8 @@ def run_optuna_study(
                         "trial_number": int(trial.number),
                         "hpo_mode": True,
                         "skip_disk_checkpoints": bool(skip_disk_checkpoints_in_hpo),
+                        "hpo_objective_metric": objective_metric_name,
+                        "hpo_enable_sampling_pruning": bool(enable_sampling_pruning),
                         "allow_shared_s4_warm_start": bool(
                             share_s4_warm_start_in_hpo and study_family.startswith("S4_")
                         ),
@@ -1044,6 +1084,7 @@ def run_optuna_study(
                 selection_objective_value=None,
                 selection_efficiency_eligible=None,
                 selection_efficiency_notes=None,
+                wall_time_sec=float(time.time() - start),
                 state="PRUNED",
             )
             raise
@@ -1065,6 +1106,7 @@ def run_optuna_study(
                 selection_objective_value=None,
                 selection_efficiency_eligible=None,
                 selection_efficiency_notes=None,
+                wall_time_sec=float(time.time() - start),
                 state="FAIL",
             )
             if torch.cuda.is_available():
@@ -1106,6 +1148,11 @@ def run_optuna_study(
         mean_total_raw_samples_drawn = float(
             metrics.get("mean_total_raw_samples_drawn", float("nan"))
         )
+        model_setup_wall_time_sec = float(metrics.get("model_setup_wall_time_seconds", float("nan")))
+        sampling_wall_time_sec = float(metrics.get("sampling_wall_time_seconds", float("nan")))
+        evaluation_wall_time_sec = float(metrics.get("evaluation_wall_time_seconds", float("nan")))
+        generated_samples = int(metrics.get("generated_samples", len(eval_df)))
+        target_rows = int(metrics.get("target_rows", 0))
         selection_objective_value, selection_efficiency_eligible, selection_efficiency_notes = (
             _compute_selection_objective_value(
                 objective_value=float(objective_value),
@@ -1141,6 +1188,11 @@ def run_optuna_study(
         trial.set_user_attr("selection_efficiency_eligible", bool(selection_efficiency_eligible))
         trial.set_user_attr("selection_efficiency_notes", list(selection_efficiency_notes))
         trial.set_user_attr("wall_time_sec", float(wall_time))
+        trial.set_user_attr("model_setup_wall_time_sec", model_setup_wall_time_sec)
+        trial.set_user_attr("sampling_wall_time_sec", sampling_wall_time_sec)
+        trial.set_user_attr("evaluation_wall_time_sec", evaluation_wall_time_sec)
+        trial.set_user_attr("generated_samples", int(generated_samples))
+        trial.set_user_attr("target_rows", int(target_rows))
         trial.set_user_attr("run_name", str(run_cfg["run_name"]))
         _write_trial_summary(
             study_root,
@@ -1159,6 +1211,12 @@ def run_optuna_study(
             selection_objective_value=float(selection_objective_value),
             selection_efficiency_eligible=bool(selection_efficiency_eligible),
             selection_efficiency_notes=list(selection_efficiency_notes),
+            wall_time_sec=float(wall_time),
+            model_setup_wall_time_sec=model_setup_wall_time_sec,
+            sampling_wall_time_sec=sampling_wall_time_sec,
+            evaluation_wall_time_sec=evaluation_wall_time_sec,
+            generated_samples=int(generated_samples),
+            target_rows=int(target_rows),
             state="COMPLETE",
         )
         return objective_value
@@ -1189,6 +1247,12 @@ def run_optuna_study(
             "mean_total_raw_samples_drawn": trial.user_attrs.get("mean_total_raw_samples_drawn"),
             "selection_objective_value": trial.user_attrs.get("selection_objective_value"),
             "selection_efficiency_eligible": trial.user_attrs.get("selection_efficiency_eligible"),
+            "wall_time_sec": trial.user_attrs.get("wall_time_sec"),
+            "model_setup_wall_time_sec": trial.user_attrs.get("model_setup_wall_time_sec"),
+            "sampling_wall_time_sec": trial.user_attrs.get("sampling_wall_time_sec"),
+            "evaluation_wall_time_sec": trial.user_attrs.get("evaluation_wall_time_sec"),
+            "generated_samples": trial.user_attrs.get("generated_samples"),
+            "target_rows": trial.user_attrs.get("target_rows"),
         }
         for trial in study.trials
     ]
@@ -1267,6 +1331,36 @@ def run_optuna_study(
                 if "selection_efficiency_notes" in trial.user_attrs
                 else None
             ),
+            "wall_time_sec": (
+                float(trial.user_attrs["wall_time_sec"])
+                if "wall_time_sec" in trial.user_attrs
+                else None
+            ),
+            "model_setup_wall_time_sec": (
+                float(trial.user_attrs["model_setup_wall_time_sec"])
+                if "model_setup_wall_time_sec" in trial.user_attrs
+                else None
+            ),
+            "sampling_wall_time_sec": (
+                float(trial.user_attrs["sampling_wall_time_sec"])
+                if "sampling_wall_time_sec" in trial.user_attrs
+                else None
+            ),
+            "evaluation_wall_time_sec": (
+                float(trial.user_attrs["evaluation_wall_time_sec"])
+                if "evaluation_wall_time_sec" in trial.user_attrs
+                else None
+            ),
+            "generated_samples": (
+                int(trial.user_attrs["generated_samples"])
+                if "generated_samples" in trial.user_attrs
+                else None
+            ),
+            "target_rows": (
+                int(trial.user_attrs["target_rows"])
+                if "target_rows" in trial.user_attrs
+                else None
+            ),
             "hyperparameters": dict(trial.params),
         }
         for trial in study.trials
@@ -1315,6 +1409,22 @@ def run_optuna_study(
                     "best_mean_total_raw_samples_drawn": float(
                         best_trial.user_attrs.get("mean_total_raw_samples_drawn", float("nan"))
                     ),
+                    "best_wall_time_sec": float(
+                        best_trial.user_attrs.get("wall_time_sec", float("nan"))
+                    ),
+                    "best_model_setup_wall_time_sec": float(
+                        best_trial.user_attrs.get("model_setup_wall_time_sec", float("nan"))
+                    ),
+                    "best_sampling_wall_time_sec": float(
+                        best_trial.user_attrs.get("sampling_wall_time_sec", float("nan"))
+                    ),
+                    "best_evaluation_wall_time_sec": float(
+                        best_trial.user_attrs.get("evaluation_wall_time_sec", float("nan"))
+                    ),
+                    "best_generated_samples": int(
+                        best_trial.user_attrs.get("generated_samples", 0)
+                    ),
+                    "best_target_rows": int(best_trial.user_attrs.get("target_rows", 0)),
                     "best_params": dict(best_trial.params),
                 },
                 handle,

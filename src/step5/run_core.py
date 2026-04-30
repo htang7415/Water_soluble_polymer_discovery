@@ -5,13 +5,14 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 import torch
 import yaml
 
-from .config import build_run_config, resolve_step5_generation_budget
+from .config import build_run_config, resolve_step5_generation_budget, resolve_step5_sampling_num_steps
 from .conditional_sampling import create_conditional_sampler, sample_conditional_with_class_prior
 from .dataset import ConditionScaler, build_inference_condition_bundle_from_target_row
 from .dpo import train_s4_dpo_alignment
@@ -74,6 +75,24 @@ def _resolve_cross_target_duplicate_rejection_enabled(resolved) -> bool:
             continue
         return bool(raw_value)
     return default_value
+
+
+def _resolve_hpo_sampling_objective_column(metric_name: str, evaluation_df: pd.DataFrame) -> Optional[str]:
+    """Map an HPO objective metric to a per-sample hit column for intermediate pruning."""
+
+    candidates_by_metric = {
+        "mean_success_hit_rate_discovery": ["success_hit_discovery", "success_hit"],
+        "mean_success_hit_rate": ["success_hit"],
+        "mean_property_success_hit_rate_discovery": [
+            "property_success_hit_discovery",
+            "property_success_hit",
+        ],
+        "mean_property_success_hit_rate": ["property_success_hit"],
+    }
+    for column in candidates_by_metric.get(str(metric_name).strip(), ["success_hit_discovery", "success_hit"]):
+        if column in evaluation_df.columns:
+            return str(column)
+    return None
 
 
 def create_run_dirs(run_dir: Path, *, create_checkpoints_dir: bool = True) -> Dict[str, Path]:
@@ -519,7 +538,7 @@ def run_single_target_sampling(
         sampler = GuidedSampler(
             diffusion_model=diffusion_model,
             tokenizer=tokenizer,
-            num_steps=resolved.base_config["diffusion"]["num_steps"],
+            num_steps=resolve_step5_sampling_num_steps(resolved.step5, resolved.base_config),
             temperature=float(resolved.step5["sampling_temperature"]),
             top_k=resolved.base_config.get("sampling", {}).get("top_k"),
             top_p=resolved.base_config.get("sampling", {}).get("top_p"),
@@ -601,7 +620,7 @@ def run_single_target_sampling(
         sampler = GuidedConditionalSampler(
             diffusion_model=diffusion_model,
             tokenizer=tokenizer,
-            num_steps=resolved.base_config["diffusion"]["num_steps"],
+            num_steps=resolve_step5_sampling_num_steps(resolved.step5, resolved.base_config),
             temperature=float(resolved.step5["sampling_temperature"]),
             top_k=resolved.base_config.get("sampling", {}).get("top_k"),
             top_p=resolved.base_config.get("sampling", {}).get("top_p"),
@@ -687,9 +706,20 @@ def execute_step5_run(
     extra_context: Optional[Dict[str, Any]] = None,
     pruning_callback: Optional[Callable[..., None]] = None,
 ) -> Dict[str, Any]:
+    extra_context = extra_context or {}
+    run_wall_start = time.perf_counter()
     run_cfg = run_cfg or build_run_config(resolved, run_name)
     run_dir = run_dir or (resolved.method_root / str(run_cfg["run_name"]))
-    target_rows_df = target_rows_df.copy() if target_rows_df is not None else resolved.target_family_df.copy()
+    explicit_target_rows = target_rows_df is not None
+    target_rows_df = target_rows_df.copy() if explicit_target_rows else resolved.target_family_df.copy()
+    raw_max_target_rows = resolved.step5.get("max_target_rows")
+    if not explicit_target_rows and raw_max_target_rows not in {None, "", "null"}:
+        max_target_rows = int(raw_max_target_rows)
+        if max_target_rows <= 0:
+            raise ValueError("step5.max_target_rows must be >= 1 when provided.")
+        target_rows_df = target_rows_df.head(max_target_rows).copy()
+        if target_rows_df.empty:
+            raise ValueError("step5.max_target_rows selected zero target rows.")
     generation_budget = int(
         generation_budget
         if generation_budget is not None
@@ -700,7 +730,7 @@ def execute_step5_run(
     if num_rounds > len(sampling_seeds):
         raise ValueError("num_rounds exceeds the number of provided sampling seeds.")
 
-    skip_disk_checkpoints = bool((extra_context or {}).get("skip_disk_checkpoints", False))
+    skip_disk_checkpoints = bool(extra_context.get("skip_disk_checkpoints", False))
     run_dirs = create_run_dirs(run_dir, create_checkpoints_dir=not skip_disk_checkpoints)
     save_run_config_snapshot(
         run_dirs,
@@ -721,6 +751,7 @@ def execute_step5_run(
     )
     evaluator = shared_evaluator
     s2_scaler = None
+    model_setup_start = time.perf_counter()
 
     if canonical_family in {"S2", "S3"}:
         reuse_checkpoint_path, reuse_metrics_dir = _resolve_reusable_s2_artifact_paths(extra_context=extra_context)
@@ -849,11 +880,18 @@ def execute_step5_run(
         prior = resolve_class_sampling_prior(resolved, run_cfg, tokenizer, metrics_dir=run_dirs["metrics_dir"])
         _write_json({"checkpoint_path": str(checkpoint_path)}, run_dirs["metrics_dir"] / "step1_checkpoint.json")
 
+    sampling_wall_time_seconds = 0.0
+    evaluation_wall_time_seconds = 0.0
     generated_frames: List[pd.DataFrame] = []
     evaluation_frames: List[pd.DataFrame] = []
     round_oracle_rows: List[Dict[str, int]] = []
     sampling_meta_rows: List[Dict[str, Any]] = []
     sample_id_start = 1
+    hpo_objective_metric = str(extra_context.get("hpo_objective_metric", "mean_success_hit_rate_discovery")).strip()
+    hpo_sampling_pruning_enabled = bool(extra_context.get("hpo_enable_sampling_pruning", False))
+    hpo_objective_sum = 0.0
+    hpo_objective_count = 0
+    hpo_sampling_step = 0
     reject_duplicate_canonical_across_targets = _resolve_cross_target_duplicate_rejection_enabled(resolved)
     cycle_backbone_template_cores_across_targets = bool(
         getattr(prior, "cycle_backbone_template_cores_across_targets", False)
@@ -861,6 +899,7 @@ def execute_step5_run(
 
     if canonical_family in {"S1", "S3"} and evaluator is None:
         evaluator = load_step5_evaluator(resolved, device=device)
+    model_setup_wall_time_seconds = time.perf_counter() - model_setup_start
 
     for round_id, sampling_seed in enumerate(sampling_seeds[:num_rounds], start=1):
         append_log_message(
@@ -899,6 +938,7 @@ def execute_step5_run(
                 ),
                 echo=True,
             )
+            target_sampling_start = time.perf_counter()
             smiles, guidance_stats, sample_meta = run_single_target_sampling(
                 run_cfg=run_cfg,
                 resolved=resolved,
@@ -913,21 +953,8 @@ def execute_step5_run(
                 seen_canonical_smiles=round_seen_canonical_smiles,
                 sampling_state=round_sampling_state,
             )
-            sampling_meta_rows.append(
-                {
-                    "run_name": str(run_cfg["run_name"]),
-                    "canonical_family": str(run_cfg["canonical_family"]),
-                    "round_id": int(round_id),
-                    "sampling_seed": int(sampling_seed),
-                    "target_row_id": int(target_row["target_row_id"]),
-                    "target_row_key": str(target_row["target_row_key"]),
-                    "c_target": str(target_row["c_target"]),
-                    "temperature": float(target_row["temperature"]),
-                    "phi": float(target_row["phi"]),
-                    "chi_target": float(target_row["chi_target"]),
-                    **sample_meta,
-                }
-            )
+            target_sampling_wall_time_seconds = time.perf_counter() - target_sampling_start
+            sampling_wall_time_seconds += float(target_sampling_wall_time_seconds)
             generated_df = build_generated_samples_frame(
                 smiles,
                 target_row=target_row,
@@ -940,7 +967,10 @@ def execute_step5_run(
             sample_id_start += int(len(generated_df))
             if evaluator is None:
                 evaluator = load_step5_evaluator(resolved, device=device)
+            target_evaluation_start = time.perf_counter()
             evaluation_df = evaluate_generated_samples(generated_df, evaluator)
+            target_evaluation_wall_time_seconds = time.perf_counter() - target_evaluation_start
+            evaluation_wall_time_seconds += float(target_evaluation_wall_time_seconds)
             generated_count = int(len(generated_df))
             valid_count = int(evaluation_df["valid_ok"].astype(int).sum()) if "valid_ok" in evaluation_df.columns else 0
             property_hit_count = (
@@ -961,6 +991,23 @@ def execute_step5_run(
             evaluation_frames.append(evaluation_df)
             round_soluble_calls += int(guidance_stats.get("training_soluble_oracle_calls", 0))
             round_chi_calls += int(guidance_stats.get("training_chi_oracle_calls", 0))
+            sampling_meta_rows.append(
+                {
+                    "run_name": str(run_cfg["run_name"]),
+                    "canonical_family": str(run_cfg["canonical_family"]),
+                    "round_id": int(round_id),
+                    "sampling_seed": int(sampling_seed),
+                    "target_row_id": int(target_row["target_row_id"]),
+                    "target_row_key": str(target_row["target_row_key"]),
+                    "c_target": str(target_row["c_target"]),
+                    "temperature": float(target_row["temperature"]),
+                    "phi": float(target_row["phi"]),
+                    "chi_target": float(target_row["chi_target"]),
+                    "target_sampling_wall_time_seconds": float(target_sampling_wall_time_seconds),
+                    "target_evaluation_wall_time_seconds": float(target_evaluation_wall_time_seconds),
+                    **sample_meta,
+                }
+            )
             append_log_message(
                 run_dirs["run_dir"],
                 (
@@ -971,6 +1018,39 @@ def execute_step5_run(
                 ),
                 echo=True,
             )
+            if pruning_callback is not None and hpo_sampling_pruning_enabled:
+                objective_column = _resolve_hpo_sampling_objective_column(hpo_objective_metric, evaluation_df)
+                if objective_column is not None:
+                    hpo_objective_sum += float(
+                        pd.to_numeric(evaluation_df[objective_column], errors="coerce").fillna(0.0).sum()
+                    )
+                    hpo_objective_count += int(len(evaluation_df))
+                elif generated_count > 0:
+                    hpo_objective_count += int(generated_count)
+                hpo_sampling_step += 1
+                cumulative_objective = (
+                    float(hpo_objective_sum) / float(hpo_objective_count)
+                    if hpo_objective_count > 0
+                    else 0.0
+                )
+                pruning_callback(
+                    stage="sampling",
+                    step=int(hpo_sampling_step),
+                    value=float(cumulative_objective),
+                    metrics={
+                        "objective_metric": hpo_objective_metric,
+                        "sampling_objective_column": objective_column,
+                        "cumulative_sampling_objective": float(cumulative_objective),
+                        "cumulative_sampling_samples": int(hpo_objective_count),
+                        "round_id": int(round_id),
+                        "target_idx": int(target_idx),
+                        "target_rows": int(len(target_rows_df)),
+                        "generated": int(generated_count),
+                        "valid": int(valid_count),
+                        "property_hits": int(property_hit_count),
+                        "success_hits": int(success_hit_count),
+                    },
+                )
 
         round_oracle_rows.append(
             {
@@ -1084,6 +1164,15 @@ def execute_step5_run(
                 if "total_raw_samples_drawn" in sampling_meta_df.columns and not sampling_meta_df.empty
                 else 0.0
             ),
+            "model_setup_wall_time_seconds": float(model_setup_wall_time_seconds),
+            "sampling_wall_time_seconds": float(sampling_wall_time_seconds),
+            "evaluation_wall_time_seconds": float(evaluation_wall_time_seconds),
+            "total_wall_time_seconds": float(time.perf_counter() - run_wall_start),
+            "generated_samples": int(len(generated_samples_df)),
+            "evaluated_samples": int(len(evaluation_results_df)),
+            "target_rows": int(len(target_rows_df)),
+            "generation_budget": int(generation_budget),
+            "num_sampling_rounds": int(num_rounds),
         }
     )
 

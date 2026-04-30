@@ -30,6 +30,27 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return merged
 
 
+def _load_step5_bundle_config(config_path: str | Path) -> Dict[str, Any]:
+    """Load a Step 5 config, optionally merging a small overlay into a base config."""
+
+    config_path = Path(config_path)
+    config = load_config(str(config_path))
+    if not isinstance(config, dict):
+        return config
+    extends = config.get("extends", config.get("base_step5_config"))
+    if extends in {None, "", "null"}:
+        return config
+    base_path = Path(str(extends))
+    if not base_path.is_absolute():
+        base_path = config_path.parent / base_path
+    override = {
+        key: deepcopy(value)
+        for key, value in config.items()
+        if key not in {"extends", "base_step5_config"}
+    }
+    return _deep_merge(_load_step5_bundle_config(base_path), override)
+
+
 def _as_serializable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -125,6 +146,15 @@ def resolve_step5_hpo_generation_budget(hpo_cfg: Dict[str, Any], c_target: str) 
     base_budget = int(hpo_cfg["hpo_generation_budget"])
     overrides = _resolve_class_numeric_overrides(hpo_cfg.get("hpo_generation_budget_by_class", {}))
     return int(round(overrides.get(str(c_target).strip().lower(), float(base_budget))))
+
+
+def resolve_step5_sampling_num_steps(step5_cfg: Dict[str, Any], base_config: Dict[str, Any]) -> int:
+    """Resolve sampler reverse-diffusion steps without changing checkpoint shapes."""
+    base_steps = int(base_config["diffusion"]["num_steps"])
+    raw_steps = step5_cfg.get("sampling_num_steps", None)
+    if raw_steps in {None, "", "null"}:
+        return int(base_steps)
+    return int(max(1, min(base_steps, int(raw_steps))))
 
 
 def resolve_step5_sa_thresholds(step5_cfg: Dict[str, Any], c_target: str) -> Dict[str, float]:
@@ -834,7 +864,10 @@ def load_step5_config(
     c_target_override: Optional[str] = None,
 ) -> ResolvedStep5Config:
     base_config = load_config(base_config_path)
-    step5_bundle = load_config(config_path)
+    step5_bundle = _load_step5_bundle_config(config_path)
+    base_config_overrides = deepcopy(step5_bundle.get("base_config_overrides", {}))
+    if base_config_overrides:
+        base_config = _deep_merge(base_config, base_config_overrides)
     step5_cfg = deepcopy(step5_bundle.get("step5", {}))
     step5_1_cfg = deepcopy(step5_bundle.get("step5_1", {}))
     hpo_cfg = deepcopy(step5_bundle.get("step5_hpo", {}))

@@ -8,7 +8,7 @@ import torch
 
 from src.sampling.sampler import ConstrainedSampler
 from src.step5.conditional_diffusion import ConditionalDiscreteMaskingDiffusion
-from src.step5.config import ResolvedStep5Config
+from src.step5.config import ResolvedStep5Config, resolve_step5_sampling_num_steps
 from src.step5.frozen_sampling import ResolvedClassSamplingPrior, sample_with_class_prior
 from src.data.tokenizer import PSmilesTokenizer
 
@@ -237,7 +237,9 @@ def create_conditional_sampler(
         diffusion_model=diffusion_model,
         tokenizer=tokenizer,
         num_steps=int(
-            resolved.base_config["diffusion"]["num_steps"] if num_steps is None else num_steps
+            resolve_step5_sampling_num_steps(resolved.step5, resolved.base_config)
+            if num_steps is None
+            else num_steps
         ),
         temperature=float(resolved.step5["sampling_temperature"]),
         top_k=sampling_cfg.get("top_k"),

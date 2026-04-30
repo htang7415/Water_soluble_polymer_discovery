@@ -1,0 +1,130 @@
+extends: config5.yaml
+
+# Fast Step 5 HPO profile for broad 24-hour exploration.
+# It keeps the main Step 5 settings from config5.yaml but lowers per-trial
+# fidelity so Optuna can sample more hyperparameter settings before refitting.
+step5_hpo:
+  root_dirname: step5_hpo_fast
+  n_startup_trials: 4
+  pruner: median
+  pruner_n_startup_trials: 2
+  pruner_n_warmup_steps: 1
+  enable_sampling_pruning: true
+  trial_wall_time_limit_seconds: 2700
+  reuse_shared_s4_warm_start: true
+  skip_disk_checkpoints: true
+  hpo_s2_max_steps: 1000
+  hpo_s2_val_checks: 2
+  hpo_rl_num_steps: 8
+  hpo_rl_proxy_eval_checks: 1
+  hpo_sampling_batch_size: 32
+  hpo_decode_class_match_sampling_attempts_max: 6
+  hpo_decode_class_match_oversample_factor: 1.5
+  hpo_decode_class_match_max_request_size: 128
+  hpo_decode_class_match_max_total_raw_samples: 512
+  hpo_decode_partial_quota_min_fill_ratio: 0.25
+  hpo_s4_trajectories_per_batch: 4
+  hpo_s4_rl_diffusion_num_steps: 6
+  hpo_s4_replay_batch_size: 4
+  hpo_num_targets: 1
+  hpo_generation_budget: 8
+  hpo_generation_budget_by_class:
+    polyacrylate: 8
+    polyether: 8
+    polyamide: 8
+    polyester: 8
+    polyimide: 8
+    polysulfone: 8
+    polystyrene: 8
+  hpo_num_rounds: 1
+  hpo_sampling_seeds: [101]
+  efficiency_min_class_match_acceptance_rate: 0.005
+  efficiency_max_mean_total_raw_samples_drawn: 512
+  method_runtime_overrides:
+    S3:
+      hpo_s2_max_steps: 1000
+      hpo_s2_val_checks: 2
+      hpo_generation_budget: 8
+      hpo_generation_budget_by_class:
+        polyacrylate: 8
+        polyether: 8
+        polyamide: 8
+        polyester: 8
+        polyimide: 8
+        polysulfone: 8
+        polystyrene: 8
+    S4_rl:
+      hpo_rl_num_steps: 8
+      hpo_rl_proxy_eval_checks: 1
+      hpo_s4_trajectories_per_batch: 4
+      hpo_s4_replay_batch_size: 4
+      hpo_s4_rl_diffusion_num_steps: 6
+      hpo_generation_budget: 8
+      hpo_generation_budget_by_class:
+        polyacrylate: 8
+        polyether: 8
+        polyamide: 8
+        polyester: 8
+        polyimide: 8
+        polysulfone: 8
+        polystyrene: 8
+    S4_ppo:
+      hpo_rl_num_steps: 8
+      hpo_rl_proxy_eval_checks: 1
+      hpo_s4_trajectories_per_batch: 4
+      hpo_s4_replay_batch_size: 4
+      hpo_s4_rl_diffusion_num_steps: 6
+      hpo_generation_budget: 8
+      hpo_generation_budget_by_class:
+        polyacrylate: 8
+        polyether: 8
+        polyamide: 8
+        polyester: 8
+        polyimide: 8
+        polysulfone: 8
+        polystyrene: 8
+    S4_grpo:
+      hpo_rl_num_steps: 8
+      hpo_rl_proxy_eval_checks: 1
+      hpo_s4_trajectories_per_batch: 4
+      hpo_s4_replay_batch_size: 4
+      hpo_s4_rl_diffusion_num_steps: 6
+      hpo_generation_budget: 8
+      hpo_generation_budget_by_class:
+        polyacrylate: 8
+        polyether: 8
+        polyamide: 8
+        polyester: 8
+        polyimide: 8
+        polysulfone: 8
+        polystyrene: 8
+    S4_dpo:
+      hpo_generation_budget: 8
+      hpo_generation_budget_by_class:
+        polyacrylate: 8
+        polyether: 8
+        polyamide: 8
+        polyester: 8
+        polyimide: 8
+        polysulfone: 8
+        polystyrene: 8
+      hpo_s4_dpo_checkpoint_selection_mode: val_dpo_loss
+      hpo_decode_class_match_max_request_size: 128
+      hpo_decode_class_match_max_total_raw_samples: 512
+      hpo_s4_dpo_cfg_scale_min: 1.0
+      hpo_s4_dpo_offline_pair_budget_choices: [64, 128]
+      hpo_s4_dpo_batch_size_choices: [16]
+      hpo_s4_dpo_num_epochs_choices: [1]
+      hpo_s4_dpo_d_water_budget_fraction_choices: [0.5]
+      hpo_s4_dpo_pair_source_choices: [target_row_synthetic]
+      hpo_s4_dpo_synthetic_candidates_per_target_choices: [2, 4]
+      efficiency_min_class_match_acceptance_rate: 0.005
+      efficiency_max_mean_total_raw_samples_drawn: 512
+  method_budgets:
+    S1: {n_trials: 24, timeout_hours_medium: 24}
+    S2: {n_trials: 16, timeout_hours_medium: 24}
+    S3: {n_trials: 16, timeout_hours_medium: 24}
+    S4_rl: {n_trials: 12, timeout_hours_medium: 24}
+    S4_ppo: {n_trials: 12, timeout_hours_medium: 24}
+    S4_grpo: {n_trials: 12, timeout_hours_medium: 24}
+    S4_dpo: {n_trials: 16, timeout_hours_medium: 24}

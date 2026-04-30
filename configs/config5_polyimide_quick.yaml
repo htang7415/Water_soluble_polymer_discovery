@@ -1,3 +1,7 @@
+base_config_overrides:
+  sampling:
+    batch_size: 16
+
 step5:
   split_mode: polymer
   classification_split_mode: polymer
@@ -14,6 +18,7 @@ step5:
     - S4_dpo
     - S4_ppo
     - S4_grpo
+  max_target_rows: 5
   generation_budget: 4
   generation_budget_by_class:
     polyacrylate: 4
@@ -25,7 +30,14 @@ step5:
     polystyrene: 6
   sampling_temperature: 1.0
   inference_batch_size: 32
+  sampling_num_steps: 4
   raw_generation_valid_only: false
+  decode_constraint_class_match_sampling_attempts_max: 2
+  decode_constraint_class_match_oversample_factor: 1.0
+  decode_constraint_class_match_max_request_size: 8
+  decode_constraint_class_match_max_total_raw_samples: 16
+  decode_constraint_allow_partial_quota_return: true
+  decode_constraint_partial_quota_min_fill_ratio: 0.25
   class_decode_prior_mode: "on"
   class_token_bias_start_frac: 0.5
   class_token_bias_start_frac_by_class_overrides:
@@ -89,7 +101,7 @@ step5:
     warmup_steps: 10
     warmup_schedule: linear
     lr_schedule: constant_after_warmup
-    max_steps: 100
+    max_steps: 40
     val_check_interval_steps: 10
     early_stopping_patience_checks: 2
     early_stopping_min_delta: 1.0e-4
@@ -147,7 +159,7 @@ step5:
     count_training_oracle_calls_separately: true
     rl_checkpoint_selection_mode: proxy_property_success_hit_rate
     rl_prompt_source: benchmark_target_rows
-    rl_diffusion_num_steps: 25
+    rl_diffusion_num_steps: 8
     sol_log_prob_floor: -5.0
     sol_log_prob_floor_by_class_overrides:
       polyamide: -12.0
@@ -202,7 +214,7 @@ step5:
     lr_schedule: constant_after_warmup
     kl_weight: 0.01
     gradient_checkpointing: true
-    rl_num_steps: 10
+    rl_num_steps: 3
     policy_update_epochs: 1
     normalize_advantages: false
     ppo_clip_eps: 0.2
@@ -215,7 +227,7 @@ step5:
     rl_proxy_generation_budget: 4
     rl_proxy_generation_budget_by_class_overrides:
       polyimide: 4
-    trajectories_per_batch: 8
+    trajectories_per_batch: 4
     dpo:
       offline_pair_budget: 64
       offline_pair_budget_by_class_overrides:
@@ -333,10 +345,10 @@ step5_hpo:
   hpo_rl_num_steps: 3
   hpo_rl_proxy_eval_checks: 1
   hpo_sampling_batch_size: 16
-  hpo_decode_class_match_sampling_attempts_max: 4
-  hpo_decode_class_match_oversample_factor: 1.25
-  hpo_decode_class_match_max_request_size: 16
-  hpo_decode_class_match_max_total_raw_samples: 96
+  hpo_decode_class_match_sampling_attempts_max: 2
+  hpo_decode_class_match_oversample_factor: 1.0
+  hpo_decode_class_match_max_request_size: 8
+  hpo_decode_class_match_max_total_raw_samples: 16
   hpo_num_targets: 1
   hpo_generation_budget: 4
   hpo_decode_partial_quota_min_fill_ratio: 0.25
@@ -366,8 +378,8 @@ step5_hpo:
       hpo_s4_rl_diffusion_num_steps: 8
     S4_dpo:
       hpo_s4_dpo_checkpoint_selection_mode: val_dpo_loss
-      hpo_decode_class_match_max_request_size: 16
-      hpo_decode_class_match_max_total_raw_samples: 96
+      hpo_decode_class_match_max_request_size: 8
+      hpo_decode_class_match_max_total_raw_samples: 16
       hpo_s4_dpo_cfg_scale_min: 1.0
       hpo_s4_dpo_offline_pair_budget_choices: [64]
       hpo_s4_dpo_batch_size_choices: [16]

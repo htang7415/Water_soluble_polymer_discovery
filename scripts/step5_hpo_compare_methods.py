@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator, PercentFormatter
 import numpy as np
 import pandas as pd
 
@@ -19,15 +20,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.step5.config import load_step5_config
 from src.step5.plotting import apply_step5_plot_style
+from src.utils.figure_style import save_publication_figure
 
 METHOD_LABELS = {
-    "S1": "S1: conditional sampling",
-    "S2": "S2: conditional diffusion",
-    "S3": "S3: conditional guided",
-    "S4_dpo": "S4: rl-DPO",
-    "S4_grpo": "S4: rl-GRPO",
-    "S4_ppo": "S4: rl-PPO",
-    "S4_rl": "S4: rl-finetuned",
+    "S1": "S1",
+    "S2": "S2",
+    "S3": "S3",
+    "S4_dpo": "S4-DPO",
+    "S4_grpo": "S4-GRPO",
+    "S4_ppo": "S4-PPO",
+    "S4_rl": "S4-RL",
 }
 
 
@@ -41,6 +43,8 @@ def _load_trials_df(study_root: Path) -> pd.DataFrame:
             trial_id,
             MAX(CASE WHEN "key" = 'mean_property_success_hit_rate_reporting' THEN value_json END)
                 AS mean_property_success_hit_rate,
+            MAX(CASE WHEN "key" = 'mean_property_success_hit_rate_discovery' THEN value_json END)
+                AS mean_property_success_hit_rate_discovery,
             MAX(CASE WHEN "key" = 'mean_success_hit_rate_reporting' THEN value_json END)
                 AS mean_success_hit_rate,
             MAX(CASE WHEN "key" = 'mean_success_hit_rate_discovery' THEN value_json END)
@@ -52,6 +56,7 @@ def _load_trials_df(study_root: Path) -> pd.DataFrame:
         t.number AS trial_number,
         t.state AS state,
         attr.mean_property_success_hit_rate,
+        attr.mean_property_success_hit_rate_discovery,
         attr.mean_success_hit_rate,
         attr.mean_success_hit_rate_discovery
     FROM trials t
@@ -76,52 +81,75 @@ def _running_best(values: Iterable[float]) -> list[float]:
     return running_best
 
 
-def _build_plot_frame(study_root: Path, metric_col: str) -> pd.DataFrame:
+def _build_plot_frame(study_root: Path, metric_cols: list[str]) -> pd.DataFrame:
     trials_df = _load_trials_df(study_root)
-    frame = trials_df.loc[:, ["trial_number", metric_col]].copy()
+    available_metric_cols = [col for col in metric_cols if col in trials_df.columns]
+    frame = trials_df.loc[:, ["trial_number", *available_metric_cols]].copy()
     frame["trial_number"] = pd.to_numeric(frame["trial_number"], errors="coerce")
-    frame[metric_col] = pd.to_numeric(frame[metric_col], errors="coerce")
+    if available_metric_cols:
+        metric_values = pd.to_numeric(frame[available_metric_cols[0]], errors="coerce")
+        for metric_col in available_metric_cols[1:]:
+            metric_values = metric_values.combine_first(pd.to_numeric(frame[metric_col], errors="coerce"))
+        frame["metric_value"] = metric_values
+    else:
+        frame["metric_value"] = np.nan
     frame = frame.loc[frame["trial_number"].notna()].sort_values("trial_number", kind="mergesort").reset_index(drop=True)
-    frame["running_best"] = _running_best(frame[metric_col].to_numpy(dtype=float))
+    frame["running_best"] = _running_best(frame["metric_value"].to_numpy(dtype=float))
     return frame
 
 
-def _plot_metric(study_root: Path, metric_col: str, ylabel: str, output_name: str, *, font_size: int, dpi: int) -> None:
+def _plot_metric(study_root: Path, metric_cols: list[str], ylabel: str, output_name: str, *, font_size: int, dpi: int) -> None:
     apply_step5_plot_style(font_size=font_size, dpi=dpi)
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
 
     plotted_any = False
     ymax = 0.0
     for method_dir in sorted(path for path in study_root.iterdir() if path.is_dir()):
         try:
-            frame = _build_plot_frame(method_dir, metric_col=metric_col)
+            frame = _build_plot_frame(method_dir, metric_cols=metric_cols)
         except Exception:
             continue
         if frame.empty or not np.isfinite(frame["running_best"].to_numpy(dtype=float)).any():
             continue
         plotted_any = True
-        ymax = max(ymax, float(np.nanmax(frame["running_best"].to_numpy(dtype=float))))
+        trial_numbers = frame["trial_number"].to_numpy(dtype=int)
+        running_best = frame["running_best"].to_numpy(dtype=float)
+        ymax = max(ymax, float(np.nanmax(running_best)))
         ax.plot(
-            frame["trial_number"].astype(int),
-            frame["running_best"].astype(float),
-            linewidth=2.0,
+            trial_numbers,
+            running_best,
+            linewidth=1.8,
             marker="o",
-            markersize=4.0,
+            markersize=4.8,
+            markeredgecolor="white",
+            markeredgewidth=0.35,
             label=METHOD_LABELS.get(method_dir.name, method_dir.name),
         )
 
     if plotted_any:
-        ax.set_ylim(0.0, max(1.0, min(1.02, ymax * 1.05 if ymax > 0.0 else 1.0)))
-        ax.legend(frameon=False, loc="lower right")
-        ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
+        ax.set_ylim(0.0, max(1.0, min(1.08, ymax * 1.12 if ymax > 0.0 else 1.0)))
+        ax.legend(
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.01, 1.0),
+            borderaxespad=0.0,
+            fontsize=int(font_size),
+            ncol=1,
+            columnspacing=0.9,
+            handlelength=1.5,
+        )
     else:
         ax.text(0.5, 0.5, "No completed trials", ha="center", va="center", transform=ax.transAxes)
         ax.set_ylim(0.0, 1.0)
 
     ax.set_xlabel("Trial")
     ax.set_ylabel(ylabel)
-    fig.tight_layout()
-    fig.savefig(study_root / output_name, dpi=dpi)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.grid(True, axis="y", linestyle=(0, (3, 3)), linewidth=0.65, color="#D8DEE4", alpha=0.9)
+    fig.tight_layout(rect=(0, 0, 0.78, 1) if plotted_any else None)
+    save_publication_figure(fig, study_root / output_name, dpi=dpi, write_pdf=False)
     plt.close(fig)
 
 
@@ -156,7 +184,7 @@ def main() -> None:
 
     _plot_metric(
         study_root,
-        metric_col="mean_property_success_hit_rate",
+        metric_cols=["mean_property_success_hit_rate_discovery", "mean_property_success_hit_rate"],
         ylabel="Property success hit rate",
         output_name="hpo_compare_best_mean_property_success_hit_rate.png",
         font_size=int(args.font_size),
@@ -164,7 +192,15 @@ def main() -> None:
     )
     _plot_metric(
         study_root,
-        metric_col="mean_success_hit_rate",
+        metric_cols=["mean_success_hit_rate_discovery", "mean_success_hit_rate"],
+        ylabel="Success hit rate",
+        output_name="hpo_compare_best_success_hit_rate.png",
+        font_size=int(args.font_size),
+        dpi=int(args.dpi),
+    )
+    _plot_metric(
+        study_root,
+        metric_cols=["mean_success_hit_rate_discovery", "mean_success_hit_rate"],
         ylabel="Success hit rate",
         output_name="hpo_compare_best_mean_success_hit_rate.png",
         font_size=int(args.font_size),

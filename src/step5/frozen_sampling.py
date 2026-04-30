@@ -21,7 +21,7 @@ from src.evaluation.class_decode_constraints import (
 from src.evaluation.polymer_class import BACKBONE_CLASS_MATCH_CLASSES, PolymerClassifier
 from src.model.diffusion import DiscreteMaskingDiffusion
 from src.sampling.sampler import ConstrainedSampler
-from src.step5.config import ResolvedStep5Config
+from src.step5.config import ResolvedStep5Config, resolve_step5_sampling_num_steps
 from src.data.tokenizer import PSmilesTokenizer
 from src.utils.chemistry import (
     canonicalize_smiles,
@@ -1008,7 +1008,7 @@ def create_constrained_sampler(
     sampler = ConstrainedSampler(
         diffusion_model=diffusion_model,
         tokenizer=tokenizer,
-        num_steps=resolved.base_config["diffusion"]["num_steps"],
+        num_steps=resolve_step5_sampling_num_steps(resolved.step5, resolved.base_config),
         temperature=float(resolved.step5["sampling_temperature"]),
         top_k=sampling_cfg.get("top_k"),
         top_p=sampling_cfg.get("top_p"),
@@ -1471,7 +1471,7 @@ def _resolve_class_match_request_size(
             request_size = max(int(base_request_size), int(adaptive_request_size))
             request_strategy = "adaptive_acceptance_tail"
 
-    if prior.class_match_max_request_size is not None:
+    if prior.enforce_class_match and prior.class_match_max_request_size is not None:
         capped_request_size = min(int(request_size), int(prior.class_match_max_request_size))
         clipped_by_max_request_size = int(capped_request_size) < int(request_size)
         request_size = int(capped_request_size)
