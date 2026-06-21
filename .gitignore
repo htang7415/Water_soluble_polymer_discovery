@@ -22,6 +22,7 @@ rl_postprocess/
 logs/
 experiments*/
 Experiments*/
+/Tokenizor_comparation_20260421/
 
 # Historical/local generated folders and scratch files
 Bi_Diffusion_SMILES/
